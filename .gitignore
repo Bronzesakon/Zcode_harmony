@@ -13,3 +13,6 @@
 
 # 本地参考项目（仅本地保留，不随仓库上传）
 /Deepseek-Harmony_Reference/
+
+# 本地工具资产（ZCode 项目级技能等），仅本地保留
+/.zcode/
