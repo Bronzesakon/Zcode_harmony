@@ -341,7 +341,7 @@ struct Index {
                   .fontColor(this.themeColor('#FFFFFF', '#333333'))
                   .margin({ bottom: 20 })
 
-                Row() {
+                Row({ space: 12 }) {
                   // 相册
                   Column() {
                     SymbolGlyph($r('sys.symbol.picture'))
@@ -372,7 +372,6 @@ struct Index {
                   .borderRadius(14)
                   .justifyContent(FlexAlign.Center)
                   .backgroundColor(this.themeColor('#3A3A3A', '#F5F5F5'))
-                  .margin({ left: 12 })
                   .onClick(() => this.handlePickFile())
                 }
                 .width('100%')

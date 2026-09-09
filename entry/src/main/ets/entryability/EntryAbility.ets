@@ -156,10 +156,15 @@ export default class EntryAbility extends UIAbility {
   }
 
   /**
-   * 状态栏固定背景色 + 图标配色（跟随系统深浅）
-   * 背景与窗口背景同色，保证状态栏区与页面无缝衔接。
+   * 状态栏配色（跟随系统深浅）
+   *
+   * 背景色保持透明，固定色由页面顶部占位 Row 提供（沉浸模式下窗口铺满全屏，
+   * 该 Row 正好覆盖状态栏区域）。这是官方推荐做法：若在此直接给 statusBarColor
+   * 赋值，系统会在启动/退出过渡动画期间就立即刷成该颜色，窗口尚未铺满屏幕时
+   * 状态栏会突兀变色（FAQ faqs-arkui-1652）。透明则由页面内容自然带出同色。
+   *
    * colorMode 显式传入：onConfigurationUpdate 回调中 this.context.config 尚未刷新，
-   * 读取它只能得到上一档模式，会造成状态栏与页面配色反相。
+   * 读取它只能得到上一档模式，会造成状态栏图标与页面配色反相。
    */
   private applySystemBar(colorMode?: ConfigurationConstant.ColorMode): void {
     if (!mainWindowClass) {
@@ -168,10 +173,9 @@ export default class EntryAbility extends UIAbility {
     const isDark: boolean =
       (colorMode !== undefined ? colorMode : this.context.config.colorMode)
         === ConfigurationConstant.ColorMode.COLOR_MODE_DARK;
-    const barBg: string = isDark ? BAR_BG_DARK : BAR_BG_LIGHT;
 
     const sysBarProps: window.SystemBarProperties = {
-      statusBarColor: barBg,
+      statusBarColor: '#00000000',
       statusBarContentColor: isDark ? BAR_ICON_DARK : BAR_ICON_LIGHT
     };
     try {
@@ -182,9 +186,9 @@ export default class EntryAbility extends UIAbility {
       hilog.warn(DOMAIN, TAG, 'applySystemBar exception');
     }
 
-    // 窗口背景同色：状态栏配置在部分窗口形态下不生效时，仍能透出正确底色
+    // 窗口背景同步固定色：状态栏透明后，启动过渡期由窗口底色兜底，避免闪白
     try {
-      mainWindowClass.setWindowBackgroundColor(barBg);
+      mainWindowClass.setWindowBackgroundColor(isDark ? BAR_BG_DARK : BAR_BG_LIGHT);
     } catch (err) {
       hilog.warn(DOMAIN, TAG, 'setWindowBackgroundColor not supported');
     }
