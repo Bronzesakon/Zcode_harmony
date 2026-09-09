@@ -81,7 +81,9 @@ export default class EntryAbility extends UIAbility {
       const current: ConfigurationConstant.ColorMode | undefined = AppStorage.get('currentColorMode');
       if (current !== newColorMode) {
         AppStorage.setOrCreate<ConfigurationConstant.ColorMode>('currentColorMode', newColorMode);
-        this.applySystemBar();
+        // 必须用回调入参 newConfig.colorMode：此时 this.context.config 尚未刷新，
+        // 沿用会拿到上一档模式，导致状态栏与页面配色反相
+        this.applySystemBar(newColorMode);
       }
     }
 
@@ -154,14 +156,17 @@ export default class EntryAbility extends UIAbility {
 
   /**
    * 状态栏固定背景色 + 图标配色（跟随系统深浅）
-   * 背景与窗口背景同色，保证状态栏区与页面无缝衔接
+   * 背景与窗口背景同色，保证状态栏区与页面无缝衔接。
+   * colorMode 显式传入：onConfigurationUpdate 回调中 this.context.config 尚未刷新，
+   * 读取它只能得到上一档模式，会造成状态栏与页面配色反相。
    */
-  private applySystemBar(): void {
+  private applySystemBar(colorMode?: ConfigurationConstant.ColorMode): void {
     if (!mainWindowClass) {
       return;
     }
     const isDark: boolean =
-      this.context.config.colorMode === ConfigurationConstant.ColorMode.COLOR_MODE_DARK;
+      (colorMode !== undefined ? colorMode : this.context.config.colorMode)
+        === ConfigurationConstant.ColorMode.COLOR_MODE_DARK;
     const barBg: string = isDark ? BAR_BG_DARK : BAR_BG_LIGHT;
 
     const sysBarProps: window.SystemBarProperties = {
