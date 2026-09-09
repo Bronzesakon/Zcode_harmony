@@ -1,48 +1,236 @@
-import { AbilityConstant, ConfigurationConstant, UIAbility, Want } from '@kit.AbilityKit';
+/**
+ * ZCode 远程 EntryAbility
+ *
+ * 迁移自 Deepseek-Harmony（https://github.com/SakuraNeko/Deepseek-Harmony）
+ * MIT License © Sakura Neko
+ *
+ * 窗口约定（项目文档 §8 / §11）：
+ * - 不启用沉浸式布局：窗口内容区由系统默认避让顶部状态栏，页面自然从状态栏下方开始。
+ * - 状态栏固定背景色（暗 #2B2B2B / 亮 #ECECEE），图标暗色白、亮色黑，跟随系统深浅切换。
+ * - 底部贴底由页面 expandSafeArea(BOTTOM) 负责，此处不干预。
+ */
+import { AbilityConstant, Configuration, ConfigurationConstant, UIAbility, Want } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
+import { webview } from '@kit.ArkWeb';
 import { window } from '@kit.ArkUI';
+import { BusinessError } from '@kit.BasicServicesKit';
+import { i18n } from '@kit.LocalizationKit';
+import { isValidRemoteUrl, loadRemoteUrl } from '../common/RemoteUrlManager';
 
-const DOMAIN = 0x0000;
+const DOMAIN = 0x0001;
+const TAG = 'ZCodeEntryAbility';
+
+// 状态栏固定配色（项目文档 §11，与控制页网页侧栏实测底色一致）
+const BAR_BG_DARK = '#FF2B2B2B';
+const BAR_BG_LIGHT = '#FFECECEE';
+const BAR_ICON_DARK = '#FFFFFF';
+const BAR_ICON_LIGHT = '#000000';
+
+let webEngineInitialized: boolean = false;
+let mainWindowClass: window.Window | null = null;
 
 export default class EntryAbility extends UIAbility {
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
+    // Web 引擎只初始化一次，避免重复初始化导致异常
+    if (!webEngineInitialized) {
+      try {
+        webview.WebviewController.initializeWebEngine();
+        webEngineInitialized = true;
+        hilog.info(DOMAIN, TAG, 'WebEngine initialized');
+      } catch (err) {
+        hilog.error(DOMAIN, TAG, 'Failed to initialize WebEngine');
+      }
+    }
+
     try {
       this.context.getApplicationContext().setColorMode(ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET);
     } catch (err) {
-      hilog.error(DOMAIN, 'testTag', 'Failed to set colorMode. Cause: %{public}s', JSON.stringify(err));
+      hilog.error(DOMAIN, TAG, 'Failed to set colorMode');
     }
-    hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onCreate');
+
+    // 当前系统颜色模式，供 WebView 深色模式适配与状态栏配色
+    AppStorage.setOrCreate<ConfigurationConstant.ColorMode>('currentColorMode', this.context.config.colorMode);
+
+    // 当前系统语言，供 WebView 语言适配
+    try {
+      AppStorage.setOrCreate<string>('systemLanguage', i18n.System.getSystemLanguage());
+    } catch (err) {
+      hilog.error(DOMAIN, TAG, 'Failed to get system language');
+    }
+
+    // 冷启动预读持久化 URL（Index.aboutToAppear 消费，URL 本身不落日志）
+    const savedUrl: string = loadRemoteUrl(this.context);
+    AppStorage.setOrCreate<string>('bootRemoteUrl', savedUrl);
+
+    // 快捷方式「扫码连接」路由（项目文档 §7）
+    this.handleScanAction(want);
+    // 深链兜底：z.ai 域 /remote 前缀链接直接作为连接 URL
+    this.handleDeepLink(want);
+
+    hilog.info(DOMAIN, TAG, 'Ability onCreate, hasSavedUrl=%{public}s', String(savedUrl !== ''));
   }
 
   onDestroy(): void {
-    hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onDestroy');
+    hilog.info(DOMAIN, TAG, 'Ability onDestroy');
+  }
+
+  // 系统深浅色 / 语言变化：同步 AppStorage，并重刷状态栏配色
+  onConfigurationUpdate(newConfig: Configuration): void {
+    const newColorMode: ConfigurationConstant.ColorMode | undefined = newConfig.colorMode;
+    if (newColorMode !== undefined) {
+      const current: ConfigurationConstant.ColorMode | undefined = AppStorage.get('currentColorMode');
+      if (current !== newColorMode) {
+        AppStorage.setOrCreate<ConfigurationConstant.ColorMode>('currentColorMode', newColorMode);
+        this.applySystemBar();
+      }
+    }
+
+    const newLanguage: string | undefined = newConfig.language;
+    if (newLanguage !== undefined) {
+      const current: string | undefined = AppStorage.get('systemLanguage');
+      if (current !== newLanguage) {
+        AppStorage.setOrCreate<string>('systemLanguage', newLanguage);
+      }
+    }
   }
 
   onWindowStageCreate(windowStage: window.WindowStage): void {
-    // Main window is created, set main page for this ability
-    hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onWindowStageCreate');
+    hilog.info(DOMAIN, TAG, 'Ability onWindowStageCreate');
+
+    // 先取主窗口：在页面首次构建前把状态栏避让高度写入 AppStorage，
+    // 页面据此做顶部 padding，避免异步写入导致的初始 0 值竞态（顶部被压状态栏）
+    try {
+      mainWindowClass = windowStage.getMainWindowSync();
+    } catch (err) {
+      hilog.error(DOMAIN, TAG, 'Failed to obtain main window');
+    }
+    if (mainWindowClass) {
+      // 沉浸式布局：窗口内容铺满全屏（含底部手势条区域），底部因此天然贴底。
+      // 顶部状态栏避让改由页面 padding 承担（topAvoidPx），避免内容压状态栏。
+      try {
+        mainWindowClass.setImmersiveModeEnabledState(true);
+      } catch (err) {
+        hilog.warn(DOMAIN, TAG, 'setImmersiveModeEnabledState not supported');
+      }
+
+      // 启动即定色，避免冷启动闪屏（与状态栏固定色一致）
+      this.applySystemBar();
+      this.syncTopAvoid();
+      // 旋转 / 分屏 / 悬浮窗导致状态栏高度变化时刷新避让值
+      try {
+        mainWindowClass.on('avoidAreaChange', (options: window.AvoidAreaOptions) => {
+          if (options.type === window.AvoidAreaType.TYPE_SYSTEM) {
+            this.syncTopAvoid();
+          }
+        });
+      } catch (err) {
+        hilog.warn(DOMAIN, TAG, 'avoidAreaChange register failed');
+      }
+    }
 
     windowStage.loadContent('pages/Index', (err) => {
       if (err.code) {
-        hilog.error(DOMAIN, 'testTag', 'Failed to load the content. Cause: %{public}s', JSON.stringify(err));
-        return;
+        hilog.error(DOMAIN, TAG, 'Failed to load the content. Cause: %{public}s', JSON.stringify(err));
       }
-      hilog.info(DOMAIN, 'testTag', 'Succeeded in loading the content.');
     });
   }
 
   onWindowStageDestroy(): void {
-    // Main window is destroyed, release UI related resources
-    hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onWindowStageDestroy');
+    hilog.info(DOMAIN, TAG, 'Ability onWindowStageDestroy');
   }
 
   onForeground(): void {
-    // Ability has brought to foreground
-    hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onForeground');
+    hilog.info(DOMAIN, TAG, 'Ability onForeground');
   }
 
   onBackground(): void {
-    // Ability has back to background
-    hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onBackground');
+    hilog.info(DOMAIN, TAG, 'Ability onBackground');
+  }
+
+  // 返回手势兜底（项目文档 §10）：true = 移到后台不销毁
+  onBackPressed(): boolean {
+    return true;
+  }
+
+  /**
+   * 状态栏固定背景色 + 图标配色（跟随系统深浅）
+   * 背景与窗口背景同色，保证状态栏区与页面无缝衔接
+   */
+  private applySystemBar(): void {
+    if (!mainWindowClass) {
+      return;
+    }
+    const isDark: boolean =
+      this.context.config.colorMode === ConfigurationConstant.ColorMode.COLOR_MODE_DARK;
+    const barBg: string = isDark ? BAR_BG_DARK : BAR_BG_LIGHT;
+
+    const sysBarProps: window.SystemBarProperties = {
+      statusBarColor: barBg,
+      statusBarContentColor: isDark ? BAR_ICON_DARK : BAR_ICON_LIGHT
+    };
+    try {
+      mainWindowClass.setWindowSystemBarProperties(sysBarProps).catch((err: BusinessError) => {
+        hilog.warn(DOMAIN, TAG, 'setWindowSystemBarProperties failed: %{public}d', err.code);
+      });
+    } catch (err) {
+      hilog.warn(DOMAIN, TAG, 'applySystemBar exception');
+    }
+
+    // 窗口背景同色：状态栏配置在部分窗口形态下不生效时，仍能透出正确底色
+    try {
+      mainWindowClass.setWindowBackgroundColor(barBg);
+    } catch (err) {
+      hilog.warn(DOMAIN, TAG, 'setWindowBackgroundColor not supported');
+    }
+  }
+
+  /**
+   * 读取系统状态栏避让高度（px）写入 AppStorage，供页面顶部 padding 使用。
+   * 页面根容器不向顶部扩展安全区，避让完全由页面自身 padding 承担。
+   */
+  private syncTopAvoid(): void {
+    if (!mainWindowClass) {
+      return;
+    }
+    try {
+      const avoid: window.AvoidArea =
+        mainWindowClass.getWindowAvoidArea(window.AvoidAreaType.TYPE_SYSTEM);
+      AppStorage.setOrCreate<number>('topAvoidPx', avoid.topRect.height);
+    } catch (err) {
+      hilog.warn(DOMAIN, TAG, 'syncTopAvoid failed');
+    }
+  }
+
+  /**
+   * 热启动接收新的快捷方式扫码指令 / Deep Link
+   */
+  onNewWant(want: Want, launchParam: AbilityConstant.LaunchParam): void {
+    this.handleScanAction(want);
+    this.handleDeepLink(want);
+  }
+
+  /**
+   * 快捷方式路由：want.parameters.action === 'scan' → AppStorage → Index 拉起扫码
+   */
+  private handleScanAction(want: Want): void {
+    const params = want?.parameters;
+    if (params && (params.action === 'scan' || params['action'] === 'scan')) {
+      AppStorage.setOrCreate('scanAction', 'scan');
+      hilog.info(DOMAIN, TAG, 'Scan shortcut action received');
+    } else {
+      // 非扫码启动：清空残留指令，防止旧值干扰
+      AppStorage.setOrCreate('scanAction', '');
+    }
+  }
+
+  /**
+   * Deep Link：z.ai 域 /remote 前缀的 https 链接 → 作为连接 URL（扫码为主入口，此处兜底）
+   */
+  private handleDeepLink(want: Want): void {
+    const uri = want?.uri;
+    if (uri && isValidRemoteUrl(uri)) {
+      hilog.info(DOMAIN, TAG, 'Valid remote DeepLink received');
+      AppStorage.setOrCreate('deepLinkUrl', uri);
+    }
   }
 }

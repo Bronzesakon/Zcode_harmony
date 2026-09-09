@@ -2,15 +2,103 @@
   "string": [
     {
       "name": "module_desc",
-      "value": "module description"
+      "value": "ZCode 远程控制"
     },
     {
       "name": "EntryAbility_desc",
-      "value": "description"
+      "value": "ZCode 远程控制主入口"
     },
     {
       "name": "EntryAbility_label",
-      "value": "label"
+      "value": "ZCode 远程"
+    },
+    {
+      "name": "app_title",
+      "value": "ZCode 远程"
+    },
+    {
+      "name": "shortcut_scan",
+      "value": "扫码连接"
+    },
+    {
+      "name": "scan_connect_button",
+      "value": "扫码连接"
+    },
+    {
+      "name": "guide_desc",
+      "value": "在电脑端 ZCode 打开手机远程控制，扫描二维码即可连接"
+    },
+    {
+      "name": "guide_hint_shortcut",
+      "value": "也可以长按桌面图标，选择「扫码连接」"
+    },
+    {
+      "name": "internet_reason",
+      "value": "需要访问网络以加载 ZCode 远程控制页面"
+    },
+    {
+      "name": "network_info_reason",
+      "value": "用于检测网络连接状态，提供更好的网络异常提示"
+    },
+    {
+      "name": "error_network_title",
+      "value": "网络未连接"
+    },
+    {
+      "name": "error_load_title",
+      "value": "页面加载失败"
+    },
+    {
+      "name": "error_network_desc",
+      "value": "请检查设备的网络连接设置"
+    },
+    {
+      "name": "error_load_desc",
+      "value": "请检查网络连接后重试"
+    },
+    {
+      "name": "error_desc_with_rescan",
+      "value": "连接失效时，可长按桌面图标选择「扫码连接」"
+    },
+    {
+      "name": "retry_button",
+      "value": "重新加载"
+    },
+    {
+      "name": "upload_modal_title",
+      "value": "选择上传方式"
+    },
+    {
+      "name": "upload_album",
+      "value": "相册"
+    },
+    {
+      "name": "upload_file",
+      "value": "文件"
+    },
+    {
+      "name": "upload_hint",
+      "value": "可选择图片或文件"
+    },
+    {
+      "name": "toast_invalid_qr",
+      "value": "无效二维码，请扫描 ZCode 远程控制二维码"
+    },
+    {
+      "name": "toast_external_link",
+      "value": "无法打开外部链接"
+    },
+    {
+      "name": "toast_download_done",
+      "value": "下载完成"
+    },
+    {
+      "name": "toast_download_fail",
+      "value": "下载失败"
+    },
+    {
+      "name": "toast_save_done",
+      "value": "已保存到下载目录"
     }
   ]
 }

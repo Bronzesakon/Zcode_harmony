@@ -13,6 +13,11 @@
 
 # 本地参考项目（仅本地保留，不随仓库上传）
 /Deepseek-Harmony_Reference/
+/zemote/
 
 # 本地工具资产（ZCode 项目级技能等），仅本地保留
 /.zcode/
+
+# 本地构建/调试缓存（arkts 检查缓存、hdc 采集产物）
+/.cache/
+/.dsh-hdc/

@@ -1,0 +1,19 @@
+{
+  "shortcuts": [
+    {
+      "shortcutId": "scan_connect",
+      "label": "$string:shortcut_scan",
+      "icon": "$media:shortcut_scan_icon",
+      "wants": [
+        {
+          "bundleName": "com.zcode.control",
+          "moduleName": "entry",
+          "abilityName": "EntryAbility",
+          "parameters": {
+            "action": "scan"
+          }
+        }
+      ]
+    }
+  ]
+}
