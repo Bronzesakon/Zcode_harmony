@@ -56,14 +56,9 @@ struct Index {
   @State showInvalidQrToast: boolean = false;
   // 扫码中标识：避免引导页按钮重复拉起扫码
   @State isScanning: boolean = false;
-  // 状态栏避让高度（px）：EntryAbility 在 loadContent 之前同步写入，旋转/分屏时刷新
+  // 状态栏高度（px）：EntryAbility 读取并写入，用于页面顶部占位
   @StorageProp('topAvoidPx') topAvoidPx: number = 0;
   private pendingFileListHandler: ((fileList: Array<string>) => void) | null = null;
-
-  // 顶部避让高度（vp）：AppStorage 存物理像素，布局需换算为 vp
-  get topAvoidVp(): number {
-    return this.getUIContext().px2vp(this.topAvoidPx);
-  }
 
   aboutToAppear(): void {
     this.remoteUrl = AppStorage.get<string>('bootRemoteUrl') ?? '';
@@ -184,6 +179,13 @@ struct Index {
 
   build() {
     Column() {
+      // 状态栏占位：沉浸模式下窗口从屏幕顶端开始，此处留出状态栏高度，
+      // 使网页显示区域顶端严格对齐状态栏底部
+      Row()
+        .width('100%')
+        .height(this.topAvoidPx > 0 ? `${this.topAvoidPx}px` : '0px')
+        .backgroundColor(this.webBgColor)
+
       if (this.hasConnection) {
         Stack({ alignContent: Alignment.Top }) {
           Web({ src: this.remoteUrl, controller: this.controller })
@@ -398,7 +400,6 @@ struct Index {
         }
         .width('100%')
         .layoutWeight(1)
-        // 控制页：顶部由系统默认避让状态栏，底部贴底
         .backgroundColor(this.webBgColor)
       } else {
         // 首次开屏扫码引导页：应用名 + 一句话说明 + 主按钮（不自动拉相机）
@@ -444,7 +445,7 @@ struct Index {
           .margin({ bottom: 80 })
         }
         .width('100%')
-        .height('100%')
+        .layoutWeight(1)
         .constraintSize({ maxWidth: 560 })
         .backgroundColor(this.webBgColor)
       }
@@ -466,8 +467,6 @@ struct Index {
     }
     .width('100%')
     .height('100%')
-    // 顶部 padding 避让状态栏（系统栏区透出同色窗口背景）；底部不避让，内容贴底
-    .padding({ top: this.topAvoidVp })
     .backgroundColor(this.webBgColor)
   }
 

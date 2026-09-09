@@ -99,16 +99,14 @@ export default class EntryAbility extends UIAbility {
   onWindowStageCreate(windowStage: window.WindowStage): void {
     hilog.info(DOMAIN, TAG, 'Ability onWindowStageCreate');
 
-    // 先取主窗口：在页面首次构建前把状态栏避让高度写入 AppStorage，
-    // 页面据此做顶部 padding，避免异步写入导致的初始 0 值竞态（顶部被压状态栏）
     try {
       mainWindowClass = windowStage.getMainWindowSync();
     } catch (err) {
       hilog.error(DOMAIN, TAG, 'Failed to obtain main window');
     }
+
     if (mainWindowClass) {
-      // 沉浸式布局：窗口内容铺满全屏（含底部手势条区域），底部因此天然贴底。
-      // 顶部状态栏避让改由页面 padding 承担（topAvoidPx），避免内容压状态栏。
+      // 沉浸式布局：窗口铺满全屏（底部天然贴底），顶部由页面按状态栏高度留白
       try {
         mainWindowClass.setImmersiveModeEnabledState(true);
       } catch (err) {
@@ -117,8 +115,8 @@ export default class EntryAbility extends UIAbility {
 
       // 启动即定色，避免冷启动闪屏（与状态栏固定色一致）
       this.applySystemBar();
-      this.syncTopAvoid();
-      // 旋转 / 分屏 / 悬浮窗导致状态栏高度变化时刷新避让值
+
+      // 旋转 / 分屏导致状态栏高度变化时刷新避让值
       try {
         mainWindowClass.on('avoidAreaChange', (options: window.AvoidAreaOptions) => {
           if (options.type === window.AvoidAreaType.TYPE_SYSTEM) {
@@ -133,7 +131,10 @@ export default class EntryAbility extends UIAbility {
     windowStage.loadContent('pages/Index', (err) => {
       if (err.code) {
         hilog.error(DOMAIN, TAG, 'Failed to load the content. Cause: %{public}s', JSON.stringify(err));
+        return;
       }
+      // 内容加载完成后系统才上报避让区；此前读取会得到 0，导致网页顶到屏幕最上沿
+      this.syncTopAvoid();
     });
   }
 
@@ -190,8 +191,8 @@ export default class EntryAbility extends UIAbility {
   }
 
   /**
-   * 读取系统状态栏避让高度（px）写入 AppStorage，供页面顶部 padding 使用。
-   * 页面根容器不向顶部扩展安全区，避让完全由页面自身 padding 承担。
+   * 读取系统状态栏高度（px）写入 AppStorage，供页面顶部占位使用。
+   * 必须在 loadContent 之后读取：内容加载前系统尚未上报避让区，会得到 0。
    */
   private syncTopAvoid(): void {
     if (!mainWindowClass) {
