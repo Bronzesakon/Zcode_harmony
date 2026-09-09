@@ -11,6 +11,5 @@
 **/.test
 /.appanalyzer
 
-# 本地参考项目（仅本地保留，不随仓库上传；改名 _Reference 后第一行可移除）
-/Deepseek-Harmony/
+# 本地参考项目（仅本地保留，不随仓库上传）
 /Deepseek-Harmony_Reference/
