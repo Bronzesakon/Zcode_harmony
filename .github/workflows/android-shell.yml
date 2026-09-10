@@ -53,12 +53,12 @@ concurrency:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # The injected JavaScript protocol layer. Catches the bug class that would
-  # otherwise only show up on a device — wire-format regressions, fragmentation,
-  # bridge routing — and needs neither a JDK nor an Android SDK.
+  # Fast static gate: the injected JavaScript layer plus a structural Kotlin
+  # check. Everything here needs neither a JDK nor an Android SDK, so it stays
+  # off the build job's critical path.
   # ---------------------------------------------------------------------------
   js:
-    name: Protocol tests (Node)
+    name: Static checks (Node + Kotlin)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -75,6 +75,13 @@ jobs:
           # cannot be verified offline.
           node -e "const [maj]=process.versions.node.split('.').map(Number); if (maj < 20) { console.error('Node 20+ required for node --test'); process.exit(1); }"
           node --test
+
+      # About a second, and it catches what hand-editing produces — unbalanced
+      # delimiters, a package that disagrees with its directory, leftover merge
+      # markers — instead of leaving those to surface minutes later in Gradle.
+      - name: Kotlin structure check
+        working-directory: android-shell
+        run: python3 tools/check_kotlin_structure.py
 
   # ---------------------------------------------------------------------------
   # Kotlin/Java build, unit tests and the signed APK.

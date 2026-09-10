@@ -1,22 +1,27 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- Matches the HarmonyOS build's fixed light palette (its status-bar colour
-         is #F8F8F8), so the two shells look like one product. -->
-    <color name="brand_background">#FFF8F8F8</color>
-    <color name="brand_surface">#FFFFFFFF</color>
-    <color name="brand_on_surface">#FF1B1B1F</color>
-    <color name="brand_on_surface_variant">#FF6B6B72</color>
-    <color name="brand_primary">#FF1F6FEB</color>
-    <color name="brand_outline">#FFE2E2E6</color>
-    <color name="brand_error">#FFB3261E</color>
+    <!-- Only the launcher icon's background stays a literal: it must match the
+         HarmonyOS artwork's pure black, independent of the theme.
 
-    <!-- Upload-source tiles: the HarmonyOS modal pairs #F5F5F5 tiles with a
-         #FFFFFF card in light mode, so the same two values are reused here. -->
-    <color name="brand_surface_variant">#FFF5F5F5</color>
-    <color name="brand_tile_ripple">#141F6FEB</color>
+         Everything else now references Material 3 *colour roles*
+         (?attr/colorSurface, ?attr/colorOnSurfaceVariant, …) instead of a
+         hand-rolled palette. Reasons, in order of weight:
 
-    <!-- Legacy bitmap fallback (mipmap-xxxhdpi/ic_launcher.png) carries the same
-         artwork flattened; the adaptive background layer is pure black because
-         background.png in the HarmonyOS icon is pure black. -->
+         1. The previous fixed light palette made dark mode broken by
+            construction: the theme was DayNight but every colour was pinned to a
+            light value, so a dark-mode device got light surfaces under dark
+            system bar icons.
+         2. The Material 3 documentation archived under docs/ states that the
+            colour role system is what guarantees accessible contrast, whereas
+            hand-picked hex values do not.
+         3. With dynamic colour enabled (see ZcodeRemoteApp), Android 12+ derives
+            the whole scheme from the system/wallpaper palette, so on ColorOS the
+            app blends with 流体云 instead of fighting it. Older devices fall back
+            to the Material 3 baseline scheme, which is light/dark complete.
+
+         Trade-off accepted deliberately: the HarmonyOS build's fixed #F8F8F8
+         palette is no longer mirrored. Two shells looking identical was
+         nice-to-have; a UI that is correct in dark mode and consistent with the
+         platform was the goal for this pass. -->
     <color name="ic_launcher_background">#FF000000</color>
 </resources>

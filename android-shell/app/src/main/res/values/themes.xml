@@ -1,17 +1,23 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- DayNight so the WebView's own dark styling and the system chrome agree. -->
-    <style name="Theme.ZcodeRemote" parent="Theme.Material3.DayNight.NoActionBar">
-        <item name="colorPrimary">@color/brand_primary</item>
-        <item name="android:windowBackground">@color/brand_background</item>
-        <!-- 不设 statusBarColor / navigationBarColor：targetSdk 35 的
-             edge-to-edge 下它们会被忽略，系统栏区域显示的是 windowBackground，
-             而 inset 由 enableLightEdgeToEdge/padForSystemBars 处理。 -->
-    </style>
+    <!-- Material 3 DayNight, unmodified on purpose.
+
+         No colour roles are overridden here any more: the Material 3 baseline
+         scheme is a complete, contrast-checked light/dark pair, and overriding a
+         single role (as this file used to, with a fixed brand blue) breaks the
+         pair — a light-tone primary is unreadable on a dark-tone surface. On
+         Android 12+ the whole scheme is replaced at runtime by the system's
+         dynamic palette anyway (ZcodeRemoteApp calls DynamicColors), so anything
+         pinned here would only affect older devices, inconsistently.
+
+         statusBarColor / navigationBarColor are absent by design: edge-to-edge
+         (enforced from targetSdk 35) ignores them, and the insets are handled in
+         core/WindowInsets.kt. -->
+    <style name="Theme.ZcodeRemote" parent="Theme.Material3.DayNight.NoActionBar" />
 
     <!-- Shown while the process starts, before the WebView has anything to
-         paint: a flat background avoids a white/black flash. -->
+         paint: the themed background avoids a white/black flash. -->
     <style name="Theme.ZcodeRemote.Splash" parent="Theme.ZcodeRemote">
-        <item name="android:windowBackground">@color/brand_background</item>
+        <item name="android:windowBackground">?android:attr/colorBackground</item>
     </style>
 </resources>

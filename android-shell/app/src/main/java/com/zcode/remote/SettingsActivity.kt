@@ -21,7 +21,7 @@ import com.google.android.material.materialswitch.MaterialSwitch
 import com.zcode.remote.core.Diagnostics
 import com.zcode.remote.core.RemoteUrl
 import com.zcode.remote.core.ShellLog
-import com.zcode.remote.core.enableLightEdgeToEdge
+import com.zcode.remote.core.enableThemeEdgeToEdge
 import com.zcode.remote.core.padForSystemBars
 import com.zcode.remote.databinding.ActivitySettingsBinding
 
@@ -42,7 +42,7 @@ class SettingsActivity : AppCompatActivity() {
     private var refresh: Runnable? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        enableLightEdgeToEdge()
+        enableThemeEdgeToEdge()
         super.onCreate(savedInstanceState)
         ShellRuntime.init(this)
         binding = ActivitySettingsBinding.inflate(layoutInflater)

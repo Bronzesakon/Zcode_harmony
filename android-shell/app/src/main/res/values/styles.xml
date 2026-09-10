@@ -1,35 +1,49 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- Settings screen building blocks. Kept as styles so the XML stays
-         readable and row metrics stay consistent. -->
+    <!-- Settings screen building blocks, expressed with Material 3 roles and type
+         styles instead of hand-picked sp sizes and hex colours. Sizes follow the
+         M3 list guidance: 56dp minimum row height so every row is a comfortable
+         touch target, 16dp horizontal margins for the cards. -->
+
     <style name="SettingsSection" parent="">
         <item name="android:layout_width">match_parent</item>
         <item name="android:layout_height">wrap_content</item>
         <item name="android:paddingStart">20dp</item>
         <item name="android:paddingEnd">20dp</item>
-        <item name="android:paddingTop">22dp</item>
+        <item name="android:paddingTop">24dp</item>
         <item name="android:paddingBottom">8dp</item>
-        <item name="android:textColor">@color/brand_primary</item>
-        <item name="android:textSize">13sp</item>
-        <item name="android:textStyle">bold</item>
+        <item name="android:textAppearance">?attr/textAppearanceTitleSmall</item>
+        <item name="android:textColor">?attr/colorPrimary</item>
     </style>
 
-    <style name="SettingsCard" parent="">
+    <!-- One card per section: M3 filled card, medium (12dp) shape, low-emphasis
+         surface container — the tonal roles keep it distinguishable from the
+         background in both light and dark mode. -->
+    <style name="SettingsCard" parent="Widget.Material3.CardView.Filled">
         <item name="android:layout_width">match_parent</item>
         <item name="android:layout_height">wrap_content</item>
-        <item name="android:layout_marginStart">12dp</item>
-        <item name="android:layout_marginEnd">12dp</item>
+        <item name="android:layout_marginStart">16dp</item>
+        <item name="android:layout_marginEnd">16dp</item>
+        <item name="cardBackgroundColor">?attr/colorSurfaceContainerLow</item>
+        <item name="shapeAppearance">?attr/shapeAppearanceMediumComponent</item>
+        <item name="cardElevation">0dp</item>
+    </style>
+
+    <!-- Cards host a single vertical column of rows. -->
+    <style name="SettingsCardContent" parent="">
+        <item name="android:layout_width">match_parent</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:orientation">vertical</item>
         <item name="android:paddingStart">16dp</item>
         <item name="android:paddingEnd">16dp</item>
-        <item name="android:paddingTop">14dp</item>
-        <item name="android:paddingBottom">14dp</item>
-        <item name="android:background">@color/brand_surface</item>
+        <item name="android:paddingTop">8dp</item>
+        <item name="android:paddingBottom">8dp</item>
     </style>
 
     <style name="SettingsRow" parent="">
         <item name="android:layout_width">match_parent</item>
         <item name="android:layout_height">wrap_content</item>
-        <item name="android:minHeight">48dp</item>
+        <item name="android:minHeight">56dp</item>
         <item name="android:gravity">center_vertical</item>
         <item name="android:clickable">true</item>
         <item name="android:focusable">true</item>
@@ -39,23 +53,22 @@
     <style name="SettingsRowTitle" parent="">
         <item name="android:layout_width">match_parent</item>
         <item name="android:layout_height">wrap_content</item>
-        <item name="android:textColor">@color/brand_on_surface</item>
-        <item name="android:textSize">15sp</item>
+        <item name="android:textAppearance">?attr/textAppearanceBodyLarge</item>
+        <item name="android:textColor">?attr/colorOnSurface</item>
     </style>
 
     <style name="SettingsRowSubtitle" parent="">
         <item name="android:layout_width">match_parent</item>
         <item name="android:layout_height">wrap_content</item>
-        <item name="android:layout_marginTop">3dp</item>
-        <item name="android:textColor">@color/brand_on_surface_variant</item>
-        <item name="android:textSize">13sp</item>
+        <item name="android:layout_marginTop">2dp</item>
+        <item name="android:textAppearance">?attr/textAppearanceBodyMedium</item>
+        <item name="android:textColor">?attr/colorOnSurfaceVariant</item>
     </style>
 
+    <!-- The outline role is what M3 specifies for dividers. -->
     <style name="SettingsDivider" parent="">
         <item name="android:layout_width">match_parent</item>
         <item name="android:layout_height">1dp</item>
-        <item name="android:layout_marginTop">10dp</item>
-        <item name="android:layout_marginBottom">10dp</item>
-        <item name="android:background">@color/brand_outline</item>
+        <item name="android:background">?attr/colorOutlineVariant</item>
     </style>
 </resources>

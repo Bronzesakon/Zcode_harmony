@@ -23,6 +23,7 @@
     <string name="menu_reload">刷新网页</string>
     <string name="menu_settings">设置</string>
 
+    <string name="action_back">返回</string>
     <string name="action_reload">重试</string>
     <string name="action_change_url">换个链接</string>
 

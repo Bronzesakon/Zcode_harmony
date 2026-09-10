@@ -26,7 +26,7 @@
         android:layout_height="wrap_content"
         android:clickable="true"
         android:focusable="true"
-        app:cardBackgroundColor="@color/brand_surface"
+        app:cardBackgroundColor="?attr/colorSurfaceContainerHigh"
         app:cardCornerRadius="16dp"
         app:cardElevation="8dp"
         app:layout_constraintBottom_toBottomOf="parent"
@@ -46,7 +46,7 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:text="@string/upload_modal_title"
-                android:textColor="@color/brand_on_surface"
+                android:textColor="?attr/colorOnSurface"
                 android:textSize="18sp"
                 android:textStyle="bold" />
 
@@ -62,7 +62,7 @@
                     android:layout_marginEnd="6dp"
                     android:clickable="true"
                     android:focusable="true"
-                    app:cardBackgroundColor="@color/brand_surface_variant"
+                    app:cardBackgroundColor="?attr/colorSurfaceContainerHighest"
                     app:cardCornerRadius="14dp"
                     app:cardElevation="0dp"
                     app:layout_constraintBottom_toBottomOf="parent"
@@ -72,7 +72,7 @@
                     app:layout_constraintHorizontal_weight="1"
                     app:layout_constraintStart_toStartOf="parent"
                     app:layout_constraintTop_toTopOf="parent"
-                    app:rippleColor="@color/brand_tile_ripple">
+                    >
 
                     <LinearLayout
                         android:layout_width="match_parent"
@@ -84,14 +84,15 @@
                             android:layout_width="32dp"
                             android:layout_height="32dp"
                             android:importantForAccessibility="no"
-                            android:src="@drawable/ic_upload_photo" />
+                            android:src="@drawable/ic_upload_photo"
+                            app:tint="?attr/colorOnSurface" />
 
                         <TextView
                             android:layout_width="wrap_content"
                             android:layout_height="wrap_content"
                             android:layout_marginTop="8dp"
                             android:text="@string/upload_album"
-                            android:textColor="@color/brand_on_surface"
+                            android:textColor="?attr/colorOnSurface"
                             android:textSize="13sp" />
                     </LinearLayout>
                 </com.google.android.material.card.MaterialCardView>
@@ -103,7 +104,7 @@
                     android:layout_marginStart="6dp"
                     android:clickable="true"
                     android:focusable="true"
-                    app:cardBackgroundColor="@color/brand_surface_variant"
+                    app:cardBackgroundColor="?attr/colorSurfaceContainerHighest"
                     app:cardCornerRadius="14dp"
                     app:cardElevation="0dp"
                     app:layout_constraintBottom_toBottomOf="parent"
@@ -112,7 +113,7 @@
                     app:layout_constraintHorizontal_weight="1"
                     app:layout_constraintStart_toEndOf="@id/tileAlbum"
                     app:layout_constraintTop_toTopOf="parent"
-                    app:rippleColor="@color/brand_tile_ripple">
+                    >
 
                     <LinearLayout
                         android:layout_width="match_parent"
@@ -124,14 +125,15 @@
                             android:layout_width="32dp"
                             android:layout_height="32dp"
                             android:importantForAccessibility="no"
-                            android:src="@drawable/ic_upload_file" />
+                            android:src="@drawable/ic_upload_file"
+                            app:tint="?attr/colorOnSurface" />
 
                         <TextView
                             android:layout_width="wrap_content"
                             android:layout_height="wrap_content"
                             android:layout_marginTop="8dp"
                             android:text="@string/upload_file"
-                            android:textColor="@color/brand_on_surface"
+                            android:textColor="?attr/colorOnSurface"
                             android:textSize="13sp" />
                     </LinearLayout>
                 </com.google.android.material.card.MaterialCardView>
@@ -142,7 +144,7 @@
                 android:layout_height="wrap_content"
                 android:layout_marginTop="16dp"
                 android:text="@string/upload_hint"
-                android:textColor="@color/brand_on_surface_variant"
+                android:textColor="?attr/colorOnSurfaceVariant"
                 android:textSize="13sp" />
         </LinearLayout>
     </com.google.android.material.card.MaterialCardView>

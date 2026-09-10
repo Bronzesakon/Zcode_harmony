@@ -36,7 +36,7 @@ import com.zcode.remote.core.Diagnostics
 import com.zcode.remote.core.Prefs
 import com.zcode.remote.core.RemoteUrl
 import com.zcode.remote.core.UploadMime
-import com.zcode.remote.core.enableLightEdgeToEdge
+import com.zcode.remote.core.enableThemeEdgeToEdge
 import com.zcode.remote.core.padForSystemBars
 import com.zcode.remote.databinding.ActivityMainBinding
 
@@ -118,8 +118,8 @@ class MainActivity : AppCompatActivity() {
     ) { uris -> deliverPickedFiles(uris) }
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        // Must precede setContentView: see enableLightEdgeToEdge().
-        enableLightEdgeToEdge()
+        // Must precede setContentView: see enableThemeEdgeToEdge().
+        enableThemeEdgeToEdge()
         super.onCreate(savedInstanceState)
         ShellRuntime.init(this)
         prefs = ShellRuntime.prefs()

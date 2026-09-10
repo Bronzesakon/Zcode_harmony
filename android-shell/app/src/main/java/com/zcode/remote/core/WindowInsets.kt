@@ -1,5 +1,6 @@
 package com.zcode.remote.core
 
+import android.content.res.Configuration
 import android.graphics.Color
 import android.view.View
 import androidx.activity.ComponentActivity
@@ -17,28 +18,31 @@ import androidx.core.view.WindowInsetsCompat
  * toolbar's overflow button gets clipped by the status bar, and bottom content
  * sits under the navigation bar.
  *
- * [enableLightEdgeToEdge] wraps androidx's `enableEdgeToEdge`, which is an
- * extension on ComponentActivity (not Activity) — hence the receiver below. It is
- * called first so the behaviour is identical across API 26..35. Skipping it would leave pre-15 devices in the old non-edge-to-edge
+ * [enableThemeEdgeToEdge] is called first so the behaviour is identical across
+ * API 26..35. Skipping it would leave pre-15 devices in the old non-edge-to-edge
  * mode where the decor has already inset the content, and [padForSystemBars]
  * would then pad a second time.
- *
- * The styles are forced to "light" rather than left on auto: this app's palette
- * is a fixed light colour in both day and night mode, so the system bar icons
- * must stay dark regardless of the device's theme.
  */
-fun ComponentActivity.enableLightEdgeToEdge() {
-    enableEdgeToEdge(
-        statusBarStyle = SystemBarStyle.light(Color.TRANSPARENT, Color.TRANSPARENT),
-        navigationBarStyle = SystemBarStyle.light(Color.TRANSPARENT, Color.TRANSPARENT),
-    )
+fun ComponentActivity.enableThemeEdgeToEdge() {
+    // The system bar icons must contrast with whatever the window paints behind
+    // them — that is the theme's surface, which inverts with night mode. Forcing
+    // "light" styling unconditionally (as an earlier revision did) leaves the
+    // status bar icons invisible in dark mode.
+    val night = (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
+        Configuration.UI_MODE_NIGHT_YES
+    val style = if (night) {
+        SystemBarStyle.dark(Color.TRANSPARENT)
+    } else {
+        SystemBarStyle.light(Color.TRANSPARENT, Color.TRANSPARENT)
+    }
+    enableEdgeToEdge(statusBarStyle = style, navigationBarStyle = style)
 }
 
 /**
  * Pads [this] root view by the system bars and any display cutout, so the app's
  * content stays inside the safe area while the window background still paints
- * behind the bars. The root of each layout carries the app background colour,
- * which is what makes that strip look intentional rather than like a gap.
+ * behind the bars. The root of each layout carries the themed background, which
+ * is what makes that strip look intentional rather than like a gap.
  */
 fun View.padForSystemBars() {
     ViewCompat.setOnApplyWindowInsetsListener(this) { view, insets ->
