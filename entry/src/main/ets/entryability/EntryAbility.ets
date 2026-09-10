@@ -6,7 +6,8 @@
  *
  * 窗口约定（项目文档 §8 / §11）：
  * - 不启用沉浸式布局：窗口内容区由系统默认避让顶部状态栏，页面自然从状态栏下方开始。
- * - 状态栏固定背景色（暗 #2B2B2B / 亮 #ECECEE），图标暗色白、亮色黑，跟随系统深浅切换。
+ * - 状态栏背景透明，实际底色由页面顶部占位 Row 提供；色值走设备/深浅色限定资源
+ *   app.color.status_bar_bg（手机走动态采样兜底，平板用固定色），图标暗色白、亮色黑。
  * - 底部贴底由页面 expandSafeArea(BOTTOM) 负责，此处不干预。
  */
 import { AbilityConstant, Configuration, ConfigurationConstant, UIAbility, Want } from '@kit.AbilityKit';
@@ -20,11 +21,13 @@ import { isValidRemoteUrl, loadRemoteUrl } from '../common/RemoteUrlManager';
 const DOMAIN = 0x0001;
 const TAG = 'ZCodeEntryAbility';
 
-// 状态栏固定配色（项目文档 §11，与控制页网页侧栏实测底色一致）
-const BAR_BG_DARK = '#FF2B2B2B';
-const BAR_BG_LIGHT = '#FFECECEE';
+// 状态栏配色（项目文档 §11）
+// 底色由设备/深浅色限定资源 status_bar_bg 提供（手机=动态采样兜底色，平板=侧栏固定色）；
+// 常量仅作为资源读取异常时的兜底。
 const BAR_ICON_DARK = '#FFFFFF';
 const BAR_ICON_LIGHT = '#000000';
+const BAR_BG_FALLBACK_DARK = '#FF1F1F20';
+const BAR_BG_FALLBACK_LIGHT = '#FFFFFFFF';
 
 let webEngineInitialized: boolean = false;
 let mainWindowClass: window.Window | null = null;
@@ -186,11 +189,28 @@ export default class EntryAbility extends UIAbility {
       hilog.warn(DOMAIN, TAG, 'applySystemBar exception');
     }
 
-    // 窗口背景同步固定色：状态栏透明后，启动过渡期由窗口底色兜底，避免闪白
+    // 窗口背景同步限定底色：状态栏透明后，启动过渡期由窗口底色兜底，避免闪白。
+    // 色值随设备（tablet 限定词目录）与深浅色自动切换，手机/平板各取所需。
     try {
-      mainWindowClass.setWindowBackgroundColor(isDark ? BAR_BG_DARK : BAR_BG_LIGHT);
+      mainWindowClass.setWindowBackgroundColor(this.resolveStatusBarBg());
     } catch (err) {
       hilog.warn(DOMAIN, TAG, 'setWindowBackgroundColor not supported');
+    }
+  }
+
+  /**
+   * 读取设备/深浅色限定的状态栏底色（app.color.status_bar_bg）。
+   * 平板命中 tablet / tablet-dark 限定词目录，手机命中 base / dark，取不到时回退兜底常量。
+   */
+  private resolveStatusBarBg(): string {
+    try {
+      const value: number = this.context.resourceManager.getColorByNameSync('status_bar_bg');
+      return '#' + (value >>> 0).toString(16).padStart(8, '0');
+    } catch (err) {
+      hilog.warn(DOMAIN, TAG, 'resolveStatusBarBg failed, using fallback');
+      const isDark: boolean =
+        this.context.config.colorMode === ConfigurationConstant.ColorMode.COLOR_MODE_DARK;
+      return isDark ? BAR_BG_FALLBACK_DARK : BAR_BG_FALLBACK_LIGHT;
     }
   }
 

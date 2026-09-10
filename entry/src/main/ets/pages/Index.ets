@@ -14,7 +14,7 @@ import { common, ConfigurationConstant, Want } from '@kit.AbilityKit';
 import { fileIo as fs, fileUri, picker } from '@kit.CoreFileKit';
 import { photoAccessHelper } from '@kit.MediaLibraryKit';
 import { scanBarcode, scanCore } from '@kit.ScanKit';
-import { BusinessError } from '@kit.BasicServicesKit';
+import { BusinessError, deviceInfo } from '@kit.BasicServicesKit';
 import { i18n } from '@kit.LocalizationKit';
 import { connection } from '@kit.NetworkKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
@@ -26,6 +26,80 @@ import { isValidRemoteUrl, saveRemoteUrl } from '../common/RemoteUrlManager';
 const DOMAIN = 0x0001;
 const TAG = 'ZCodeIndex';
 
+/**
+ * 网页顶部底色采样脚本（返回 #RRGGBB，取不到返回空串）
+ *
+ * 网页显示区被顶到状态栏下方，故视口 y≈0 处的有效背景色 = 状态栏下方那一条的真实颜色
+ * （控制页即两级菜单标题栏）。做法：多点取样 + 众数投票，命中透明/分隔线时回溯祖先求
+ * 半透明叠加后的有效不透明底色；全链路无实心底色（渐变/背景图/跨域 iframe）时返回空串，
+ * 交由原生回退到限定资源色。
+ */
+const STATUS_BAR_SAMPLE_JS: string = `
+(function () {
+  function parseColor(c) {
+    if (!c) { return null; }
+    var m = c.match(/rgba?\\(([^)]+)\\)/);
+    if (!m) { return null; }
+    var p = m[1].split(',');
+    if (p.length < 3) { return null; }
+    var r = parseFloat(p[0]);
+    var g = parseFloat(p[1]);
+    var b = parseFloat(p[2]);
+    var a = p.length > 3 ? parseFloat(p[3]) : 1;
+    if (isNaN(r) || isNaN(g) || isNaN(b) || isNaN(a)) { return null; }
+    return { r: r, g: g, b: b, a: a };
+  }
+  function over(fg, bg) {
+    var a = fg.a;
+    return {
+      r: Math.round(fg.r * a + bg.r * (1 - a)),
+      g: Math.round(fg.g * a + bg.g * (1 - a)),
+      b: Math.round(fg.b * a + bg.b * (1 - a))
+    };
+  }
+  function hex(c) {
+    function h(n) { var s = n.toString(16); return s.length < 2 ? '0' + s : s; }
+    return '#' + h(c.r) + h(c.g) + h(c.b);
+  }
+  function effective(el) {
+    var stack = [];
+    var node = el;
+    while (node && node.nodeType === 1) {
+      var c = parseColor(getComputedStyle(node).backgroundColor);
+      if (c && c.a > 0) {
+        stack.push(c);
+        if (c.a >= 1) { break; }
+      }
+      node = node.parentElement;
+    }
+    if (!node || node.nodeType !== 1) { return ''; }
+    var last = stack.length > 0 ? stack[stack.length - 1] : null;
+    if (!last || last.a < 1) { return ''; }
+    var out = stack.pop();
+    for (var i = stack.length - 1; i >= 0; i--) { out = over(stack[i], out); }
+    return hex(out);
+  }
+  try {
+    var w = window.innerWidth;
+    var pts = [1, 3, 6, 12, 20];
+    var votes = {};
+    for (var i = 0; i < pts.length; i++) {
+      var el = document.elementFromPoint(Math.round(w / 2), pts[i])
+        || document.elementFromPoint(4, pts[i])
+        || document.body;
+      var c = effective(el);
+      if (c) { votes[c] = (votes[c] || 0) + 1; }
+    }
+    var best = '';
+    var top = -1;
+    for (var k in votes) { if (votes[k] > top) { top = votes[k]; best = k; } }
+    return best;
+  } catch (e) {
+    return '';
+  }
+})()
+`;
+
 @Entry
 @Component
 struct Index {
@@ -34,7 +108,7 @@ struct Index {
   @State hasConnection: boolean = false;
   @State loadingProgress: number = 0;
   @State isLoading: boolean = true;
-  @State isError: boolean = false;
+  @State @Watch('onErrorStateChange') isError: boolean = false;
   @State isNetworkError: boolean = false;
   // 快捷方式扫码指令通道（EntryAbility onCreate/onNewWant 写入）
   @StorageLink('scanAction') @Watch('onScanActionChange') scanAction: string = '';
@@ -50,6 +124,14 @@ struct Index {
   @StorageProp('currentColorMode') @Watch('onColorModeChange')
   currentColorMode: ConfigurationConstant.ColorMode = ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET;
   @State webBgColor: string = '#FFFFFFFF';
+  // 状态栏占位底色：平板取设备限定资源固定色，手机控制页取网页顶部实测色（兜底同上）
+  @State statusBarColor: ResourceColor = $r('app.color.status_bar_bg');
+  // 手机端才做动态取色；平板保持固定色（避免影响平板上已正常的观感）
+  private readonly isPhone: boolean = deviceInfo.deviceType === deviceInfo.DeviceTypes.TYPE_PHONE;
+  // 上一次采样结果（空串 = 尚未取到有效色，走资源兜底）
+  private sampledBarColor: string = '';
+  private statusBarTimer: number = -1;
+  private readonly STATUS_BAR_POLL_MS: number = 1000;
   // 上传方式选择模态框（相册 + 文件两项）
   @State showUploadModal: boolean = false;
   // 无效二维码提示
@@ -73,6 +155,7 @@ struct Index {
   aboutToDisappear(): void {
     // 组件销毁前清理定时器，避免内存泄漏和无效回调
     this.clearLoadTimeout();
+    this.stopStatusBarWatch();
   }
 
   onPageShow(): void {
@@ -117,6 +200,7 @@ struct Index {
       this.loadControlPage(target);
     } else {
       this.hasConnection = true;
+      this.syncStatusBarColor();
     }
   }
 
@@ -129,6 +213,101 @@ struct Index {
     this.webBgColor =
       this.currentColorMode === ConfigurationConstant.ColorMode.COLOR_MODE_DARK
         ? '#FF2B2B2B' : '#FFECECEE';
+    // 网页会随 prefers-color-scheme 重绘，旧采样值立即失效，先回退兜底色再重新采样
+    this.sampledBarColor = '';
+    this.syncStatusBarColor();
+    if (this.hasConnection && !this.isError) {
+      this.scheduleStatusBarSample(200);
+    }
+  }
+
+  /**
+   * 决定状态栏占位 Row 当前应使用的颜色：
+   * - 原生页（扫码引导 / 加载失败）与页面自身背景保持一致（webBgColor）；
+   * - 平板控制页用设备限定资源固定色（现状不变）；
+   * - 手机控制页用网页顶部动态采样色，未取到时回退到限定资源色。
+   */
+  // 错误页出现/消失时同步状态栏底色（错误页为原生背景，需与 webBgColor 一致）
+  onErrorStateChange(): void {
+    if (this.isError) {
+      this.stopStatusBarWatch();
+    }
+    this.syncStatusBarColor();
+  }
+
+  private syncStatusBarColor(): void {
+    if (!this.hasConnection || this.isError) {
+      this.statusBarColor = this.webBgColor;
+      return;
+    }
+    if (!this.isPhone || this.sampledBarColor === '') {
+      this.statusBarColor = $r('app.color.status_bar_bg');
+      return;
+    }
+    this.statusBarColor = this.sampledBarColor;
+  }
+
+  // 启动状态栏取色轮询（仅手机控制页；幂等）
+  private startStatusBarWatch(): void {
+    if (!this.isPhone || this.statusBarTimer !== -1) {
+      return;
+    }
+    this.statusBarTimer = setInterval(() => {
+      if (!this.hasConnection || this.isError) {
+        return;
+      }
+      this.sampleStatusBarColor();
+    }, this.STATUS_BAR_POLL_MS);
+  }
+
+  private stopStatusBarWatch(): void {
+    if (this.statusBarTimer !== -1) {
+      clearInterval(this.statusBarTimer);
+      this.statusBarTimer = -1;
+    }
+  }
+
+  // 延迟单次采样：页面加载完成后尽快刷新，不必等一个轮询周期
+  private scheduleStatusBarSample(delayMs: number): void {
+    if (!this.isPhone || !this.hasConnection || this.isError) {
+      return;
+    }
+    setTimeout(() => {
+      if (this.hasConnection && !this.isError) {
+        this.sampleStatusBarColor();
+      }
+    }, delayMs);
+  }
+
+  // 读取网页顶部有效底色并同步；仅当取值变化时更新，避免无谓重绘
+  private sampleStatusBarColor(): void {
+    try {
+      this.controller.runJavaScript(STATUS_BAR_SAMPLE_JS, (err: BusinessError, result: string) => {
+        if (err || !result) {
+          return;
+        }
+        const color: string = this.normalizeSampledColor(result);
+        if (color === '' || color === this.sampledBarColor) {
+          return;
+        }
+        this.sampledBarColor = color;
+        this.syncStatusBarColor();
+      });
+    } catch (err) {
+      hilog.warn(DOMAIN, TAG, 'sampleStatusBarColor failed');
+    }
+  }
+
+  // 采样返回值归一化为 #AARRGGBB；非法值返回空串（交由资源兜底）
+  private normalizeSampledColor(raw: string): string {
+    let value: string = raw.trim();
+    if (value.length >= 2 && value.charAt(0) === '"' && value.charAt(value.length - 1) === '"') {
+      value = value.substring(1, value.length - 1);
+    }
+    if (!/^#[0-9a-fA-F]{6}$/.test(value)) {
+      return '';
+    }
+    return '#FF' + value.substring(1).toUpperCase();
   }
 
   // 深浅色 UI 取色助手
@@ -160,6 +339,7 @@ struct Index {
           this.loadControlPage(scanned);
         } else {
           this.hasConnection = true;
+          this.syncStatusBarColor();
         }
       } else {
         // 无效二维码：提示后丢弃，不保存，原状态不变
@@ -180,11 +360,11 @@ struct Index {
   build() {
     Column() {
       // 状态栏占位：沉浸模式下窗口从屏幕顶端开始，此处留出状态栏高度，
-      // 使网页显示区域顶端严格对齐状态栏底部
+      // 使网页显示区域顶端严格对齐状态栏底部；底色取控制页顶部实测色（平板/兜底为限定资源）
       Row()
         .width('100%')
         .height(this.topAvoidPx > 0 ? `${this.topAvoidPx}px` : '0px')
-        .backgroundColor(this.webBgColor)
+        .backgroundColor(this.statusBarColor)
 
       if (this.hasConnection) {
         Stack({ alignContent: Alignment.Top }) {
@@ -225,6 +405,9 @@ struct Index {
             .onPageEnd(() => {
               this.isLoading = false;
               this.clearLoadTimeout();
+              // 页面就绪后采样顶部底色，随后转入低频轮询（SPA 路由/主题切换时自动跟随）
+              this.scheduleStatusBarSample(80);
+              this.startStatusBarWatch();
             })
             .onErrorReceive((event) => {
               if (event && event.error && event.error.getErrorCode() !== 0) {
@@ -650,6 +833,9 @@ struct Index {
   // 热切换到新扫码结果（覆盖式单连接）
   private loadControlPage(target: string): void {
     try {
+      // 新页面顶部配色未知：先回退兜底色，待加载完成后重新采样
+      this.sampledBarColor = '';
+      this.syncStatusBarColor();
       this.controller.loadUrl(target);
       this.isError = false;
     } catch (err) {
