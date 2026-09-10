@@ -31,26 +31,36 @@ on:
   push:
     branches: [main, pre]
     tags: ['v*']
+    # Only the paths that can change the APK. Documentation and the local-only
+    # reference archives (android-shell/docs, ColorOS_docs) are deliberately absent,
+    # which is how doc-only commits avoid spending a build.
+    #
+    # NOTE: GitHub rejects a workflow that uses `paths` and `paths-ignore` for the
+    # same event — the run is created and fails validation with no jobs at all
+    # (observed). Hence one filter, listing the code paths explicitly.
     paths:
-      - 'android-shell/**'
+      - 'android-shell/app/**'
+      - 'android-shell/tools/**'
+      - 'android-shell/gradle/**'
+      - 'android-shell/*.gradle.kts'
+      - 'android-shell/gradle.properties'
+      - 'android-shell/gradlew'
+      - 'android-shell/gradlew.bat'
+      - 'android-shell/.gitattributes'
       - '.github/workflows/android-shell.yml'
       - '.github/scripts/android-shell-release-notes.ps1'
-    # Documentation-only changes cannot alter the APK, so they must not spend a
-    # build. (paths and paths-ignore compose: a run happens when paths matches AND
-    # paths-ignore does not exclude it.)
-    paths-ignore:
-      - 'android-shell/**.md'
-      - 'android-shell/docs/**'
-      - 'android-shell/ColorOS_docs/**'
   pull_request:
     paths:
-      - 'android-shell/**'
+      - 'android-shell/app/**'
+      - 'android-shell/tools/**'
+      - 'android-shell/gradle/**'
+      - 'android-shell/*.gradle.kts'
+      - 'android-shell/gradle.properties'
+      - 'android-shell/gradlew'
+      - 'android-shell/gradlew.bat'
+      - 'android-shell/.gitattributes'
       - '.github/workflows/android-shell.yml'
       - '.github/scripts/android-shell-release-notes.ps1'
-    paths-ignore:
-      - 'android-shell/**.md'
-      - 'android-shell/docs/**'
-      - 'android-shell/ColorOS_docs/**'
   workflow_dispatch:
 
 permissions:
