@@ -27,15 +27,24 @@ const DOMAIN = 0x0001;
 const TAG = 'ZCodeIndex';
 
 /**
- * 网页顶部底色采样脚本（返回 #RRGGBB，取不到返回空串）
+ * 网页顶部底色观察脚本（经 JavaSciptProxy 主动回推，取代固定轮询/延时采样）
  *
  * 网页显示区被顶到状态栏下方，故视口 y≈0 处的有效背景色 = 状态栏下方那一条的真实颜色
  * （控制页即两级菜单标题栏）。做法：多点取样 + 众数投票，命中透明/分隔线时回溯祖先求
- * 半透明叠加后的有效不透明底色；全链路无实心底色（渐变/背景图/跨域 iframe）时返回空串，
- * 交由原生回退到限定资源色。
+ * 半透明叠加后的有效不透明底色；全链路无实心底色（渐变/背景图/跨域 iframe）时取不到色值。
+ *
+ * 事件驱动：在 document 上挂 MutationObserver（含 <html> 属性/class 变化，覆盖 SPA 路由与
+ * 主题切换），另监听 resize / 屏幕方向 / prefers-color-scheme；顶部有效色一旦变化即经
+ * window.zcodeStatusBar 立即回推原生 —— 头部渲染出来的那一帧就完成取色，无需等待轮询周期
+ * 或人为延时。安装幂等：__zcodeTopColorHooked 置位后重复安装为空操作；document 尚未就绪时
+ * 返回 'retry' 且不置位，留待后续时机（FCP / onPageEnd）重试。
  */
-const STATUS_BAR_SAMPLE_JS: string = `
+const STATUS_BAR_OBSERVER_JS: string = `
 (function () {
+  if (window.__zcodeTopColorHooked) { return 'dup'; }
+  if (!document.documentElement) { return 'retry'; }
+  window.__zcodeTopColorHooked = true;
+
   function parseColor(c) {
     if (!c) { return null; }
     var m = c.match(/rgba?\\(([^)]+)\\)/);
@@ -79,26 +88,89 @@ const STATUS_BAR_SAMPLE_JS: string = `
     for (var i = stack.length - 1; i >= 0; i--) { out = over(stack[i], out); }
     return hex(out);
   }
-  try {
-    var w = window.innerWidth;
-    var pts = [1, 3, 6, 12, 20];
-    var votes = {};
-    for (var i = 0; i < pts.length; i++) {
-      var el = document.elementFromPoint(Math.round(w / 2), pts[i])
-        || document.elementFromPoint(4, pts[i])
-        || document.body;
-      var c = effective(el);
-      if (c) { votes[c] = (votes[c] || 0) + 1; }
+  // 计算视口顶部有效底色（#RRGGBB；取不到返回空串）
+  function compute() {
+    try {
+      var w = window.innerWidth;
+      var pts = [1, 3, 6, 12, 20];
+      var votes = {};
+      for (var i = 0; i < pts.length; i++) {
+        var el = document.elementFromPoint(Math.round(w / 2), pts[i])
+          || document.elementFromPoint(4, pts[i])
+          || document.body;
+        var c = effective(el);
+        if (c) { votes[c] = (votes[c] || 0) + 1; }
+      }
+      var best = '';
+      var top = -1;
+      for (var k in votes) { if (votes[k] > top) { top = votes[k]; best = k; } }
+      return best;
+    } catch (e) {
+      return '';
     }
-    var best = '';
-    var top = -1;
-    for (var k in votes) { if (votes[k] > top) { top = votes[k]; best = k; } }
-    return best;
-  } catch (e) {
-    return '';
   }
+
+  // 变化去重后经桥回推原生
+  var last = '';
+  function push() {
+    scheduled = false;
+    var c = compute();
+    if (!c || c === last) { return; }
+    last = c;
+    try {
+      if (window.zcodeStatusBar && window.zcodeStatusBar.onTopColor) {
+        window.zcodeStatusBar.onTopColor(c);
+      }
+    } catch (e) {}
+  }
+
+  // 合并同一帧内的密集 DOM 变更（React 渲染期 MutationObserver 会高频触发）
+  var scheduled = false;
+  function schedule() {
+    if (scheduled) { return; }
+    scheduled = true;
+    if (window.requestAnimationFrame) {
+      window.requestAnimationFrame(function () { setTimeout(push, 0); });
+    } else {
+      setTimeout(push, 0);
+    }
+  }
+
+  try {
+    var mo = new MutationObserver(schedule);
+    mo.observe(document.documentElement, { subtree: true, childList: true, attributes: true });
+    window.addEventListener('resize', schedule, true);
+    window.addEventListener('orientationchange', schedule, true);
+    document.addEventListener('DOMContentLoaded', schedule, true);
+    window.addEventListener('load', schedule, true);
+    document.addEventListener('visibilitychange', schedule, true);
+    if (window.matchMedia) {
+      try {
+        var mq = window.matchMedia('(prefers-color-scheme: dark)');
+        if (mq.addEventListener) { mq.addEventListener('change', schedule); }
+      } catch (e) {}
+    }
+  } catch (e) {}
+  schedule();
+  return 'ok';
 })()
 `;
+
+/**
+ * 状态栏底色桥：网页侧观察到顶部有效底色变化时，经 window.zcodeStatusBar.onTopColor
+ * 把色值推给原生（方法名须与 methodList 一致）。
+ */
+class StatusBarColorBridge {
+  private handler: (hex: string) => void = () => {};
+
+  setHandler(handler: (hex: string) => void): void {
+    this.handler = handler;
+  }
+
+  onTopColor(color: string): void {
+    this.handler(color);
+  }
+}
 
 @Entry
 @Component
@@ -120,18 +192,20 @@ struct Index {
   delegate: webview.WebDownloadDelegate = new webview.WebDownloadDelegate();
   private pageLoadTimer: number = -1;
   private readonly LOAD_TIMEOUT_MS: number = 15000;
-  // 深浅色跟随系统：避让区/容器取控制页网页背景同色（暗=左栏深灰，亮=白）
+  // 深浅色跟随系统：容器/空白底取远程网页自身的开屏壳底色（亮 #F8F8F8 / 暗 #161616），
+  // 与网页 own boot splash 一致，消除开屏二阶段的底色跳变
   @StorageProp('currentColorMode') @Watch('onColorModeChange')
   currentColorMode: ConfigurationConstant.ColorMode = ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET;
-  @State webBgColor: string = '#FFFFFFFF';
-  // 状态栏占位底色：平板取设备限定资源固定色，手机控制页取网页顶部实测色（兜底同上）
+  @State webBgColor: string = '#FFF8F8F8';
+  // 状态栏占位底色：兜底为网页开屏壳底色（限定资源，与启动空白底同色），
+  // 手机控制页加载完成后由网页顶部实测色细化
   @State statusBarColor: ResourceColor = $r('app.color.status_bar_bg');
-  // 手机端才做动态取色；平板保持固定色（避免影响平板上已正常的观感）
+  // 仅手机端在页面加载后做动态取色；平板整程保持开屏壳底色
   private readonly isPhone: boolean = deviceInfo.deviceType === deviceInfo.DeviceTypes.TYPE_PHONE;
-  // 上一次采样结果（空串 = 尚未取到有效色，走资源兜底）
+  // 上一次由网页回推的顶部色（空串 = 尚未取到有效色，走资源兜底）
   private sampledBarColor: string = '';
-  private statusBarTimer: number = -1;
-  private readonly STATUS_BAR_POLL_MS: number = 1000;
+  // 网页底色回推桥（javaScriptProxy 注入为 window.zcodeStatusBar）
+  private barBridge: StatusBarColorBridge = new StatusBarColorBridge();
   // 上传方式选择模态框（相册 + 文件两项）
   @State showUploadModal: boolean = false;
   // 无效二维码提示
@@ -141,10 +215,14 @@ struct Index {
   // 状态栏高度（px）：EntryAbility 读取并写入，用于页面顶部占位
   @StorageProp('topAvoidPx') topAvoidPx: number = 0;
   private pendingFileListHandler: ((fileList: Array<string>) => void) | null = null;
+  // 页面是否处于前台可见：快捷方式在后台送达时，扫码指令需留到 onPageShow 再执行
+  private pageVisible: boolean = false;
 
   aboutToAppear(): void {
     this.remoteUrl = AppStorage.get<string>('bootRemoteUrl') ?? '';
     this.hasConnection = this.remoteUrl !== '';
+    // 网页回推的顶部色 → 原生状态栏底色
+    this.barBridge.setHandler((hex: string) => this.onTopColorFromWeb(hex));
     // 初始化深浅色背景
     this.onColorModeChange();
     if (this.hasConnection) {
@@ -155,16 +233,17 @@ struct Index {
   aboutToDisappear(): void {
     // 组件销毁前清理定时器，避免内存泄漏和无效回调
     this.clearLoadTimeout();
-    this.stopStatusBarWatch();
   }
 
   onPageShow(): void {
+    this.pageVisible = true;
     // 控制页前台常亮（项目文档 §3 #13）
     if (this.hasConnection) {
       this.setKeepScreenOn(true);
     }
-    // 引导页状态下由快捷方式冷启动：页面可见后自动拉起扫码
-    if (!this.hasConnection && this.scanAction === 'scan') {
+    // 快捷方式「扫码连接」：已存连接时必须照常拉起扫码（快捷方式语义 = 显式重扫），
+    // 原实现误加 !hasConnection 条件，导致扫过一次码后快捷方式被直连控制页吞掉。
+    if (this.scanAction === 'scan') {
       this.consumeScanAction();
       this.startScan();
     }
@@ -174,9 +253,11 @@ struct Index {
     }
   }
 
-  // 快捷方式触发热启动扫码
+  // 快捷方式触发热启动扫码：仅在页面已前台可见时立即拉起；若应用在后台收到指令，
+  // 保留 scanAction 交由 onPageShow 拉起（后台调 startScanForResult 起不来相机，
+  // 且指令已消费会造成本次扫码意图丢失）。
   onScanActionChange(): void {
-    if (this.scanAction === 'scan') {
+    if (this.scanAction === 'scan' && this.pageVisible) {
       this.consumeScanAction();
       this.startScan();
     }
@@ -208,30 +289,27 @@ struct Index {
     AppStorage.set<string>('scanAction', '');
   }
 
-  // 深浅色切换：避让区/容器背景取控制页网页侧栏实测底色（暗=#2B2B2B，亮=#ECECEE，2026-09-09 真机取样）
+  // 深浅色切换：容器/空白底取远程网页开屏壳底色（亮 #F8F8F8 / 暗 #161616）。
+  // 取值来源：网页 bootstrap 内联脚本 BROWSER_THEME_COLORS（data-zcode-browser-theme-surface），
+  // 即浏览器默认空白底与页面 logo 加载页的共用底色，二者天然对齐。
   onColorModeChange(): void {
     this.webBgColor =
       this.currentColorMode === ConfigurationConstant.ColorMode.COLOR_MODE_DARK
-        ? '#FF2B2B2B' : '#FFECECEE';
-    // 网页会随 prefers-color-scheme 重绘，旧采样值立即失效，先回退兜底色再重新采样
+        ? '#FF161616' : '#FFF8F8F8';
+    // 网页会随 prefers-color-scheme 重绘，旧值立即失效，先回退兜底色；
+    // 页内 MutationObserver 会捕获主题切换并把新色值回推，无需原生主动重采
     this.sampledBarColor = '';
     this.syncStatusBarColor();
-    if (this.hasConnection && !this.isError) {
-      this.scheduleStatusBarSample(200);
-    }
   }
 
   /**
    * 决定状态栏占位 Row 当前应使用的颜色：
    * - 原生页（扫码引导 / 加载失败）与页面自身背景保持一致（webBgColor）；
-   * - 平板控制页用设备限定资源固定色（现状不变）；
-   * - 手机控制页用网页顶部动态采样色，未取到时回退到限定资源色。
+   * - 控制页兜底用网页开屏壳底色资源（与启动空白底同色）；
+   * - 手机控制页在网页回推顶部色后用它细化，未回推时保持上述兜底色。
    */
   // 错误页出现/消失时同步状态栏底色（错误页为原生背景，需与 webBgColor 一致）
   onErrorStateChange(): void {
-    if (this.isError) {
-      this.stopStatusBarWatch();
-    }
     this.syncStatusBarColor();
   }
 
@@ -247,59 +325,33 @@ struct Index {
     this.statusBarColor = this.sampledBarColor;
   }
 
-  // 启动状态栏取色轮询（仅手机控制页；幂等）
-  private startStatusBarWatch(): void {
-    if (!this.isPhone || this.statusBarTimer !== -1) {
-      return;
-    }
-    this.statusBarTimer = setInterval(() => {
-      if (!this.hasConnection || this.isError) {
-        return;
-      }
-      this.sampleStatusBarColor();
-    }, this.STATUS_BAR_POLL_MS);
-  }
-
-  private stopStatusBarWatch(): void {
-    if (this.statusBarTimer !== -1) {
-      clearInterval(this.statusBarTimer);
-      this.statusBarTimer = -1;
-    }
-  }
-
-  // 延迟单次采样：页面加载完成后尽快刷新，不必等一个轮询周期
-  private scheduleStatusBarSample(delayMs: number): void {
+  // 网页侧观察到顶部有效底色变化时的即时回调（仅手机控制页生效）
+  private onTopColorFromWeb(raw: string): void {
     if (!this.isPhone || !this.hasConnection || this.isError) {
       return;
     }
-    setTimeout(() => {
-      if (this.hasConnection && !this.isError) {
-        this.sampleStatusBarColor();
-      }
-    }, delayMs);
+    const color: string = this.normalizeSampledColor(raw);
+    if (color === '' || color === this.sampledBarColor) {
+      return;
+    }
+    this.sampledBarColor = color;
+    this.syncStatusBarColor();
   }
 
-  // 读取网页顶部有效底色并同步；仅当取值变化时更新，避免无谓重绘
-  private sampleStatusBarColor(): void {
+  // 安装/重试页内底色观察脚本（幂等：页内已装载则返回 'dup'，document 未就绪返回 'retry'）
+  private installStatusBarObserver(): void {
     try {
-      this.controller.runJavaScript(STATUS_BAR_SAMPLE_JS, (err: BusinessError, result: string) => {
-        if (err || !result) {
-          return;
-        }
-        const color: string = this.normalizeSampledColor(result);
-        if (color === '' || color === this.sampledBarColor) {
-          return;
-        }
-        this.sampledBarColor = color;
-        this.syncStatusBarColor();
-      });
+      this.controller.runJavaScript(STATUS_BAR_OBSERVER_JS);
     } catch (err) {
-      hilog.warn(DOMAIN, TAG, 'sampleStatusBarColor failed');
+      hilog.warn(DOMAIN, TAG, 'installStatusBarObserver failed');
     }
   }
 
   // 采样返回值归一化为 #AARRGGBB；非法值返回空串（交由资源兜底）
   private normalizeSampledColor(raw: string): string {
+    if (!raw) {
+      return '';
+    }
     let value: string = raw.trim();
     if (value.length >= 2 && value.charAt(0) === '"' && value.charAt(value.length - 1) === '"') {
       value = value.substring(1, value.length - 1);
@@ -318,7 +370,8 @@ struct Index {
 
   // 拉起默认界面扫码（系统统一 UI，相机权限系统预授权）
   private startScan(): void {
-    if (this.isScanning) {
+    // 页面不在前台时系统扫码 UI 无法正常弹出，直接放弃（指令仍留在 scanAction 待下次可见时消费）
+    if (this.isScanning || !this.pageVisible) {
       return;
     }
     this.isScanning = true;
@@ -374,10 +427,22 @@ struct Index {
             .fileAccess(true)
             .mixedMode(1)
             .imageAccess(true)
-            .zoomAccess(true)
+            // 禁止双指/双击手势缩放：套壳页应按窗口宽度自适应，缩放会破坏布局且无实际收益
+            .zoomAccess(false)
+            // 显式启用网页 meta viewport：ArkWeb 默认以 UA 是否含 "Mobile" 决定是否解析该标签，
+            // 平板默认 UA 不含 Mobile（DeviceCompat 为空），会导致 width=device-width 被忽略、
+            // 网页按固定布局宽度缩放显示，分屏/悬浮窗切换时布局错乱。置 true 覆盖该默认关闭态。
+            .metaViewport(true)
             .darkMode(2) // WebDarkMode.Auto: 跟随系统深色模式，传递 prefers-color-scheme 给网页
             .backgroundColor(this.webBgColor)
             .geolocationAccess(true)
+            // 网页顶部底色观察桥：网页侧观察到头部落色变化即经此回推，驱动状态栏即时更新
+            .javaScriptProxy({
+              object: this.barBridge,
+              name: 'zcodeStatusBar',
+              methodList: ['onTopColor'],
+              controller: this.controller
+            })
             .width('100%')
             .height('100%')
             .onControllerAttached(() => {
@@ -402,12 +467,15 @@ struct Index {
                 this.loadingProgress = event.newProgress;
               }
             })
+            .onFirstContentfulPaint(() => {
+              // 首帧内容出现即安装观察脚本：不等 onPageEnd，页面顶部一绘制就回推色值
+              this.installStatusBarObserver();
+            })
             .onPageEnd(() => {
               this.isLoading = false;
               this.clearLoadTimeout();
-              // 页面就绪后采样顶部底色，随后转入低频轮询（SPA 路由/主题切换时自动跟随）
-              this.scheduleStatusBarSample(80);
-              this.startStatusBarWatch();
+              // 兜底安装：FCP 早于 document 就绪时会返回 'retry'，此处补齐；已装载则为空操作
+              this.installStatusBarObserver();
             })
             .onErrorReceive((event) => {
               if (event && event.error && event.error.getErrorCode() !== 0) {
@@ -653,6 +721,7 @@ struct Index {
   }
 
   onPageHide(): void {
+    this.pageVisible = false;
     // 切后台恢复系统息屏节奏（项目文档 §3 #13）
     if (this.hasConnection) {
       this.setKeepScreenOn(false);

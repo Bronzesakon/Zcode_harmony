@@ -7,7 +7,8 @@
  * 窗口约定（项目文档 §8 / §11）：
  * - 不启用沉浸式布局：窗口内容区由系统默认避让顶部状态栏，页面自然从状态栏下方开始。
  * - 状态栏背景透明，实际底色由页面顶部占位 Row 提供；色值走设备/深浅色限定资源
- *   app.color.status_bar_bg（手机走动态采样兜底，平板用固定色），图标暗色白、亮色黑。
+ *   app.color.status_bar_bg（对齐远程网页开屏壳底色，手机控制页加载后由动态采样细化），
+ *   图标暗色白、亮色黑。
  * - 底部贴底由页面 expandSafeArea(BOTTOM) 负责，此处不干预。
  */
 import { AbilityConstant, Configuration, ConfigurationConstant, UIAbility, Want } from '@kit.AbilityKit';
@@ -22,12 +23,12 @@ const DOMAIN = 0x0001;
 const TAG = 'ZCodeEntryAbility';
 
 // 状态栏配色（项目文档 §11）
-// 底色由设备/深浅色限定资源 status_bar_bg 提供（手机=动态采样兜底色，平板=侧栏固定色）；
-// 常量仅作为资源读取异常时的兜底。
+// 底色由设备/深浅色限定资源 status_bar_bg 提供，取值对齐远程网页开屏壳底色
+// （亮 #F8F8F8 / 暗 #161616）；常量仅作为资源读取异常时的兜底。
 const BAR_ICON_DARK = '#FFFFFF';
 const BAR_ICON_LIGHT = '#000000';
-const BAR_BG_FALLBACK_DARK = '#FF1F1F20';
-const BAR_BG_FALLBACK_LIGHT = '#FFFFFFFF';
+const BAR_BG_FALLBACK_DARK = '#FF161616';
+const BAR_BG_FALLBACK_LIGHT = '#FFF8F8F8';
 
 let webEngineInitialized: boolean = false;
 let mainWindowClass: window.Window | null = null;
