@@ -4,8 +4,9 @@
     <style name="Theme.ZcodeRemote" parent="Theme.Material3.DayNight.NoActionBar">
         <item name="colorPrimary">@color/brand_primary</item>
         <item name="android:windowBackground">@color/brand_background</item>
-        <item name="android:statusBarColor">@color/brand_background</item>
-        <item name="android:navigationBarColor">@color/brand_background</item>
+        <!-- 不设 statusBarColor / navigationBarColor：targetSdk 35 的
+             edge-to-edge 下它们会被忽略，系统栏区域显示的是 windowBackground，
+             而 inset 由 enableLightEdgeToEdge/padForSystemBars 处理。 -->
     </style>
 
     <!-- Shown while the process starts, before the WebView has anything to

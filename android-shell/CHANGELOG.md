@@ -24,6 +24,10 @@
 - **后台存活取证**：注入层上报收帧计数与配对确认次数；回到前台时输出一行结论（`后台存活检查：时长 X，期间收到 N 帧、配对确认 M 次 → 保活成立/失败`），把迁移文档 §8 第 4 步从「凭感觉」变成可读出的测量。
 - 云端 CI：`js`（Node 协议层测试）与 `build`（单次 Gradle 调用完成 release 单元测试 + APK）并行；签名从 Secrets 恢复，产物重命名 + md5 + apksigner 校验签名者 DN；`v*` tag 触发 Release。
 
+### Fixed
+- 顶部工具栏被状态栏遮挡（右上角溢出菜单被压住）：`targetSdk 35` 起 Android 15 强制 edge-to-edge，窗口会画到系统栏下面且 `statusBarColor` 被忽略。改为 `enableEdgeToEdge` + 根布局消费 systemBars/displayCutout inset，两个 Activity 都覆盖。
+- 底部内容相对可视区偏左 / 右边距偏大：去掉 WebView 的 `useWideViewPort` 与 `loadWithOverviewMode`（这两个开关是给桌面版老页面用的，对自适应 SPA 会让视口宽度与实际显示宽度不一致）；同时注入层新增视口尺寸上报，便于把这类问题变成可读数字而不是靠截图争论。
+
 ### Notes
 - 单元测试 35 项（JS 协议层与注入层）+ 20 项（Kotlin 通知判定算法），全部在 CI 运行。
 - 仅中文界面；`minSdk 26`，`compileSdk/targetSdk 35`；纯 Kotlin/Java 无 native 库，单一通用 APK。

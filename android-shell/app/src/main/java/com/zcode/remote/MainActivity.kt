@@ -32,6 +32,8 @@ import com.journeyapps.barcodescanner.ScanOptions
 import com.zcode.remote.core.Diagnostics
 import com.zcode.remote.core.Prefs
 import com.zcode.remote.core.RemoteUrl
+import com.zcode.remote.core.enableLightEdgeToEdge
+import com.zcode.remote.core.padForSystemBars
 import com.zcode.remote.databinding.ActivityMainBinding
 
 /**
@@ -84,12 +86,18 @@ class MainActivity : AppCompatActivity() {
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        // Must precede setContentView: see enableLightEdgeToEdge().
+        enableLightEdgeToEdge()
         super.onCreate(savedInstanceState)
         ShellRuntime.init(this)
         prefs = ShellRuntime.prefs()
 
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        // targetSdk 35 forces edge-to-edge, so the toolbar would otherwise sit
+        // under the status bar (clipping its overflow button) and the page under
+        // the navigation bar.
+        binding.root.padForSystemBars()
         setSupportActionBar(binding.toolbar)
 
         binding.btnScan.setOnClickListener { startScan() }
@@ -128,8 +136,10 @@ class MainActivity : AppCompatActivity() {
             mediaPlaybackRequiresUserGesture = false
             mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
             cacheMode = WebSettings.LOAD_DEFAULT
-            useWideViewPort = true
-            loadWithOverviewMode = true
+            // Deliberately NOT setting useWideViewPort / loadWithOverviewMode:
+            // they exist to make legacy desktop pages fit, and on a responsive
+            // SPA they can make the viewport width disagree with the visible
+            // area (content then looks off-centre relative to the scrollbar).
             // The default UA is kept deliberately: the page does its own mobile
             // feature detection and a custom UA could change its behaviour.
         }

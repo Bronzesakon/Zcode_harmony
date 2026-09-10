@@ -619,6 +619,36 @@
         }
     };
 
+    /**
+     * Reports the CSS viewport metrics.
+     *
+     * This exists to make layout problems measurable instead of a screenshot
+     * argument: if innerWidth * devicePixelRatio does not match the WebView's
+     * own width, the page is being laid out at a different scale than it is
+     * displayed at, which shows up as content sitting off-centre relative to
+     * the scrollbar.
+     */
+    function reportViewport() {
+        // Wrapped because it runs from a timer: by the time it fires the
+        // document may be going away, and an exception here would escape into
+        // whatever is tearing the page down.
+        try {
+            var doc = document.documentElement || {};
+            var vv = window.visualViewport;
+            post('diag', {
+                level: 'info',
+                message: '视口 innerWidth=' + window.innerWidth +
+                    ' innerHeight=' + window.innerHeight +
+                    ' clientWidth=' + (doc.clientWidth || 0) +
+                    ' scrollWidth=' + (doc.scrollWidth || 0) +
+                    ' dpr=' + (window.devicePixelRatio || 0) +
+                    ' scale=' + (vv ? Math.round(vv.scale * 100) / 100 : 'n/a')
+            });
+        } catch (e) {
+            // page torn down; nothing to report
+        }
+    }
+
     /** Lets the native side flip the subscribe-all switch without a reload. */
     G.__zcodeShellSetSubscribeAll = function (enabled) {
         if (!client) {
@@ -658,4 +688,9 @@
     startHeartbeat();
     post('ready', {href: location.href, subscribeAll: config().subscribeAll !== false});
     reportLiveness();
+    // After the first layout pass, and again whenever the viewport changes.
+    setTimeout(reportViewport, 1200);
+    window.addEventListener('resize', function () {
+        setTimeout(reportViewport, 300);
+    });
 })();
