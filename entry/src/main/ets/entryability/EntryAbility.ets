@@ -154,7 +154,8 @@ export default class EntryAbility extends UIAbility {
     hilog.info(DOMAIN, TAG, 'Ability onBackground');
   }
 
-  // 返回手势兜底（项目文档 §10）：true = 移到后台不销毁
+  // 返回兜底（项目文档 §10）：页面 onBackPress 返回 false 时到达此处（当前仅手机）。
+  // true = 移到后台不销毁：手机侧滑返回→应用退后台，WebView 会话保留；平板被页面消费，不会到这里。
   onBackPressed(): boolean {
     return true;
   }

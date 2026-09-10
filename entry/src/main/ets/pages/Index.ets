@@ -27,99 +27,63 @@ const DOMAIN = 0x0001;
 const TAG = 'ZCodeIndex';
 
 /**
- * 网页顶部底色观察脚本（经 JavaSciptProxy 主动回推，取代固定轮询/延时采样）
+ * 状态栏两套固定表面色（双端一致，色值取自远程页静态资源解析，2026-09-10 资源嗅探 + 真机像素双验证）。
+ * 运行时零取色：网页侧只回推状态名（'boot' | 'main'），原生查本表直接换色：
+ * - Boot 面：网页 bootstrap BROWSER_THEME_COLORS / --color-background，
+ *   覆盖 开屏空白、Boot 加载壳、KICKED/接管提示等状态页（页顶同为 bg-background）；
+ * - Main 面：--color-background-win-alt，即控制页外壳区底色
+ *   （平板状态栏正下方即此色，真机像素实测一致）；
+ * - 手机 Main 变体：--color-header（#FFFFFF / #202020）。手机窄屏布局在状态栏正下方
+ *   是白色标题栏（其下才是外壳区），故手机进入主页面后用 Header 色对齐顶栏。
+ */
+const BAR_SURFACE_LIGHT = '#FFECECEE';
+const BAR_SURFACE_DARK = '#FF2B2B2B';
+const BAR_HEADER_LIGHT = '#FFFFFFFF';
+const BAR_HEADER_DARK = '#FF202020';
+const BAR_BOOT_LIGHT = '#FFF8F8F8';
+const BAR_BOOT_DARK = '#FF161616';
+
+/**
+ * 网页状态观察脚本（经 JavaScriptProxy 回推状态名，取代任何运行时取色）
  *
- * 网页显示区被顶到状态栏下方，故视口 y≈0 处的有效背景色 = 状态栏下方那一条的真实颜色
- * （控制页即两级菜单标题栏）。做法：多点取样 + 众数投票，命中透明/分隔线时回溯祖先求
- * 半透明叠加后的有效不透明底色；全链路无实心底色（渐变/背景图/跨域 iframe）时取不到色值。
+ * 色值在开发期已由静态资源解析确定（HTML 内联 BROWSER_THEME_COLORS + CSS token），
+ * 运行时唯一要做的是判断网页处于哪个状态，因此本脚本只做 DOM 存在性检查：
+ * - '.zcode-boot-loading'：网页预渲染的 Boot 加载壳元素（React 挂载后移除）；
+ * - '.bg-background-win-alt'：控制页主视图根节点（SPA 路由/状态页切换时挂载或卸载）。
+ * main = 主视图在且 Boot 壳已卸载；其余（Boot 壳、KICKED/接管等状态页）一律 'boot'。
+ * KICKED 页替换主视图 → 自动落回 boot，与"状态页页顶 = Boot 色"的资源解析结论一致。
  *
- * 事件驱动：在 document 上挂 MutationObserver（含 <html> 属性/class 变化，覆盖 SPA 路由与
- * 主题切换），另监听 resize / 屏幕方向 / prefers-color-scheme；顶部有效色一旦变化即经
- * window.zcodeStatusBar 立即回推原生 —— 头部渲染出来的那一帧就完成取色，无需等待轮询周期
- * 或人为延时。安装幂等：__zcodeTopColorHooked 置位后重复安装为空操作；document 尚未就绪时
- * 返回 'retry' 且不置位，留待后续时机（FCP / onPageEnd）重试。
+ * 事件驱动：MutationObserver 监听 DOM 结构与 class 变化，rAF 合帧后状态有变才回推
+ * 状态名（非色值），空闲零开销。安装幂等：__zcodePageStateHooked 置位后重复安装为
+ * 空操作；document 尚未就绪时返回 'retry' 且不置位，留待 FCP / onPageEnd 重试。
  */
 const STATUS_BAR_OBSERVER_JS: string = `
 (function () {
-  if (window.__zcodeTopColorHooked) { return 'dup'; }
+  if (window.__zcodePageStateHooked) { return 'dup'; }
   if (!document.documentElement) { return 'retry'; }
-  window.__zcodeTopColorHooked = true;
+  window.__zcodePageStateHooked = true;
 
-  function parseColor(c) {
-    if (!c) { return null; }
-    var m = c.match(/rgba?\\(([^)]+)\\)/);
-    if (!m) { return null; }
-    var p = m[1].split(',');
-    if (p.length < 3) { return null; }
-    var r = parseFloat(p[0]);
-    var g = parseFloat(p[1]);
-    var b = parseFloat(p[2]);
-    var a = p.length > 3 ? parseFloat(p[3]) : 1;
-    if (isNaN(r) || isNaN(g) || isNaN(b) || isNaN(a)) { return null; }
-    return { r: r, g: g, b: b, a: a };
-  }
-  function over(fg, bg) {
-    var a = fg.a;
-    return {
-      r: Math.round(fg.r * a + bg.r * (1 - a)),
-      g: Math.round(fg.g * a + bg.g * (1 - a)),
-      b: Math.round(fg.b * a + bg.b * (1 - a))
-    };
-  }
-  function hex(c) {
-    function h(n) { var s = n.toString(16); return s.length < 2 ? '0' + s : s; }
-    return '#' + h(c.r) + h(c.g) + h(c.b);
-  }
-  function effective(el) {
-    var stack = [];
-    var node = el;
-    while (node && node.nodeType === 1) {
-      var c = parseColor(getComputedStyle(node).backgroundColor);
-      if (c && c.a > 0) {
-        stack.push(c);
-        if (c.a >= 1) { break; }
-      }
-      node = node.parentElement;
-    }
-    if (!node || node.nodeType !== 1) { return ''; }
-    var last = stack.length > 0 ? stack[stack.length - 1] : null;
-    if (!last || last.a < 1) { return ''; }
-    var out = stack.pop();
-    for (var i = stack.length - 1; i >= 0; i--) { out = over(stack[i], out); }
-    return hex(out);
-  }
-  // 计算视口顶部有效底色（#RRGGBB；取不到返回空串）
-  function compute() {
+  // 状态判定：纯 DOM 存在性检查（getElementsByClassName 零样式读取）
+  function computeState() {
     try {
-      var w = window.innerWidth;
-      var pts = [1, 3, 6, 12, 20];
-      var votes = {};
-      for (var i = 0; i < pts.length; i++) {
-        var el = document.elementFromPoint(Math.round(w / 2), pts[i])
-          || document.elementFromPoint(4, pts[i])
-          || document.body;
-        var c = effective(el);
-        if (c) { votes[c] = (votes[c] || 0) + 1; }
-      }
-      var best = '';
-      var top = -1;
-      for (var k in votes) { if (votes[k] > top) { top = votes[k]; best = k; } }
-      return best;
+      var main = document.getElementsByClassName('bg-background-win-alt');
+      var boot = document.getElementsByClassName('zcode-boot-loading');
+      return (main.length > 0 && boot.length === 0) ? 'main' : 'boot';
     } catch (e) {
       return '';
     }
   }
 
-  // 变化去重后经桥回推原生
+  // 状态变化去重后经桥回推原生（推状态名，不推色值）
   var last = '';
   function push() {
     scheduled = false;
-    var c = compute();
-    if (!c || c === last) { return; }
-    last = c;
+    var s = computeState();
+    if (!s || s === last) { return; }
+    last = s;
     try {
-      if (window.zcodeStatusBar && window.zcodeStatusBar.onTopColor) {
-        window.zcodeStatusBar.onTopColor(c);
+      if (window.zcodeStatusBar && window.zcodeStatusBar.onPageState) {
+        window.zcodeStatusBar.onPageState(s);
       }
     } catch (e) {}
   }
@@ -139,17 +103,6 @@ const STATUS_BAR_OBSERVER_JS: string = `
   try {
     var mo = new MutationObserver(schedule);
     mo.observe(document.documentElement, { subtree: true, childList: true, attributes: true });
-    window.addEventListener('resize', schedule, true);
-    window.addEventListener('orientationchange', schedule, true);
-    document.addEventListener('DOMContentLoaded', schedule, true);
-    window.addEventListener('load', schedule, true);
-    document.addEventListener('visibilitychange', schedule, true);
-    if (window.matchMedia) {
-      try {
-        var mq = window.matchMedia('(prefers-color-scheme: dark)');
-        if (mq.addEventListener) { mq.addEventListener('change', schedule); }
-      } catch (e) {}
-    }
   } catch (e) {}
   schedule();
   return 'ok';
@@ -157,18 +110,18 @@ const STATUS_BAR_OBSERVER_JS: string = `
 `;
 
 /**
- * 状态栏底色桥：网页侧观察到顶部有效底色变化时，经 window.zcodeStatusBar.onTopColor
- * 把色值推给原生（方法名须与 methodList 一致）。
+ * 网页状态桥：网页侧观察到状态切换（Boot 壳/状态页 ↔ 控制页主视图）时，
+ * 经 window.zcodeStatusBar.onPageState 把状态名推给原生（方法名须与 methodList 一致）。
  */
 class StatusBarColorBridge {
-  private handler: (hex: string) => void = () => {};
+  private handler: (state: string) => void = () => {};
 
-  setHandler(handler: (hex: string) => void): void {
+  setHandler(handler: (state: string) => void): void {
     this.handler = handler;
   }
 
-  onTopColor(color: string): void {
-    this.handler(color);
+  onPageState(state: string): void {
+    this.handler(state);
   }
 }
 
@@ -196,14 +149,15 @@ struct Index {
   // 与网页 own boot splash 一致，消除开屏二阶段的底色跳变
   @StorageProp('currentColorMode') @Watch('onColorModeChange')
   currentColorMode: ConfigurationConstant.ColorMode = ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET;
-  @State webBgColor: string = '#FFF8F8F8';
-  // 状态栏占位底色：兜底为网页开屏壳底色（限定资源，与启动空白底同色），
-  // 手机控制页加载完成后由网页顶部实测色细化
+  @State webBgColor: string = BAR_BOOT_LIGHT;
+  // 状态栏占位底色：初始取开屏壳底色资源（四端限定目录已统一为 Boot 色），
+  // 之后由「网页状态 → 固定表面色」查表驱动，只会在两套固定色之间切换
   @State statusBarColor: ResourceColor = $r('app.color.status_bar_bg');
-  // 仅手机端在页面加载后做动态取色；平板整程保持开屏壳底色
+  // 设备形态：仅用于返回手势策略（onBackPress 平板全吞）；状态栏配色已双端统一，不再按设备分叉
   private readonly isPhone: boolean = deviceInfo.deviceType === deviceInfo.DeviceTypes.TYPE_PHONE;
-  // 上一次由网页回推的顶部色（空串 = 尚未取到有效色，走资源兜底）
-  private sampledBarColor: string = '';
+  // 网页当前状态（网页侧 DOM 标记判定后回推）：true = 控制页主视图，false = Boot 壳/状态页/未回推。
+  // 与深浅色模式无关：模式切换时保留原值直接重映射
+  private webPageOnMain: boolean = false;
   // 网页底色回推桥（javaScriptProxy 注入为 window.zcodeStatusBar）
   private barBridge: StatusBarColorBridge = new StatusBarColorBridge();
   // 上传方式选择模态框（相册 + 文件两项）
@@ -221,8 +175,8 @@ struct Index {
   aboutToAppear(): void {
     this.remoteUrl = AppStorage.get<string>('bootRemoteUrl') ?? '';
     this.hasConnection = this.remoteUrl !== '';
-    // 网页回推的顶部色 → 原生状态栏底色
-    this.barBridge.setHandler((hex: string) => this.onTopColorFromWeb(hex));
+    // 网页状态回推 → 原生状态栏固定色查表
+    this.barBridge.setHandler((state: string) => this.onPageStateFromWeb(state));
     // 初始化深浅色背景
     this.onColorModeChange();
     if (this.hasConnection) {
@@ -289,24 +243,20 @@ struct Index {
     AppStorage.set<string>('scanAction', '');
   }
 
-  // 深浅色切换：容器/空白底取远程网页开屏壳底色（亮 #F8F8F8 / 暗 #161616）。
-  // 取值来源：网页 bootstrap 内联脚本 BROWSER_THEME_COLORS（data-zcode-browser-theme-surface），
-  // 即浏览器默认空白底与页面 logo 加载页的共用底色，二者天然对齐。
+  // 深浅色切换：容器/空白底取远程网页开屏壳底色（BAR_BOOT_*，与 BROWSER_THEME_COLORS 对齐）。
+  // 状态判定与模式无关，不重置：换模式后按当前状态直接重映射固定色
   onColorModeChange(): void {
     this.webBgColor =
       this.currentColorMode === ConfigurationConstant.ColorMode.COLOR_MODE_DARK
-        ? '#FF161616' : '#FFF8F8F8';
-    // 网页会随 prefers-color-scheme 重绘，旧值立即失效，先回退兜底色；
-    // 页内 MutationObserver 会捕获主题切换并把新色值回推，无需原生主动重采
-    this.sampledBarColor = '';
+        ? BAR_BOOT_DARK : BAR_BOOT_LIGHT;
     this.syncStatusBarColor();
   }
 
   /**
-   * 决定状态栏占位 Row 当前应使用的颜色：
-   * - 原生页（扫码引导 / 加载失败）与页面自身背景保持一致（webBgColor）；
-   * - 控制页兜底用网页开屏壳底色资源（与启动空白底同色）；
-   * - 手机控制页在网页回推顶部色后用它细化，未回推时保持上述兜底色。
+   * 决定状态栏占位 Row 当前应使用的颜色（双端统一，仅两套固定色，运行时零取色）：
+   * - 原生页（扫码引导 / 加载失败）与页面自身背景一致（webBgColor = Boot 色）；
+   * - 控制页：网页回推 main（主视图在挂）→ Main 固定色；
+   *   回推 boot（Boot 壳 / KICKED 等状态页）或未回推 → Boot 色（webBgColor）。
    */
   // 错误页出现/消失时同步状态栏底色（错误页为原生背景，需与 webBgColor 一致）
   onErrorStateChange(): void {
@@ -318,23 +268,26 @@ struct Index {
       this.statusBarColor = this.webBgColor;
       return;
     }
-    if (!this.isPhone || this.sampledBarColor === '') {
-      this.statusBarColor = $r('app.color.status_bar_bg');
+    if (this.webPageOnMain) {
+      // 主页面：平板状态栏正下方是外壳区（win-alt），手机是白色标题栏（header），按设备查表
+      this.statusBarColor = this.isPhone
+        ? this.themeColor(BAR_HEADER_DARK, BAR_HEADER_LIGHT)
+        : this.themeColor(BAR_SURFACE_DARK, BAR_SURFACE_LIGHT);
       return;
     }
-    this.statusBarColor = this.sampledBarColor;
+    this.statusBarColor = this.webBgColor;
   }
 
-  // 网页侧观察到顶部有效底色变化时的即时回调（仅手机控制页生效）
-  private onTopColorFromWeb(raw: string): void {
-    if (!this.isPhone || !this.hasConnection || this.isError) {
+  // 网页侧状态切换回调（双端统一：查固定色表直接换色）
+  private onPageStateFromWeb(state: string): void {
+    if (!this.hasConnection || this.isError) {
       return;
     }
-    const color: string = this.normalizeSampledColor(raw);
-    if (color === '' || color === this.sampledBarColor) {
+    const onMain: boolean = state === 'main';
+    if (onMain === this.webPageOnMain) {
       return;
     }
-    this.sampledBarColor = color;
+    this.webPageOnMain = onMain;
     this.syncStatusBarColor();
   }
 
@@ -345,21 +298,6 @@ struct Index {
     } catch (err) {
       hilog.warn(DOMAIN, TAG, 'installStatusBarObserver failed');
     }
-  }
-
-  // 采样返回值归一化为 #AARRGGBB；非法值返回空串（交由资源兜底）
-  private normalizeSampledColor(raw: string): string {
-    if (!raw) {
-      return '';
-    }
-    let value: string = raw.trim();
-    if (value.length >= 2 && value.charAt(0) === '"' && value.charAt(value.length - 1) === '"') {
-      value = value.substring(1, value.length - 1);
-    }
-    if (!/^#[0-9a-fA-F]{6}$/.test(value)) {
-      return '';
-    }
-    return '#FF' + value.substring(1).toUpperCase();
   }
 
   // 深浅色 UI 取色助手
@@ -436,11 +374,12 @@ struct Index {
             .darkMode(2) // WebDarkMode.Auto: 跟随系统深色模式，传递 prefers-color-scheme 给网页
             .backgroundColor(this.webBgColor)
             .geolocationAccess(true)
-            // 网页顶部底色观察桥：网页侧观察到头部落色变化即经此回推，驱动状态栏即时更新
+            // 网页状态观察桥：网页侧以 DOM 标记判定状态（Boot/主视图）并回推状态名，
+            // 原生据此查固定色表切换状态栏底色（运行时零取色）
             .javaScriptProxy({
               object: this.barBridge,
               name: 'zcodeStatusBar',
-              methodList: ['onTopColor'],
+              methodList: ['onPageState'],
               controller: this.controller
             })
             .width('100%')
@@ -728,13 +667,28 @@ struct Index {
     }
   }
 
-  // 全吞返回手势：上传模态框开时先关模态框，其余场景一律消费事件（项目文档 §10）
+  // 返回手势按设备分化（项目文档 §10，2026-09-10 修订）：
+  // - 手机（与参考项目一致的三级链）：① 上传模态框开着 → 关模态框并消费；
+  //   ② WebView 有回退历史 → backward() 回退上一级网页并消费；
+  //   ③ 无历史 → 返回 false 走系统默认，由 EntryAbility.onBackPressed 兜底「移到后台不销毁」。
+  // - 平板：恒 true 全吞屏蔽（侧滑返回易与多窗/分屏边缘手势误触）。
   onBackPress(): boolean {
     if (this.showUploadModal) {
       this.dismissUploadModal();
       return true;
     }
-    return true;
+    if (!this.isPhone) {
+      return true;
+    }
+    try {
+      if (this.controller.accessBackward()) {
+        this.controller.backward();
+        return true;
+      }
+    } catch (err) {
+      hilog.warn(DOMAIN, TAG, 'onBackPress backward failed');
+    }
+    return false;
   }
 
   // 前台常亮 / 后台恢复
@@ -902,8 +856,8 @@ struct Index {
   // 热切换到新扫码结果（覆盖式单连接）
   private loadControlPage(target: string): void {
     try {
-      // 新页面顶部配色未知：先回退兜底色，待加载完成后重新采样
-      this.sampledBarColor = '';
+      // 新页面从 Boot 状态起步：先回 Boot 色，待观察脚本回推 main 后再切 Main 色
+      this.webPageOnMain = false;
       this.syncStatusBarColor();
       this.controller.loadUrl(target);
       this.isError = false;
