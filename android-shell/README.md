@@ -1,5 +1,8 @@
 # android-shell — ZCode 远程（安卓薄壳）
 
+> **接手排查请先读 [`HANDOVER.md`](HANDOVER.md)**：当前进度、必须随项目迁移的文件清单（CI 配置在父仓库根、
+> 参考文档与签名材料不在 git 里）、未验证项清单、待决策项、提交地图。
+
 把上层鸿蒙工程「ZCode 远程」的薄壳思路搬到安卓：**WebView 加载 `zcode.z.ai/remote/v4` + 原生对接系统能力**，并补上鸿蒙版没有的**任务通知**与**后台保活**。
 
 - 包名 / 应用名：`com.zcode.remote` / 「ZCode 远程」
