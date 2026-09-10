@@ -18,6 +18,7 @@
 # 本地工具资产（ZCode 项目级技能等），仅本地保留
 /.zcode/
 
-# 本地构建/调试缓存（arkts 检查缓存、hdc 采集产物）
+# 本地构建/调试缓存（arkts 检查缓存、hdc 采集产物、hvigor 临时工作区）
 /.cache/
 /.dsh-hdc/
+/.dsh-hvigor-tmp/
