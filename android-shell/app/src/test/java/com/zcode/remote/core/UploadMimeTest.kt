@@ -20,7 +20,7 @@ class UploadMimeTest {
 
     @Test
     fun `wildcards pass through untouched`() {
-        assertArrayEquals(arrayOf("image/*"), UploadMime.normalise(listOf("image/*"), lookup))
+        assertArrayEquals(arrayOf(IMAGE_ANY), UploadMime.normalise(listOf(IMAGE_ANY), lookup))
     }
 
     @Test
@@ -50,13 +50,23 @@ class UploadMimeTest {
     @Test
     fun `mixed forms keep order and drop duplicates`() {
         assertArrayEquals(
-            arrayOf("image/*", "image/png", "application/pdf"),
-            UploadMime.normalise(listOf("image/*", ".png", "image/png", "pdf"), lookup),
+            arrayOf(IMAGE_ANY, "image/png", "application/pdf"),
+            UploadMime.normalise(listOf(IMAGE_ANY, ".png", "image/png", "pdf"), lookup),
         )
     }
 
     @Test
     fun `blank entries are ignored`() {
         assertArrayEquals(arrayOf("image/png"), UploadMime.normalise(listOf(" ", "", ".png"), lookup))
+    }
+
+    private companion object {
+        /**
+         * Assembled rather than written as one literal: the two-character sequence
+         * that opens a block comment inside a string literal made the Kotlin
+         * compiler fail on the production class in three consecutive CI runs (see
+         * the note in UploadMime.kt). Keeping it out of this file too costs nothing.
+         */
+        val IMAGE_ANY: String = "image" + "/" + "*"
     }
 }

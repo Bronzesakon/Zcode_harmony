@@ -28,6 +28,18 @@
 - 顶部工具栏被状态栏遮挡（右上角溢出菜单被压住）：`targetSdk 35` 起 Android 15 强制 edge-to-edge，窗口会画到系统栏下面且 `statusBarColor` 被忽略。改为 `enableEdgeToEdge` + 根布局消费 systemBars/displayCutout inset，两个 Activity 都覆盖。
 - 底部内容相对可视区偏左 / 右边距偏大：去掉 WebView 的 `useWideViewPort` 与 `loadWithOverviewMode`（这两个开关是给桌面版老页面用的，对自适应 SPA 会让视口宽度与实际显示宽度不一致）；同时注入层新增视口尺寸上报，便于把这类问题变成可读数字而不是靠截图争论。
 
+### Added（本轮第二批）
+- **网页文件上传**：补上此前完全缺失的 `WebChromeClient.onShowFileChooser`——在此之前网页里点上传是死的。接入系统相册（Photo Picker，上限 5）/文件（SAF）选择器，弹窗「选择上传方式」对齐鸿蒙版；三条路径都不需要存储权限，未改 Manifest。唯一缺口：`MODE_SAVE`（网页请求保存文件）仍返回 false。
+- **ColorOS 16 流体云（Android 16 Live Updates）**：走平台路径，无需 OPPO 审批（OPPO 卡片路线需企业账号+定邀白名单+授权码）。声明 `POST_PROMOTED_NOTIFICATIONS`；常驻任务通知请求提升并带状态栏芯片（运行中/等待确认）。提升名额只给 2 张卡：先「等待确认」，再按最近活动取运行中任务（`PromotionPolicy`，7 项单测）。
+  - 不调 androidx API 的原因：`setRequestPromotedOngoing` / `setShortCriticalText` 的封装只在 androidx.core 1.17.0，该 AAR 声明 minCompileSdk=36 且 minAGP=8.9.1；而平台侧全部效果是写两个 extras，故按 androidx 源码里的字面键直接写，API<36 惰性无害
+  - 「已完成」按官方 UX 规范走标准通知：规范明确「实时更新必须表示正在积极进行的活动……活动发生在过去请勿使用实时更新」
+- **界面按 Material 3 规范梳理**：颜色改用 M3 颜色角色 + 启用动态配色（Android 12+ 取系统调色板），修复暗色模式此前从构造上就是坏的问题；字阶改用 M3 字阶；设置页改 MaterialCardView 卡片（12dp 圆角/低强调容器/56dp 行高/outlineVariant 分隔线）；空态与错误态补图标与字阶；上传弹窗颜色改角色（尺寸指标保留对齐鸿蒙）。
+- CI 新增 Kotlin 结构检查步骤（括号配平/包名与目录一致/合并残留），放在快 job 里。
+
+### Fixed（本轮第二批）
+- edge-to-edge 的系统栏图标此前被无条件强化为「浅色背景深色图标」，暗色模式下不可见；改为按 `uiMode` 在 `SystemBarStyle.light/dark` 间切换。
+- 恢复 `action_back` 字符串（此前误判未使用而删除，设置页返回键标题要用）。
+
 ### Notes
 - 单元测试 35 项（JS 协议层与注入层）+ 20 项（Kotlin 通知判定算法），全部在 CI 运行。
 - 仅中文界面；`minSdk 26`，`compileSdk/targetSdk 35`；纯 Kotlin/Java 无 native 库，单一通用 APK。
