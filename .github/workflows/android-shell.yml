@@ -35,11 +35,22 @@ on:
       - 'android-shell/**'
       - '.github/workflows/android-shell.yml'
       - '.github/scripts/android-shell-release-notes.ps1'
+    # Documentation-only changes cannot alter the APK, so they must not spend a
+    # build. (paths and paths-ignore compose: a run happens when paths matches AND
+    # paths-ignore does not exclude it.)
+    paths-ignore:
+      - 'android-shell/**.md'
+      - 'android-shell/docs/**'
+      - 'android-shell/ColorOS_docs/**'
   pull_request:
     paths:
       - 'android-shell/**'
       - '.github/workflows/android-shell.yml'
       - '.github/scripts/android-shell-release-notes.ps1'
+    paths-ignore:
+      - 'android-shell/**.md'
+      - 'android-shell/docs/**'
+      - 'android-shell/ColorOS_docs/**'
   workflow_dispatch:
 
 permissions:
