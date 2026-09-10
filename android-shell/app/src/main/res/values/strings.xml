@@ -26,6 +26,14 @@
     <string name="action_reload">重试</string>
     <string name="action_change_url">换个链接</string>
 
+    <!-- File/image upload: the wording is copied verbatim from the HarmonyOS
+         build (entry/src/main/resources/base/element/string.json) so the two
+         shells stay one product. -->
+    <string name="upload_modal_title">选择上传方式</string>
+    <string name="upload_album">相册</string>
+    <string name="upload_file">文件</string>
+    <string name="upload_hint">可选择图片或文件</string>
+
     <!-- settings -->
     <string name="settings_section_connection">连接</string>
     <string name="settings_current_url">当前链接</string>

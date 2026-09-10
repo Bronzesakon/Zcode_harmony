@@ -10,6 +10,11 @@
     <color name="brand_outline">#FFE2E2E6</color>
     <color name="brand_error">#FFB3261E</color>
 
+    <!-- Upload-source tiles: the HarmonyOS modal pairs #F5F5F5 tiles with a
+         #FFFFFF card in light mode, so the same two values are reused here. -->
+    <color name="brand_surface_variant">#FFF5F5F5</color>
+    <color name="brand_tile_ripple">#141F6FEB</color>
+
     <!-- Legacy bitmap fallback (mipmap-xxxhdpi/ic_launcher.png) carries the same
          artwork flattened; the adaptive background layer is pure black because
          background.png in the HarmonyOS icon is pure black. -->

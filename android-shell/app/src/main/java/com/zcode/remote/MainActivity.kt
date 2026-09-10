@@ -12,6 +12,8 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.view.View
+import android.webkit.ValueCallback
+import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
@@ -21,6 +23,7 @@ import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.Toast
 import androidx.activity.addCallback
+import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
@@ -32,6 +35,7 @@ import com.journeyapps.barcodescanner.ScanOptions
 import com.zcode.remote.core.Diagnostics
 import com.zcode.remote.core.Prefs
 import com.zcode.remote.core.RemoteUrl
+import com.zcode.remote.core.UploadMime
 import com.zcode.remote.core.enableLightEdgeToEdge
 import com.zcode.remote.core.padForSystemBars
 import com.zcode.remote.databinding.ActivityMainBinding
@@ -84,6 +88,34 @@ class MainActivity : AppCompatActivity() {
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
             Diagnostics.info(if (granted) "通知权限已授予" else "通知权限被拒绝")
         }
+
+    /**
+     * The `<input type="file">` callback currently waiting for a pick. It lives
+     * here rather than in the dialog because the result arrives after the dialog
+     * is gone, and it must be invoked exactly once or the page's upload hangs.
+     */
+    private var pendingFileCallback: ValueCallback<Array<Uri>>? = null
+
+    // Four launchers rather than two: FileChooserParams says whether the page
+    // asked for one file or many, and each picker has its own contract. Both
+    // photo contracts fall back to ACTION_OPEN_DOCUMENT by themselves on devices
+    // without the photo picker, so no manual fallback is needed.
+
+    private val photoPickerSingle = registerForActivityResult(
+        ActivityResultContracts.PickVisualMedia(),
+    ) { uri -> deliverPickedFiles(uri?.let { listOf(it) }.orEmpty()) }
+
+    private val photoPickerMultiple = registerForActivityResult(
+        ActivityResultContracts.PickMultipleVisualMedia(MAX_UPLOAD_ITEMS),
+    ) { uris -> deliverPickedFiles(uris) }
+
+    private val documentPickerSingle = registerForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri -> deliverPickedFiles(uri?.let { listOf(it) }.orEmpty()) }
+
+    private val documentPickerMultiple = registerForActivityResult(
+        ActivityResultContracts.OpenMultipleDocuments(),
+    ) { uris -> deliverPickedFiles(uris) }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         // Must precede setContentView: see enableLightEdgeToEdge().
@@ -201,6 +233,30 @@ class MainActivity : AppCompatActivity() {
                 val description = error.description?.toString().orEmpty()
                 Diagnostics.log("warn", "网页加载失败: $description")
                 showError(getString(R.string.error_network) + if (description.isEmpty()) "" else "\n($description)")
+            }
+        }
+
+        // File uploads. WebView ships no default chooser, so without this the
+        // page's <input type="file"> silently does nothing.
+        webView.webChromeClient = object : WebChromeClient() {
+            override fun onShowFileChooser(
+                webView: WebView,
+                filePathCallback: ValueCallback<Array<Uri>>,
+                fileChooserParams: WebChromeClient.FileChooserParams,
+            ): Boolean {
+                if (fileChooserParams.mode == WebChromeClient.FileChooserParams.MODE_SAVE) {
+                    // Saving is a separate flow (ACTION_CREATE_DOCUMENT) and is
+                    // not implemented yet. Returning false keeps the previous
+                    // behaviour instead of holding a callback we never fire.
+                    Diagnostics.log("warn", "网页请求保存文件，暂未实现（MODE_SAVE）")
+                    return false
+                }
+                // A second request while one is still pending would strand the
+                // first callback and freeze that input.
+                pendingFileCallback?.onReceiveValue(null)
+                pendingFileCallback = filePathCallback
+                showUploadSourceDialog(fileChooserParams)
+                return true
             }
         }
     }
@@ -389,6 +445,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        // A callback that outlives the WebView would leak it, and the page would
+        // sit waiting on that input forever.
+        pendingFileCallback?.onReceiveValue(null)
+        pendingFileCallback = null
         // Drop the evaluator: it closes over this Activity's binding.
         ShellRuntime.setJsEvaluator(null)
         super.onDestroy()
@@ -479,6 +539,80 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // ------------------------------------------------------------- file upload
+
+    /**
+     * Mirrors the HarmonyOS build: a modal offering 相册 or 文件, then the matching
+     * system picker. Neither path needs a storage permission — the photo picker
+     * grants access to just the chosen media, and SAF grants access to just the
+     * chosen documents.
+     */
+    private fun showUploadSourceDialog(params: WebChromeClient.FileChooserParams) {
+        val multiple = params.mode == WebChromeClient.FileChooserParams.MODE_OPEN_MULTIPLE
+        val pickMode = if (multiple) "多选" else "单选"
+        val mimeTypes = UploadMime.normalisePlatform(params.acceptTypes?.toList())
+        val request = PickVisualMediaRequest(visualMediaTypeFor(mimeTypes))
+
+        UploadSourceDialog(
+            context = this,
+            onPickImages = {
+                Diagnostics.info("上传方式：相册（$pickMode）")
+                try {
+                    if (multiple) {
+                        photoPickerMultiple.launch(request)
+                    } else {
+                        photoPickerSingle.launch(request)
+                    }
+                } catch (e: Exception) {
+                    Diagnostics.log("warn", "相册选择器打不开：${e.message}")
+                    deliverPickedFiles(emptyList())
+                }
+            },
+            onPickFiles = {
+                Diagnostics.info("上传方式：文件（$pickMode）accept=${mimeTypes.joinToString()}")
+                try {
+                    if (multiple) {
+                        documentPickerMultiple.launch(mimeTypes)
+                    } else {
+                        documentPickerSingle.launch(mimeTypes)
+                    }
+                } catch (e: Exception) {
+                    Diagnostics.log("warn", "文件选择器打不开：${e.message}")
+                    deliverPickedFiles(emptyList())
+                }
+            },
+            onCancelled = { deliverPickedFiles(emptyList()) },
+        ).show()
+    }
+
+    /**
+     * The 相册 tile opens the photo picker, which only handles image/video. This
+     * mirrors the HarmonyOS build's IMAGE_TYPE, except that an explicitly
+     * video-only `accept` gets the video grid rather than a photo-only one.
+     */
+    private fun visualMediaTypeFor(
+        mimeTypes: Array<String>,
+    ): ActivityResultContracts.PickVisualMedia.VisualMediaType =
+        if (mimeTypes.isNotEmpty() && mimeTypes.all { it.startsWith("video/") }) {
+            ActivityResultContracts.PickVisualMedia.VideoOnly
+        } else {
+            ActivityResultContracts.PickVisualMedia.ImageOnly
+        }
+
+    /**
+     * Hands the pick back to the WebView. The contract is that the callback is
+     * invoked exactly once, with null meaning "cancelled" — never invoking it is
+     * what leaves an `<input type="file">` permanently stuck.
+     */
+    private fun deliverPickedFiles(uris: List<Uri>) {
+        val callback = pendingFileCallback ?: return
+        pendingFileCallback = null
+        Diagnostics.info(
+            if (uris.isEmpty()) "文件选择已取消" else "已选择 ${uris.size} 个文件，交回网页"
+        )
+        callback.onReceiveValue(if (uris.isEmpty()) null else uris.toTypedArray())
+    }
+
     private fun toast(message: String) {
         Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
     }
@@ -494,5 +628,8 @@ class MainActivity : AppCompatActivity() {
         private const val ALLOWED_ROOT = "z.ai"
         private const val LOCATE_RETRY_MS = 600L
         private const val MAX_LOCATE_ATTEMPTS = 40
+
+        /** Mirrors the HarmonyOS build's PhotoViewPicker maxSelectNumber. */
+        private const val MAX_UPLOAD_ITEMS = 5
     }
 }
