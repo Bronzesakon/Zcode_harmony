@@ -12,6 +12,7 @@ import com.zcode.remote.R
 import com.zcode.remote.core.AttentionEvent
 import com.zcode.remote.core.CompletionEvent
 import com.zcode.remote.core.Diagnostics
+import com.zcode.remote.core.PromotionPolicy
 import com.zcode.remote.core.TaskStore
 
 /**
@@ -126,6 +127,15 @@ class Notifier(private val context: Context) {
         for (id in update.removedIds) {
             manager.cancel(id)
         }
+        // Live Updates / 流体云: only a couple of cards, chosen deliberately — see
+        // PromotionPolicy. The group summary further down is intentionally NOT
+        // promoted: Android refuses to promote a summary, and it would duplicate
+        // what the per-task cards already say.
+        val promoted = PromotionPolicy.choose(update.running)
+        if (update.running.isNotEmpty() && lastPromotedCount != promoted.size) {
+            lastPromotedCount = promoted.size
+            Diagnostics.info(LiveUpdate.describeEligibility(context, channelImportanceMin = false))
+        }
         if (update.running.isEmpty()) {
             manager.cancel(ID_GROUP_SUMMARY)
             return
@@ -143,10 +153,13 @@ class Notifier(private val context: Context) {
                 intent,
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
             )
-            val notification = NotificationCompat.Builder(context, CHANNEL_RUNNING)
+            val builder = NotificationCompat.Builder(context, CHANNEL_RUNNING)
                 .setSmallIcon(R.drawable.ic_stat_zcode)
                 .setContentTitle(item.title)
                 .setContentText(item.body)
+                // BigTextStyle is one of the four styles Android will promote, so
+                // no ProgressStyle is needed to reach the fluid cloud. (A
+                // percentage bar would mean nothing for a coding task anyway.)
                 .setStyle(NotificationCompat.BigTextStyle().bigText(item.body))
                 .setContentIntent(pending)
                 .setGroup(GROUP_RUNNING)
@@ -155,9 +168,12 @@ class Notifier(private val context: Context) {
                 .setShowWhen(false)
                 .setPriority(NotificationCompat.PRIORITY_LOW)
                 .setSilent(true)
-                .build()
+            // The status chip reuses D9's two status words: 运行中 / 等待确认.
+            if (item.id in promoted) {
+                LiveUpdate.requestPromotion(builder, item.status.label)
+            }
             try {
-                manager.notify(item.id, notification)
+                manager.notify(item.id, builder.build())
             } catch (e: SecurityException) {
                 Diagnostics.log("warn", "更新任务通知失败: ${e.message}")
             }
@@ -267,6 +283,13 @@ class Notifier(private val context: Context) {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
     }
+
+    /**
+     * How many cards were promoted last time. Only used so the fluid-cloud
+     * eligibility note is logged when that number changes instead of on every
+     * preview delta.
+     */
+    private var lastPromotedCount = -1
 
     /** Ids for the transient (completion / attention) notifications. */
     private var transientId = ID_TRANSIENT_BASE

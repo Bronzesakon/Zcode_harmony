@@ -8,6 +8,12 @@
     <!-- QR scanning -->
     <uses-permission android:name="android.permission.CAMERA" />
 
+    <!-- Android 16 Live Updates (ColorOS 16 流体云). A normal, non-runtime
+         permission: declaring it is what makes the app eligible at all. The
+         actual promotion is opt-in per notification (see notify/LiveUpdate.kt)
+         and the user can still switch it off in Settings. -->
+    <uses-permission android:name="android.permission.POST_PROMOTED_NOTIFICATIONS" />
+
     <!-- Android 13+ runtime permission for the task notifications -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
