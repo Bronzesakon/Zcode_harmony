@@ -1,0 +1,198 @@
+name: Android Shell Build
+
+# Quality gates + a signed APK for the android-shell thin client.
+#
+# Nothing is installed locally: the shell is built entirely in the cloud
+# (migration doc, D13). The workflow is arranged for wall-clock speed:
+#
+#   js     ─┐
+#            ├─► release (tags only)
+#   build  ─┘
+#
+#   * `js` and `build` are separate jobs so they run CONCURRENTLY. The JS suite
+#     needs no JDK and no Android SDK, so leaving it in the build job would add
+#     its runtime to the critical path for nothing.
+#   * `build` runs ONE Gradle invocation for both the unit tests and the APK.
+#     Testing the release variant shares `compileReleaseKotlin` with
+#     `assembleRelease`, so sources compile once instead of once per variant, and
+#     a second Gradle startup is avoided.
+#   * Shallow clone + Gradle dependency/build caching keep repeat runs to ~2 min.
+on:
+  push:
+    branches: [main, beta]
+    tags: ['v*']
+    paths:
+      - 'android-shell/**'
+      - '.github/workflows/android-shell.yml'
+      - '.github/scripts/android-shell-release-notes.ps1'
+  pull_request:
+    paths:
+      - 'android-shell/**'
+      - '.github/workflows/android-shell.yml'
+      - '.github/scripts/android-shell-release-notes.ps1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push supersedes an in-flight build of the same branch.
+concurrency:
+  group: android-shell-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # The injected JavaScript protocol layer. Catches the bug class that would
+  # otherwise only show up on a device — wire-format regressions, fragmentation,
+  # bridge routing — and needs neither a JDK nor an Android SDK.
+  # ---------------------------------------------------------------------------
+  js:
+    name: Protocol tests (Node)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      - name: Protocol + injected-layer tests
+        working-directory: android-shell
+        run: |
+          node --version
+          # No setup-node step on purpose: the runner image already ships a
+          # modern Node. Assert the floor rather than pin an action SHA that
+          # cannot be verified offline.
+          node -e "const [maj]=process.versions.node.split('.').map(Number); if (maj < 20) { console.error('Node 20+ required for node --test'); process.exit(1); }"
+          node --test
+
+  # ---------------------------------------------------------------------------
+  # Kotlin/Java build, unit tests and the signed APK.
+  # ---------------------------------------------------------------------------
+  build:
+    name: APK + unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      # JDK 17 matches the module's compileOptions. `cache: gradle` restores
+      # ~/.gradle (dependency cache + local build cache), which is what makes
+      # repeat runs fast.
+      - name: Set up Java 17
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      # Restore the release keystore from GitHub Secrets so CI-built APKs share
+      # the signature of every other build of this app (overwrite-install works).
+      # Secret names come from the zemote project: one keystore, two apps (D14).
+      # Signing setup is folded into the build step to save a step's overhead.
+      - name: Build and test
+        working-directory: android-shell
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          chmod +x ./gradlew
+
+          if [ -n "${KEYSTORE_B64:-}" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > release.jks
+            {
+              echo "storeFile=$PWD/release.jks"
+              echo "storePassword=$STORE_PASSWORD"
+              echo "keyPassword=$KEY_PASSWORD"
+              echo "keyAlias=$KEY_ALIAS"
+            } > key.properties
+            echo "SIGNING_CONFIGURED=true" >> "$GITHUB_ENV"
+            echo "Release signing configured from secrets."
+          else
+            echo "SIGNING_CONFIGURED=false" >> "$GITHUB_ENV"
+            echo "::warning title=Debug-signed build::ANDROID_KEYSTORE_BASE64 is not set - the APK falls back to the debug key and cannot overwrite-install a release-signed build."
+          fi
+
+          # Unit tests + APK in ONE invocation: the release variant's compiled
+          # classes are shared, and Gradle starts once.
+          ./gradlew :app:testReleaseUnitTest :app:assembleRelease --stacktrace
+
+      # Single universal APK: pure Kotlin, no native libraries, so no ABI split.
+      - name: Rename APK, checksum and verify signature
+        working-directory: android-shell
+        run: |
+          set -euo pipefail
+          OUT=app/build/outputs/apk/release
+          mv "$OUT/app-release.apk" "$OUT/zcode-remote.apk"
+          (cd "$OUT" && md5sum zcode-remote.apk > zcode-remote.apk.md5 && ls -l zcode-remote.apk*)
+
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          APKSIGNER="$(find "$SDK/build-tools" -maxdepth 2 -type f -name apksigner 2>/dev/null | sort -V | tail -1)"
+          if [ -z "$APKSIGNER" ]; then
+            echo "apksigner not found under $SDK - skipping signature verification."
+            exit 0
+          fi
+          dn="$("$APKSIGNER" verify --print-certs "$OUT/zcode-remote.apk" | sed -n 's/^Signer #1 certificate DN: //p')"
+          echo "zcode-remote.apk -> ${dn:-unknown signer}"
+          if [ "${SIGNING_CONFIGURED:-false}" = "true" ]; then
+            case "$dn" in
+              *"CN=Android Debug"*)
+                echo "::error::Debug-signed even though a release keystore was configured."
+                exit 1
+                ;;
+            esac
+          fi
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: zcode-remote-apk-${{ github.sha }}
+          path: |
+            android-shell/app/build/outputs/apk/release/zcode-remote.apk
+            android-shell/app/build/outputs/apk/release/zcode-remote.apk.md5
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # Publishing needs a write token, so it is isolated here instead of widening
+  # the permissions of the build job (which runs on untrusted PR code).
+  # ---------------------------------------------------------------------------
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [js, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      - name: Download APK artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: zcode-remote-apk-${{ github.sha }}
+          path: dist
+
+      # Reads the "## [X.Y.Z]" section for the tag from android-shell/CHANGELOG.md.
+      - name: Prepare release notes
+        shell: pwsh
+        run: .github/scripts/android-shell-release-notes.ps1
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          files: |
+            dist/zcode-remote.apk
+            dist/zcode-remote.apk.md5
+          name: ${{ github.ref_name }}
+          body_path: release-notes.md
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}

@@ -1,0 +1,16 @@
+# The Gradle wrapper's shell script must keep LF endings: a CRLF `gradlew`
+# checked out on Windows, committed, and then run on the Linux CI runner fails
+# with "bad interpreter". The .bat is the opposite.
+gradlew text eol=lf
+*.sh text eol=lf
+*.bat text eol=crlf
+
+# Wrapper and keystore binaries are exactly that; never touch their line endings.
+gradle/wrapper/gradle-wrapper.jar binary
+*.jks binary
+*.png binary
+
+# The injected scripts and the protocol module are shipped verbatim into the
+# WebView and also run under Node in CI; normalise them so a Windows checkout
+# cannot introduce CRLF-only surprises in the test expectations.
+*.js text eol=lf

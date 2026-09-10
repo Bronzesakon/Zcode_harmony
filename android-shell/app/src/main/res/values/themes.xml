@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- DayNight so the WebView's own dark styling and the system chrome agree. -->
+    <style name="Theme.ZcodeRemote" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="colorPrimary">@color/brand_primary</item>
+        <item name="android:windowBackground">@color/brand_background</item>
+        <item name="android:statusBarColor">@color/brand_background</item>
+        <item name="android:navigationBarColor">@color/brand_background</item>
+    </style>
+
+    <!-- Shown while the process starts, before the WebView has anything to
+         paint: a flat background avoids a white/black flash. -->
+    <style name="Theme.ZcodeRemote.Splash" parent="Theme.ZcodeRemote">
+        <item name="android:windowBackground">@color/brand_background</item>
+    </style>
+</resources>

@@ -1,0 +1,12 @@
+# 本地签名配置示例
+#
+# 复制为 key.properties 后填入真实值；该文件已被 .gitignore 忽略，切勿提交。
+# CI 不用这个文件：workflow 从 GitHub Secrets 生成同名的 key.properties。
+#
+# 密钥库类型为 PKCS12，因此 keyPassword 必须与 storePassword 相同。
+# 路径可以是绝对路径，也可以相对 android-shell/ 目录。
+
+storeFile=../zemote/android/app/zemote-release.jks
+storePassword=<keystore 密码>
+keyPassword=<与 storePassword 相同>
+keyAlias=zemote

@@ -1,0 +1,12 @@
+<!-- Status-bar icon for the foreground/notification channels. Must be a plain
+     white-on-transparent silhouette: Android tints and masks it. Derived from
+     the app mark's Z so the notification reads as this app. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M5,6L19,6L19,9.6L11.2,14.4L19,14.4L19,18L5,18L5,14.4L12.8,9.6L5,9.6Z" />
+</vector>

@@ -1,0 +1,234 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/brand_background"
+    android:fillViewport="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:paddingBottom="32dp">
+
+        <com.google.android.material.appbar.MaterialToolbar
+            android:id="@+id/toolbar"
+            android:layout_width="match_parent"
+            android:layout_height="?attr/actionBarSize"
+            android:background="@color/brand_surface"
+            app:navigationIcon="@drawable/ic_back"
+            app:title="@string/settings_title"
+            app:titleTextColor="@color/brand_on_surface" />
+
+        <!-- ===== 连接 ===== -->
+        <TextView
+            style="@style/SettingsSection"
+            android:text="@string/settings_section_connection" />
+
+        <LinearLayout
+            style="@style/SettingsCard"
+            android:orientation="vertical">
+
+            <TextView
+                style="@style/SettingsRowTitle"
+                android:text="@string/settings_current_url" />
+
+            <TextView
+                android:id="@+id/currentUrl"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:textColor="@color/brand_on_surface_variant"
+                android:textIsSelectable="true"
+                android:textSize="13sp" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnChangeUrl"
+                style="@style/Widget.Material3.Button.OutlinedButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="14dp"
+                android:text="@string/settings_change_url" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnReloadWeb"
+                style="@style/Widget.Material3.Button.TextButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/settings_reload" />
+        </LinearLayout>
+
+        <!-- ===== 通知 ===== -->
+        <TextView
+            style="@style/SettingsSection"
+            android:text="@string/settings_section_notifications" />
+
+        <LinearLayout
+            style="@style/SettingsCard"
+            android:orientation="vertical">
+
+            <LinearLayout
+                android:id="@+id/rowNotificationPermission"
+                style="@style/SettingsRow"
+                android:orientation="horizontal">
+
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:orientation="vertical">
+
+                    <TextView
+                        style="@style/SettingsRowTitle"
+                        android:text="@string/settings_notification_permission" />
+
+                    <TextView
+                        android:id="@+id/notificationPermissionState"
+                        style="@style/SettingsRowSubtitle" />
+                </LinearLayout>
+            </LinearLayout>
+
+            <View style="@style/SettingsDivider" />
+
+            <LinearLayout
+                android:id="@+id/rowClearNotifications"
+                style="@style/SettingsRow"
+                android:orientation="horizontal">
+
+                <TextView
+                    style="@style/SettingsRowTitle"
+                    android:text="@string/settings_clear_notifications" />
+            </LinearLayout>
+        </LinearLayout>
+
+        <!-- ===== 后台保活 ===== -->
+        <TextView
+            style="@style/SettingsSection"
+            android:text="@string/settings_section_keepalive" />
+
+        <LinearLayout
+            style="@style/SettingsCard"
+            android:orientation="vertical">
+
+            <LinearLayout
+                android:id="@+id/rowBattery"
+                style="@style/SettingsRow"
+                android:orientation="horizontal">
+
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:orientation="vertical">
+
+                    <TextView
+                        style="@style/SettingsRowTitle"
+                        android:text="@string/settings_battery_optimization" />
+
+                    <TextView
+                        android:id="@+id/batteryState"
+                        style="@style/SettingsRowSubtitle" />
+                </LinearLayout>
+            </LinearLayout>
+        </LinearLayout>
+
+        <!-- ===== 高级 ===== -->
+        <TextView
+            style="@style/SettingsSection"
+            android:text="@string/settings_section_advanced" />
+
+        <LinearLayout
+            style="@style/SettingsCard"
+            android:orientation="vertical">
+
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/switchSubscribeAll"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:minHeight="52dp"
+                android:text="@string/settings_subscribe_all"
+                android:textColor="@color/brand_on_surface"
+                android:textSize="15sp" />
+
+            <TextView
+                android:id="@+id/subscribeAllState"
+                style="@style/SettingsRowSubtitle"
+                android:layout_marginTop="0dp" />
+
+        </LinearLayout>
+
+        <!-- ===== 诊断（真机调试的唯一窗口） ===== -->
+        <TextView
+            style="@style/SettingsSection"
+            android:text="@string/settings_section_diagnostics" />
+
+        <LinearLayout
+            style="@style/SettingsCard"
+            android:orientation="vertical">
+
+            <TextView
+                style="@style/SettingsRowTitle"
+                android:text="@string/settings_survival" />
+
+            <TextView
+                android:id="@+id/survivalText"
+                style="@style/SettingsRowSubtitle"
+                android:text="@string/settings_survival_loading" />
+
+            <View style="@style/SettingsDivider" />
+
+            <LinearLayout
+                android:id="@+id/rowDiagnostics"
+                style="@style/SettingsRow"
+                android:orientation="horizontal">
+
+                <TextView
+                    style="@style/SettingsRowTitle"
+                    android:text="@string/settings_inject_diagnostics" />
+            </LinearLayout>
+
+            <View style="@style/SettingsDivider" />
+
+            <LinearLayout
+                android:id="@+id/rowShareLog"
+                style="@style/SettingsRow"
+                android:orientation="horizontal">
+
+                <TextView
+                    style="@style/SettingsRowTitle"
+                    android:text="@string/settings_share_log" />
+            </LinearLayout>
+
+            <View style="@style/SettingsDivider" />
+
+            <LinearLayout
+                android:id="@+id/rowClearDiagnostics"
+                style="@style/SettingsRow"
+                android:orientation="horizontal">
+
+                <TextView
+                    style="@style/SettingsRowTitle"
+                    android:text="@string/settings_clear_diagnostics" />
+            </LinearLayout>
+        </LinearLayout>
+
+        <!-- ===== 关于 ===== -->
+        <TextView
+            style="@style/SettingsSection"
+            android:text="@string/settings_section_about" />
+
+        <LinearLayout
+            style="@style/SettingsCard"
+            android:orientation="vertical">
+
+            <TextView
+                style="@style/SettingsRowTitle"
+                android:text="@string/settings_version" />
+
+            <TextView
+                android:id="@+id/versionText"
+                style="@style/SettingsRowSubtitle" />
+        </LinearLayout>
+    </LinearLayout>
+</ScrollView>

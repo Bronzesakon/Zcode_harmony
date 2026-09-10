@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Layers are the HarmonyOS build's own icon artwork, copied verbatim from
+     AppScope/resources/base/media/ (foreground.png + background.png), so both
+     apps share one visual identity. The Z occupies the central 49% of the
+     canvas, i.e. inside the 72dp adaptive-icon safe zone, so the system mask
+     crops only the (near-black) squircle shell behind it.
+
+     No <monochrome> layer on purpose: the only artwork available is the
+     composed squircle-plus-Z, which would flatten into a filled blob under a
+     themed-icon tint. Without it, Android simply falls back to this icon. -->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@drawable/ic_launcher_background" />
+    <foreground android:drawable="@drawable/ic_launcher_foreground" />
+</adaptive-icon>

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Only the log snapshot written by ShellLog.exportToFile() is shared this way;
+     nothing else in the app is exposed. -->
+<paths>
+    <cache-path name="share" path="share/" />
+</paths>

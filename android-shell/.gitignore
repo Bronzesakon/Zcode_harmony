@@ -1,0 +1,20 @@
+# Gradle / Android build outputs
+build/
+.gradle/
+local.properties
+
+# Release signing material — NEVER commit these.
+# CI writes key.properties from GitHub Secrets; locally you create it by hand
+# (see key.properties.example).
+key.properties
+*.jks
+*.keystore
+
+# IDE
+.idea/
+*.iml
+captures/
+
+# Node-based protocol tests (tools/) keep no build output, but be explicit so a
+# stray npm artefact can never reach the repo.
+node_modules/

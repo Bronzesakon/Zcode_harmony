@@ -20,8 +20,11 @@
 
 # 项目内部记录（需求、调研与变更记录），仅本地保留，不随仓库上传
 /项目文档.md
+/安卓薄壳迁移文档.md
 
 # 本地构建/调试缓存（arkts 检查缓存、hdc 采集产物、hvigor 临时工作区）
 /.cache/
 /.dsh-hdc/
 /.dsh-hvigor-tmp/
+# 安卓薄壳子工程（android-shell/）**随仓库上传**，不要在根上忽略它；
+# 其自身的构建产物与签名文件由 android-shell/.gitignore 处理。

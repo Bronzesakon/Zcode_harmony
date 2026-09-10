@@ -1,0 +1,1706 @@
+/**
+ * zcode-protocol.js — wire-level client for the ZCode remote relay protocol.
+ *
+ * WHY THIS EXISTS
+ * The shell is a WebView around the real web client at zcode.z.ai/remote/v4.
+ * That page already holds an authenticated relay socket; we ride it instead of
+ * logging in ourselves. To read task state we must speak the same protocol the
+ * page speaks, so this file implements the wire format:
+ *
+ *   relay frame      {type:'data', payload:<business payload>, client_ts}
+ *   business payload  {zcode_type:'workspace-list-request' | 'rpc-frame' | ...}
+ *   rpc-frame         base64 chunk of a logical message + crc32 + fragmentation
+ *   ChannelClient     value-codec stream: [reqType, reqId, channel, name] + args
+ *
+ * The essential discovery (from the reference client) is that on the workspace
+ * bridge path each reassembled rpc-frame message IS one ChannelClient body —
+ * there is no extra IPC header layer. Value encoding is the only codec needed.
+ *
+ * Two consumers:
+ *   * active  — we open our own workspace bridges and subscribe, which is what
+ *               lets us notify for workspaces the page is NOT showing (D7).
+ *   * passive — we decode the page's own traffic and read its sessions-index,
+ *               which covers the workspace the user is looking at at zero cost
+ *               and no protocol writes at all.
+ *
+ * No DOM and no browser API beyond TextEncoder/atob — the file is loaded as a
+ * document-start script in the WebView AND required directly by the Node unit
+ * tests in tools/, so every byte-level decision here is testable offline.
+ */
+(function (root, factory) {
+    'use strict';
+    var api = factory();
+    if (typeof module === 'object' && module && module.exports) {
+        module.exports = api;
+    }
+    if (root) {
+        root.ZcodeProtocol = api;
+    }
+})(typeof globalThis !== 'undefined' ? globalThis : null, function () {
+    'use strict';
+
+    // -----------------------------------------------------------------------
+    // Limits (mirrors the reference transport; exceeding them drops a frame
+    // rather than growing memory without bound)
+    // -----------------------------------------------------------------------
+    var MAX_MESSAGE_BYTES = 16 * 1024 * 1024;
+    var MAX_FRAGMENT_BYTES = 512 * 1024;
+    var MAX_FRAGMENTS = 64;
+    var MAX_LOGICAL_FRAGMENTS = 64;
+    var MAX_CONTAINER_ITEMS = 100000;
+    var MAX_VALUE_BYTES = 16 * 1024 * 1024;
+
+    // ChannelClient request/response type tags.
+    var REQ_PROMISE = 100;
+    var REQ_PROMISE_CANCEL = 101;
+    var REQ_EVENT_LISTEN = 102;
+    var REQ_EVENT_DISPOSE = 103;
+    var RES_INITIALIZE = 200;
+    var RES_PROMISE_SUCCESS = 201;
+    var RES_PROMISE_ERROR = 202;
+    var RES_PROMISE_ERROR_OBJ = 203;
+    var RES_EVENT_FIRE = 204;
+
+    // Well-known channel + method names.
+    var CHANNEL_CONVERSATION = 'zcode-agent';
+    var EVENT_SESSIONS_INDEX = 'onDynamicSessionsIndexFrame';
+    var METHOD_SUBSCRIBE_SI = 'subscribeSessionsIndexV4';
+    var METHOD_UNSUBSCRIBE_SI = 'unsubscribeSessionsIndexV4';
+    var METHOD_RESYNC_SI = 'resyncSessionsIndexV4';
+
+    // V4 capabilities (notably sessions-index) are gated on the desktop's
+    // protocol version negotiation: a 0.x value here silently disables them.
+    // The page's own clientHello is observed at runtime and preferred over
+    // this fallback, so a desktop-side bump does not need a shell release.
+    var DEFAULT_CLIENT_HELLO = {
+        protocolVersion: 3,
+        appVersion: '3.6.5',
+        clientKind: 'mobileApp'
+    };
+
+    // -----------------------------------------------------------------------
+    // bytes
+    // -----------------------------------------------------------------------
+    var _encoder = new TextEncoder();
+    var _decoder = new TextDecoder('utf-8');
+
+    function utf8Encode(str) {
+        return _encoder.encode(str);
+    }
+
+    function utf8Decode(bytes) {
+        return _decoder.decode(bytes);
+    }
+
+    function base64Encode(bytes) {
+        var out = '';
+        // Chunked so a 512 KiB fragment never overflows the argument limit of
+        // String.fromCharCode.apply.
+        for (var i = 0; i < bytes.length; i += 0x8000) {
+            out += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+        }
+        return btoa(out);
+    }
+
+    function base64Decode(str) {
+        var bin = atob(str);
+        var out = new Uint8Array(bin.length);
+        for (var i = 0; i < bin.length; i++) {
+            out[i] = bin.charCodeAt(i);
+        }
+        return out;
+    }
+
+    function concatBytes(list) {
+        var total = 0;
+        for (var i = 0; i < list.length; i++) {
+            total += list[i].length;
+        }
+        var out = new Uint8Array(total);
+        var offset = 0;
+        for (var j = 0; j < list.length; j++) {
+            out.set(list[j], offset);
+            offset += list[j].length;
+        }
+        return out;
+    }
+
+    function randomId(prefix) {
+        var rnd = Math.floor(Math.random() * 0x7FFFFFFF).toString(36);
+        return prefix + '-' + Date.now().toString(36) + '-' + rnd;
+    }
+
+    // -----------------------------------------------------------------------
+    // crc32 (IEEE 802.3 — same table semantics as the web client's checksum)
+    // -----------------------------------------------------------------------
+    var CRC_TABLE = (function () {
+        var table = new Int32Array(256);
+        for (var i = 0; i < 256; i++) {
+            var c = i;
+            for (var k = 0; k < 8; k++) {
+                c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+            }
+            table[i] = c;
+        }
+        return table;
+    })();
+
+    function crc32(bytes) {
+        var crc = -1;
+        for (var i = 0; i < bytes.length; i++) {
+            crc = CRC_TABLE[(crc ^ bytes[i]) & 0xFF] ^ (crc >>> 8);
+        }
+        return (crc ^ -1) >>> 0;
+    }
+
+    function crc32Hex(bytes) {
+        return ('00000000' + crc32(bytes).toString(16)).slice(-8);
+    }
+
+    // -----------------------------------------------------------------------
+    // value codec — 7-bit little-endian varints, one type tag byte
+    //   0 null | 1 string | 2/3 bytes | 4 array | 5 JSON | 6 int
+    // -----------------------------------------------------------------------
+    function ByteWriter() {
+        this._buf = new Uint8Array(256);
+        this._len = 0;
+    }
+
+    ByteWriter.prototype._ensure = function (extra) {
+        if (this._len + extra <= this._buf.length) {
+            return;
+        }
+        var size = this._buf.length * 2;
+        while (size < this._len + extra) {
+            size *= 2;
+        }
+        var next = new Uint8Array(size);
+        next.set(this._buf.subarray(0, this._len));
+        this._buf = next;
+    };
+
+    ByteWriter.prototype.byte = function (value) {
+        this._ensure(1);
+        this._buf[this._len++] = value & 0xFF;
+        return this;
+    };
+
+    ByteWriter.prototype.varint = function (value) {
+        this._ensure(5);
+        var v = value >>> 0;
+        do {
+            var b = v & 0x7F;
+            v >>>= 7;
+            if (v > 0) {
+                b |= 0x80;
+            }
+            this._buf[this._len++] = b;
+        } while (v > 0);
+        return this;
+    };
+
+    ByteWriter.prototype.bytes = function (arr) {
+        this._ensure(arr.length);
+        this._buf.set(arr, this._len);
+        this._len += arr.length;
+        return this;
+    };
+
+    ByteWriter.prototype.toBytes = function () {
+        return this._buf.slice(0, this._len);
+    };
+
+    function ByteReader(data) {
+        this.data = data;
+        this.pos = 0;
+    }
+
+    Object.defineProperty(ByteReader.prototype, 'remaining', {
+        get: function () {
+            return this.data.length - this.pos;
+        }
+    });
+
+    ByteReader.prototype.byte = function () {
+        if (this.pos >= this.data.length) {
+            throw new Error('ByteReader: out of data');
+        }
+        return this.data[this.pos++];
+    };
+
+    ByteReader.prototype.varint = function () {
+        var value = 0;
+        var shift = 0;
+        while (this.pos < this.data.length) {
+            var b = this.data[this.pos++];
+            if (shift === 28 && (b & 0xF0) !== 0) {
+                throw new Error('ByteReader: varint overflow');
+            }
+            value |= (b & 0x7F) << shift;
+            if ((b & 0x80) === 0) {
+                return value >>> 0;
+            }
+            shift += 7;
+            if (shift > 28) {
+                throw new Error('ByteReader: varint overflow');
+            }
+        }
+        throw new Error('ByteReader: truncated varint');
+    };
+
+    ByteReader.prototype.bytes = function (n) {
+        if (this.pos + n > this.data.length) {
+            throw new Error('ByteReader: cannot read ' + n + ' bytes');
+        }
+        var out = this.data.subarray(this.pos, this.pos + n);
+        this.pos += n;
+        return out;
+    };
+
+    function encodeValue(writer, value) {
+        if (value === null || value === undefined) {
+            writer.byte(0);
+            return;
+        }
+        if (typeof value === 'string') {
+            var str = utf8Encode(value);
+            writer.byte(1).varint(str.length).bytes(str);
+            return;
+        }
+        if (value instanceof Uint8Array) {
+            writer.byte(3).varint(value.length).bytes(value);
+            return;
+        }
+        if (Array.isArray(value)) {
+            writer.byte(4).varint(value.length);
+            for (var i = 0; i < value.length; i++) {
+                encodeValue(writer, value[i]);
+            }
+            return;
+        }
+        if (typeof value === 'number' && isFinite(value) &&
+            Math.floor(value) === value && value >= 0 && value <= 0x7FFFFFFF) {
+            writer.byte(6).varint(value);
+            return;
+        }
+        // Everything else (booleans, floats, plain objects) travels as JSON,
+        // which is what the reference encoder does for any non-int scalar.
+        var json = utf8Encode(JSON.stringify(value));
+        writer.byte(5).varint(json.length).bytes(json);
+    }
+
+    function decodeValue(reader) {
+        var tag = reader.byte();
+        switch (tag) {
+            case 0:
+                return null;
+            case 1: {
+                var len = reader.varint();
+                if (len > MAX_VALUE_BYTES) {
+                    throw new Error('value: string too large');
+                }
+                return utf8Decode(reader.bytes(len));
+            }
+            case 2:
+            case 3: {
+                var n = reader.varint();
+                if (n > MAX_VALUE_BYTES) {
+                    throw new Error('value: bytes too large');
+                }
+                return reader.bytes(n);
+            }
+            case 4: {
+                var count = reader.varint();
+                if (count > MAX_CONTAINER_ITEMS) {
+                    throw new Error('value: array too large');
+                }
+                var arr = new Array(count);
+                for (var i = 0; i < count; i++) {
+                    arr[i] = decodeValue(reader);
+                }
+                return arr;
+            }
+            case 5: {
+                var jlen = reader.varint();
+                if (jlen > MAX_VALUE_BYTES) {
+                    throw new Error('value: object too large');
+                }
+                return JSON.parse(utf8Decode(reader.bytes(jlen)));
+            }
+            case 6:
+                return reader.varint();
+            default:
+                throw new Error('value: unknown tag ' + tag);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // rpc-frame: outbound fragmentation
+    // -----------------------------------------------------------------------
+    function RpcFrameSender(options) {
+        this.bridgeSessionId = options.bridgeSessionId;
+        this.bridgeGeneration = options.bridgeGeneration;
+        this.recoveryId = options.recoveryId;
+        this.sendPayload = options.sendPayload;
+        this._seq = 0;
+        this._messageSeq = 0;
+    }
+
+    RpcFrameSender.prototype.sendMessage = function (bytes) {
+        if (!bytes.length) {
+            throw new Error('rpcFrame: empty message');
+        }
+        if (bytes.length > MAX_MESSAGE_BYTES) {
+            throw new Error('rpcFrame: message too large');
+        }
+        var messageSeq = ++this._messageSeq;
+        var checksum = crc32Hex(bytes);
+        var fragmentCount = Math.ceil(bytes.length / MAX_FRAGMENT_BYTES);
+        if (fragmentCount > MAX_FRAGMENTS) {
+            throw new Error('rpcFrame: too many fragments');
+        }
+        for (var i = 0; i < fragmentCount; i++) {
+            var start = i * MAX_FRAGMENT_BYTES;
+            var end = Math.min(start + MAX_FRAGMENT_BYTES, bytes.length);
+            this._seq += 1;
+            var payload = {
+                zcode_type: 'rpc-frame',
+                bridgeSessionId: this.bridgeSessionId,
+                seq: this._seq,
+                messageSeq: messageSeq,
+                fragmentIndex: i,
+                fragmentCount: fragmentCount,
+                messageBytes: bytes.length,
+                checksum: { algorithm: 'crc32', value: checksum },
+                dataBase64: base64Encode(bytes.subarray(start, end))
+            };
+            if (this.bridgeGeneration !== undefined && this.bridgeGeneration !== null) {
+                payload.bridgeGeneration = this.bridgeGeneration;
+            }
+            if (this.recoveryId) {
+                payload.recoveryId = this.recoveryId;
+            }
+            this.sendPayload(payload);
+        }
+    };
+
+    // -----------------------------------------------------------------------
+    // rpc-frame: inbound reassembly (+ ack)
+    // -----------------------------------------------------------------------
+    function RpcFrameAssembler(options) {
+        this.bridgeSessionId = options.bridgeSessionId;
+        this.onMessage = options.onMessage;
+        /** Called with the messageSeq of every fully received message. */
+        this.onAck = options.onAck || function () {};
+        this.onLog = options.onLog || function () {};
+        this._assemblies = {};
+    }
+
+    RpcFrameAssembler.prototype.acceptPayload = function (payload) {
+        if (!payload || payload.bridgeSessionId !== this.bridgeSessionId) {
+            return false;
+        }
+        var type = payload.zcode_type;
+        if (type === 'rpc-frame-ack') {
+            return true;
+        }
+        if (type !== 'rpc-frame') {
+            return false;
+        }
+        var messageSeq = payload.messageSeq;
+        var fragmentIndex = payload.fragmentIndex;
+        var fragmentCount = payload.fragmentCount;
+        var messageBytes = payload.messageBytes;
+        var dataBase64 = payload.dataBase64;
+        if (typeof messageSeq !== 'number' || typeof fragmentIndex !== 'number' ||
+            typeof fragmentCount !== 'number' || typeof messageBytes !== 'number' ||
+            typeof dataBase64 !== 'string') {
+            return true;
+        }
+        if (fragmentCount < 1 || fragmentCount > MAX_FRAGMENTS ||
+            fragmentIndex < 0 || fragmentIndex >= fragmentCount ||
+            messageBytes < 1 || messageBytes > MAX_MESSAGE_BYTES) {
+            return true;
+        }
+        var chunk;
+        try {
+            chunk = base64Decode(dataBase64);
+        } catch (e) {
+            return true;
+        }
+        if (chunk.length > MAX_FRAGMENT_BYTES) {
+            return true;
+        }
+        var checksum = payload.checksum && payload.checksum.value;
+        var existing = this._assemblies[messageSeq];
+        if (existing &&
+            (existing.fragmentCount !== fragmentCount ||
+                existing.messageBytes !== messageBytes ||
+                existing.checksum !== checksum)) {
+            delete this._assemblies[messageSeq];
+            return true;
+        }
+        var assembly = existing || (this._assemblies[messageSeq] = {
+            fragmentCount: fragmentCount,
+            messageBytes: messageBytes,
+            checksum: checksum,
+            fragments: new Array(fragmentCount),
+            received: 0,
+            at: Date.now()
+        });
+        if (assembly.fragments[fragmentIndex] === undefined) {
+            assembly.received += 1;
+        }
+        assembly.fragments[fragmentIndex] = chunk;
+        if (assembly.received !== assembly.fragmentCount) {
+            return true;
+        }
+        delete this._assemblies[messageSeq];
+        var message = concatBytes(assembly.fragments);
+        if (message.length !== assembly.messageBytes) {
+            this.onLog('rpc message ' + messageSeq + ' size mismatch');
+            return true;
+        }
+        if (assembly.checksum && crc32Hex(message) !== assembly.checksum) {
+            this.onLog('rpc message ' + messageSeq + ' checksum mismatch');
+            return true;
+        }
+        this.onAck(messageSeq);
+        try {
+            this.onMessage(message);
+        } catch (e) {
+            this.onLog('rpc message ' + messageSeq + ' handler failed: ' + e);
+        }
+        return true;
+    };
+
+    /** Drops assemblies that never completed (a fragment was lost). */
+    RpcFrameAssembler.prototype.purgeStale = function (maxAgeMs) {
+        var now = Date.now();
+        for (var key in this._assemblies) {
+            if (now - this._assemblies[key].at > maxAgeMs) {
+                delete this._assemblies[key];
+            }
+        }
+    };
+
+    // -----------------------------------------------------------------------
+    // ChannelClient — request/response + event listen over a bridge
+    // -----------------------------------------------------------------------
+    /**
+     * `idBase` exists for a specific reason: when we ride the page's own
+     * bridge we share the endpoint with the page's ChannelClient, which
+     * numbers its requests from 0. Starting ours at a high offset makes an id
+     * collision (which would deliver our response to the page's handler, or
+     * vice versa) effectively impossible.
+     */
+    function ChannelClient(options) {
+        this.sendBody = options.sendBody;
+        this.idBase = options.idBase || 0x100000;
+        this.onLog = options.onLog || function () {};
+        this._nextId = this.idBase;
+        this._pending = {};
+        this._listeners = {};
+        this._initialized = false;
+        this._initializeWaiters = [];
+    }
+
+    ChannelClient.prototype._handleInitialize = function () {
+        this._initialized = true;
+        var waiters = this._initializeWaiters;
+        this._initializeWaiters = [];
+        for (var i = 0; i < waiters.length; i++) {
+            waiters[i]();
+        }
+    };
+
+    ChannelClient.prototype.whenReady = function (timeoutMs) {
+        var self = this;
+        if (this._initialized) {
+            return Promise.resolve();
+        }
+        return new Promise(function (resolve, reject) {
+            var timer = setTimeout(function () {
+                reject(new Error('channel init timeout (no Initialize frame)'));
+            }, timeoutMs || 30000);
+            self._initializeWaiters.push(function () {
+                clearTimeout(timer);
+                resolve();
+            });
+        });
+    };
+
+    ChannelClient.prototype.handleMessage = function (bytes) {
+        var reader;
+        var header;
+        try {
+            reader = new ByteReader(bytes);
+            header = decodeValue(reader);
+        } catch (e) {
+            this.onLog('ipc: undecodable body: ' + e);
+            return;
+        }
+        if (!Array.isArray(header) || typeof header[0] !== 'number') {
+            return;
+        }
+        var type = header[0];
+        if (type === RES_INITIALIZE) {
+            this._handleInitialize();
+            return;
+        }
+        if (header.length < 2 || typeof header[1] !== 'number') {
+            return;
+        }
+        var id = header[1];
+        var data;
+        try {
+            data = reader.remaining > 0 ? decodeValue(reader) : null;
+        } catch (e) {
+            this.onLog('ipc: bad payload for id ' + id + ': ' + e);
+            return;
+        }
+        if (type === RES_EVENT_FIRE) {
+            var listener = this._listeners[id];
+            if (listener) {
+                try {
+                    listener(data);
+                } catch (e) {
+                    this.onLog('ipc: event handler failed: ' + e);
+                }
+            }
+            return;
+        }
+        var pending = this._pending[id];
+        if (!pending) {
+            return;
+        }
+        if (type === RES_PROMISE_SUCCESS) {
+            delete this._pending[id];
+            pending.resolve(data);
+        } else if (type === RES_PROMISE_ERROR) {
+            delete this._pending[id];
+            var message = (data && typeof data === 'object' && data.message) ?
+                data.message : String(data);
+            pending.reject(new Error(message));
+        } else if (type === RES_PROMISE_ERROR_OBJ) {
+            delete this._pending[id];
+            pending.reject(new Error(typeof data === 'string' ? data : JSON.stringify(data)));
+        }
+    };
+
+    ChannelClient.prototype._sendRequest = function (reqType, id, channel, name, arg) {
+        var writer = new ByteWriter();
+        encodeValue(writer, [reqType, id, channel, name]);
+        encodeValue(writer, arg === undefined ? null : arg);
+        this.sendBody(writer.toBytes());
+    };
+
+    ChannelClient.prototype.call = function (channel, method, args, timeoutMs) {
+        var self = this;
+        var budget = timeoutMs || 30000;
+        return this.whenReady(budget).then(function () {
+            return new Promise(function (resolve, reject) {
+                var id = self._nextId++;
+                var timer = setTimeout(function () {
+                    delete self._pending[id];
+                    reject(new Error(channel + '.' + method + ' timed out'));
+                }, budget);
+                self._pending[id] = {
+                    resolve: function (value) {
+                        clearTimeout(timer);
+                        resolve(value);
+                    },
+                    reject: function (err) {
+                        clearTimeout(timer);
+                        reject(err);
+                    }
+                };
+                self.onLog('call ' + channel + '.' + method + ' id=' + id);
+                self._sendRequest(REQ_PROMISE, id, channel, method, args);
+            });
+        });
+    };
+
+    /**
+     * Listens for a channel event. `arg` is the scope object the desktop needs
+     * to route the event (e.g. {workspacePath, workspaceIdentity}).
+     */
+    ChannelClient.prototype.addEventListener = function (channel, event, arg, onEvent) {
+        var self = this;
+        var id = this._nextId++;
+        this._listeners[id] = onEvent;
+        this.onLog('listen ' + channel + '.' + event + ' id=' + id);
+        // The listen must not be sent before the desktop's Initialize frame;
+        // sending early silently loses the event stream.
+        this.whenReady(30000).then(function () {
+            if (self._listeners[id]) {
+                self._sendRequest(REQ_EVENT_LISTEN, id, channel, event,
+                    arg === undefined ? null : arg);
+            }
+        }).catch(function () {
+            delete self._listeners[id];
+        });
+        return {
+            id: id,
+            dispose: function () {
+                if (!self._listeners[id]) {
+                    return;
+                }
+                delete self._listeners[id];
+                self._sendRequest(REQ_EVENT_DISPOSE, id, channel, event, null);
+            }
+        };
+    };
+
+    // -----------------------------------------------------------------------
+    // sessions-index state (snapshot + delta application)
+    // -----------------------------------------------------------------------
+    function normalizeSession(raw) {
+        var pending = raw.pendingInteraction;
+        var interactionId = '';
+        if (pending && typeof pending === 'object') {
+            interactionId = pending.interactionId === undefined ||
+                pending.interactionId === null ? '' : String(pending.interactionId);
+        }
+        return {
+            sessionId: raw.sessionId === undefined || raw.sessionId === null ?
+                '' : String(raw.sessionId),
+            parentSessionId: raw.parentSessionId === undefined || raw.parentSessionId === null ?
+                '' : String(raw.parentSessionId),
+            title: raw.title === undefined || raw.title === null ? '' : String(raw.title),
+            phase: raw.phase === undefined || raw.phase === null ? '' : String(raw.phase),
+            preview: raw.lastAssistantPreview === undefined || raw.lastAssistantPreview === null ?
+                '' : String(raw.lastAssistantPreview),
+            lastActivityAt: typeof raw.lastActivityAt === 'number' ? raw.lastActivityAt : 0,
+            hasBackgroundWork: raw.hasBackgroundWork === true,
+            pendingInteractionId: interactionId
+        };
+    }
+
+    function SessionsIndexState() {
+        this.workspaceId = null;
+        this.logEpoch = null;
+        this.seq = 0;
+        this.sessions = {};
+        this.ready = false;
+        this.needsResync = false;
+        this._fragments = {};
+    }
+
+    SessionsIndexState.prototype.reset = function () {
+        this.workspaceId = null;
+        this.logEpoch = null;
+        this.seq = 0;
+        this.sessions = {};
+        this.ready = false;
+        this._fragments = {};
+    };
+
+    /** Accepts the wire envelope {topic, kind:'complete'|'fragment', ...}. */
+    SessionsIndexState.prototype.applyWireFrame = function (wire) {
+        if (!wire || typeof wire !== 'object') {
+            return false;
+        }
+        if (wire.kind === 'complete') {
+            return this.applyLogicalFrame(wire.frame);
+        }
+        if (wire.kind !== 'fragment') {
+            return false;
+        }
+        var id = wire.logicalFrameId;
+        var index = wire.fragmentIndex;
+        var count = wire.fragmentCount;
+        var dataBase64 = wire.dataBase64;
+        if (typeof id !== 'string' || typeof index !== 'number' ||
+            typeof count !== 'number' || typeof dataBase64 !== 'string') {
+            return false;
+        }
+        if (count < 1 || count > MAX_LOGICAL_FRAGMENTS || index < 0 || index >= count) {
+            return false;
+        }
+        var assembly = this._fragments[id];
+        if (!assembly || assembly.count !== count) {
+            assembly = {
+                count: count,
+                parts: new Array(count),
+                received: 0,
+                at: Date.now()
+            };
+            this._fragments[id] = assembly;
+        }
+        if (assembly.parts[index] === undefined) {
+            assembly.received += 1;
+        }
+        try {
+            assembly.parts[index] = base64Decode(dataBase64);
+        } catch (e) {
+            delete this._fragments[id];
+            return false;
+        }
+        if (assembly.received !== count) {
+            return false;
+        }
+        delete this._fragments[id];
+        var decoded;
+        try {
+            decoded = JSON.parse(utf8Decode(concatBytes(assembly.parts)));
+        } catch (e) {
+            return false;
+        }
+        return this.applyLogicalFrame(decoded);
+    };
+
+    SessionsIndexState.prototype.applyLogicalFrame = function (frame) {
+        if (!frame || typeof frame !== 'object') {
+            return false;
+        }
+        var payload = frame.payload;
+        if (!payload || typeof payload !== 'object') {
+            return false;
+        }
+        var toSeq = typeof frame.toSeq === 'number' ? frame.toSeq : this.seq;
+        if (payload.kind === 'snapshot') {
+            var snapshot = payload.snapshot;
+            if (!snapshot || typeof snapshot !== 'object') {
+                return false;
+            }
+            this.workspaceId = typeof snapshot.workspaceId === 'string' ? snapshot.workspaceId : null;
+            this.logEpoch = typeof snapshot.logEpoch === 'string' ? snapshot.logEpoch : null;
+            this.sessions = {};
+            var list = Array.isArray(snapshot.sessions) ? snapshot.sessions : [];
+            for (var i = 0; i < list.length; i++) {
+                var entry = normalizeSession(list[i] || {});
+                if (entry.sessionId) {
+                    this.sessions[entry.sessionId] = entry;
+                }
+            }
+            this.seq = toSeq;
+        } else if (payload.kind === 'deltas') {
+            var fromSeq = typeof frame.fromSeq === 'number' ? frame.fromSeq : this.seq;
+            if (fromSeq !== this.seq) {
+                // Lost an update: the caller must resync, otherwise the phase
+                // table silently drifts and completion events are missed.
+                this.needsResync = true;
+                return false;
+            }
+            var deltas = Array.isArray(payload.deltas) ? payload.deltas : [];
+            for (var d = 0; d < deltas.length; d++) {
+                var delta = deltas[d];
+                if (!delta || typeof delta !== 'object') {
+                    continue;
+                }
+                if (delta.op === 'session.upserted' && delta.session) {
+                    var upserted = normalizeSession(delta.session);
+                    if (upserted.sessionId) {
+                        this.sessions[upserted.sessionId] = upserted;
+                    }
+                } else if (delta.op === 'session.removed') {
+                    delete this.sessions[String(delta.sessionId)];
+                }
+            }
+            this.seq = toSeq;
+        } else {
+            return false;
+        }
+        this.ready = true;
+        return true;
+    };
+
+    SessionsIndexState.prototype.list = function () {
+        var out = [];
+        for (var key in this.sessions) {
+            out.push(this.sessions[key]);
+        }
+        out.sort(function (a, b) {
+            return b.lastActivityAt - a.lastActivityAt;
+        });
+        return out;
+    };
+
+    // -----------------------------------------------------------------------
+    // workspace helpers (same key/title rules as the reference client)
+    // -----------------------------------------------------------------------
+    function workspaceKeyOf(workspace) {
+        if (!workspace || typeof workspace !== 'object') {
+            return null;
+        }
+        var identity = workspace.workspaceIdentity;
+        if (typeof identity === 'string' && identity.trim()) {
+            return identity.trim();
+        }
+        var path = workspace.workspacePath;
+        if (typeof path === 'string' && path) {
+            return path;
+        }
+        var fallbacks = ['workspaceKey', 'key', 'id'];
+        for (var i = 0; i < fallbacks.length; i++) {
+            var value = workspace[fallbacks[i]];
+            if (typeof value === 'string' && value) {
+                return value;
+            }
+        }
+        return null;
+    }
+
+    function workspaceTitle(workspace) {
+        if (!workspace || typeof workspace !== 'object') {
+            return '未知工作区';
+        }
+        if (typeof workspace.label === 'string' && workspace.label) {
+            return workspace.label;
+        }
+        var path = workspace.workspacePath;
+        if (typeof path === 'string' && path) {
+            var parts = path.split(/[\\/]/).filter(function (p) {
+                return p.length > 0;
+            });
+            return parts.length ? parts[parts.length - 1] : path;
+        }
+        var identity = workspace.workspaceIdentity;
+        if (typeof identity === 'string' && identity) {
+            return identity;
+        }
+        return workspaceKeyOf(workspace) || '未知工作区';
+    }
+
+    // -----------------------------------------------------------------------
+    // Bridge — one workspace's RPC endpoint
+    // -----------------------------------------------------------------------
+    function Bridge(options) {
+        this.key = options.key;
+        this.scope = options.scope;
+        this.info = options.info;
+        this.bridgeSessionId = options.bridgeSessionId;
+        this.generation = options.generation;
+        this.recoveryId = options.recoveryId;
+        this.sender = null;
+        this.assembler = null;
+        this.channels = null;
+        this.closed = false;
+        this._clientHello = null;
+    }
+
+    Bridge.prototype.attach = function (sendPayload, options) {
+        var self = this;
+        this.sender = new RpcFrameSender({
+            bridgeSessionId: this.bridgeSessionId,
+            bridgeGeneration: this.generation,
+            recoveryId: this.recoveryId,
+            sendPayload: sendPayload
+        });
+        this.assembler = new RpcFrameAssembler({
+            bridgeSessionId: this.bridgeSessionId,
+            onLog: options.onLog,
+            onAck: function (messageSeq) {
+                sendPayload({
+                    zcode_type: 'rpc-frame-ack',
+                    bridgeSessionId: self.bridgeSessionId,
+                    ackMessageSeq: messageSeq
+                });
+            },
+            onMessage: function (bytes) {
+                self.channels.handleMessage(bytes);
+            }
+        });
+        this.channels = new ChannelClient({
+            sendBody: function (bytes) {
+                self.sender.sendMessage(bytes);
+            },
+            // Share the socket with the page's own client: keep our request ids
+            // far away from the small integers it allocates.
+            idBase: options.idBase,
+            onLog: options.onLog
+        });
+    };
+
+    Bridge.prototype.acceptPayload = function (payload) {
+        if (this.closed || !this.assembler) {
+            return false;
+        }
+        return this.assembler.acceptPayload(payload);
+    };
+
+    Bridge.prototype.clientHello = function () {
+        return this._clientHello || DEFAULT_CLIENT_HELLO;
+    };
+
+    // -----------------------------------------------------------------------
+    // RemoteClient — the business layer
+    // -----------------------------------------------------------------------
+    /**
+     * options:
+     *   send            function(businessPayload)   -> writes to the relay
+     *   log             function(message)
+     *   idBase          number (default 0x100000)
+     *   maxWorkspaces   number (default 12)
+     *   subscribeAll    boolean — false keeps the client in passive-only mode
+     *
+     * Events (assign callbacks):
+     *   onSessions(update)   {key, title, workspacePath, workspaceIdentity,
+     *                         source, sessions:[...]}
+     *   onStatus(status)     {active, passive, workspaces, bridges, reason}
+     */
+    function RemoteClient(options) {
+        this._send = options.send;
+        this._log = options.log || function () {};
+        this._idBase = options.idBase || 0x100000;
+        this._maxWorkspaces = options.maxWorkspaces || 12;
+        this.subscribeAll = options.subscribeAll !== false;
+
+        this.onSessions = null;
+        this.onStatus = null;
+
+        this._pending = {};
+        // Two indexes on purpose: workspaces are addressed by key (for
+        // lifecycle/status) while inbound rpc-frames are addressed by
+        // bridgeSessionId. Mixing them up silently drops every response.
+        this._bridges = {};
+        this._bridgesById = {};
+        this._activeKeys = {};
+        // Frames can arrive for a bridge before openBridge's await continuation
+        // has attached the transport (the desktop pushes Initialize the moment
+        // it accepts the bridge). Anything addressed to a bridge we requested
+        // is held here and flushed on attach. Bridges we did NOT request — i.e.
+        // the page's own — are never buffered, so this cannot grow on their
+        // traffic.
+        this._pendingBridgePayloads = {};
+        this._inflightOpens = 0;
+        this._bridgeSeq = 0;
+        this._bridgeGeneration = 0;
+        this._clientHello = null;
+
+        // passive side
+        this._passive = {};
+        this._outboundListenIds = {};
+        this._bridgeWorkspace = {};
+        this._started = false;
+        this._lastStatus = null;
+    }
+
+    RemoteClient.prototype._emitStatus = function (reason) {
+        if (!this.onStatus) {
+            return;
+        }
+        var bridges = 0;
+        for (var key in this._bridges) {
+            if (!this._bridges[key].closed) {
+                bridges += 1;
+            }
+        }
+        var passive = 0;
+        for (var p in this._passive) {
+            passive += 1;
+        }
+        var status = {
+            active: this.subscribeAll,
+            bridges: bridges,
+            passive: passive,
+            reason: reason || ''
+        };
+        var json = JSON.stringify(status);
+        if (json !== this._lastStatus) {
+            this._lastStatus = json;
+            this.onStatus(status);
+        }
+    };
+
+    // ---------------------------------------------------------------- requests
+
+    RemoteClient.prototype._request = function (payload, match, timeoutMs) {
+        var self = this;
+        var requestId = payload.requestId;
+        return new Promise(function (resolve, reject) {
+            var timer = setTimeout(function () {
+                delete self._pending[requestId];
+                reject(new Error('request ' + requestId + ' timed out'));
+            }, timeoutMs || 30000);
+            self._pending[requestId] = {
+                match: match,
+                resolve: function (value) {
+                    clearTimeout(timer);
+                    resolve(value);
+                },
+                reject: function (err) {
+                    clearTimeout(timer);
+                    reject(err);
+                }
+            };
+            self._send(payload);
+        });
+    };
+
+    /** Every inbound business payload must be fed here. */
+    RemoteClient.prototype.acceptPayload = function (payload) {
+        if (!payload || typeof payload !== 'object') {
+            return;
+        }
+        var type = payload.zcode_type;
+        if (type === 'rpc-frame' || type === 'rpc-frame-ack') {
+            var bridge = this._bridgesById[payload.bridgeSessionId];
+            if (bridge) {
+                bridge.acceptPayload(payload);
+                return;
+            }
+            var buffer = this._pendingBridgePayloads[payload.bridgeSessionId];
+            if (buffer) {
+                if (buffer.length < 128) {
+                    buffer.push(payload);
+                } else {
+                    this._log('pre-attach buffer full for ' + payload.bridgeSessionId);
+                }
+                return;
+            }
+            // While a bridge open is in flight the desktop may address frames
+            // to a bridgeSessionId it chose itself, so keep a short-lived
+            // catch-all that attach() filters by the real id. Outside that
+            // window nothing is buffered, so the page's own traffic is ignored.
+            if (this._inflightOpens > 0) {
+                var catchAll = this._pendingBridgePayloads['*'] ||
+                    (this._pendingBridgePayloads['*'] = []);
+                if (catchAll.length < 128) {
+                    catchAll.push(payload);
+                }
+            }
+            return;
+        }
+        if (type === 'bridge-degraded') {
+            this._handleDegraded(payload);
+        }
+        // Responses are matched by predicate, not by our requestId: the
+        // desktop does not guarantee that a reply echoes it.
+        for (var id in this._pending) {
+            var pending = this._pending[id];
+            var value = null;
+            try {
+                value = pending.match(payload);
+            } catch (e) {
+                value = null;
+            }
+            if (value) {
+                delete this._pending[id];
+                pending.resolve(value);
+                return;
+            }
+        }
+    };
+
+    RemoteClient.prototype._handleDegraded = function (payload) {
+        var bridgeSessionId = payload.bridgeSessionId;
+        for (var key in this._bridges) {
+            var bridge = this._bridges[key];
+            if (bridge.bridgeSessionId === bridgeSessionId) {
+                this._log('bridge degraded for ' + key + ': ' + (payload.reason || 'unknown'));
+                this._scheduleReopen(key, 1);
+            }
+        }
+    };
+
+    RemoteClient.prototype.listWorkspaces = function () {
+        var requestId = randomId('zcshell-ws');
+        var self = this;
+        return this._request({
+            zcode_type: 'workspace-list-request',
+            requestId: requestId
+        }, function (payload) {
+            if (payload.zcode_type !== 'workspace-list-response') {
+                return null;
+            }
+            if (payload.requestId !== requestId) {
+                return null;
+            }
+            var result = payload.result;
+            if (Array.isArray(result)) {
+                return result;
+            }
+            if (result && Array.isArray(result.workspaces)) {
+                return result.workspaces;
+            }
+            return [];
+        }, 20000).then(function (list) {
+            self._log('workspace list: ' + list.length);
+            return list;
+        });
+    };
+
+    RemoteClient.prototype.openBridge = function (workspace, generation, recoveryId) {
+        var key = workspaceKeyOf(workspace);
+        if (!key) {
+            return Promise.reject(new Error('workspace has no key'));
+        }
+        var self = this;
+        var bridgeSessionId = randomId('zcshell-bridge');
+        var requestId = randomId('zcshell-bopen');
+        var scope = { workspacePath: workspace.workspacePath };
+        if (workspace.workspaceIdentity) {
+            scope.workspaceIdentity = workspace.workspaceIdentity;
+        }
+        var payload = {
+            zcode_type: 'workspace-bridge-open',
+            requestId: requestId,
+            bridgeSessionId: bridgeSessionId,
+            bridgeGeneration: generation,
+            workspaceKey: key
+        };
+        if (recoveryId) {
+            payload.recoveryId = recoveryId;
+        }
+        // Start buffering before the request goes out: the desktop may push
+        // Initialize before this promise resolves.
+        this._pendingBridgePayloads[bridgeSessionId] = [];
+        this._inflightOpens += 1;
+        return this._request(payload, function (reply) {
+            if (reply.bridgeSessionId !== bridgeSessionId) {
+                return null;
+            }
+            if (reply.zcode_type === 'workspace-bridge-error') {
+                return { error: String(reply.error || 'workspace-bridge-error') };
+            }
+            if (reply.zcode_type === 'workspace-bridge-ready') {
+                return { info: reply.bridge || {} };
+            }
+            return null;
+        }, 30000).then(function (reply) {
+            if (reply.error) {
+                self._releaseInflight(bridgeSessionId, null);
+                throw new Error(reply.error);
+            }
+            var info = reply.info;
+            var bridge = new Bridge({
+                key: key,
+                scope: scope,
+                info: info,
+                bridgeSessionId: info.bridgeSessionId || bridgeSessionId,
+                generation: typeof info.bridgeGeneration === 'number' ?
+                    info.bridgeGeneration : generation,
+                recoveryId: info.recoveryId
+            });
+            bridge.attach(function (out) {
+                self._send(out);
+            }, {
+                onLog: function (message) {
+                    self._log('[' + key + '] ' + message);
+                },
+                idBase: self._idBase
+            });
+            self._bridges[key] = bridge;
+            self._bridgesById[bridge.bridgeSessionId] = bridge;
+            self._log('bridge ready for ' + key + ' (' + bridge.bridgeSessionId + ')');
+            // Replay whatever arrived while the bridge was still being set up;
+            // this is where the desktop's Initialize frame usually comes from.
+            var buffered = self._releaseInflight(bridgeSessionId, bridge.bridgeSessionId);
+            for (var i = 0; i < buffered.length; i++) {
+                bridge.acceptPayload(buffered[i]);
+            }
+            self._emitStatus('bridge open ' + key);
+            return bridge;
+        }, function (err) {
+            self._releaseInflight(bridgeSessionId, null);
+            throw err;
+        });
+    };
+
+    /**
+     * Ends the "bridge open in flight" window and returns every frame buffered
+     * for it, in arrival order. Must run on the failure path too, otherwise the
+     * catch-all buffer would keep growing on the page's own traffic.
+     */
+    RemoteClient.prototype._releaseInflight = function (requestedId, actualId) {
+        var out = (this._pendingBridgePayloads[requestedId] || []).slice();
+        delete this._pendingBridgePayloads[requestedId];
+        if (actualId && actualId !== requestedId) {
+            out = out.concat(this._pendingBridgePayloads[actualId] || []);
+            delete this._pendingBridgePayloads[actualId];
+        }
+        var catchAll = this._pendingBridgePayloads['*'];
+        if (catchAll) {
+            for (var i = 0; i < catchAll.length; i++) {
+                if (catchAll[i].bridgeSessionId === requestedId ||
+                    (actualId && catchAll[i].bridgeSessionId === actualId)) {
+                    out.push(catchAll[i]);
+                }
+            }
+        }
+        this._inflightOpens = Math.max(0, this._inflightOpens - 1);
+        if (this._inflightOpens === 0) {
+            delete this._pendingBridgePayloads['*'];
+        }
+        return out;
+    };
+
+    /**
+     * Handshake + subscribe + listen. The desktop gates V4 capabilities on the
+     * clientHello exchange, so it must run before subscribeSessionsIndexV4.
+     */
+    RemoteClient.prototype.subscribeSessionsIndex = function (bridge) {
+        var self = this;
+        var state = new SessionsIndexState();
+        var hello = this._clientHello || DEFAULT_CLIENT_HELLO;
+        var cleanup = {
+            listener: null,
+            subscriptionId: null
+        };
+
+        var run = bridge.channels
+            .call(CHANNEL_CONVERSATION, 'helloConversationV4', [], 45000)
+            .then(function () {
+                return bridge.channels.call(CHANNEL_CONVERSATION, 'initializeConversationV4', [{
+                    kind: 'clientHello',
+                    protocolVersion: hello.protocolVersion,
+                    clientId: randomId('zcshell-client'),
+                    clientKind: hello.clientKind,
+                    appVersion: hello.appVersion
+                }], 45000);
+            })
+            .then(function () {
+                var args = {};
+                for (var k in bridge.scope) {
+                    args[k] = bridge.scope[k];
+                }
+                args.runtimePolicy = 'existing-only';
+                return bridge.channels.call(CHANNEL_CONVERSATION, METHOD_SUBSCRIBE_SI, [args], 60000);
+            })
+            .then(function (result) {
+                var ack = result && result.ack ? result.ack : null;
+                cleanup.subscriptionId = ack && ack.subscriptionId ? ack.subscriptionId : null;
+                if (!cleanup.subscriptionId) {
+                    throw new Error('subscribeSessionsIndexV4: no ack.subscriptionId');
+                }
+                cleanup.listener = bridge.channels.addEventListener(
+                    CHANNEL_CONVERSATION,
+                    EVENT_SESSIONS_INDEX,
+                    bridge.scope,
+                    function (data) {
+                        if (!data || typeof data !== 'object') {
+                            return;
+                        }
+                        if (!data.topic || String(data.topic).indexOf('sessions-index/') !== 0) {
+                            return;
+                        }
+                        if (state.applyWireFrame(data)) {
+                            self._emitSessions(bridge.key, bridge, state, 'active');
+                        }
+                        if (state.needsResync) {
+                            state.needsResync = false;
+                            self._resyncSessionsIndex(bridge, cleanup.subscriptionId, state);
+                        }
+                    }
+                );
+                self._log('subscribed sessions-index for ' + bridge.key);
+                return {
+                    key: bridge.key,
+                    scope: bridge.scope,
+                    state: state,
+                    dispose: function () {
+                        if (cleanup.listener) {
+                            cleanup.listener.dispose();
+                            cleanup.listener = null;
+                        }
+                        if (!cleanup.subscriptionId) {
+                            return Promise.resolve();
+                        }
+                        var args = {};
+                        for (var k in bridge.scope) {
+                            args[k] = bridge.scope[k];
+                        }
+                        args.subscriptionId = cleanup.subscriptionId;
+                        args.runtimePolicy = 'existing-only';
+                        return bridge.channels
+                            .call(CHANNEL_CONVERSATION, METHOD_UNSUBSCRIBE_SI, [args], 15000)
+                            .catch(function () {});
+                    }
+                };
+            });
+
+        return run;
+    };
+
+    RemoteClient.prototype._resyncSessionsIndex = function (bridge, subscriptionId, state) {
+        var args = {};
+        for (var k in bridge.scope) {
+            args[k] = bridge.scope[k];
+        }
+        args.subscriptionId = subscriptionId;
+        args.runtimePolicy = 'existing-only';
+        if (state.logEpoch) {
+            args.base = { logEpoch: state.logEpoch, seq: state.seq };
+        }
+        this._log('resync sessions-index for ' + bridge.key + ' (gap at seq ' + state.seq + ')');
+        bridge.channels
+            .call(CHANNEL_CONVERSATION, METHOD_RESYNC_SI, [args], 30000)
+            .catch(function (err) {
+                bridge._logResyncFailed = String(err);
+            });
+    };
+
+    RemoteClient.prototype._emitSessions = function (key, bridge, state, source) {
+        if (!this.onSessions) {
+            return;
+        }
+        var scope = bridge.scope || {};
+        this.onSessions({
+            key: key,
+            title: workspaceTitle(scope),
+            workspacePath: scope.workspacePath || '',
+            workspaceIdentity: scope.workspaceIdentity || '',
+            source: source,
+            sessions: state.list()
+        });
+    };
+
+    // ------------------------------------------------------------------ active
+
+    RemoteClient.prototype._scheduleReopen = function (key, attempt) {
+        var self = this;
+        var bridge = this._bridges[key];
+        if (!bridge || bridge.closed) {
+            return;
+        }
+        bridge.closed = true;
+        var workspace = {
+            workspacePath: bridge.scope.workspacePath,
+            workspaceIdentity: bridge.scope.workspaceIdentity
+        };
+        if (attempt > 3) {
+            this._log('giving up on ' + key + ' after ' + attempt + ' attempts');
+            this._forgetBridge(key);
+            this._emitStatus('degraded ' + key);
+            return;
+        }
+        var delay = Math.min(30000, 2000 * Math.pow(2, attempt - 1));
+        this._log('reopening ' + key + ' in ' + delay + 'ms (attempt ' + attempt + ')');
+        setTimeout(function () {
+            if (!self.subscribeAll || self._passive[key]) {
+                return;
+            }
+            self.openBridge(workspace, ++self._bridgeGeneration, bridge.recoveryId)
+                .then(function (next) {
+                    return self.subscribeSessionsIndex(next);
+                })
+                .then(function () {
+                    self._log('recovered ' + key);
+                    self._emitStatus('recovered ' + key);
+                })
+                .catch(function (err) {
+                    self._log('reopen failed for ' + key + ': ' + err);
+                    self._scheduleReopen(key, attempt + 1);
+                });
+        }, delay);
+    };
+
+    /**
+     * Starts (or refreshes) active coverage: one bridge + one sessions-index
+     * subscription per workspace the page is not already covering.
+     */
+    RemoteClient.prototype.start = function () {
+        var self = this;
+        if (this._started) {
+            return Promise.resolve();
+        }
+        this._started = true;
+        if (!this.subscribeAll) {
+            this._emitStatus('passive only (subscribe-all off)');
+            return Promise.resolve();
+        }
+        return this.listWorkspaces().then(function (list) {
+            var targets = [];
+            for (var i = 0; i < list.length; i++) {
+                var workspace = list[i];
+                var key = workspaceKeyOf(workspace);
+                if (!key || targets.length >= self._maxWorkspaces) {
+                    continue;
+                }
+                if (self._passive[key] || self._activeKeys[key]) {
+                    // The page already streams this one; do not duplicate it.
+                    continue;
+                }
+                targets.push(workspace);
+            }
+            self._log('active subscribe: ' + targets.length + ' workspace(s) of ' + list.length);
+            // Sequential with a small gap: opening a dozen RPC bridges at once
+            // hammers the desktop and makes failures hard to attribute.
+            return targets.reduce(function (chain, workspace) {
+                return chain.then(function () {
+                    return self._openAndSubscribe(workspace);
+                }).then(function () {
+                    return new Promise(function (r) {
+                        setTimeout(r, 500);
+                    });
+                });
+            }, Promise.resolve());
+        }).then(function () {
+            self._emitStatus('active started');
+        }).catch(function (err) {
+            self._log('active subscribe failed: ' + err);
+            self._emitStatus('active failed: ' + err);
+        });
+    };
+
+    /** Re-runs active coverage after a failed or empty first attempt. */
+    RemoteClient.prototype.retryStart = function () {
+        if (!this.subscribeAll) {
+            return Promise.resolve();
+        }
+        this._started = false;
+        return this.start();
+    };
+
+    RemoteClient.prototype._openAndSubscribe = function (workspace) {
+        var self = this;
+        var key = workspaceKeyOf(workspace);
+        this._activeKeys[key] = true;
+        this._bridgeGeneration += 1;
+        return this.openBridge(workspace, this._bridgeGeneration)
+            .then(function (bridge) {
+                return self.subscribeSessionsIndex(bridge);
+            })
+            .then(function (sub) {
+                self._subs = self._subs || {};
+                self._subs[key] = sub;
+                self._emitStatus('subscribed ' + key);
+            })
+            .catch(function (err) {
+                delete self._activeKeys[key];
+                self._forgetBridge(key);
+                self._log('subscribe failed for ' + key + ': ' + err);
+                self._emitStatus('subscribe failed ' + key);
+            });
+    };
+
+    /** Drops both indexes for a workspace; the frame router keys off the id. */
+    RemoteClient.prototype._forgetBridge = function (key) {
+        var bridge = this._bridges[key];
+        delete this._bridges[key];
+        delete this._activeKeys[key];
+        if (bridge) {
+            bridge.closed = true;
+            delete this._bridgesById[bridge.bridgeSessionId];
+        }
+    };
+
+    // ----------------------------------------------------------------- passive
+
+    /**
+     * Passive coverage: watch the page's own traffic. No writes, so this
+     * cannot disturb the page — it is the fallback when active subscription is
+     * switched off and the diagnostics channel when it is on.
+     */
+    RemoteClient.prototype.acceptObservedPayload = function (payload, outbound) {
+        if (!payload || typeof payload !== 'object') {
+            return;
+        }
+        if (payload.zcode_type === 'rpc-frame') {
+            if (outbound) {
+                this._observeOutboundRpc(payload);
+            } else {
+                this._observeInboundRpc(payload);
+            }
+            return;
+        }
+        if (outbound) {
+            return;
+        }
+        if (payload.zcode_type === 'workspace-bridge-ready' && payload.bridge) {
+            var info = payload.bridge;
+            if (info.workspaceKey) {
+                this._bridgeWorkspace[payload.bridgeSessionId] = info.workspaceKey;
+            }
+        }
+    };
+
+    RemoteClient.prototype._observeOutboundRpc = function (payload) {
+        if (this._bridgesById[payload.bridgeSessionId]) {
+            return;
+        }
+        var bytes = this._tryAssemble(payload, true);
+        if (!bytes) {
+            return;
+        }
+        var header;
+        var args;
+        try {
+            var reader = new ByteReader(bytes);
+            header = decodeValue(reader);
+            args = reader.remaining > 0 ? decodeValue(reader) : null;
+        } catch (e) {
+            return;
+        }
+        if (!Array.isArray(header) || header[0] !== REQ_EVENT_LISTEN) {
+            if (Array.isArray(header) && header[0] === REQ_PROMISE) {
+                // Learn the page's clientHello so our own handshake agrees with
+                // whatever protocol version the desktop negotiated with it.
+                if (header[3] === 'initializeConversationV4' && Array.isArray(args) &&
+                    args[0] && args[0].kind === 'clientHello') {
+                    this._clientHello = {
+                        protocolVersion: args[0].protocolVersion,
+                        appVersion: args[0].appVersion,
+                        clientKind: args[0].clientKind
+                    };
+                }
+            }
+            return;
+        }
+        if (header[3] !== EVENT_SESSIONS_INDEX) {
+            return;
+        }
+        var scope = args && typeof args === 'object' ? args : {};
+        var key = workspaceKeyOf(scope);
+        if (!key) {
+            return;
+        }
+        this._outboundListenIds[payload.bridgeSessionId + '#' + header[1]] = key;
+        this._bridgeWorkspace[payload.bridgeSessionId] = key;
+        if (!this._passive[key]) {
+            this._passive[key] = {
+                key: key,
+                scope: scope,
+                state: new SessionsIndexState()
+            };
+            this._log('passive: following sessions-index of ' + key);
+            this._emitStatus('passive tracking ' + key);
+        }
+    };
+
+    RemoteClient.prototype._observeInboundRpc = function (payload) {
+        if (this._bridgesById[payload.bridgeSessionId]) {
+            return;
+        }
+        var key = this._bridgeWorkspace[payload.bridgeSessionId];
+        if (!key) {
+            return;
+        }
+        var bytes = this._tryAssemble(payload, false);
+        if (!bytes) {
+            return;
+        }
+        var header;
+        var data;
+        try {
+            var reader = new ByteReader(bytes);
+            header = decodeValue(reader);
+            data = reader.remaining > 0 ? decodeValue(reader) : null;
+        } catch (e) {
+            return;
+        }
+        if (!Array.isArray(header) || header[0] !== RES_EVENT_FIRE) {
+            return;
+        }
+        if (this._outboundListenIds[payload.bridgeSessionId + '#' + header[1]] !== key) {
+            return;
+        }
+        var entry = this._passive[key];
+        if (!entry || !data || typeof data !== 'object') {
+            return;
+        }
+        if (entry.state.applyWireFrame(data)) {
+            this._emitSessions(key, {
+                scope: entry.scope
+            }, entry.state, 'passive');
+        }
+    };
+
+    /** Reassembles the page's rpc-frames in a side table (never acks). */
+    RemoteClient.prototype._tryAssemble = function (payload, outbound) {
+        var table = outbound ? '_observedOut' : '_observedIn';
+        if (!this[table]) {
+            this[table] = {};
+        }
+        var assemblies = this[table];
+        var messageSeq = payload.messageSeq;
+        var fragmentIndex = payload.fragmentIndex;
+        var fragmentCount = payload.fragmentCount;
+        var messageBytes = payload.messageBytes;
+        var dataBase64 = payload.dataBase64;
+        if (typeof messageSeq !== 'number' || typeof fragmentIndex !== 'number' ||
+            typeof fragmentCount !== 'number' || typeof messageBytes !== 'number' ||
+            typeof dataBase64 !== 'string') {
+            return null;
+        }
+        if (fragmentCount < 1 || fragmentCount > MAX_FRAGMENTS ||
+            messageBytes < 1 || messageBytes > MAX_MESSAGE_BYTES) {
+            return null;
+        }
+        var assembly = assemblies[messageSeq];
+        if (!assembly || assembly.count !== fragmentCount) {
+            assembly = {
+                count: fragmentCount,
+                bytes: messageBytes,
+                parts: new Array(fragmentCount),
+                received: 0,
+                at: Date.now()
+            };
+            assemblies[messageSeq] = assembly;
+        }
+        if (assembly.parts[fragmentIndex] === undefined) {
+            assembly.received += 1;
+        }
+        try {
+            assembly.parts[fragmentIndex] = base64Decode(dataBase64);
+        } catch (e) {
+            delete assemblies[messageSeq];
+            return null;
+        }
+        if (assembly.received !== fragmentCount) {
+            return null;
+        }
+        delete assemblies[messageSeq];
+        var joined = concatBytes(assembly.parts);
+        return joined.length === messageBytes ? joined : null;
+    };
+
+    RemoteClient.prototype.takeObservedCounts = function () {
+        var counts = { passive: 0, active: 0 };
+        for (var p in this._passive) {
+            counts.passive += 1;
+        }
+        for (var a in this._bridges) {
+            if (!this._bridges[a].closed) {
+                counts.active += 1;
+            }
+        }
+        return counts;
+    };
+
+    RemoteClient.prototype.dispose = function () {
+        this.subscribeAll = false;
+        for (var key in this._bridges) {
+            this._bridges[key].closed = true;
+        }
+        this._bridges = {};
+        this._bridgesById = {};
+        this._activeKeys = {};
+        this._pending = {};
+    };
+
+    // -----------------------------------------------------------------------
+    return {
+        // constants
+        CHANNEL_CONVERSATION: CHANNEL_CONVERSATION,
+        EVENT_SESSIONS_INDEX: EVENT_SESSIONS_INDEX,
+        REQ_PROMISE: REQ_PROMISE,
+        REQ_EVENT_LISTEN: REQ_EVENT_LISTEN,
+        RES_INITIALIZE: RES_INITIALIZE,
+        RES_EVENT_FIRE: RES_EVENT_FIRE,
+        DEFAULT_CLIENT_HELLO: DEFAULT_CLIENT_HELLO,
+        // helpers (exported for the Node tests)
+        utf8Encode: utf8Encode,
+        utf8Decode: utf8Decode,
+        base64Encode: base64Encode,
+        base64Decode: base64Decode,
+        concatBytes: concatBytes,
+        crc32: crc32,
+        crc32Hex: crc32Hex,
+        ByteWriter: ByteWriter,
+        ByteReader: ByteReader,
+        encodeValue: encodeValue,
+        decodeValue: decodeValue,
+        RpcFrameSender: RpcFrameSender,
+        RpcFrameAssembler: RpcFrameAssembler,
+        ChannelClient: ChannelClient,
+        SessionsIndexState: SessionsIndexState,
+        workspaceKeyOf: workspaceKeyOf,
+        workspaceTitle: workspaceTitle,
+        normalizeSession: normalizeSession,
+        RemoteClient: RemoteClient,
+        MAX_FRAGMENT_BYTES: MAX_FRAGMENT_BYTES
+    };
+});
