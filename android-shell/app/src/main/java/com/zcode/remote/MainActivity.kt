@@ -139,8 +139,10 @@ class MainActivity : AppCompatActivity() {
             Diagnostics.info("WebView 远程调试已启用")
         }
         // §5.5: stops the renderer being deprioritised/reclaimed while the app
-        // is backgrounded. Must be called on this WebView instance.
-        WebView.setRendererPriorityPolicy(webView, WebView.RENDERER_PRIORITY_IMPORTANT, false)
+        // is backgrounded. This is an INSTANCE method — verified against AOSP
+        // WebView.java (`public void setRendererPriorityPolicy(int, boolean)`),
+        // not the static call the migration doc's shorthand suggested.
+        webView.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false)
 
         webView.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(

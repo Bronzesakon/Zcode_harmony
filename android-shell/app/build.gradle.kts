@@ -102,6 +102,10 @@ android {
 
     buildFeatures {
         viewBinding = true
+        // AGP 8 defaults buildConfig to false, so BuildConfig.DEBUG does not
+        // exist until this is switched on (it is used to gate WebView remote
+        // debugging).
+        buildConfig = true
     }
 
     packaging {
