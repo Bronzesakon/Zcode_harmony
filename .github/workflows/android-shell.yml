@@ -1,30 +1,35 @@
 name: Android Shell Build
 
-# Quality gates + a signed APK for the android-shell thin client.
+# Quality gates + an installable APK for the android-shell thin client.
 #
 # Nothing is installed locally: the shell is built entirely in the cloud
-# (migration doc, D13). The workflow is arranged for wall-clock speed:
+# (migration doc, D13). Two things shape this file:
 #
-#   js     ─┐
-#            ├─► release (tags only)
-#   build  ─┘
+# 1. WALL-CLOCK SPEED. `js` and `build` are separate jobs so they run
+#    CONCURRENTLY (the JS suite needs no JDK and no Android SDK, so leaving it in
+#    the build job would add its runtime to the critical path for nothing), and
+#    `build` runs ONE Gradle invocation for both the unit tests and the APK —
+#    testing the release variant shares `compileReleaseKotlin` with
+#    assembleRelease, so sources compile once instead of once per variant.
+#    Shallow clone + Gradle caching keep repeat runs to ~2-3 minutes.
 #
-#   * `js` and `build` are separate jobs so they run CONCURRENTLY. The JS suite
-#     needs no JDK and no Android SDK, so leaving it in the build job would add
-#     its runtime to the critical path for nothing.
-#   * `build` runs ONE Gradle invocation for both the unit tests and the APK.
-#     Testing the release variant shares `compileReleaseKotlin` with
-#     `assembleRelease`, so sources compile once instead of once per variant, and
-#     a second Gradle startup is avoided.
-#   * Shallow clone + Gradle dependency/build caching keep repeat runs to ~2 min.
+# 2. RELEASE FLOW (user decision, 2026-09-10):
+#      pre branch  -> publishes a PRE-RELEASE automatically, tagged
+#                     v<version>-pre.<run number>, so a test build is one tap
+#                     away on the Releases page instead of hidden in Artifacts.
+#      v* tag      -> publishes a normal Release, notes taken from CHANGELOG.md.
+#    A tag created here with GITHUB_TOKEN does not re-trigger this workflow
+#    (GitHub suppresses events from its own token), so the pre-release path
+#    cannot recurse.
 #
-# Build failures are re-emitted as ::error:: annotations on purpose: Actions
-# logs need authentication to read, while annotations are rendered into the job
-# page's HTML. Whoever debugs this build has no local Android toolchain, so the
-# annotations are the only failure channel they can actually see.
+# Build failures are re-emitted as ::error:: annotations on purpose: Actions logs
+# need authentication to read (they 404 anonymously), while annotations are
+# rendered into the job page HTML. Whoever debugs this build has no local Android
+# toolchain, so annotations are the only failure channel they can actually see.
+# tools/watch_ci.py reads them without gh or a token.
 on:
   push:
-    branches: [main, beta]
+    branches: [main, pre]
     tags: ['v*']
     paths:
       - 'android-shell/**'
@@ -40,7 +45,8 @@ on:
 permissions:
   contents: read
 
-# A newer push supersedes an in-flight build of the same branch.
+# A newer push supersedes an in-flight build of the same ref. The ref is part of
+# the key, so a push to pre never cancels a build of main.
 concurrency:
   group: android-shell-${{ github.ref }}
   cancel-in-progress: true
@@ -91,6 +97,33 @@ jobs:
           distribution: temurin
           java-version: '17'
           cache: gradle
+
+      # Version numbers, computed from the branch (see app/build.gradle.kts):
+      #   versionCode = run number, so every build installs over the previous one
+      #   versionName = "<base>-pre.<n>" on pre, "<base>" elsewhere
+      # Values go through $GITHUB_ENV, which later steps (including Gradle) and
+      # the publishing jobs read.
+      - name: Resolve version
+        id: version
+        working-directory: android-shell
+        run: |
+          base=$(sed -n 's/^zcodeBaseVersion=//p' gradle.properties | tr -d '\r' | head -1)
+          if [ -z "$base" ]; then
+            echo "::error::could not read zcodeBaseVersion from gradle.properties"
+            exit 1
+          fi
+          if [ "${GITHUB_REF}" = "refs/heads/pre" ]; then
+            name="${base}-pre.${GITHUB_RUN_NUMBER}"
+          else
+            name="$base"
+          fi
+          {
+            echo "ZCODE_VERSION_NAME=$name"
+            echo "ZCODE_VERSION_CODE=${GITHUB_RUN_NUMBER}"
+            echo "BASE_VERSION=$base"
+            echo "VERSION_TAG=v$name"
+          } >> "$GITHUB_ENV"
+          echo "version = $name (code ${GITHUB_RUN_NUMBER})"
 
       # Restore the release keystore from GitHub Secrets so CI-built APKs share
       # the signature of every other build of this app (overwrite-install works).
@@ -193,8 +226,66 @@ jobs:
           retention-days: 30
 
   # ---------------------------------------------------------------------------
-  # Publishing needs a write token, so it is isolated here instead of widening
-  # the permissions of the build job (which runs on untrusted PR code).
+  # pre branch -> automatic PRE-RELEASE. This is the everyday path: push to pre,
+  # then install straight from the Releases page.
+  # ---------------------------------------------------------------------------
+  prerelease:
+    name: Publish pre-release
+    if: github.ref == 'refs/heads/pre'
+    needs: [js, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      - name: Download APK artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: zcode-remote-apk-${{ github.sha }}
+          path: dist
+
+      - name: Resolve version and notes
+        id: meta
+        working-directory: android-shell
+        run: |
+          set -euo pipefail
+          base=$(sed -n 's/^zcodeBaseVersion=//p' gradle.properties | tr -d '\r' | head -1)
+          name="${base}-pre.${{ github.run_number }}"
+          {
+            echo "VERSION_TAG=v$name"
+            echo "VERSION_NAME=$name"
+          } >> "$GITHUB_ENV"
+          # The newest CHANGELOG section describes the base version; a
+          # pre-release has no section of its own, so reuse it and label clearly.
+          awk 'BEGIN{n=0} /^## \[/{n++} n==1{print}' CHANGELOG.md > ../pre-notes.md
+          {
+            echo ""
+            echo "---"
+            echo ""
+            echo "自动预发布，对应 \`pre\` 分支提交 \`${GITHUB_SHA:0:7}\`。"
+            echo ""
+            echo "versionCode 为 CI 运行号 \`${{ github.run_number }}\`，可直接覆盖安装上一个版本。"
+          } >> ../pre-notes.md
+
+      - name: Publish pre-release
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          tag_name: ${{ env.VERSION_TAG }}
+          name: ${{ env.VERSION_NAME }}
+          body_path: pre-notes.md
+          prerelease: true
+          files: |
+            dist/zcode-remote.apk
+            dist/zcode-remote.apk.md5
+
+  # ---------------------------------------------------------------------------
+  # v* tag -> formal Release, notes from the "## [X.Y.Z]" changelog section.
+  # Isolated from build because publishing needs a write token, and the build job
+  # runs on untrusted PR code.
   # ---------------------------------------------------------------------------
   release:
     name: Publish GitHub Release

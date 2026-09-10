@@ -35,11 +35,25 @@ android {
         applicationId = "com.zcode.remote"
         minSdk = 26
         targetSdk = 35
-        // NOTE: versionCode/versionName live here AND in CHANGELOG.md. That is
-        // the whole list — the in-app version string is read from
-        // PackageManager, so there is no third copy to drift (zemote had one).
-        versionCode = 1
-        versionName = "1.0.0"
+        // NOTE: versionName lives here AND (as the section heading) in
+        // CHANGELOG.md. That is the whole list — the in-app version string is
+        // read from PackageManager, so there is no third copy to drift (zemote
+        // had one).
+        //
+        // CI overrides both through the environment:
+        //   ZCODE_VERSION_CODE = the workflow run number, which makes every
+        //     build installable over the previous one. Android rejects an APK
+        //     whose versionCode is lower than the installed one, so a fixed
+        //     value would force an uninstall between a pre-release and a formal
+        //     release (pre builds would otherwise sit below it forever).
+        //   ZCODE_VERSION_NAME = "<base>-pre.<n>" on the pre branch, so the
+        //     installed app says which pre-release it is.
+        // Locally (and for a tagged formal release) the checked-in values apply.
+        // The base version lives in gradle.properties so that both Gradle and
+        // the workflow can read it with a trivial, stable pattern.
+        val baseVersionName = (findProperty("zcodeBaseVersion") as String?) ?: "1.0.0"
+        versionCode = System.getenv("ZCODE_VERSION_CODE")?.toIntOrNull() ?: 1
+        versionName = System.getenv("ZCODE_VERSION_NAME") ?: baseVersionName
 
         // Pure Kotlin/Java: no native libraries, so one universal APK covers
         // every ABI. No splits, no abiFilters (decision in §11.2 of the doc).

@@ -2,7 +2,7 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
-发版流程：改动 → 更新本文件顶部段落 → `git tag vX.Y.Z` → 推送。CI 会读取 `## [X.Y.Z]` 段落作为 Release 说明。
+发版流程：日常推 `pre` 分支（CI 自动发预发布 Release）；正式版更新本文件顶部段落（须与 `gradle.properties` 的 `zcodeBaseVersion` 一致），把 `pre` 合入 `main` 后 `git tag vX.Y.Z` 推送，CI 读取 `## [X.Y.Z]` 段落作为 Release 说明。
 
 ## [1.0.0] - 2026-09-10
 

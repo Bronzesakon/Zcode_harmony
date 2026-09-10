@@ -21,3 +21,7 @@ captures/
 # Node-based protocol tests (tools/) keep no build output, but be explicit so a
 # stray npm artefact can never reach the repo.
 node_modules/
+
+# 厂商官方参考文档快照（OPPO 开放平台 / Android Developers，版权归原厂商）
+# 仅本地离线查阅，不随仓库分发。
+ColorOS_docs/

@@ -17,20 +17,46 @@
 | job | 内容 | 首次 | 有缓存 |
 | --- | --- | --- | --- |
 | `js` | Node 协议层 + 注入层测试（35 项），不需要 JDK/SDK | ~1 min | ~40 s |
-| `build` | 单次 Gradle 调用：release 单元测试（20 项）+ `assembleRelease` + 签名校验 | ~4 min | ~2 min |
-| `release` | 仅 `v*` tag，下载产物并发 Release | ~20 s | ~20 s |
+| `build` | 单次 Gradle 调用：release 单元测试（20 项）+ `assembleRelease` + 签名校验 | ~4 min | ~2m 45s |
+| `prerelease` | 仅 `pre` 分支：自动打 tag 并发**预发布 Release**（可直接下载安装） | ~20 s | ~20 s |
+| `release` | 仅 `v*` tag：用 CHANGELOG 段落发正式 Release | ~20 s | ~20 s |
 
 省时间的几个点：`js` 不与 Android 构建串行；`testReleaseUnitTest` 与 `assembleRelease` 放在**同一次 Gradle 调用**里（共享 `compileReleaseKotlin`，源码只编译一次、Gradle 只启动一次）；`fetch-depth: 1`；`actions/setup-java` 的 `cache: gradle` 会恢复 `~/.gradle`（依赖缓存 + 本地 build cache）；`org.gradle.configuration-cache=true` 且 `problems=warn`，所以配置缓存只可能加速、不会让构建失败。
 
 ---
 
+## 发布流程：日常走 `pre`，正式版从 `main` 打 tag
+
+```
+main ──────────────────────────────────● v1.0.0  正式 Release
+        ╲                              ╱  （你决定何时把 pre 合入）
+   pre ──●──●──●──●
+           │  │  └─ v1.0.0-pre.<run>  预发布（自动，可直接安装）
+           │  └──── v1.0.0-pre.<run>
+           └─────── v1.0.0-pre.<run>
+```
+
+- **日常开发只推 `pre`**。每次推送到 `pre`，CI 通过后自动创建 tag `v<base>-pre.<运行号>` 并发布 **pre-release**，APK 挂在 Releases 页面上——装测试包不用再去翻 Actions 的 Artifacts。
+- **正式发布**：更新 `CHANGELOG.md` 顶部段落（必须是 `## [X.Y.Z]`，且与 `gradle.properties` 的 `zcodeBaseVersion` 一致）→ 把 `pre` 合入 `main` → 在 `main` 上 `git tag vX.Y.Z` → 推送。CI 会用 changelog 段落作为 Release 说明。
+- CI 用 GITHUB_TOKEN 创建的 tag **不会**再触发一次工作流，所以预发布不会递归。
+- `concurrency` 的 key 含 ref，所以推 `pre` 不会取消 `main` 上正在跑的构建。
+
+### 版本号的唯一来源与覆盖安装
+
+| 位置 | 内容 | 谁读它 |
+| --- | --- | --- |
+| `gradle.properties` 的 `zcodeBaseVersion` | 版本基准，如 `1.0.0` | Gradle 与 CI 共同读取 |
+| `CHANGELOG.md` 顶部 `## [X.Y.Z]` | 正式版的 Release 说明 | 发 tag 时的 notes 脚本 |
+
+`versionName` 由 CI 注入（`pre` 上是 `1.0.0-pre.<run>`，其它分支是基准值）；**`versionCode` 在所有 CI 构建里都取工作流运行号**。这一条是刻意的：Android 拒绝安装 versionCode 低于已装版本的 APK，所以固定 versionCode 会导致「正式版装上之后，再也装不上 pre 包」。用运行号保证单调递增，任何一次 CI 产物都能直接覆盖安装上一个。
+
+---
+
 ## 取 APK
 
-1. 推一次提交（改到 `android-shell/**` 才会触发），或手动跑 `workflow_dispatch`。
-2. 打开仓库 **Actions → Android Shell Build → 最近一次运行 → Artifacts → `zcode-remote-apk-<sha>`**。
-3. 解压得到 `zcode-remote.apk` 与 `zcode-remote.apk.md5`。
+**推荐（pre 分支）**：推送后打开仓库 **Releases** 页面，下载最新的 `pre-release` 里的 `zcode-remote.apk`。
 
-发版：更新 `CHANGELOG.md` 顶部段落（必须是 `## [X.Y.Z]`）→ 提交 → `git tag vX.Y.Z` → 推送。CI 会构建并发布 Release。
+其它路径：**Actions → Android Shell Build → 最近一次运行 → Artifacts → `zcode-remote-apk-<sha>`**（同样含 `zcode-remote.apk` 与 `.md5`）。
 
 ---
 
