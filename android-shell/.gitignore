@@ -3,6 +3,9 @@ build/
 .gradle/
 local.properties
 
+# 本地签名材料（keystore、密码、base64 取值来源）— 仅本地保留
+scratch/
+
 # Release signing material — NEVER commit these.
 # CI writes key.properties from GitHub Secrets; locally you create it by hand
 # (see key.properties.example).

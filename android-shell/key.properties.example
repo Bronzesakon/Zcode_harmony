@@ -5,8 +5,12 @@
 #
 # 密钥库类型为 PKCS12，因此 keyPassword 必须与 storePassword 相同。
 # 路径可以是绝对路径，也可以相对 android-shell/ 目录。
+#
+# 本项目的 keystore 在 android-shell/scratch/（仅本地保留）；
+# 密码在 scratch/keystore-password.txt。
 
-storeFile=../zemote/android/app/zemote-release.jks
-storePassword=<keystore 密码>
+storeFile=scratch/zcode-remote-release.p12
+storeType=PKCS12
+storePassword=<scratch/keystore-password.txt 的内容>
 keyPassword=<与 storePassword 相同>
-keyAlias=zemote
+keyAlias=zcode-remote

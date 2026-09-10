@@ -89,8 +89,10 @@ jobs:
 
       # Restore the release keystore from GitHub Secrets so CI-built APKs share
       # the signature of every other build of this app (overwrite-install works).
-      # Secret names come from the zemote project: one keystore, two apps (D14).
-      # Signing setup is folded into the build step to save a step's overhead.
+      # This app has its OWN keystore (android-shell/scratch/, local only); it
+      # deliberately does not reuse zemote's or the HarmonyOS project's material
+      # — see README "签名密钥". Signing setup is folded into the build step to
+      # save a step's overhead.
       - name: Build and test
         working-directory: android-shell
         env:
@@ -103,9 +105,17 @@ jobs:
           chmod +x ./gradlew
 
           if [ -n "${KEYSTORE_B64:-}" ]; then
-            echo "$KEYSTORE_B64" | base64 -d > release.jks
+            # Strip any whitespace before decoding: a Windows paste can smuggle
+            # in CR/LF or a trailing space, which would fail base64 -d with a
+            # confusing error far from its cause.
+            printf '%s' "$KEYSTORE_B64" | tr -d '[:space:]' | base64 -d > release.p12
+            if ! [ -s release.p12 ]; then
+              echo "::error::ANDROID_KEYSTORE_BASE64 did not decode to a file - check the secret value."
+              exit 1
+            fi
             {
-              echo "storeFile=$PWD/release.jks"
+              echo "storeFile=$PWD/release.p12"
+              echo "storeType=PKCS12"
               echo "storePassword=$STORE_PASSWORD"
               echo "keyPassword=$KEY_PASSWORD"
               echo "keyAlias=$KEY_ALIAS"

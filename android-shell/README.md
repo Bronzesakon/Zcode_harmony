@@ -34,18 +34,80 @@
 
 ---
 
-## 一次性配置：GitHub Secrets（必须做，否则只有 debug 签名）
+## 签名密钥（与 zemote / 鸿蒙工程都无关）
 
-在本仓库 `Bronzesakon/Zcode_harmony` 的 **Settings → Secrets and variables → Actions** 添加 4 个 secret，取值与 zemote 完全相同（同一把 keystore，决策 D14）。取值来源与步骤见 [`../zemote/独立项目文档.md`](../zemote/独立项目文档.md) §1–2：
+这个应用有**自己的** release keystore，不复用 zemote 那把，也不用鸿蒙父工程的材料。原因：
 
-| Name | 值 |
+- 鸿蒙工程用的是 DevEco **自动签名**材料（`~/.ohos/config/default_Zcode_harmony_….p12`，别名 `debugKey`，`SHA256withECDSA`）。它在 `build-profile.json5` 里的密码是 **DevEco 加密后的密文**，真值取不到，`keytool` 打不开；而且自动签名的 debug 密钥可能被 DevEco 重新生成，一旦更换，安卓侧就无法覆盖安装。HarmonyOS 的 `.p7b` profile 安卓也不使用。
+- 复用自己的密钥才能保证：**今后所有版本的 APK 都能互相覆盖安装**（Android 只接受签名一致的升级包）。
+
+材料（全部在 `scratch/`，已被 `.gitignore` 忽略，只在本机）：
+
+| 文件 | 内容 |
 | --- | --- |
-| `ANDROID_KEYSTORE_BASE64` | keystore 的 base64（单行，无尾随换行） |
-| `ANDROID_KEYSTORE_PASSWORD` | keystore 密码 |
-| `ANDROID_KEY_PASSWORD` | **与上一个相同**（PKCS12 要求） |
-| `ANDROID_KEY_ALIAS` | `zemote` |
+| `scratch/zcode-remote-release.p12` | PKCS12 keystore，RSA 2048，SHA384withRSA，有效期 10950 天，别名 `zcode-remote` |
+| `scratch/keystore-password.txt` | keystore 密码（32 位字母数字） |
+| `scratch/keystore-base64.txt` | keystore 的 base64（**单行 3676 字符，无尾随换行**），配 Secrets 用 |
 
-未配置时 CI 仍然出包，但会回退到 debug 签名并在日志里给出 `::warning`。
+证书指纹（可公开，用于核对 CI 出的包是不是这把密钥签的）：
+
+```
+SHA-256  B1:15:06:32:51:37:AA:D5:54:6F:39:02:AC:7D:FF:79:48:42:71:83:E0:71:B7:19:46:09:13:76:71:C3:46:50
+SHA-1    19:B4:73:84:3F:75:37:9C:BD:55:A3:AE:E6:D1:E4:1B:C9:03:40:CC
+```
+
+> ⚠️ **务必备份 `scratch/` 这三个文件**（例如放进密码管理器或加密备份）。keystore 一旦丢失，之后发布的 APK 都无法覆盖安装已有版本，只能卸载重装。
+
+轮换密钥（只有在确有必要时）：用 DevEco 自带的 keytool 重新生成，然后**同步更新全部 4 个 Secrets**，否则新旧包签名不一致。
+
+```bash
+JBR="/e/DevEco Studio/jbr/bin/keytool.exe"
+PW="<自己定的密码>"
+
+"$JBR" -genkeypair -v \
+  -keystore scratch/zcode-remote-release.p12 \
+  -storetype PKCS12 -alias zcode-remote \
+  -keyalg RSA -keysize 2048 -validity 10950 \
+  -storepass "$PW" -keypass "$PW" \
+  -dname "CN=ZCode Remote, OU=Mobile, O=ZCode, L=Unknown, ST=Unknown, C=CN"
+
+base64 -w0 scratch/zcode-remote-release.p12 > scratch/keystore-base64.txt
+"$JBR" -list -keystore scratch/zcode-remote-release.p12 -storepass "$PW"
+# 应输出 PrivateKeyEntry，而不是只有证书条目
+```
+
+---
+
+## 一次性配置：GitHub Secrets（4 个）
+
+在 **`Bronzesakon/Zcode_harmony` → Settings → Secrets and variables → Actions → New repository secret** 逐个添加。名称必须完全一致。
+
+| # | Name | 取值 | 说明 |
+| --- | --- | --- | --- |
+| 1 | `ANDROID_KEYSTORE_BASE64` | `android-shell/scratch/keystore-base64.txt` 的全部内容 | 单行 3676 字符，**不要手工加换行或空格**；`+` `/` `=` 都是正常字符 |
+| 2 | `ANDROID_KEYSTORE_PASSWORD` | `android-shell/scratch/keystore-password.txt` 的内容 | |
+| 3 | `ANDROID_KEY_PASSWORD` | **与 #2 完全相同** | PKCS12 要求 key 与 store 同密码 |
+| 4 | `ANDROID_KEY_ALIAS` | `zcode-remote` | |
+
+取值怎么拿到（注意别把密码贴进任何聊天或 issue）：
+
+```bash
+cd /e/Zcode_harmony/android-shell
+cat scratch/keystore-password.txt          # #2 / #3 的值，手动输入到网页
+cat scratch/keystore-base64.txt | clip     # #1 的值直接进剪贴板（Git Bash 的 clip 不会加换行）
+```
+
+粘贴 `#1` 时若用记事本中转容易被自动换行破坏；用上面的 `clip` 最稳，粘贴后确认输入框里是**连续一行**。
+
+**不配置也能出包**：CI 会回退 debug 签名并在日志里给出 `::warning title=Debug-signed build::`，但那种 APK 与正式包签名不一致，只能卸载重装。
+
+**配置是否生效怎么看**：构建日志里应出现 `Release signing configured from secrets.`，并且 `Rename APK, checksum and verify signature` 步骤会打印
+
+```
+zcode-remote.apk -> CN=ZCode Remote, OU=Mobile, O=ZCode, L=Unknown, ST=Unknown, C=CN
+```
+
+若这一步打印 `CN=Android Debug` 而 `SIGNING_CONFIGURED=true`，CI 会直接**报错失败**（避免把 debug 包当成正式包发出去）。
 
 ---
 

@@ -54,6 +54,14 @@ android {
                 // path relative to the repository root.
                 storeFile = rootProject.file(releaseStoreFile)
                 storePassword = propOrEnv("storePassword")
+                // Explicit, because a PKCS12 store named .jks would otherwise be
+                // read as legacy JKS and fail to load. Overridable for anyone
+                // bringing an older keystore.
+                storeType = propOrEnv("storeType") ?: when {
+                    releaseStoreFile.endsWith(".p12", true) ||
+                        releaseStoreFile.endsWith(".pfx", true) -> "PKCS12"
+                    else -> "JKS"
+                }
             }
         }
     }
