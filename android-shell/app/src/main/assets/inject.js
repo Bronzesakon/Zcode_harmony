@@ -183,6 +183,22 @@
         };
         wrappedSend.__zcodeShellWrapped = true;
         proto.send = wrappedSend;
+
+        // Outbound close observation. Which side tore the connection down decides
+        // what the fix is — the desktop, the transport, or the page itself — and
+        // the close event alone cannot say. The caller line disambiguates.
+        var originalClose = proto.close;
+        var wrappedClose = function () {
+            try {
+                var at = String((new Error()).stack || '').split('\n')[1] || '';
+                diag('debug', 'socket.close() 被调用 ' + at.trim().substring(0, 120));
+            } catch (e) {
+                // observation must never break the page's close
+            }
+            return originalClose.apply(this, arguments);
+        };
+        wrappedClose.__zcodeShellWrapped = true;
+        proto.close = wrappedClose;
     }
 
     function trackSocket(socket, url) {
@@ -205,9 +221,11 @@
                 liveness.socketsOpened += 1;
                 diag('info', 'relay socket open (#' + liveness.socketsOpened + ')');
             });
-            socket.addEventListener('close', function () {
+            socket.addEventListener('close', function (event) {
                 liveness.socketsClosed += 1;
-                diag('warn', 'relay socket closed');
+                diag('warn', 'relay socket closed (code=' +
+                    (event ? event.code : '?') + ' clean=' +
+                    (event ? event.wasClean : '?') + ')');
                 relayPaired = false;
                 resetClient();
                 if (activeSocket === socket) {
