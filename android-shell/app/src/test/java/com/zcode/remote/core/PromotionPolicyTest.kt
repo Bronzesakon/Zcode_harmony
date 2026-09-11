@@ -33,10 +33,10 @@ class PromotionPolicyTest {
             workspaceTitle = "仓库",
             task = task,
             status = if (waiting) TaskStatus.WAITING else TaskStatus.RUNNING,
-            body = NotifyState.formatBody(
-                if (waiting) TaskStatus.WAITING else TaskStatus.RUNNING,
-                "",
-            ),
+            // The slot allocation does not look at the body; the fallback keeps
+            // the helper honest about how a body is built (no status prefix any
+            // more — that moved into the title, see NotifyState.formatTitle).
+            body = NotifyState.formatBody("", "仓库"),
         )
     }
 

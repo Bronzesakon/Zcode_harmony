@@ -32,9 +32,7 @@ enum class PageBarState(val token: String) {
     MAIN_HEADER("main-header"),
 
     /** Control view, wide: the shell area sits directly under the bar. */
-    MAIN_SURFACE("main-surface"),
-
-    ;
+    MAIN_SURFACE("main-surface");
 
     companion object {
         val DEFAULT = BOOT

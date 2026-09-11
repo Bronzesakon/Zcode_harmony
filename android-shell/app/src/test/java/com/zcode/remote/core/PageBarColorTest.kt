@@ -16,12 +16,14 @@ import org.junit.Test
  */
 class PageBarColorTest {
 
-    private const val BOOT_LIGHT = 0xFFF8F8F8.toInt()
-    private const val BOOT_DARK = 0xFF161616.toInt()
-    private const val HEADER_LIGHT = 0xFFFFFFFF.toInt()
-    private const val HEADER_DARK = 0xFF202020.toInt()
-    private const val SURFACE_LIGHT = 0xFFECECEE.toInt()
-    private const val SURFACE_DARK = 0xFF2B2B2B.toInt()
+    // Not `const`: 0xFFF8F8F8 is a Long literal, so `.toInt()` is a call and the
+    // value is not a compile-time constant.
+    private val BOOT_LIGHT = 0xFFF8F8F8.toInt()
+    private val BOOT_DARK = 0xFF161616.toInt()
+    private val HEADER_LIGHT = 0xFFFFFFFF.toInt()
+    private val HEADER_DARK = 0xFF202020.toInt()
+    private val SURFACE_LIGHT = 0xFFECECEE.toInt()
+    private val SURFACE_DARK = 0xFF2B2B2B.toInt()
 
     @Test
     fun `every state has a light and a dark surface`() {
