@@ -267,7 +267,7 @@ zcode-remote.apk -> CN=ZCode Remote, OU=Mobile, O=ZCode, L=Unknown, ST=Unknown, 
 10. **`UploadMime.kt` 里的 `WILDCARD` 是拼接出来的，不要"顺手简化"成单个字面量。** 写成单个字面量时 `compileReleaseKotlin` 会在该列报 `Syntax error: Expecting a top level declaration`，连续三轮 CI 复现、报错逐字节相同，而文件字节是干净的纯 ASCII。Kotlin 的块注释可嵌套，嫌疑是词法器在注释深度上失手；拼接写法语义完全相同且已验证可编译。
 11. **改完 Kotlin 先跑 `python tools/check_kotlin_structure.py`**：括号配平、包名与目录一致、合并残留，一秒出结果；CI 的 Static checks job 也会跑它。
 12. **网页那条 14px 滚动条与"内容居中"在安卓上不可兼得，且**当前一律不碰**——不要再往注入层加滚动条 CSS。** 事实链：页面自己的样式表里有全局的 `*{scrollbar-width:auto;scrollbar-color:var(--color-border) transparent}` + `::-webkit-scrollbar{width:14px;height:14px}`（thumb `border:3px solid transparent` + `background-clip:padding-box`，可见部分 8px 圆角胶囊）；真机量到内容盒 1222px / 屏幕 1272px（dpr 3.5），thumb 29 设备像素宽、两侧内缩 3px——与上述规则逐像素吻合，所以底部输入框左右留白 16 vs 30 CSS px、中心偏左 7px。**Chrome 官方文档**明确："给 `::-webkit-scrollbar` 设 `width`/`height`，会把它变成 classic（占位）滚动条"。**Android WebView 更近一步**：它在引擎层把 overlay 滚动条渲染整体关掉了（WebView 负责人 torne@chromium.org 在 [issue 40226034](https://issues.chromium.org/issues/40226034)："WebView makes the blink scrollbars transparent [layer_tree_settings.cc:415] … This disables *all* rendering of overlay scrollbars in WebView"；该请求至今 P3/New），因为根滚动条约定由 Android View/主题绘制；也因此 `scrollbar-width:thin` 这类标准属性在真机上不生效（pre.17 实测无变化），唯一的把手是把 legacy 轨道宽度改小/改没（pre.16 零宽时滚动条消失、pre.18 2px 时中心偏移降到 0.86px）。鸿蒙 ArkWeb 没做这个关闭，所以同一页面在那边是 overlay、内容居中。
-    **本轮结论（已按此撤销全部注入）**：网页保持原样、注入层不写任何滚动条 CSS；"安卓也做到 overlay 且样式同网页"属另一条方案（本地画悬浮条），待定。
+    **当前做法（方案 A，已实现）**：注入层 `§6` 做两件事——① 一条 `::-webkit-scrollbar{width:0!important;height:0!important}` 把网页那条轨道压成 0（**唯一动到网页的地方，且只动宽度**），内容盒随即回到满宽（真机复核：卡片左右留白 59/59、中心 635.5 = 屏幕中心）；② 自绘 overlay 指示条：`document` 上装**捕获阶段**的 passive `scroll` 监听（scroll 不冒泡但捕获路径照走，`event.target` 即滚动容器，因此不依赖任何选择器），一个复用 `position:fixed` 胶囊按容器矩形定位——可见 8px、距右缘内缩 3px、圆角 9999px、最短 32px（全是网页 thumb 自己的数值），颜色在每个滚动 burst 起始时从容器上读一次网页 token `--color-border`，滚动时显示、停止 700ms 后淡出；网页刻意隐藏滚动条处（`[class*=scrollbar-hide]`、pptx 渲染面、xterm 视口）跳过。性能：空闲零成本，滚动中每帧只写一次 transform，容器矩形每 burst 只量一次。**v1 只做指示、不可拖拽，只处理纵向**。
     **顺带一条取证捷径**：这类"网页布局为何如此"不必靠真机截图猜——静态资源是公开的（不带凭证），`curl -s https://zcode.z.ai/remote/v4/assets/index-<hash>.css` 就能读到页面自己的规则；hash 随构建变化，可从旧记录里取，或先从带凭证的 `/remote/v4` 页面里找（该 URL 含凭证，别回显）。
 
 ---
@@ -467,39 +467,45 @@ android-shell/
 
 ### 一句话状态
 
-`pre` @ `2b397ef`（工作区干净）。CI 全绿（JS 35 + Kotlin 37 单测）；最新构建 **`1.0.0-pre.15`** 挂在滚动预发布
+`pre` @ `18968b1`。CI 全绿（JS 35 + Kotlin 37 单测）；最新构建 **`1.0.0-pre.20`** 挂在滚动预发布
 [`android-pre`](https://github.com/Bronzesakon/Zcode_harmony/releases/tag/android-pre)（固定下载链接，可直接覆盖安装）。
-**真机只验证过一轮**（一加 PLC110 / ColorOS 16 / API 36 / WebView 153），结论尚未落定。
+**真机验证过两轮**（一加 PLC110 / ColorOS 16 / API 36 / WebView 153）：adb-bridge 闭环（装包/取日志/截图）已实测可用；
+本轮新加的悬浮滚动条**尚未在会话页复看**（见下「下一步」）。
 
-### 本轮做了什么（2026-09-11）
+### 本轮做了什么（2026-09-11 下午续）
 
-1. **修键盘遮挡输入框**——edge-to-edge 后 `adjustResize` 失效、键盘只以 `Type.ime()` inset 送达，根布局却只消费
-   systemBars/cutout；改为 `padForSystemBarsAndIme()`（底部取 `max(系统栏, 键盘)`）。**已过 CI，待真机确认**。
-2. **会话加载慢**——加取证（网页 console 进日志、每帧解码开销/longtask/页面导航计时、原生加载耗时）+ 一处降载
-   （主动订阅从「配对后 1.5s 无条件启动」改为「页面静默 ≥800ms 才启动，最迟 12s」）。**根因待读下一份真机日志**。
-3. **CI 改滚动发布**——固定 tag `android-pre`，覆写资产 + 移动 tag + 刷新标题/本轮变更/时间，已实测生效。
-4. **文档收口**——删除 `HANDOVER.md`，内容全部并入本 README，并新设本交接区。
+1. **滚动条问题收口（本轮的第六条改动）**——定位到根因是网页自带的 14px classic 滚动条占掉内容盒
+   （真机 1222px / 屏幕 1272px，dpr 3.5；底部输入框左右 16 vs 30 CSS px），而 Android WebView 在引擎层
+   关闭了 overlay 滚动条渲染、标准属性 `scrollbar-width` 无效（详见「实现要点 12」）。按用户决定走**方案 A**：
+   注入层一条 `::-webkit-scrollbar{width:0}` 让回宽度 + 自绘悬浮指示条（捕获阶段 scroll 监听、复用 fixed 胶囊、
+   每 burst 只量一次矩形、空闲零成本）。**待会话页复看**。
+2. **adb 无线调试已配对**（`192.168.0.185:37687`；另一条 mDNS 传输是同一台，断开即可消除歧义）。
+3. 中途试过并**已全部撤销**的：零宽（pre.16）、`scrollbar-width:thin`（pre.17）、2px 轨道（pre.18）、
+   只读槽宽探针——撤销记录见 git 历史，结论进了「实现要点 12」。
 
 ### 下一步（按优先级）
 
-详见「项目现状」表格（P0 后台存活 30 分钟 / P1 键盘上抬待验 / P1 悬浮弹窗取证 / P2 慢加载判读 / P3 流体云 / P4 上传与通知细节）。
-最省事的顺序：**先配对 adb** → 装 `pre.15` 验证 P1 键盘 → 同时抓 P2 日志 → 顺手跑 P1 悬浮弹窗的四条 `dumpsys`。
+1. **复看悬浮滚动条**（本轮唯一未闭环项）：装 `pre.20` → 进会话页/工作区列表页 → 应看到①内容左右留白对称（居中）
+   ②滚动时右缘出现 8px 胶囊、停止约 0.7s 后淡出、颜色跟随网页主题；日志按老口径读。
+2. 详见「项目现状」表格：P0 后台存活 30 分钟 / P1 键盘上抬待验 / P1 悬浮弹窗四条 `dumpsys` / P2 慢加载判读（另一会话在做 RPC 往返计时）/ P3 流体云 / P4 上传与通知细节。
 
 ### 拦路石 / 待决策
 
-- **adb 还没配对**（阻塞上面一切真机动作）：需要用户提供手机「无线调试 → 使用配对码配对设备」的
-  **配对 IP:端口 + 6 位配对码**（一次性凭据，用完即弃、不落盘）。
+- **手机控制端单占**：鸿蒙端接入时安卓端会被踢（现象是网页显示「已被其他设备接管 / KICKED」，且该状态页没有滚动容器，
+  量不了会话页布局）。要复看安卓侧，需在桌面端**重新扫码**；鸿蒙端是用户用来对照 overlay 观感的那台，别抢。
 - **正式版 tag 命名空间**：安卓 `tags: ['v*']` 与鸿蒙版共用空间，建议改成 `android-v*`——等用户点头（见「决策落点」）。
 
 ### 本轮最常用的几条命令
 
 ```bash
 cd android-shell
-python tools/watch_ci.py --watch        # 看 CI（无需 gh/token）
+python tools/watch_ci.py                # 看 CI（无需 gh/token）；长驻 --watch 会被消息打断，建议单次读
 ADB="C:/Program Files/UotanToolbox/Bin/platform-tools/adb.exe"
-"$ADB" install -r zcode-remote.apk      # 覆盖安装最新预发布包
+curl -sL -o zcode-remote.apk https://github.com/Bronzesakon/Zcode_harmony/releases/download/android-pre/zcode-remote.apk
+MSYS_NO_PATHCONV=1 "$ADB" install -r zcode-remote.apk
 MSYS_NO_PATHCONV=1 "$ADB" shell cat /sdcard/Android/data/com.zcode.remote/files/logs/zcode-shell.log   # 取诊断日志
 ```
+
 
 > 全量命令、配对步骤与两个本机坑（`MSYS_NO_PATHCONV`、双 adb server 冲突）都在「本机开发 → 真机调试（adb）」。
 
