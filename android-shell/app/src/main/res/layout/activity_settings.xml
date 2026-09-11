@@ -88,7 +88,9 @@
                             android:text="@string/settings_change_url_hint" />
                     </LinearLayout>
 
-                    <ImageView style="@style/MiuixRowChevron" />
+                    <ImageView
+                        style="@style/MiuixRowChevron"
+                        app:tint="@color/miuix_on_surface_actions" />
                 </LinearLayout>
 
                 <View style="@style/MiuixDivider" />
@@ -103,7 +105,9 @@
                         android:layout_weight="1"
                         android:text="@string/settings_reload" />
 
-                    <ImageView style="@style/MiuixRowChevron" />
+                    <ImageView
+                        style="@style/MiuixRowChevron"
+                        app:tint="@color/miuix_on_surface_actions" />
                 </LinearLayout>
             </LinearLayout>
 
@@ -133,7 +137,9 @@
                             style="@style/MiuixRowSummary" />
                     </LinearLayout>
 
-                    <ImageView style="@style/MiuixRowChevron" />
+                    <ImageView
+                        style="@style/MiuixRowChevron"
+                        app:tint="@color/miuix_on_surface_actions" />
                 </LinearLayout>
 
                 <View style="@style/MiuixDivider" />
@@ -148,7 +154,9 @@
                         android:layout_weight="1"
                         android:text="@string/settings_clear_notifications" />
 
-                    <ImageView style="@style/MiuixRowChevron" />
+                    <ImageView
+                        style="@style/MiuixRowChevron"
+                        app:tint="@color/miuix_on_surface_actions" />
                 </LinearLayout>
             </LinearLayout>
 
@@ -178,7 +186,9 @@
                             style="@style/MiuixRowSummary" />
                     </LinearLayout>
 
-                    <ImageView style="@style/MiuixRowChevron" />
+                    <ImageView
+                        style="@style/MiuixRowChevron"
+                        app:tint="@color/miuix_on_surface_actions" />
                 </LinearLayout>
             </LinearLayout>
 
@@ -228,7 +238,9 @@
                         android:layout_weight="1"
                         android:text="@string/settings_inject_diagnostics" />
 
-                    <ImageView style="@style/MiuixRowChevron" />
+                    <ImageView
+                        style="@style/MiuixRowChevron"
+                        app:tint="@color/miuix_on_surface_actions" />
                 </LinearLayout>
 
                 <View style="@style/MiuixDivider" />
@@ -243,7 +255,9 @@
                         android:layout_weight="1"
                         android:text="@string/settings_share_log" />
 
-                    <ImageView style="@style/MiuixRowChevron" />
+                    <ImageView
+                        style="@style/MiuixRowChevron"
+                        app:tint="@color/miuix_on_surface_actions" />
                 </LinearLayout>
 
                 <View style="@style/MiuixDivider" />
@@ -258,7 +272,9 @@
                         android:layout_weight="1"
                         android:text="@string/settings_clear_diagnostics" />
 
-                    <ImageView style="@style/MiuixRowChevron" />
+                    <ImageView
+                        style="@style/MiuixRowChevron"
+                        app:tint="@color/miuix_on_surface_actions" />
                 </LinearLayout>
             </LinearLayout>
 

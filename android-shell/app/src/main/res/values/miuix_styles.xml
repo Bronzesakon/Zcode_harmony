@@ -49,7 +49,7 @@
         <item name="android:layout_height">48dp</item>
         <item name="android:layout_marginStart">@dimen/miuix_appbar_icon_padding</item>
         <item name="android:padding">12dp</item>
-        <item name="android:background">?attr/selectableItemBackgroundBorderless</item>
+        <item name="android:background">?android:attr/selectableItemBackgroundBorderless</item>
         <item name="android:scaleType">fitCenter</item>
         <item name="android:contentDescription">@string/action_back</item>
     </style>
@@ -133,13 +133,14 @@
         <item name="android:textSize">14sp</item>
     </style>
 
-    <!-- 行尾箭头：10x16dp，actions 角色着色（ArrowPreference 的 ArrowRight） -->
+    <!-- 行尾箭头：10x16dp（ArrowPreference 的 ArrowRight 尺寸）。
+         只放框架属性：tint 是库属性，写在 style 里要靠"限定名"解析，容易踩 aapt2 的坑，
+         所以着色放在使用处的 app:tint（布局里用库属性是铁定的写法）。 -->
     <style name="MiuixRowChevron" parent="">
         <item name="android:layout_width">@dimen/miuix_chevron_width</item>
         <item name="android:layout_height">@dimen/miuix_chevron_height</item>
         <item name="android:src">@drawable/ic_chevron_right</item>
         <item name="android:scaleType">fitXY</item>
-        <item name="app:tint">@color/miuix_on_surface_actions</item>
         <item name="android:importantForAccessibility">no</item>
     </style>
 
@@ -150,19 +151,5 @@
         <item name="android:layout_marginStart">@dimen/miuix_row_inside</item>
         <item name="android:layout_marginEnd">@dimen/miuix_row_inside</item>
         <item name="android:background">@color/miuix_divider</item>
-    </style>
-
-    <!-- 次级按钮（MiuiX Button 的 TextButton 观感）：圆角胶囊 + secondary 容器色。
-         backgroundTint / cornerRadius / inset 都是 MaterialButton 的库属性，必须带
-         app: 前缀，否则会被当成当前包里的同名 attr（编译期直接报找不到）。 -->
-    <style name="MiuixButton" parent="Widget.Material3.Button.TextButton">
-        <item name="android:layout_width">match_parent</item>
-        <item name="android:layout_height">wrap_content</item>
-        <item name="android:minHeight">48dp</item>
-        <item name="android:textColor">@color/miuix_primary</item>
-        <item name="app:backgroundTint">@color/miuix_secondary_container</item>
-        <item name="app:cornerRadius">14dp</item>
-        <item name="android:insetTop">0dp</item>
-        <item name="android:insetBottom">0dp</item>
     </style>
 </resources>
