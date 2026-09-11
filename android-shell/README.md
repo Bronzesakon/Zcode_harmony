@@ -892,10 +892,16 @@ APK 已覆写到滚动预发布，真机装的是 **`1.0.0-pre.42`**（versionCo
 ```bash
 cd android-shell
 python tools/check_kotlin_structure.py     # 一秒出结果：括号配平 / 包名与目录一致 / 合并残留
-node --test                                # 54 项（protocol 32 + inject 22）
+python tools/check_resources.py            # 一秒出结果：每个 @type/name 是否都有定义
+node --test                                # 55 项（protocol 32 + inject 23）
 python tools/watch_ci.py --watch           # 匿名读 CI 状态与编译错误注解
+bash tools/device_check.sh                 # 真机一键验收（取包→装→清日志→跑→读全部判据）
 curl -sL -o zcode-remote.apk https://github.com/Bronzesakon/Zcode_harmony/releases/download/android-pre/zcode-remote.apk
 ```
+
+> `tools/device_check.sh` 是 2026-09-12 加的：它把"接上手机按顺序敲十来条 adb"固定成一个命令，
+> **不依赖屏幕是否点亮**（读日志、视图树、快捷方式注册、通知内容）。它跑不了的只有"用眼睛看"的六项，
+> 脚本末尾会把它们列出来。设备不可达时它会直接给出恢复步骤，而不是一路打空。
 
 真机侧用 `mcp__adb-bridge__*`（`adb_status` 先拿 adbPath；`target` 一律显式传 `192.168.0.185:45903`；
 屏幕上一切用 `adb_screenshot` 看，不要凭猜）：
