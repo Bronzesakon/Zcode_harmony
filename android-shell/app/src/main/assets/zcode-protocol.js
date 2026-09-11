@@ -84,6 +84,14 @@
     // relay connection before we stop trying (see _handleDegraded).
     var MAX_REOPENS_PER_BRIDGE = 2;
 
+    // Total time the subscription burst may spend waiting for the page to be
+    // idle, spread across its workspaces. The gate in inject.js keeps the burst
+    // from STARTING while the page is busy; this keeps it from ploughing on when
+    // the user opens a task mid-burst. Bounded, so a chatty page cannot stretch
+    // the burst without limit.
+    var BURST_YIELD_TOTAL_MS = 8000;
+    var BURST_YIELD_POLL_MS = 120;
+
     // V4 capabilities (notably sessions-index) are gated on the desktop's
     // protocol version negotiation: a 0.x value here silently disables them.
     // The page's own clientHello is observed at runtime and preferred over
@@ -1068,6 +1076,26 @@
     };
 
     /**
+     * Resolves once the page has no request outstanding, or once [untilMs] has
+     * passed. Used between the burst's workspaces so the shell's 4 RPCs per
+     * workspace do not sit in front of whatever the user just tapped; the
+     * deadline is what keeps a page that is never idle from stretching it.
+     */
+    RemoteClient.prototype.awaitPageIdle = function (untilMs) {
+        var self = this;
+        return new Promise(function (resolve) {
+            var check = function () {
+                if (self.inFlightPageRpcs() === 0 || Date.now() >= untilMs) {
+                    resolve();
+                    return;
+                }
+                setTimeout(check, BURST_YIELD_POLL_MS);
+            };
+            check();
+        });
+    };
+
+    /**
      * Records that the page opened its own bridge for a workspace.
      *
      * On its own this is not enough to drop ours: the page holding a bridge does
@@ -1564,9 +1592,17 @@
             self._log('active subscribe: ' + targets.length + ' workspace(s) of ' + list.length +
                 (skipped ? '（跳过 ' + skipped + ' 个页面已覆盖）' : ''));
             // Sequential with a small gap: opening a dozen RPC bridges at once
-            // hammers the desktop and makes failures hard to attribute.
+            // hammers the desktop and makes failures hard to attribute. Between
+            // workspaces the burst yields while the page has a request in
+            // flight, so tapping a task mid-burst does not leave the page's own
+            // conversation request queued behind the rest of our handshakes. The
+            // yield budget is shared across the whole burst, so this stays
+            // bounded.
+            var yieldUntil = Date.now() + BURST_YIELD_TOTAL_MS;
             return targets.reduce(function (chain, workspace) {
                 return chain.then(function () {
+                    return self.awaitPageIdle(yieldUntil);
+                }).then(function () {
                     return self._openAndSubscribe(workspace);
                 }).then(function () {
                     return new Promise(function (r) {

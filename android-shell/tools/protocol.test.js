@@ -656,3 +656,29 @@ test('in-flight page RPCs are visible, so the burst can wait for them', () => {
     }
     assert.strictEqual(client.inFlightPageRpcs(), 0, 'and it clears when answered');
 });
+
+test('the burst yields while a page request is in flight, but not past its budget', async () => {
+    const {client} = makeClient();
+    const bridge = 'page-bridge-y';
+    const request = encodeBody([P.REQ_PROMISE, 5, 'zcode-agent', 'openConversationV4'], {});
+    for (const payload of fragment(request, bridge, 1)) {
+        client.acceptObservedPayload(payload, true);
+    }
+    assert.strictEqual(client.inFlightPageRpcs(), 1);
+
+    // A deadline already in the past resolves at once: the budget is what stops
+    // a page that is never idle from stretching the burst.
+    await client.awaitPageIdle(Date.now() - 1);
+
+    // Otherwise it resumes as soon as the reply lands, rather than waiting the
+    // budget out.
+    const started = Date.now();
+    const waiting = client.awaitPageIdle(Date.now() + 5000);
+    await new Promise((r) => setTimeout(r, 30));
+    const ok = encodeBody([P.RES_PROMISE_SUCCESS, 5], {ok: true});
+    for (const payload of fragment(ok, bridge, 2)) {
+        client.acceptObservedPayload(payload, false);
+    }
+    await waiting;
+    assert.ok(Date.now() - started < 3000, 'resumed as soon as the page was idle');
+});
