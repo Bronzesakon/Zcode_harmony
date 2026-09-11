@@ -16,14 +16,14 @@
 
 ## 项目现状（先读这一节）
 
-**一句话**：功能已全部落地、CI 全绿（JS 35 项 + Kotlin 37 项单测），`pre` 每次推送都把最新 APK **覆写**到滚动预发布 [android-pre](https://github.com/Bronzesakon/Zcode_harmony/releases/tag/android-pre)（固定链接 `…/releases/download/android-pre/zcode-remote.apk`，可直接覆盖安装）——但**真机验证只做过一轮**（一加 PLC110 / ColorOS 16 / API 36 / WebView 153），下面这些还没有结论：
+**一句话**：功能已全部落地、CI 全绿（JS 38 项 + Kotlin 37 项单测），`pre` 每次推送都把最新 APK **覆写**到滚动预发布 [android-pre](https://github.com/Bronzesakon/Zcode_harmony/releases/tag/android-pre)（固定链接 `…/releases/download/android-pre/zcode-remote.apk`，可直接覆盖安装）——**真机验证已过两轮**（一加 PLC110 / ColorOS 16 / API 36 / WebView 153，含 adb 闭环与网页滚动条方案 A），下面这些还没有结论：
 
 | # | 待验证 / 待排查 | 现状 | 怎么看 |
 | --- | --- | --- | --- |
 | P0 | 后台存活 30 分钟（迁移文档 §8 第 4 步，决定整条路线成立与否） | 未做 | 退后台 30 分钟回前台，读设置页第一行结论；判读口径见「首次真机验证」 |
 | P1 | 键盘弹出时输入框上抬 | 已修（`padForSystemBarsAndIme`），**待真机确认** | 点开会话底部输入框，输入框应贴在键盘上方；日志里 `视口 … innerHeight=…` 应随键盘变化 |
 | P1 | ColorOS 弹「“ZCode 远程”正在当前页面悬浮显示…是否关闭该应用？」 | **未定位**（性质已定性，见下） | 见「已知问题 A」 |
-| P2 | 会话加载慢（连标题都要半天） | 已加取证 + 一处降载，**待判读** | 见「已知问题 B」 |
+| P2 | 会话加载慢（连标题都要半天） | **主因已定位并修复**（relay 重连后重复 bridge 引发 `rpc-transport-fault` 循环），并补齐页面自身 RPC 取证；待装新包确认 | 见「已知问题 B」 |
 | P3 | 流体云是否真的出卡 | 未验证（需 API 36） | 设置 → 诊断里的 `流体云: 可用 / 系统已关闭本应用的推广通知` |
 | P4 | 上传链路（相册 / SAF / 取消不卡住）与通知细节（分组、点击定位、完成提示音） | 未验证 | 见「网页文件上传」与「实现要点」 |
 | — | `MODE_SAVE`（网页请求保存文件） | **未实现**，返回 false 并记 warn | — |
@@ -47,14 +47,17 @@ adb shell dumpsys activity activities | grep -i zcode          # 是否被系统
 
 ### 已知问题 B：会话加载慢的判读顺序
 
-本轮已把测量接进日志（无需再改代码），下一份真机日志按这个顺序读：
+第一轮真机日志已把范围收窄，本轮据此补上了**页面自身 RPC 的取证**并修掉主因。下一份日志按这个顺序读：
 
-1. `网页开始加载` / `网页加载完成，用时 N ms`（原生）与 `页面加载计时：ttfb=… load=… 资源 N 个 / KB`（注入层导航计时）→ 网络/文档层面；
-2. `active subscribe start（页面已空闲 Xms）` → 我们自己的 bridge 何时开始握手（本轮已改为等页面静默 ≥800ms，上限 12s）；
-3. `页面开销 10s：收帧 N 个（解码合计 Yms，单帧最长 Zms）· 长任务 …` → **我们自己的主线程开销**；
-4. `[web:行号] …` → 页面自己的 console（本轮新增，错误/警告分级，每次加载上限 200 行）。
+1. `网页开始加载` / `网页加载完成(第 N 次回调)，用时 N ms · <路径> · 控制台已捕获 M 行`（原生）。只有**第 1 次**回调能与加载起点比较：后续回调是 SPA 路由切换，此前复用同一起点计时会报出「用时 736007 ms」这种假数字（第一轮 14 次回调里大部分是这种）。`控制台已捕获 M 行`是判断网页 console 有没有真的落进文件的唯一数字——第一轮全场只有 3 行，等于没取到。
+2. `页面加载计时：ttfb=… DOMContentLoaded=… load=… 资源 N 个 / KB`（注入层导航计时）→ 文档与网络层面。
+3. `页面调用慢 Nms：zcode-agent.<方法>` / `页面调用失败 Nms：… · <桌面端消息>`（**本轮新增**）→ 页面自己发给桌面端的请求与耗时。**「点进任务半天不出内容」的答案在这里**：请求有没有发出去、多久才回、回的是不是错误。
+4. `页面 RPC 10s：N 个（慢 M，失败 K）· <方法> 次数 …`（**本轮新增**）→ 每 10 秒一条的窗口汇总，用来区分「页面根本没发请求」和「发了但桌面端慢」。
+5. `active subscribe start（页面已空闲 Xms）` 与 `主动订阅完成：用时 N ms`（**本轮新增的完成行**）→ 我们自己握手风暴的代价。第一轮实测：每次 relay 断线重建客户端会重开 6–8 个工作区 × 4 条 RPC，**整段约 10–11 秒**，与页面自己的请求排在同一条 relay socket 上。
+6. `页面开销 10s：收帧 N 个（解码合计 Yms）· 长任务 …` → 我们自己的主线程开销（第一轮解码合计个位数 ms、长任务 0，**可排除**）。
+7. `[web:行号] …` → 页面自己的 console（错误/警告分级，每次加载上限 200 行）。
 
-若 1 小、3 大 → 是我们的解码/订阅挤占主线程，继续降载（限制并发 bridge 数、跳过大快照）；若 1 大 → 网络或 relay/桌面侧，下一步给协议层加 RPC 往返计时。
+**第一轮已得出的结论（本轮落成代码）**：1 小（ttfb≈400ms）、6 小 → 既不是网络也不是我们的解码。真正的机制在第 5 条：**每次 relay 断线，`resetClient()` 丢弃整个协议客户端，把「页面正在流哪个工作区」这份认知一起丢掉**，于是重建后又给页面自己占着的工作区开了第二个 bridge；桌面端以 `rpc-transport-fault` 拒掉，`reopen` 循环每 60–90 秒重演（第一轮 21 次 fault、7 次断线），把 4×N 条 RPC 反复压在同一条通道上，页面自己的会话请求只能排在后面。本轮三处修掉：① 页面覆盖情况跨重连保留（`inject.js` 的 `pageCoverage` → `sharedState`）；② 一旦发现页面自己在流某工作区，立刻撤掉我们的重复 bridge；③ 断线重建记原因、重建后的握手风暴记总耗时（留数字以备复核）。
 
 ---
 
@@ -256,7 +259,7 @@ zcode-remote.apk -> CN=ZCode Remote, OU=Mobile, O=ZCode, L=Unknown, ST=Unknown, 
 ## 实现要点（改代码前先读）
 
 1. **document-start 注入是硬性前提。** `WebViewCompat.addDocumentStartJavaScript` 必须在 `loadUrl` 之前装好，晚了就漏掉页面的首个 WebSocket 连接。系统 WebView 不支持时会回退到 `onPageStarted` 并在日志里警告「可能漏首帧」。
-2. **协议层比预期深一层。** 通知要的 `sessions-index` 不在明文的 relay 载荷里，而是包在 `rpc-frame`（base64 + crc32 + 分片）里的 ChannelClient 值流；`assets/zcode-protocol.js` 实现了这一层，并有 35 项 Node 测试钉住线格式（含手算的黄金字节）。
+2. **协议层比预期深一层。** 通知要的 `sessions-index` 不在明文的 relay 载荷里，而是包在 `rpc-frame`（base64 + crc32 + 分片）里的 ChannelClient 值流；`assets/zcode-protocol.js` 实现了这一层，并有 38 项 Node 测试钉住线格式（含手算的黄金字节）。
 3. **不要调用 `webView.onPause()`。** 它会挂起 WebView 的定时器，正好掐掉页面的 relay 心跳。
 4. **返回键不销毁进程**，`moveTaskToBack(true)` 退到后台，保住连接。
 5. **`_bridges` 与 `_bridgesById` 是两个索引**：前者按工作区键（生命周期/状态），后者按 `bridgeSessionId`（入站帧路由）。混用会让所有响应被静默丢弃——这个 bug 已被 Node 测试抓到过一次。
@@ -269,6 +272,7 @@ zcode-remote.apk -> CN=ZCode Remote, OU=Mobile, O=ZCode, L=Unknown, ST=Unknown, 
 12. **网页那条 14px 滚动条与"内容居中"在安卓上不可兼得，且**当前一律不碰**——不要再往注入层加滚动条 CSS。** 事实链：页面自己的样式表里有全局的 `*{scrollbar-width:auto;scrollbar-color:var(--color-border) transparent}` + `::-webkit-scrollbar{width:14px;height:14px}`（thumb `border:3px solid transparent` + `background-clip:padding-box`，可见部分 8px 圆角胶囊）；真机量到内容盒 1222px / 屏幕 1272px（dpr 3.5），thumb 29 设备像素宽、两侧内缩 3px——与上述规则逐像素吻合，所以底部输入框左右留白 16 vs 30 CSS px、中心偏左 7px。**Chrome 官方文档**明确："给 `::-webkit-scrollbar` 设 `width`/`height`，会把它变成 classic（占位）滚动条"。**Android WebView 更近一步**：它在引擎层把 overlay 滚动条渲染整体关掉了（WebView 负责人 torne@chromium.org 在 [issue 40226034](https://issues.chromium.org/issues/40226034)："WebView makes the blink scrollbars transparent [layer_tree_settings.cc:415] … This disables *all* rendering of overlay scrollbars in WebView"；该请求至今 P3/New），因为根滚动条约定由 Android View/主题绘制；也因此 `scrollbar-width:thin` 这类标准属性在真机上不生效（pre.17 实测无变化），唯一的把手是把 legacy 轨道宽度改小/改没（pre.16 零宽时滚动条消失、pre.18 2px 时中心偏移降到 0.86px）。鸿蒙 ArkWeb 没做这个关闭，所以同一页面在那边是 overlay、内容居中。
     **当前做法（方案 A，已实现）**：注入层 `§6` 做两件事——① 一条 `::-webkit-scrollbar{width:0!important;height:0!important}` 把网页那条轨道压成 0（**唯一动到网页的地方，且只动宽度**），内容盒随即回到满宽（真机复核：卡片左右留白 59/59、中心 635.5 = 屏幕中心）；② 自绘 overlay 指示条：`document` 上装**捕获阶段**的 passive `scroll` 监听（scroll 不冒泡但捕获路径照走，`event.target` 即滚动容器，因此不依赖任何选择器），一个复用 `position:fixed` 胶囊按容器矩形定位——可见 8px、距右缘内缩 3px、圆角 9999px、最短 32px（全是网页 thumb 自己的数值），颜色在每个滚动 burst 起始时从容器上读一次网页 token `--color-border`，滚动时显示、停止 700ms 后淡出；网页刻意隐藏滚动条处（`[class*=scrollbar-hide]`、pptx 渲染面、xterm 视口）跳过。性能：空闲零成本，滚动中每帧只写一次 transform，容器矩形每 burst 只量一次。**v1 只做指示、不可拖拽，只处理纵向**。
     **顺带一条取证捷径**：这类"网页布局为何如此"不必靠真机截图猜——静态资源是公开的（不带凭证），`curl -s https://zcode.z.ai/remote/v4/assets/index-<hash>.css` 就能读到页面自己的规则；hash 随构建变化，可从旧记录里取，或先从带凭证的 `/remote/v4` 页面里找（该 URL 含凭证，别回显）。
+13. **页面自身的 RPC 要和我们的 bridge 分开看，且「页面覆盖情况」必须活过 relay 重连。** 被动观测不只读 sessions-index：它现在也记录页面自己的 promise 调用/回复（`_tracePageCall` / `_tracePageResult` → 日志里的 `页面调用慢`、`页面调用失败`、`页面 RPC 10s`），因为「点进任务不出内容」那个请求是**页面的**，壳自己的 bridge 永远看不到。两条硬约束：① 桌面端在一条 relay socket 上按序处理，我们的握手风暴会排在页面请求前面——所以**页面已覆盖的工作区绝不重复开 bridge**，而这份认知必须由 `inject.js` 的 `pageCoverage` 跨 `resetClient()` 存活（第一轮正是它在重连后丢失，导致重复 bridge 与 `rpc-transport-fault` 死循环，见「已知问题 B」）；② `_observeInboundRpc` 里 promise 回复按 `(bridgeSessionId, id)` 配对，**不要求先学到工作区**，否则页面 bridge 的回复会被静默丢掉——那样第 3/4 条日志永远为空。
 
 ---
 
@@ -361,9 +365,10 @@ zcode-remote.apk -> CN=ZCode Remote, OU=Mobile, O=ZCode, L=Unknown, ST=Unknown, 
 
 ```bash
 cd android-shell
-node --test                              # 35 项：线格式、分片重组、通道客户端、会话索引、注入层
+node --test                              # 38 项：线格式、分片重组、通道客户端、会话索引、注入层、页面 RPC 取证
 python tools/check_kotlin_structure.py   # 括号配平 / 包名与目录一致 / 合并残留（约 1 秒）
 python tools/watch_ci.py [--watch]       # 读 CI 状态与失败原因（无需 gh / 无需 token）
+python tools/doc_snapshot.py --probe     # 官方文档快照（docs/）的状态；详见脚本头部 docstring
 ```
 
 提交时**绝不用 `git add -A`**：仓库里有 `docs/`、`ColorOS_docs/`、`scratch/` 等不入库的大目录，一律 `git add <明确路径>`。
@@ -440,8 +445,8 @@ MSYS_NO_PATHCONV=1 "$ADB" devices -l                 # 确认出现设备
 android-shell/
 ├── app/src/main/
 │   ├── assets/
-│   │   ├── zcode-protocol.js      # 线协议：值编解码、rpc-frame、ChannelClient、RemoteClient
-│   │   └── inject.js              # document-start 注入：WS hook、可见性劫持、心跳、任务定位
+│   │   ├── zcode-protocol.js      # 线协议：值编解码、rpc-frame、ChannelClient、RemoteClient（含页面 RPC 取证）
+│   │   └── inject.js              # document-start 注入：WS hook、可见性劫持、心跳、任务定位、滚动条方案 A
 │   ├── java/com/zcode/remote/
 │   │   ├── MainActivity.kt        # WebView 壳、注入安装、扫码/粘贴/手输、通知跳转
 │   │   ├── SettingsActivity.kt    # 设置 + 诊断与存活读数
@@ -452,7 +457,7 @@ android-shell/
 │   │   ├── core/                  # NotifyState/TaskStore（纯逻辑，可单测）、Diagnostics、ShellLog、Prefs、RemoteUrl
 │   │   └── notify/Notifier.kt     # 三渠道 + 常驻/完成/待确认通知
 │   └── res/                       # 资源；应用图标直接复用鸿蒙工程的图层
-└── tools/                         # Node 测试（协议层、注入层、假桌面）
+└── tools/                         # Node 测试（协议层、注入层、假桌面）+ Kotlin 结构检查 / CI 读取 / 文档快照脚本
 ```
 
 ---
@@ -467,32 +472,38 @@ android-shell/
 
 ### 一句话状态
 
-`pre` @ `18968b1`。CI 全绿（JS 35 + Kotlin 37 单测）；最新构建 **`1.0.0-pre.20`** 挂在滚动预发布
-[`android-pre`](https://github.com/Bronzesakon/Zcode_harmony/releases/tag/android-pre)（固定下载链接，可直接覆盖安装）。
-**真机验证过两轮**（一加 PLC110 / ColorOS 16 / API 36 / WebView 153）：adb-bridge 闭环（装包/取日志/截图）已实测可用；
-本轮新加的悬浮滚动条**尚未在会话页复看**（见下「下一步」）。
+`pre` @ `7d87166`。CI 全绿（JS 38 + Kotlin 37 单测；本轮新增 3 项页面 RPC 取证测试，另 2 项滚动条用例随方案 A 改版被移除）；最新构建 **`1.0.0-pre.20`**
+挂在滚动预发布 [`android-pre`](https://github.com/Bronzesakon/Zcode_harmony/releases/tag/android-pre)（固定下载链接，可直接覆盖安装）。
+**真机验证已过两轮**（一加 PLC110 / ColorOS 16 / API 36 / WebView 153）：adb-bridge 闭环（装包/取日志/截图）实测可用；
+网页悬浮滚动条（方案 A）已复看**验收通过**；**本轮「会话加载慢」的修复与取证尚未装包复核**（见下「下一步」）。
 
-### 本轮做了什么（2026-09-11 下午续）
+### 本轮做了什么（2026-09-11 晚）
 
-1. **滚动条问题收口（本轮的第六条改动）**——定位到根因是网页自带的 14px classic 滚动条占掉内容盒
-   （真机 1222px / 屏幕 1272px，dpr 3.5；底部输入框左右 16 vs 30 CSS px），而 Android WebView 在引擎层
-   关闭了 overlay 滚动条渲染、标准属性 `scrollbar-width` 无效（详见「实现要点 12」）。按用户决定走**方案 A**：
-   注入层一条 `::-webkit-scrollbar{width:0}` 让回宽度 + 自绘悬浮指示条（捕获阶段 scroll 监听、复用 fixed 胶囊、
-   每 burst 只量一次矩形、空闲零成本）。**待会话页复看**。
-2. **adb 无线调试已配对**（`192.168.0.185:37687`；另一条 mDNS 传输是同一台，断开即可消除歧义）。
-3. 中途试过并**已全部撤销**的：零宽（pre.16）、`scrollbar-width:thin`（pre.17）、2px 轨道（pre.18）、
-   只读槽宽探针——撤销记录见 git 历史，结论进了「实现要点 12」。
+1. **「点进任务长时间不出内容」定位到主因并修复**（判读口径见「已知问题 B」）：第一轮日志显示网络与解码都可排除，
+   真机制是**每次 relay 断线后 `resetClient()` 连「页面正在流哪个工作区」这份认知一起丢**，重建后又给页面自己占着的
+   工作区开第二个 bridge → 桌面端以 `rpc-transport-fault` 拒掉 → `reopen` 循环每 60–90 秒重演（首轮 21 次 fault / 7 次断线），
+   4×N 条 RPC 反复压在同一条 relay socket 上，页面自己的会话请求只能排在后面。三处修掉：页面覆盖情况跨重连保留
+   （`inject.js` 的 `pageCoverage` → `sharedState`）、发现页面已接管就立刻撤掉重复 bridge、断线重建记原因且握手风暴记总耗时。
+2. **补上网页侧取证**：此前只能看到壳自己的 bridge，看不到页面的请求——被动观测现在也记录页面自己的 promise 调用/回复
+   （`页面调用慢`、`页面调用失败`、`页面 RPC 10s` 窗口汇总）。这是「点进任务不出内容」唯一能看到请求与往返耗时的地方。
+3. **修掉两处假日志**：`网页加载完成，用时 N ms` 对 SPA 的重复回调复用同一起点，报出过「736007 ms」——现在只对第 1 次
+   回调计时，并打印回调序号、路径与「控制台已捕获 M 行」（后者是判断网页 console 有没有落进文件的唯一数字）。
+   `active subscribe start` 曾在每次心跳 ack 后重复打印（首轮 125 次）而 `start()` 其实是空操作，现被 `isStarted()` 挡掉，
+   真实事件由 `主动订阅完成：用时 N ms` 代表。
+4. **仓库卫生**：`tools/doc_snapshot.py`（官方文档快照脚本）入库、`android-shell/.gitignore` 忽略其字节码、
+   根 `.gitignore` 忽略 `/.adb-bridge/`（adb 调试的截图 / pull / 取回的日志）。
 
 ### 下一步（按优先级）
 
-1. **复看悬浮滚动条**（本轮唯一未闭环项）：装 `pre.20` → 进会话页/工作区列表页 → 应看到①内容左右留白对称（居中）
-   ②滚动时右缘出现 8px 胶囊、停止约 0.7s 后淡出、颜色跟随网页主题；日志按老口径读。
-2. 详见「项目现状」表格：P0 后台存活 30 分钟 / P1 键盘上抬待验 / P1 悬浮弹窗四条 `dumpsys` / P2 慢加载判读（另一会话在做 RPC 往返计时）/ P3 流体云 / P4 上传与通知细节。
+1. **装本轮 CI 产出的包复核「会话加载慢」**（唯一未闭环项）：进任务页后读 `页面调用慢/失败`、`页面 RPC 10s`、
+   `主动订阅完成：用时 N ms`；判定标准是 **`rpc-transport-fault` 降到 0 或极少**，且 `active subscribe` 那行出现
+   「（跳过 N 个页面已覆盖）」。
+2. 详见「项目现状」表格：P0 后台存活 30 分钟 / P1 键盘上抬待验 / P1 悬浮弹窗四条 `dumpsys` / P3 流体云 / P4 上传与通知细节。
 
 ### 拦路石 / 待决策
 
 - **手机控制端单占**：鸿蒙端接入时安卓端会被踢（现象是网页显示「已被其他设备接管 / KICKED」，且该状态页没有滚动容器，
-  量不了会话页布局）。要复看安卓侧，需在桌面端**重新扫码**；鸿蒙端是用户用来对照 overlay 观感的那台，别抢。
+  量不了会话页布局）。要复核安卓侧，需在桌面端**重新扫码**。
 - **正式版 tag 命名空间**：安卓 `tags: ['v*']` 与鸿蒙版共用空间，建议改成 `android-v*`——等用户点头（见「决策落点」）。
 
 ### 本轮最常用的几条命令
@@ -504,9 +515,10 @@ ADB="C:/Program Files/UotanToolbox/Bin/platform-tools/adb.exe"
 curl -sL -o zcode-remote.apk https://github.com/Bronzesakon/Zcode_harmony/releases/download/android-pre/zcode-remote.apk
 MSYS_NO_PATHCONV=1 "$ADB" install -r zcode-remote.apk
 MSYS_NO_PATHCONV=1 "$ADB" shell cat /sdcard/Android/data/com.zcode.remote/files/logs/zcode-shell.log   # 取诊断日志
+MSYS_NO_PATHCONV=1 "$ADB" shell cat /sdcard/Android/data/com.zcode.remote/files/logs/zcode-shell.log | grep -c rpc-transport-fault   # 复核：重复 bridge 循环是否已消失（应≈0）
 ```
 
 
 > 全量命令、配对步骤与两个本机坑（`MSYS_NO_PATHCONV`、双 adb server 冲突）都在「本机开发 → 真机调试（adb）」。
 
-**更新记录**：2026-09-11 建立本区（首次内容即当轮交接）。
+**更新记录**：2026-09-11 建立本区；同日第二轮改写（滚动条方案 A 验收 + 「会话加载慢」主因修复与取证补齐）。
