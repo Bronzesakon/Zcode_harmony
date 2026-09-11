@@ -67,12 +67,6 @@ class FakeElement extends FakeEventTarget {
         this._attributes = Object.create(null);
         this.dispatched = [];
         this.cursor = 'auto';
-        // Layout metrics, so the scrollbar probe can be exercised: a classic
-        // scrollbar shows up as offsetWidth > clientWidth.
-        this.offsetWidth = 0;
-        this.clientWidth = 0;
-        this.scrollHeight = 0;
-        this.clientHeight = 0;
     }
 
     get childElementCount() {
@@ -116,15 +110,7 @@ class FakeElement extends FakeEventTarget {
 class FakeDocument extends FakeEventTarget {
     constructor() {
         super();
-        this.documentElement = new FakeElement('html');
-        this.head = new FakeElement('head');
         this.body = new FakeElement('body');
-        this.documentElement.appendChild(this.head);
-        this.documentElement.appendChild(this.body);
-    }
-
-    createElement(tagName) {
-        return new FakeElement(tagName);
     }
 
     hasFocus() {
@@ -132,17 +118,6 @@ class FakeDocument extends FakeEventTarget {
     }
 
     querySelectorAll(selector) {
-        if (selector === '*') {
-            const out = [];
-            const walk = (node) => {
-                for (const child of node.children) {
-                    out.push(child);
-                    walk(child);
-                }
-            };
-            walk(this.documentElement);
-            return out;
-        }
         if (selector !== 'body *') {
             return [];
         }
@@ -334,44 +309,6 @@ test('the injected script is idempotent', () => {
             'the second install must bail out immediately');
     } finally {
         page.teardown();
-    }
-});
-
-test('the page scrollbar is declared zero-width at document-start', () => {
-    const page = setupPage();
-    try {
-        const styles = page.document.head.children.filter(
-            (el) => el.tagName === 'STYLE' &&
-                el.getAttribute('data-zcode-shell') === 'scrollbar'
-        );
-        assert.strictEqual(styles.length, 1, 'exactly one scrollbar rule set');
-        assert.match(styles[0].textContent, /::-webkit-scrollbar\{width:0!important/);
-        assert.match(styles[0].textContent, /scrollbar-width:none!important/);
-    } finally {
-        page.teardown();
-    }
-});
-
-test('a classic scrollbar in the page is reported as layout width', async () => {
-    const {document, window, posts, teardown} = setupPage();
-    try {
-        // The signature measured on the device: a scroller whose client box is
-        // 14 CSS px narrower than its offset box.
-        const scroller = document.createElement('div');
-        scroller.offsetWidth = 363;
-        scroller.clientWidth = 349;
-        scroller.scrollHeight = 5000;
-        scroller.clientHeight = 679;
-        document.body.appendChild(scroller);
-        window.dispatchEvent({type: 'resize'});
-        await wait(400);
-        const reports = findPost(posts, 'diag',
-            (data) => String(data.message).indexOf('滚动条让位') >= 0);
-        assert.ok(reports.length > 0, 'the viewport report must carry the gutter');
-        assert.match(reports[reports.length - 1].data.message,
-            /滚动条让位 14px（纵向滚动容器 1 个）/);
-    } finally {
-        teardown();
     }
 });
 

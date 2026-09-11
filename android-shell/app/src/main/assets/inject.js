@@ -9,9 +9,6 @@
  *   4. Keep the page convinced it is visible, so it does not pause itself when
  *      the app goes to the background.
  *   5. Expose __zcodeShellLocateTask() for notification taps.
- *   6. Adapt the desktop layout to the phone: the page's classic scrollbar
- *      takes layout width, which pushes everything centred inside the page
- *      left of the screen's centre.
  *
  * Installed via WebViewCompat.addDocumentStartJavaScript, i.e. BEFORE any page
  * script runs. That timing is mandatory: the page opens its WebSocket during
@@ -447,6 +444,16 @@
     var startScheduled = false;
     var startAttempts = 0;
 
+    /**
+     * What the page already streams is a fact about the PAGE, not about one
+     * client instance. `resetClient()` runs on every relay disconnect, so this
+     * object has to outlive it: without it the rebuilt client re-opens an active
+     * bridge for the very workspace the page is showing, the desktop rejects the
+     * duplicate with rpc-transport-fault, and the reopen loop keeps hammering the
+     * channel the user's own conversation request is queued on.
+     */
+    var pageCoverage = {passive: {}, outboundListenIds: {}, bridgeWorkspace: {}};
+
     function createClient() {
         var cfg = config();
         var next = new P.RemoteClient({
@@ -454,7 +461,8 @@
             log: function (message) {
                 diag('debug', message);
             },
-            subscribeAll: cfg.subscribeAll !== false
+            subscribeAll: cfg.subscribeAll !== false,
+            sharedState: pageCoverage
         });
         next.onSessions = function (update) {
             post('sessions', update);
@@ -488,6 +496,7 @@
                 // ignore
             }
             client = null;
+            diag('warn', 'relay 断开，重建协议客户端（页面覆盖情况保留）');
         }
         startScheduled = false;
     }
@@ -515,6 +524,13 @@
 
     function maybeStartActive() {
         if (!relayPaired || startScheduled || !client) {
+            return;
+        }
+        if (client.isStarted && client.isStarted()) {
+            // The desktop answers every heartbeat with a pair ack, and each ack
+            // re-enters here. start() is a no-op after the first call, so logging
+            // again would claim a restart that never happened — 125 of those
+            // buried the real (re)subscribe lines in the first field log.
             return;
         }
         startScheduled = true;
@@ -689,6 +705,16 @@
         setInterval(function () {
             reportLiveness();
             reportPerf();
+            if (client && client.reportPageRpcWindow) {
+                try {
+                    // What the page itself asked the desktop for, and how long the
+                    // answer took. This is the only visibility into "opening a task
+                    // hangs": those requests are the page's, not ours.
+                    client.reportPageRpcWindow();
+                } catch (e) {
+                    // instrumentation must never break the page
+                }
+            }
             if (!relayPaired || !deviceSid) {
                 return;
             }
@@ -868,37 +894,6 @@
      * displayed at, which shows up as content sitting off-centre relative to
      * the scrollbar.
      */
-    /**
-     * Widest classic scrollbar in the page, in CSS px.
-     *
-     * offsetWidth minus clientWidth is the border plus the scrollbar; the page's
-     * scrollers have no border, so for them the difference *is* the scrollbar.
-     * Reported next to the viewport so the gutter fix can be settled by a number
-     * in the log rather than by a screenshot.
-     */
-    function scrollbarGutter() {
-        try {
-            var all = document.querySelectorAll('*');
-            var widest = 0;
-            var scrollers = 0;
-            var limit = Math.min(all.length, 4000);
-            for (var i = 0; i < limit; i++) {
-                var el = all[i];
-                if (el.scrollHeight - el.clientHeight < 8) {
-                    continue;
-                }
-                scrollers++;
-                var take = el.offsetWidth - el.clientWidth;
-                if (take > widest) {
-                    widest = take;
-                }
-            }
-            return {widest: widest, scrollers: scrollers};
-        } catch (e) {
-            return null;
-        }
-    }
-
     function reportViewport() {
         // Wrapped because it runs from a timer: by the time it fires the
         // document may be going away, and an exception here would escape into
@@ -906,7 +901,6 @@
         try {
             var doc = document.documentElement || {};
             var vv = window.visualViewport;
-            var gutter = scrollbarGutter();
             post('diag', {
                 level: 'info',
                 message: '视口 innerWidth=' + window.innerWidth +
@@ -914,11 +908,7 @@
                     ' clientWidth=' + (doc.clientWidth || 0) +
                     ' scrollWidth=' + (doc.scrollWidth || 0) +
                     ' dpr=' + (window.devicePixelRatio || 0) +
-                    ' scale=' + (vv ? Math.round(vv.scale * 100) / 100 : 'n/a') +
-                    (gutter
-                        ? ' · 滚动条让位 ' + gutter.widest + 'px（纵向滚动容器 ' +
-                            gutter.scrollers + ' 个）'
-                        : '')
+                    ' scale=' + (vv ? Math.round(vv.scale * 100) / 100 : 'n/a')
             });
         } catch (e) {
             // page torn down; nothing to report
@@ -949,67 +939,62 @@
     };
 
     // -----------------------------------------------------------------------
-    // 6. desktop scrollbar -> zero width
+    // 6. the page's desktop scrollbar must not take layout width
     //
-    // The page ships a desktop scrollbar globally, in its own stylesheet:
+    // The page declares a desktop scrollbar globally, in its own stylesheet:
     //
     //     *{scrollbar-width:auto;scrollbar-color:var(--color-border) transparent}
     //     ::-webkit-scrollbar{width:14px;height:14px}
-    //     ::-webkit-scrollbar-thumb{background:var(--color-border);
-    //         background-clip:padding-box;border:3px solid #0000;border-radius:9999px}
     //
-    // Styling ::-webkit-scrollbar is what makes Blink use a classic scrollbar
-    // instead of its zero-width overlay one, so every scroller in the page gives
-    // 14px of its client box to the bar. On a phone that reads as a layout bug
-    // rather than a browser affordance: the scroller's client box is narrower
-    // than the viewport, so everything centred inside it — the conversation and
-    // the composer with it — sits left of the screen's centre behind an empty
-    // strip down the right edge. Measured on the device: content box 1222px wide
-    // out of a 1272px screen = a 14.3 CSS px gutter at devicePixelRatio 3.5, and
-    // a thumb 8.3px wide inset 3.1px — the numbers above, to the pixel.
+    // Styling ::-webkit-scrollbar is what makes Blink lay the bar out as a
+    // classic one, so every scroller hands 14px of its client box to it.
+    // Measured on the device: content box 1222px of a 1272px screen at dpr 3.5,
+    // i.e. the conversation — composer included — sits 7 CSS px left of centre
+    // behind an empty strip. ArkWeb does not lay that styling out, which is why
+    // the same page is centred in the HarmonyOS shell and shows its bar as an
+    // overlay while scrolling; this brings Android to the same behaviour.
     //
-    // The page already does exactly this for the scrollers it cares about
-    // (`.scrollbar-hide`, `[data-zcode-pptx-render-surface] *`), so this is the
-    // page's own idiom applied to the whole document. `scrollbar-width` is the
-    // standard property and wins over the legacy pseudo-element wherever the
-    // engine knows it; the `::-webkit-scrollbar` rule is what covers engines
-    // that predate it. Hiding the bar gives the content its 14px back — 4% of a
-    // 363px viewport — at the cost of the position indicator; the platform's own
-    // scrollbars are invisible except while scrolling anyway.
+    // Specifying the standard `scrollbar-width` with a value other than `auto`
+    // is what makes Chromium ignore the legacy ::-webkit-scrollbar declarations,
+    // so the bar becomes the platform's: overlay (zero layout width) and tinted
+    // by the page's own `scrollbar-color` — the page keeps its look, it just
+    // stops reserving width. No !important, and no properties other than the
+    // one: appended after the page's sheet, an ordinary universal rule beats the
+    // page's `*{scrollbar-width:auto}` while still losing to its
+    // higher-specificity `.scrollbar-hide` / `[data-zcode-pptx-render-surface] *`
+    // rules, so the scrollers the page deliberately keeps bar-less stay that
+    // way. Nothing here reads the DOM at runtime; it is one stylesheet, once.
     // -----------------------------------------------------------------------
-    var SCROLLBAR_CSS =
-        '::-webkit-scrollbar{width:0!important;height:0!important}' +
-        '*{scrollbar-width:none!important}';
+    var SCROLLBAR_CSS = '*{scrollbar-width:thin}';
+    var scrollbarStyleEl = null;
 
-    function installScrollbarFix() {
+    function installScrollbarWidth() {
         try {
             var parent = document.head || document.documentElement;
             if (!parent) {
-                // document-start can land before <html> exists. Retry at the
-                // parser's first opportunity rather than let the gutter flash
-                // for a whole page load.
-                document.addEventListener('DOMContentLoaded', installScrollbarFix);
-                return false;
+                // document-start can land before <html> exists; boot's
+                // DOMContentLoaded listener runs this again.
+                return;
             }
-            var style = document.createElement('style');
-            style.setAttribute('data-zcode-shell', 'scrollbar');
-            style.textContent = SCROLLBAR_CSS;
-            parent.appendChild(style);
-            return true;
+            if (!scrollbarStyleEl) {
+                scrollbarStyleEl = document.createElement('style');
+                scrollbarStyleEl.setAttribute('data-zcode-shell', 'scrollbar-width');
+                scrollbarStyleEl.textContent = SCROLLBAR_CSS;
+            }
+            // appendChild on an already-attached node MOVES it, so running this
+            // again on DOMContentLoaded puts the rule after the page's own
+            // stylesheet, which is what the cascade above relies on.
+            parent.appendChild(scrollbarStyleEl);
         } catch (e) {
-            diag('warn', '滚动条修正注入失败: ' + e);
-            return false;
+            diag('warn', '滚动条宽度修正失败: ' + e);
         }
     }
 
     // -----------------------------------------------------------------------
     // boot
     // -----------------------------------------------------------------------
-    try {
-        installScrollbarFix();
-    } catch (e) {
-        diag('error', '滚动条修正失败: ' + e);
-    }
+    installScrollbarWidth();
+    document.addEventListener('DOMContentLoaded', installScrollbarWidth);
     try {
         installVisibilityHijack();
     } catch (e) {
