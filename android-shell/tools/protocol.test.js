@@ -640,6 +640,95 @@ test('a workspace that keeps faulting is dropped instead of reopened forever', a
     assert.ok(!logs.some((m) => m.indexOf('reopening') === 0), 'and it did not reopen');
 });
 
+test('a workspace the desktop refuses on every connection goes on cooldown', async () => {
+    const logs = [];
+    // The real shape: a relay rebuild replaces the client but keeps the state
+    // object, so the fault history has to live there. Otherwise every rebuild
+    // hands the refused workspace a clean slate and the loop never ends — the
+    // field log showed exactly that on `default`, faulting every ~45 s.
+    const shared = {};
+    const refuse = (client) => {
+        const ours = client._bridges['/repo/refused'];
+        assert.ok(ours, 'the bridge is open before the desktop refuses it');
+        client.acceptPayload({
+            zcode_type: 'bridge-degraded',
+            bridgeSessionId: ours.bridgeSessionId,
+            reason: 'rpc-transport-fault'
+        });
+    };
+    for (let i = 0; i < 3; i += 1) {
+        const made = makeClient({
+            log: (message) => logs.push(message),
+            maxReopensPerBridge: 0,
+            sharedState: shared
+        });
+        made.desktop.workspaces = [{workspacePath: '/repo/refused'}];
+        await made.client.start();
+        refuse(made.client);
+    }
+    assert.ok(
+        logs.some((m) => m.includes('冷却 /repo/refused')),
+        'three consecutive connections must back the workspace off'
+    );
+
+    // The next connection skips it, but still covers everything else.
+    const fourth = makeClient({log: (m) => logs.push(m), sharedState: shared});
+    fourth.desktop.workspaces = [
+        {workspacePath: '/repo/refused'},
+        {workspacePath: '/repo/healthy', workspaceIdentity: 'ws-ok'}
+    ];
+    await fourth.client.start();
+    assert.deepStrictEqual(
+        fourth.desktop.subscriptions.map((s) => s.scope.workspaceIdentity),
+        ['ws-ok'],
+        'the cooled workspace is skipped, healthy coverage is untouched'
+    );
+});
+
+test('a cooled-down workspace is retried once the cooldown expires', async () => {
+    // A back-off, not a permanent drop: a desktop that was unreachable for a
+    // while must not cost notification coverage forever.
+    const shared = {cooldownUntil: {'/repo/refused': Date.now() - 1}};
+    const {client, desktop} = makeClient({sharedState: shared});
+    desktop.workspaces = [{workspacePath: '/repo/refused'}];
+    await client.start();
+    assert.strictEqual(desktop.subscriptions.length, 1, 'an expired cooldown means try again');
+    assert.ok(client.sharedState().cooldownUntil, 'and the map keeps travelling with the state');
+});
+
+test('page-held evidence survives a relay rebuild (attached, not read)', async () => {
+    // Regression for a silent one: the constructor read the page-owned maps with
+    // `shared.pageOwned || {}`, so a caller object that did not carry the key yet
+    // left the client with a PRIVATE map — the knowledge died with the client in
+    // the real app, while the explicit sharedState() juggling in the tests hid it.
+    const shared = {};
+    const first = makeClient({sharedState: shared});
+    first.desktop.workspaces = [{workspacePath: '/repo/page', workspaceIdentity: 'ws-page'}];
+    await first.client.start();
+    const ours = first.client._bridges['ws-page'];
+
+    first.client.acceptObservedPayload({
+        zcode_type: 'workspace-bridge-ready',
+        bridgeSessionId: 'page-bridge-1',
+        bridge: {bridgeSessionId: 'page-bridge-1', workspaceKey: 'ws-page'}
+    }, false);
+    first.client.acceptPayload({
+        zcode_type: 'bridge-degraded',
+        bridgeSessionId: ours.bridgeSessionId,
+        reason: 'rpc-transport-fault'
+    });
+    assert.strictEqual(first.client._pageOwned['ws-page'], true, 'marked page-owned');
+
+    const second = makeClient({sharedState: shared});
+    second.desktop.workspaces = [{workspacePath: '/repo/page', workspaceIdentity: 'ws-page'}];
+    await second.client.start();
+    assert.strictEqual(
+        second.desktop.subscriptions.length,
+        0,
+        'the rebuilt client must still know the page owns it'
+    );
+});
+
 test('in-flight page RPCs are visible, so the burst can wait for them', () => {
     const {client} = makeClient();
     const bridge = 'page-bridge-9';

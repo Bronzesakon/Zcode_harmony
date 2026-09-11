@@ -84,6 +84,18 @@
     // relay connection before we stop trying (see _handleDegraded).
     var MAX_REOPENS_PER_BRIDGE = 2;
 
+    // A workspace that faults once is a transient transport problem and deserves
+    // a retry. One that faults again on the NEXT connection is the desktop
+    // refusing it, and re-opening it there is what closed the loop: a relay
+    // rebuild wiped the per-connection budget, the burst re-opened the bridge,
+    // and the fault came back on the same cadence (field log: `default` faulted
+    // every ~45 s, forever). After this many distinct connections have faulted on
+    // one key it goes on cooldown. Deliberately reversible — the cooldown expires
+    // and the key is tried again — so a desktop that was merely unreachable for a
+    // while can never cost notification coverage permanently.
+    var FAULT_COOLDOWN_CONNECTIONS = 3;
+    var FAULT_COOLDOWN_MS = 10 * 60 * 1000;
+
     // Total time the subscription burst may spend waiting for the page to be
     // idle, spread across its workspaces. The gate in inject.js keeps the burst
     // from STARTING while the page is busy; this keeps it from ploughing on when
@@ -1000,6 +1012,22 @@
         // workspace the page was already showing, and the desktop answered with
         // bridge-degraded/rpc-transport-fault in a loop.
         this._shared = options.sharedState || null;
+        // Attach, don't just read. `x = shared.x || {}` silently hands the client
+        // a private map when the caller's object happens not to carry that key
+        // yet — which is exactly what happened to pageBridges/pageOwned: the
+        // comment above promised they outlived the client, the code did not
+        // deliver it in the real app (the tests passed only because they built
+        // the state object explicitly). Mutating the shared object here is what
+        // makes the promise true.
+        var sharedMaps = ['passive', 'outboundListenIds', 'bridgeWorkspace',
+            'pageBridges', 'pageOwned', 'faultStreak', 'cooldownUntil'];
+        if (this._shared) {
+            for (var mi = 0; mi < sharedMaps.length; mi += 1) {
+                if (!this._shared[sharedMaps[mi]]) {
+                    this._shared[sharedMaps[mi]] = {};
+                }
+            }
+        }
         this._passive = (this._shared && this._shared.passive) || {};
         this._outboundListenIds = (this._shared && this._shared.outboundListenIds) || {};
         this._bridgeWorkspace = (this._shared && this._shared.bridgeWorkspace) || {};
@@ -1012,6 +1040,14 @@
         // desktop refused our duplicate. Only ever set on that evidence, so a
         // transient fault can never silently cost us notification coverage.
         this._pageOwned = (this._shared && this._shared.pageOwned) || {};
+        // Fault history outlives the client too, and for the opposite reason to
+        // `_faultCounts` below: rebuilding the relay connection must NOT hand a
+        // repeatedly-refused workspace a clean slate, or the loop never ends.
+        this._faultStreak = (this._shared && this._shared.faultStreak) || {};
+        this._cooldownUntil = (this._shared && this._shared.cooldownUntil) || {};
+        // Faults already counted for this relay connection: one connection earns
+        // one strike however many times it reopens the same key within it.
+        this._faultedInConnection = {};
         // bridgeSessionIds WE asked for, so a `workspace-bridge-ready` can be
         // attributed to the shell or to the page. Needed because ownership is
         // decided from that reply, and our own reply arrives before the bridge
@@ -1062,7 +1098,9 @@
             outboundListenIds: this._outboundListenIds,
             bridgeWorkspace: this._bridgeWorkspace,
             pageBridges: this._pageBridges,
-            pageOwned: this._pageOwned
+            pageOwned: this._pageOwned,
+            faultStreak: this._faultStreak,
+            cooldownUntil: this._cooldownUntil
         };
     };
 
@@ -1219,15 +1257,55 @@
         }
     };
 
+    /** True while a workspace the desktop keeps refusing is being backed off. */
+    RemoteClient.prototype._inCooldown = function (key) {
+        var until = this._cooldownUntil[key];
+        return typeof until === 'number' && until > Date.now();
+    };
+
+    /**
+     * One strike per relay connection for a workspace the desktop degraded, and
+     * the cooldown once strikes run out.
+     *
+     * `_faultCounts` only bounds the churn inside one connection; a relay rebuild
+     * used to reset it, so a workspace the desktop refuses on every connection was
+     * retried on every connection. Striking across connections is what turns that
+     * into a back-off. The count is cleared when the cooldown is applied, so the
+     * attempt after it starts from zero rather than cooling down on its first
+     * fault.
+     *
+     * Returns true when the caller must not reopen the key.
+     */
+    RemoteClient.prototype._noteFault = function (key) {
+        if (this._faultedInConnection[key]) {
+            return this._inCooldown(key);
+        }
+        this._faultedInConnection[key] = true;
+        var streak = (this._faultStreak[key] || 0) + 1;
+        if (streak < FAULT_COOLDOWN_CONNECTIONS) {
+            this._faultStreak[key] = streak;
+            return false;
+        }
+        delete this._faultStreak[key];
+        this._cooldownUntil[key] = Date.now() + FAULT_COOLDOWN_MS;
+        this._log('冷却 ' + key + '：连续 ' + streak + ' 条 relay 连接都被桌面端 fault，' +
+            Math.round(FAULT_COOLDOWN_MS / 60000) + ' 分钟内不再为它开 bridge（到期自动重试）');
+        return true;
+    };
+
     RemoteClient.prototype._handleDegraded = function (payload) {
         var bridgeSessionId = payload.bridgeSessionId;
         var reason = payload.reason || 'unknown';
+        // The desktop sometimes explains the fault in the same payload; without
+        // it a repeated fault on one workspace is indistinguishable from any other.
+        var detail = payload.message || payload.error || payload.detail;
         for (var key in this._bridges) {
             var bridge = this._bridges[key];
             if (bridge.bridgeSessionId !== bridgeSessionId) {
                 continue;
             }
-            this._log('bridge degraded for ' + key + ': ' + reason);
+            this._log('bridge degraded for ' + key + ': ' + reason +
+                (detail ? ' · ' + detail : ''));
             // Two pieces of evidence together mean "we cannot have this one":
             // the page opened its own bridge for the workspace, AND the desktop
             // is refusing ours. Only then do we give up on it for good — a bare
@@ -1236,6 +1314,11 @@
             if (this._pageBridges[key] && !this._pageOwned[key]) {
                 this._pageOwned[key] = true;
                 this._log('放弃 ' + key + '：页面自己持有该工作区，桌面端拒绝我们的重复 bridge（通知改由页面侧覆盖）');
+                this._forgetBridge(key);
+                this._emitStatus('degraded ' + key);
+                return;
+            }
+            if (this._noteFault(key)) {
                 this._forgetBridge(key);
                 this._emitStatus('degraded ' + key);
                 return;
@@ -1537,7 +1620,8 @@
         var delay = Math.min(30000, 2000 * Math.pow(2, attempt - 1));
         this._log('reopening ' + key + ' in ' + delay + 'ms (attempt ' + attempt + ')');
         setTimeout(function () {
-            if (!self.subscribeAll || self._passive[key] || self._pageOwned[key]) {
+            if (!self.subscribeAll || self._passive[key] || self._pageOwned[key] ||
+                self._inCooldown(key)) {
                 return;
             }
             self.openBridge(workspace, ++self._bridgeGeneration, bridge.recoveryId)
@@ -1573,10 +1657,18 @@
         return this.listWorkspaces().then(function (list) {
             var targets = [];
             var skipped = 0;
+            var cooled = 0;
             for (var i = 0; i < list.length; i++) {
                 var workspace = list[i];
                 var key = workspaceKeyOf(workspace);
                 if (!key || targets.length >= self._maxWorkspaces) {
+                    continue;
+                }
+                if (self._inCooldown(key)) {
+                    // This desktop refused the workspace on several consecutive
+                    // relay connections. Re-opening it here is the churn the
+                    // user sees as "正在尝试重连"; wait the cooldown out.
+                    cooled += 1;
                     continue;
                 }
                 if (self._passive[key] || self._pageOwned[key] || self._activeKeys[key]) {
@@ -1590,7 +1682,8 @@
                 targets.push(workspace);
             }
             self._log('active subscribe: ' + targets.length + ' workspace(s) of ' + list.length +
-                (skipped ? '（跳过 ' + skipped + ' 个页面已覆盖）' : ''));
+                (skipped ? '（跳过 ' + skipped + ' 个页面已覆盖）' : '') +
+                (cooled ? '（冷却中 ' + cooled + ' 个）' : ''));
             // Sequential with a small gap: opening a dozen RPC bridges at once
             // hammers the desktop and makes failures hard to attribute. Between
             // workspaces the burst yields while the page has a request in

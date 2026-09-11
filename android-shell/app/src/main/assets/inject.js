@@ -473,7 +473,16 @@
      * duplicate with rpc-transport-fault, and the reopen loop keeps hammering the
      * channel the user's own conversation request is queued on.
      */
-    var pageCoverage = {passive: {}, outboundListenIds: {}, bridgeWorkspace: {}};
+    var pageCoverage = {
+        passive: {},
+        outboundListenIds: {},
+        bridgeWorkspace: {},
+        // Fault history, also per-PAGE rather than per-client: a relay rebuild
+        // must not reset the strike count on a workspace the desktop refuses
+        // every time (that reset was the loop; see zcode-protocol.js).
+        faultStreak: {},
+        cooldownUntil: {}
+    };
 
     function createClient() {
         var cfg = config();
