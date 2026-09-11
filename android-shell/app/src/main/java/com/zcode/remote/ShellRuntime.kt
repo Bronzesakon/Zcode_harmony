@@ -90,6 +90,7 @@ object ShellRuntime {
     private var backgroundFrameBase = 0
     private var backgroundAckBase = 0
     private var backgroundTickBase = 0
+    private var backgroundNativeTickBase = 0
 
     /** Set on return to foreground; the next liveness report resolves it. */
     @Volatile
@@ -126,11 +127,16 @@ object ShellRuntime {
             val frames = current.inboundFrames - backgroundFrameBase
             val acks = current.pairAcks - backgroundAckBase
             val ticks = current.heartbeatTicks - backgroundTickBase
+            val pumpedTicks = current.nativeTicks - backgroundNativeTickBase
             // The decisive question is NOT "did frames arrive" — they can arrive
             // without a single timer running — but "did a heartbeat tick run at
             // all". Measured on device: the WebView suspends the page's timer
             // queue while the app is backgrounded, so before the native pump this
             // number was always zero even on a link that was still delivering.
+            // `pumpedTicks` is the stricter number: it counts ticks the page
+            // actually executed in response to a dispatch from here, which is what
+            // separates "the pump works" from "the dispatches queued up and ran in
+            // a burst when the app came back".
             val verdict = when {
                 ticks > 0 -> "保活成立（后台心跳在跑）"
                 frames > 0 -> "心跳未跑（后台定时器仍被挂起），链接可能已断"
@@ -138,9 +144,9 @@ object ShellRuntime {
             }
             val duration = formatDuration(backgroundEndedAt - backgroundStartedForVerdict)
             Diagnostics.info(
-                "后台存活检查：时长 $duration，期间心跳 $ticks 次" +
-                    "（原生泵 $pumpDispatchesForVerdict 次）、收到 $frames 帧、" +
-                    "配对确认 $acks 次 → $verdict"
+                "后台存活检查：时长 $duration，期间注入层心跳 $ticks 次" +
+                    "（其中原生泵驱动 $pumpedTicks 次、原生共发令 $pumpDispatchesForVerdict 次）、" +
+                    "收到 $frames 帧、配对确认 $acks 次 → $verdict"
             )
         }
     }
@@ -181,6 +187,7 @@ object ShellRuntime {
             backgroundFrameBase = snapshot?.inboundFrames ?: 0
             backgroundAckBase = snapshot?.pairAcks ?: 0
             backgroundTickBase = snapshot?.heartbeatTicks ?: 0
+            backgroundNativeTickBase = snapshot?.nativeTicks ?: 0
         }
     }
 
@@ -211,6 +218,23 @@ object ShellRuntime {
     private var pumpDispatches = 0
     private var pumpDispatchesForVerdict = 0
 
+    /**
+     * The pump runs on an ASYNCHRONOUS main-thread handler, which is the whole
+     * point: while the window is invisible the Choreographer's sync barrier is
+     * never removed (no vsync is delivered to a window that is not visible), and
+     * a synchronous message — which is what `postDelayed` on an ordinary Handler
+     * produces — is not delivered while a barrier is pending. Measured on device:
+     * a dispatch due at +15s was delivered 3m26s late, at the instant the app came
+     * back to the foreground, so the pump never actually ran while backgrounded.
+     * Asynchronous messages bypass the barrier.
+     */
+    private val pumpHandler: Handler =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            Handler.createAsync(Looper.getMainLooper())
+        } else {
+            Handler(Looper.getMainLooper())
+        }
+
     private val pumpRunnable = object : Runnable {
         override fun run() {
             if (!appIsForeground) {
@@ -224,15 +248,15 @@ object ShellRuntime {
                         )
                     }
                 }
-                mainHandler.postDelayed(this, PUMP_INTERVAL_MS)
+                pumpHandler.postDelayed(this, PUMP_INTERVAL_MS)
             }
         }
     }
 
     private fun startHeartbeatPump() {
-        mainHandler.removeCallbacks(pumpRunnable)
+        pumpHandler.removeCallbacks(pumpRunnable)
         pumpDispatches = 0
-        mainHandler.postDelayed(pumpRunnable, PUMP_INTERVAL_MS)
+        pumpHandler.postDelayed(pumpRunnable, PUMP_INTERVAL_MS)
         Diagnostics.log(
             "debug",
             "后台心跳泵已启动（每 ${PUMP_INTERVAL_MS / 1000}s 驱动一次注入层心跳）",
@@ -240,7 +264,7 @@ object ShellRuntime {
     }
 
     private fun stopHeartbeatPump() {
-        mainHandler.removeCallbacks(pumpRunnable)
+        pumpHandler.removeCallbacks(pumpRunnable)
         if (pumpDispatches > 0) {
             Diagnostics.log("debug", "后台心跳泵已停止，本次共发出 $pumpDispatches 次")
         }
