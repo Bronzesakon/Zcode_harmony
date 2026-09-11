@@ -35,7 +35,25 @@ object ShellRuntime {
     private lateinit var prefs: Prefs
     private lateinit var notifier: Notifier
 
-    private val mainHandler = Handler(Looper.getMainLooper())
+    /**
+     * Main-thread handler for everything this class schedules.
+     *
+     * Asynchronous on API 28+, and that is load-bearing rather than a detail.
+     * An ordinary message posted to the main looper is NOT delivered while the
+     * window is invisible: the Choreographer's sync barrier starves it. Measured
+     * on the field device — the background heartbeat pump logged 39 dispatches
+     * across a 10-minute screen-off window and `__zcodeShellHeartbeat()` ran
+     * ZERO times, while a dispatch due at +15s was once delivered 3m26s late, at
+     * the instant the app came back to the foreground. Fixing the pump's own
+     * handler was not enough: the pump handed the JS evaluation to this handler,
+     * so it starved one hop later. Both hops are asynchronous now.
+     */
+    private val mainHandler: Handler =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            Handler.createAsync(Looper.getMainLooper())
+        } else {
+            Handler(Looper.getMainLooper())
+        }
 
     val store = TaskStore()
 
@@ -188,20 +206,19 @@ object ShellRuntime {
     // ------------------------------------------------------------ heartbeat pump
     //
     // The injected layer's own interval cannot be relied on while the app is
-    // backgrounded: on this device the page's timer queue stops for the whole
-    // stint (measured: zero ticks across 10-minute windows), the desktop stops
-    // hearing from us, and the page then declares the link dead the moment the
-    // renderer wakes up — which is the reconnect seen on return. Driving the
-    // same tick from here keeps the pairing warm instead, and the desktop's acks
-    // also keep the page's own watchdog quiet.
+    // backgrounded: the renderer throttles a hidden page's timers, so the tick
+    // stops, the desktop stops hearing from us, and the page's own ack watchdog
+    // (30s, re-armed by every pair_status_ack) declares the link dead and
+    // reconnects. Driving the same tick from here keeps the pairing warm, and
+    // because that watchdog re-arms on ANY pair_status_ack, our probe is also
+    // what stops the page from tearing its socket down every ~95s.
     //
     // Two properties are load-bearing and easy to undo by simplifying:
     //
-    //  * The handler is asynchronous (API 28+). Ordinary messages posted to the
-    //    main looper are NOT delivered while the window is invisible — measured:
-    //    a dispatch due at +15s arrived 3m26s late, at the instant the app came
-    //    back to the foreground. Asynchronous messages are not blocked by the
-    //    Choreographer's sync barrier, which is what starves them.
+    //  * Both hops are asynchronous (see `mainHandler`): the pump's own timer AND
+    //    the JS evaluation it triggers. A sync post on either hop is starved by
+    //    the Choreographer's sync barrier while the window is invisible —
+    //    measured: 39 dispatch logs, zero executions.
     //  * None of this helps if the platform gives the process no execution at
     //    all: with ColorOS's default battery policy the app is frozen/killed
     //    while backgrounded (o-kill/o-stop at importance=FOREGROUND_SERVICE, and
@@ -220,14 +237,6 @@ object ShellRuntime {
     private var pumpDispatches = 0
     private var pumpDispatchesForVerdict = 0
 
-    /** See the class comment above: asynchronous is the point, not a detail. */
-    private val pumpHandler: Handler =
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            Handler.createAsync(Looper.getMainLooper())
-        } else {
-            Handler(Looper.getMainLooper())
-        }
-
     private val pumpRunnable = object : Runnable {
         override fun run() {
             if (!appIsForeground) {
@@ -238,15 +247,15 @@ object ShellRuntime {
                         Diagnostics.log("debug", "后台心跳泵 #$pumpDispatches 次发令")
                     }
                 }
-                pumpHandler.postDelayed(this, PUMP_INTERVAL_MS)
+                mainHandler.postDelayed(this, PUMP_INTERVAL_MS)
             }
         }
     }
 
     private fun startHeartbeatPump() {
-        pumpHandler.removeCallbacks(pumpRunnable)
+        mainHandler.removeCallbacks(pumpRunnable)
         pumpDispatches = 0
-        pumpHandler.postDelayed(pumpRunnable, PUMP_INTERVAL_MS)
+        mainHandler.postDelayed(pumpRunnable, PUMP_INTERVAL_MS)
         Diagnostics.log(
             "debug",
             "后台心跳泵已启动（每 ${PUMP_INTERVAL_MS / 1000}s 驱动一次注入层心跳）",
@@ -254,7 +263,7 @@ object ShellRuntime {
     }
 
     private fun stopHeartbeatPump() {
-        pumpHandler.removeCallbacks(pumpRunnable)
+        mainHandler.removeCallbacks(pumpRunnable)
         if (pumpDispatches > 0) {
             Diagnostics.log("debug", "后台心跳泵已停止，本次共发出 $pumpDispatches 次")
         }
