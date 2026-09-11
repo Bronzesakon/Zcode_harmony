@@ -26,5 +26,7 @@
 /.cache/
 /.dsh-hdc/
 /.dsh-hvigor-tmp/
+# adb-bridge（安卓真机调试）的截图 / pull / 取回的日志，仅本机
+/.adb-bridge/
 # 安卓薄壳子工程（android-shell/）**随仓库上传**，不要在根上忽略它；
 # 其自身的构建产物与签名文件由 android-shell/.gitignore 处理。
