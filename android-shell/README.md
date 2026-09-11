@@ -1,7 +1,8 @@
 # android-shell — ZCode 远程（安卓薄壳）
 
-> **接手排查先读本文件**：进度与待验证项见「项目现状」，必须随项目带走的文件清单见「交接清单」，
-> 环境与真机调试（含 adb）见「本机开发」。状态信息只留这一处，不再另设交接文档。
+> **新会话接手：先跳到文末[「交接文本区」](#交接文本区新会话从这里开始)**（每次会话收尾时就地改写，非追加）。
+> 本文件是唯一的状态与配置来源：进度与待验证项看「项目现状」与「已知问题」，
+> 迁移清单看「交接清单」，环境、adb 与取日志约定看「本机开发」，发版看「发布流程」。已不再另设交接文档。
 
 把上层鸿蒙工程「ZCode 远程」的薄壳思路搬到安卓：**WebView 加载 `zcode.z.ai/remote/v4` + 原生对接系统能力**，并补上鸿蒙版没有的**任务通知**与**后台保活**。
 
@@ -394,18 +395,41 @@ MSYS_NO_PATHCONV=1 "$ADB" connect <IP:端口>
 MSYS_NO_PATHCONV=1 "$ADB" devices -l                 # 确认出现设备
 ```
 
-配对码是**一次性凭据**：不要入库，不要写进日志、文档或提交信息。配对成功后，本机就具备完整的真机闭环（本机唯一缺的 JDK/SDK 由 CI 补上）：
+配对码是**一次性凭据**：不要入库，不要写进日志、文档或提交信息。
+
+#### 约定：真机验证与读日志的闭环（照这个顺序做）
+
+本机没有 Android SDK，所以 **adb 是唯一能连安卓真机的通道**（会话里的 `dsh-hdc-bridge` MCP 只覆盖鸿蒙设备）。每轮真机验证都走同一条闭环，别临时发明步骤：
+
+1. **取包**：CI 产出的滚动预发布固定链接（见「取 APK」），或 `adb install -r` 一个已下载的 `zcode-remote.apk`。
+2. **装包**：`adb install -r`（versionCode 取 CI 运行号、单调递增，永远能盖过上一版，无需卸载）。
+3. **复现**：操作手机。需要看页面内部时用 WebView 远程调试（debug 包或设置里的「WebView 调试」开关 → 桌面 Chrome `chrome://inspect`）。
+4. **取日志**（**约定：一律从这条固定路径读**，不要靠截图猜）：
+
+   ```bash
+   "$ADB" shell cat /sdcard/Android/data/com.zcode.remote/files/logs/zcode-shell.log
+   "$ADB" shell cat /sdcard/Android/data/com.zcode.remote/files/logs/zcode-shell.log.1  # 轮转后的上一份
+   "$ADB" logcat -d -s ZCodeRemote   # 与日志文件同源：Diagnostics 会镜像到 logcat，适合边操作边看
+   ```
+
+   - 日志文件 512 KB 轮转（`.1` 是上一份）；`Diagnostics` 另有 400 行内存环形缓冲，随「导出日志」一起给出。
+   - 手机上也能不接电脑取日志：**设置 → 诊断 → 分享/导出日志文件**（FileProvider，含历史会话与崩溃堆栈）。
+   - 清空：设置页的「清空日志」，或 `adb shell rm` 掉上面两个文件（应用下次写入会重建）。
+5. **判读**：按「项目现状」与「已知问题 A/B」里写的口径读数字（例如后台存活的结论行、慢加载的四步判读顺序、悬浮弹窗的 `dumpsys` 组合）。
+6. **落回文档**：结论写进「项目现状」表格与文末「交接文本区」（就地改写，不要追加）。
+
+补充命令（排查系统层问题时用）：
 
 ```bash
-"$ADB" install -r zcode-remote.apk        # 覆盖安装（versionCode 单调递增，永远能盖过上一版）
-"$ADB" shell am start -n com.zcode.remote/.MainActivity
-"$ADB" shell cat /sdcard/Android/data/com.zcode.remote/files/logs/zcode-shell.log   # 诊断日志（含历史会话 + 崩溃堆栈）
 "$ADB" shell dumpsys window windows | grep -i zcode    # 窗口类型（判断「悬浮显示」这类系统弹窗）
-"$ADB" shell appops get com.zcode.remote              # 权限 / AppOps 实况
-"$ADB" logcat -d -s ZCodeRemote                        # 与日志文件同源（Diagnostics 会镜像到 logcat）
+"$ADB" shell appops get com.zcode.remote               # 权限 / AppOps 实况
+"$ADB" shell dumpsys notification --noredact | grep -i -A5 zcode   # 是否有 promoted（流体云）通知在展示
+"$ADB" shell dumpsys activity activities | grep -i zcode           # 是否被系统置于浮窗/分屏
 ```
 
-**鸿蒙测试机不要弄混**（与本子项目无关）：`192.168.0.82:12345`（HBN-AL80 / API 24）、`192.168.0.79:41247`，另有若干串口。本会话挂着 `dsh-hdc-bridge` MCP（`hdc_list_targets` / `hdc_shell` / `hdc_screenshot` 等），能直接操作这些鸿蒙设备，但**它连不到安卓真机**——安卓侧一律用上面的 adb。
+两个本机专属的坑：① Git Bash 会把设备绝对路径改写成 Windows 路径（`/sdcard/...` 变成 `C:/Program Files/Git/sdcard/...`），凡带设备路径的命令都要加 **`MSYS_NO_PATHCONV=1`**；② 本机有两套 adb（雷电 34 / UotanToolbox 36），出现 `cannot connect to daemon at tcp:5037` 时先 `kill-server`，再用上面推荐的那个 adb 重新 `start-server`。
+
+**鸿蒙测试机不要弄混**（与本子项目无关）：`192.168.0.82:12345`（HBN-AL80 / API 24）、`192.168.0.79:41247`，另有若干串口；`dsh-hdc-bridge` MCP（`hdc_list_targets` / `hdc_shell` / `hdc_screenshot`）能直接操作它们，但**连不到安卓真机**。
 
 ## 目录
 
@@ -427,3 +451,53 @@ android-shell/
 │   └── res/                       # 资源；应用图标直接复用鸿蒙工程的图层
 └── tools/                         # Node 测试（协议层、注入层、假桌面）
 ```
+
+---
+
+## 交接文本区（新会话从这里开始）
+
+> **约定：本区每次会话收尾时**就地改写**，不是追加。**
+> 改写时删掉已完成的条目、把现状改成新的、只保留仍然成立的信息——追加会让下一个会话先读到已经过期的结论
+> （本项目此前就是因为这个才删掉了独立的交接文档，只留这一处）。
+> **细节不要往这里堆**：架构与实现 → 「实现要点」；待验证项与判读口径 → 「项目现状 / 已知问题 A·B」；
+> 环境、adb 与取日志的约定 → 「本机开发」；发版 → 「发布流程」。本区只留：状态、本轮做了什么、下一步、拦路石。
+
+### 一句话状态
+
+`pre` @ `2b397ef`（工作区干净）。CI 全绿（JS 35 + Kotlin 37 单测）；最新构建 **`1.0.0-pre.15`** 挂在滚动预发布
+[`android-pre`](https://github.com/Bronzesakon/Zcode_harmony/releases/tag/android-pre)（固定下载链接，可直接覆盖安装）。
+**真机只验证过一轮**（一加 PLC110 / ColorOS 16 / API 36 / WebView 153），结论尚未落定。
+
+### 本轮做了什么（2026-09-11）
+
+1. **修键盘遮挡输入框**——edge-to-edge 后 `adjustResize` 失效、键盘只以 `Type.ime()` inset 送达，根布局却只消费
+   systemBars/cutout；改为 `padForSystemBarsAndIme()`（底部取 `max(系统栏, 键盘)`）。**已过 CI，待真机确认**。
+2. **会话加载慢**——加取证（网页 console 进日志、每帧解码开销/longtask/页面导航计时、原生加载耗时）+ 一处降载
+   （主动订阅从「配对后 1.5s 无条件启动」改为「页面静默 ≥800ms 才启动，最迟 12s」）。**根因待读下一份真机日志**。
+3. **CI 改滚动发布**——固定 tag `android-pre`，覆写资产 + 移动 tag + 刷新标题/本轮变更/时间，已实测生效。
+4. **文档收口**——删除 `HANDOVER.md`，内容全部并入本 README，并新设本交接区。
+
+### 下一步（按优先级）
+
+详见「项目现状」表格（P0 后台存活 30 分钟 / P1 键盘上抬待验 / P1 悬浮弹窗取证 / P2 慢加载判读 / P3 流体云 / P4 上传与通知细节）。
+最省事的顺序：**先配对 adb** → 装 `pre.15` 验证 P1 键盘 → 同时抓 P2 日志 → 顺手跑 P1 悬浮弹窗的四条 `dumpsys`。
+
+### 拦路石 / 待决策
+
+- **adb 还没配对**（阻塞上面一切真机动作）：需要用户提供手机「无线调试 → 使用配对码配对设备」的
+  **配对 IP:端口 + 6 位配对码**（一次性凭据，用完即弃、不落盘）。
+- **正式版 tag 命名空间**：安卓 `tags: ['v*']` 与鸿蒙版共用空间，建议改成 `android-v*`——等用户点头（见「决策落点」）。
+
+### 本轮最常用的几条命令
+
+```bash
+cd android-shell
+python tools/watch_ci.py --watch        # 看 CI（无需 gh/token）
+ADB="C:/Program Files/UotanToolbox/Bin/platform-tools/adb.exe"
+"$ADB" install -r zcode-remote.apk      # 覆盖安装最新预发布包
+MSYS_NO_PATHCONV=1 "$ADB" shell cat /sdcard/Android/data/com.zcode.remote/files/logs/zcode-shell.log   # 取诊断日志
+```
+
+> 全量命令、配对步骤与两个本机坑（`MSYS_NO_PATHCONV`、双 adb server 冲突）都在「本机开发 → 真机调试（adb）」。
+
+**更新记录**：2026-09-11 建立本区（首次内容即当轮交接）。
