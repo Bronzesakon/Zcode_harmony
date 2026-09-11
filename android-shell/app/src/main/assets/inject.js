@@ -9,6 +9,9 @@
  *   4. Keep the page convinced it is visible, so it does not pause itself when
  *      the app goes to the background.
  *   5. Expose __zcodeShellLocateTask() for notification taps.
+ *   6. Stand in for the page's scrollbar: zero its space-taking rail and draw an
+ *      overlay bar, so the page's content is centred and the position indicator
+ *      survives (Android WebView will not render overlay scrollbars itself).
  *
  * Installed via WebViewCompat.addDocumentStartJavaScript, i.e. BEFORE any page
  * script runs. That timing is mandatory: the page opens its WebSocket during
@@ -939,8 +942,232 @@
     };
 
     // -----------------------------------------------------------------------
+    // 6. overlay scrollbar
+    //
+    // The page ships a classic, space-taking scrollbar in its own stylesheet
+    // (`::-webkit-scrollbar{width:14px;height:14px}` with a 3px-inset pill
+    // thumb), and Chrome turns any ::-webkit-scrollbar width into a classic
+    // bar: "when you set the width or height of ::-webkit-scrollbar, an overlay
+    // scrollbar is always displayed, effectively turning it into a classic
+    // scrollbar" (developer.chrome.com/docs/css-ui/scrollbar-styling). Measured
+    // on the device that costs the content box 14.3 CSS px — 1222px of a 1272px
+    // screen at dpr 3.5 — so the conversation, composer included, sat 7 CSS px
+    // left of centre behind an empty strip.
+    //
+    // Android WebView cannot hand that width back on its own: it switches
+    // overlay scrollbar rendering off entirely, because the root scrollbar is
+    // expected to be drawn by the Android view (chromium issue 40226034, from
+    // the WebView owners). That is also why the standard `scrollbar-width`
+    // property has no effect there, verified on the device. ArkWeb does not do
+    // that, which is why the same page is centred in the HarmonyOS shell with a
+    // bar that appears while scrolling and fades.
+    //
+    // So: zero the page's rail (the one page-side rule, and what gives the
+    // content its width back) and draw the indicator ourselves, in the page's
+    // own geometry and its own colour token, appearing on scroll and fading out
+    // after it — an overlay, exactly the thing being stood in for. Idle cost is
+    // zero: nothing is created, measured or timed until something in the page
+    // actually scrolls.
+    // -----------------------------------------------------------------------
+    var SCROLLBAR_CSS = '::-webkit-scrollbar{width:0!important;height:0!important}';
+
+    function installScrollbarWidth() {
+        try {
+            var parent = document.head || document.documentElement;
+            if (!parent) {
+                // document-start can land before <html> exists.
+                document.addEventListener('DOMContentLoaded', installScrollbarWidth);
+                return;
+            }
+            var style = document.createElement('style');
+            style.setAttribute('data-zcode-shell', 'scrollbar-width');
+            style.textContent = SCROLLBAR_CSS;
+            parent.appendChild(style);
+        } catch (e) {
+            diag('warn', '滚动条宽度置零失败: ' + e);
+        }
+    }
+
+    // The page's own thumb numbers, reused so the overlay is indistinguishable
+    // from it: a 14px rail whose thumb is inset 3px per side (border:3px solid
+    // transparent + background-clip:padding-box), rounded, and at least 32px.
+    var BAR_INSET = 3;
+    var BAR_WIDTH = 8;
+    var BAR_MIN = 32;
+    var BAR_FADE_MS = 700;
+    var BAR_COLOR_FALLBACK = 'rgba(128,128,128,0.5)';
+    var BAR_Z = 2147483647;
+
+    var barEl = null;
+    var barTarget = null;
+    var barRect = null;
+    var barFrame = 0;
+    var barHideTimer = 0;
+    var barLive = false;
+    // Scrollers the page deliberately keeps bar-less; verdicts are cached per
+    // element so the check runs at most once per scroller.
+    var barSkipped = typeof WeakSet === 'function' ? new WeakSet() : null;
+
+    function scheduleFrame(fn) {
+        if (typeof G.requestAnimationFrame === 'function') {
+            return G.requestAnimationFrame(fn);
+        }
+        return setTimeout(fn, 16);
+    }
+
+    function barElement() {
+        if (barEl) {
+            return barEl;
+        }
+        var el = document.createElement('div');
+        el.setAttribute('data-zcode-shell', 'scrollbar');
+        var s = el.style;
+        // Out of flow and never a hit target: the page's own interaction and
+        // layout must not be able to tell it is there.
+        s.position = 'fixed';
+        s.left = '0px';
+        s.top = '0px';
+        s.width = BAR_WIDTH + 'px';
+        s.borderRadius = '9999px';
+        s.opacity = '0';
+        s.pointerEvents = 'none';
+        s.zIndex = String(BAR_Z);
+        s.transition = 'opacity 160ms linear';
+        s.willChange = 'transform, opacity';
+        // The page's colour token, read from the scroller at paint time: it is
+        // defined on the page's theme wrapper, so it follows light/dark for
+        // free and nothing here has to know either value.
+        s.background = BAR_COLOR_FALLBACK;
+        (document.body || document.documentElement).appendChild(el);
+        barEl = el;
+        return el;
+    }
+
+    function barPaint(scroller) {
+        var el = barElement();
+        if (!barRect) {
+            barRect = scroller.getBoundingClientRect();
+            try {
+                var token = G.getComputedStyle(scroller).getPropertyValue('--color-border');
+                if (token) {
+                    el.style.background = token.trim();
+                }
+            } catch (e) {
+                // keep the fallback; the bar is still visible and correct
+            }
+        }
+        var overflow = scroller.scrollHeight - scroller.clientHeight;
+        var track = barRect.height - BAR_INSET * 2;
+        if (overflow <= 0 || track <= BAR_MIN) {
+            el.style.opacity = '0';
+            return;
+        }
+        var size = Math.max(BAR_MIN, Math.round(track * scroller.clientHeight / scroller.scrollHeight));
+        var y = barRect.top + BAR_INSET + (track - size) * (scroller.scrollTop / overflow);
+        var x = barRect.right - BAR_INSET - BAR_WIDTH;
+        el.style.height = size + 'px';
+        el.style.transform = 'translate3d(' + Math.round(x) + 'px,' + Math.round(y) + 'px,0)';
+        el.style.opacity = '1';
+    }
+
+    function barOnFrame() {
+        barFrame = 0;
+        try {
+            if (barTarget) {
+                barPaint(barTarget);
+            }
+        } catch (e) {
+            // the page is being torn down; the bar simply stops updating
+        }
+    }
+
+    function barHide() {
+        barHideTimer = 0;
+        barLive = false;
+        if (barEl) {
+            barEl.style.opacity = '0';
+        }
+    }
+
+    function barSkippedHere(el) {
+        if (barSkipped && barSkipped.has(el)) {
+            return true;
+        }
+        var skip = false;
+        try {
+            skip = !!(el.closest && (
+                el.closest('[class*="scrollbar-hide"]') ||
+                el.closest('[data-zcode-pptx-render-surface]') ||
+                el.closest('.xterm-viewport')
+            ));
+        } catch (e) {
+            skip = false;
+        }
+        if (skip && barSkipped) {
+            barSkipped.add(el);
+        }
+        return skip;
+    }
+
+    function barOnScroll(event) {
+        try {
+            var target = event.target;
+            if (target === document || target === document.documentElement) {
+                target = document.scrollingElement || target;
+            }
+            if (!target || target.nodeType !== 1 ||
+                typeof target.getBoundingClientRect !== 'function') {
+                return;
+            }
+            // Vertical overflow only, and never where the page hid the bar on
+            // purpose (its own `.scrollbar-hide`, terminal viewport, ...).
+            if (target.scrollHeight - target.clientHeight <= 0) {
+                return;
+            }
+            if (barSkippedHere(target)) {
+                return;
+            }
+            barTarget = target;
+            if (!barLive) {
+                // Burst start: re-measure once, then only read scrollTop per
+                // frame — no layout reads in the scroll path.
+                barLive = true;
+                barRect = null;
+            }
+            if (!barFrame) {
+                barFrame = scheduleFrame(barOnFrame);
+            }
+            if (barHideTimer) {
+                clearTimeout(barHideTimer);
+            }
+            barHideTimer = setTimeout(barHide, BAR_FADE_MS);
+        } catch (e) {
+            // never let a scroll listener break the page
+        }
+    }
+
+    function installOverlayScrollbar() {
+        try {
+            // `scroll` does not bubble, but it still travels the capture path
+            // from window down to the target — so one listener sees every
+            // scroller in the page, including ones the page creates later, and
+            // without hard-coding a single selector.
+            document.addEventListener('scroll', barOnScroll, {capture: true, passive: true});
+            // Cached geometry only lives for one burst; a resize can move the
+            // scroller between bursts (keyboard, orientation, page re-layout).
+            window.addEventListener('resize', function () {
+                barRect = null;
+            });
+        } catch (e) {
+            diag('warn', '悬浮滚动条安装失败: ' + e);
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // boot
     // -----------------------------------------------------------------------
+    installScrollbarWidth();
+    installOverlayScrollbar();
     try {
         installVisibilityHijack();
     } catch (e) {
