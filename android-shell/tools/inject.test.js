@@ -652,10 +652,6 @@ test('the perf line carries the link counters that judge background reconnects',
         assert.ok(line, 'one window must show both the probe and the ack: ' + lines.join(' | '));
         assert.ok(line.includes('paired true'), line);
         assert.ok(line.includes('socket 1'), line);
-        // The page's ack watchdog re-arm question needs its own counter: the close
-        // stack proves the page reconnects from that callback, and only "armed and
-        // cleared kept climbing" vs "armed once per connection" tells us why.
-        assert.ok(line.includes('看门狗 装 '), line);
     } finally {
         page.teardown();
     }

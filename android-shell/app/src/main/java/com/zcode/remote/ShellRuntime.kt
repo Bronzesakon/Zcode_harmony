@@ -234,8 +234,19 @@ object ShellRuntime {
     //    a 15s dispatch still not delivered after 10 minutes). The per-app
     //    "allow full background behaviour" switch is what makes the pump real.
 
-    /** How often the pump drives one heartbeat tick; inside the desktop's 30s ack window. */
-    private const val PUMP_INTERVAL_MS = 15_000L
+    /**
+     * How often the pump drives one heartbeat tick.
+     *
+     * Ten seconds, matching the page's own `heartbeatIntervalMs` — the pump is
+     * standing in for a timer the renderer no longer runs while hidden, so it has
+     * to keep at least that cadence. Fifteen was not enough: the page's ack
+     * watchdog is 30s, re-armed on every ack, and the field log showed single
+     * cycles where our probe's ack did not land (windows with `链路 ack 0`). Two
+     * of those in a row is a 30s ack gap, which is exactly what makes the watchdog
+     * fire — and its callback closes the socket, which is the reconnect the user
+     * sees. Cheap to be early: one more `evaluateJavascript` per 30s.
+     */
+    private const val PUMP_INTERVAL_MS = 10_000L
 
     /** Every Nth dispatch is logged; the first one always is. */
     private const val PUMP_LOG_EVERY = 20

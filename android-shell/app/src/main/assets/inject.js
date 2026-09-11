@@ -55,47 +55,6 @@
         post('diag', {level: level, message: message});
     }
 
-    // -----------------------------------------------------------------------
-    // 0. watchdog probe (diagnostic)
-    //
-    // The page's relay client arms a 30s "ack watchdog" and re-arms it on every
-    // pair_status_ack. Our probe provokes an ack every 15s, and the link counters
-    // confirm both are still happening in the background — yet the page reconnects
-    // on its own roughly two minutes in, from that very callback
-    // (`reconnectAfterStaleWaiting`, identified from the close stack). Two ways
-    // that can be true, and they need different fixes:
-    //
-    //   * the re-arm never happens — the acks are not reaching the page's handler,
-    //     in which case the armed count stays at one per connection;
-    //   * the timer is re-armed but cannot be cancelled (throttled timer already
-    //     queued), in which case armed and cleared both climb together.
-    //
-    // Count both, for a fixed 30s delay only, and report them on the perf line.
-    // -----------------------------------------------------------------------
-    var watchdog = {armed: 0, cleared: 0, pending: {}};
-    (function () {
-        if (typeof G.setTimeout !== 'function' || typeof G.clearTimeout !== 'function') {
-            return;
-        }
-        var originalSetTimeout = G.setTimeout;
-        var originalClearTimeout = G.clearTimeout;
-        G.setTimeout = function (fn, ms) {
-            var handle = originalSetTimeout.apply(G, arguments);
-            if (ms === 30000 && handle !== undefined && handle !== null) {
-                watchdog.armed += 1;
-                watchdog.pending[handle] = 1;
-            }
-            return handle;
-        };
-        G.clearTimeout = function (handle) {
-            if (handle !== undefined && handle !== null && watchdog.pending[handle]) {
-                watchdog.cleared += 1;
-                delete watchdog.pending[handle];
-            }
-            return originalClearTimeout.apply(G, arguments);
-        };
-    })();
-
     if (!P) {
         diag('error', 'zcode-protocol.js 未加载，注入层无法工作');
         return;
@@ -483,8 +442,7 @@
             '长任务 ' + longTasks + ' 个（合计 ' + Math.round(longTaskMs) +
             'ms，最长 ' + Math.round(perf.longTaskMaxMs) + 'ms）· ' +
             '链路 ack ' + acks + ' · 探针 ' + probes + ' · paired ' + relayPaired +
-            ' socket ' + (socket ? socket.readyState : -1) +
-            ' · 看门狗 装 ' + watchdog.armed + ' 清 ' + watchdog.cleared);
+            ' socket ' + (socket ? socket.readyState : -1));
         perf.windowStartedAt = Date.now();
         perf.windowFrames = perf.decodedFrames;
         perf.windowChars = perf.inboundChars;
