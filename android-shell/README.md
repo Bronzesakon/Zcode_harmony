@@ -1,7 +1,7 @@
 # android-shell — ZCode 远程（安卓薄壳）
 
-> **接手排查请先读 [`HANDOVER.md`](HANDOVER.md)**：当前进度、必须随项目迁移的文件清单（CI 配置在父仓库根、
-> 参考文档与签名材料不在 git 里）、未验证项清单、待决策项、提交地图。
+> **接手排查先读本文件**：进度与待验证项见「项目现状」，必须随项目带走的文件清单见「交接清单」，
+> 环境与真机调试（含 adb）见「本机开发」。状态信息只留这一处，不再另设交接文档。
 
 把上层鸿蒙工程「ZCode 远程」的薄壳思路搬到安卓：**WebView 加载 `zcode.z.ai/remote/v4` + 原生对接系统能力**，并补上鸿蒙版没有的**任务通知**与**后台保活**。
 
@@ -13,6 +13,50 @@
 
 ---
 
+## 项目现状（先读这一节）
+
+**一句话**：功能已全部落地、CI 全绿（JS 35 项 + Kotlin 37 项单测），`pre` 每次推送都把最新 APK **覆写**到滚动预发布 [android-pre](https://github.com/Bronzesakon/Zcode_harmony/releases/tag/android-pre)（固定链接 `…/releases/download/android-pre/zcode-remote.apk`，可直接覆盖安装）——但**真机验证只做过一轮**（一加 PLC110 / ColorOS 16 / API 36 / WebView 153），下面这些还没有结论：
+
+| # | 待验证 / 待排查 | 现状 | 怎么看 |
+| --- | --- | --- | --- |
+| P0 | 后台存活 30 分钟（迁移文档 §8 第 4 步，决定整条路线成立与否） | 未做 | 退后台 30 分钟回前台，读设置页第一行结论；判读口径见「首次真机验证」 |
+| P1 | 键盘弹出时输入框上抬 | 已修（`padForSystemBarsAndIme`），**待真机确认** | 点开会话底部输入框，输入框应贴在键盘上方；日志里 `视口 … innerHeight=…` 应随键盘变化 |
+| P1 | ColorOS 弹「“ZCode 远程”正在当前页面悬浮显示…是否关闭该应用？」 | **未定位**（性质已定性，见下） | 见「已知问题 A」 |
+| P2 | 会话加载慢（连标题都要半天） | 已加取证 + 一处降载，**待判读** | 见「已知问题 B」 |
+| P3 | 流体云是否真的出卡 | 未验证（需 API 36） | 设置 → 诊断里的 `流体云: 可用 / 系统已关闭本应用的推广通知` |
+| P4 | 上传链路（相册 / SAF / 取消不卡住）与通知细节（分组、点击定位、完成提示音） | 未验证 | 见「网页文件上传」与「实现要点」 |
+| — | `MODE_SAVE`（网页请求保存文件） | **未实现**，返回 false 并记 warn | — |
+
+### 已知问题 A：ColorOS「悬浮显示」弹窗
+
+现象：**退出/切走应用时**弹出系统对话框「“ZCode 远程”正在当前页面悬浮显示，可能造成部分操作无响应，是否关闭该应用？」（带「上报此问题」勾选框）。
+
+已定性：这是 ColorOS 的**悬浮窗/叠加层保护**，不是崩溃也不是 ANR（社区同类现象出现在确实带悬浮窗的应用上）。已经排除的：本应用清单**没有** `SYSTEM_ALERT_WINDOW`，全代码库无 `WindowManager.addView` / `TYPE_APPLICATION_OVERLAY` / `TYPE_TOAST` / `setFullScreenIntent`，保活服务只发通知不开窗（README 早期设想的「1px overlay 兜底」**并未实现**）。
+
+剩余嫌疑：① 依赖库（如 `journeyapps:zxing-android-embedded`）向合并清单里带了权限；② 系统把流体云提升出来的胶囊/卡片算在应用头上；③ 用户把应用拖成了 ColorOS 的「自由浮窗」，与代码无关。**有 adb 后 5 分钟可定性**：
+
+```bash
+adb shell dumpsys window windows | grep -i -A3 zcode          # 有没有 overlay 类窗口
+adb shell appops get com.zcode.remote                          # SYSTEM_ALERT_WINDOW 是否被开启
+adb shell dumpsys notification --noredact | grep -i -A5 zcode  # 是否有 promoted 通知在展示
+adb shell dumpsys activity activities | grep -i zcode          # 是否被系统置于浮窗/分屏
+```
+
+若确认是流体云提升触发，唯一开关点是 `LiveUpdate.requestPromotion`（可只对「等待确认」提升，或整体去掉）。
+
+### 已知问题 B：会话加载慢的判读顺序
+
+本轮已把测量接进日志（无需再改代码），下一份真机日志按这个顺序读：
+
+1. `网页开始加载` / `网页加载完成，用时 N ms`（原生）与 `页面加载计时：ttfb=… load=… 资源 N 个 / KB`（注入层导航计时）→ 网络/文档层面；
+2. `active subscribe start（页面已空闲 Xms）` → 我们自己的 bridge 何时开始握手（本轮已改为等页面静默 ≥800ms，上限 12s）；
+3. `页面开销 10s：收帧 N 个（解码合计 Yms，单帧最长 Zms）· 长任务 …` → **我们自己的主线程开销**；
+4. `[web:行号] …` → 页面自己的 console（本轮新增，错误/警告分级，每次加载上限 200 行）。
+
+若 1 小、3 大 → 是我们的解码/订阅挤占主线程，继续降载（限制并发 bridge 数、跳过大快照）；若 1 大 → 网络或 relay/桌面侧，下一步给协议层加 RPC 往返计时。
+
+---
+
 ## 一次构建要多快
 
 工作流按墙钟时间排布，`js` 与 `build` 是两个并行 job：
@@ -20,11 +64,17 @@
 | job | 内容 | 首次 | 有缓存 |
 | --- | --- | --- | --- |
 | `js` | Node 协议层 + 注入层测试（35 项），不需要 JDK/SDK | ~1 min | ~40 s |
-| `build` | 单次 Gradle 调用：release 单元测试（20 项）+ `assembleRelease` + 签名校验 | ~4 min | ~2m 45s |
+| `build` | 单次 Gradle 调用：release 单元测试（37 项）+ `assembleRelease` + 签名校验 | ~4 min | ~2m 45s |
 | `prerelease` | 仅 `pre` 分支：把最新 APK **覆写**到滚动预发布 Release（固定下载链接） | ~20 s | ~20 s |
 | `release` | 仅 `v*` tag：用 CHANGELOG 段落发正式 Release | ~20 s | ~20 s |
 
+测试构成：JS 35 项（`tools/protocol.test.js` 22 + `tools/inject.test.js` 13，含手算黄金字节）；Kotlin 37 项（`NotifyStateTest` 22 + `PromotionPolicyTest` 7 + `UploadMimeTest` 8）。**这些是唯一能在无设备条件下验证的东西**，真机行为一律以设备为准。
+
 省时间的几个点：`js` 不与 Android 构建串行；`testReleaseUnitTest` 与 `assembleRelease` 放在**同一次 Gradle 调用**里（共享 `compileReleaseKotlin`，源码只编译一次、Gradle 只启动一次）；`fetch-depth: 1`；`actions/setup-java` 的 `cache: gradle` 会恢复 `~/.gradle`（依赖缓存 + 本地 build cache）；`org.gradle.configuration-cache=true` 且 `problems=warn`，所以配置缓存只可能加速、不会让构建失败。
+
+**坑（改 workflow 前必读）**：`paths` 与 `paths-ignore` **不能同时**用于同一事件——GitHub 会创建一个**没有任何 job** 的 run（PyYAML 能解析，本地校验拦不住）。现在只用 `paths` 显式列出会影响 APK 的路径，纯文档改动（README / CHANGELOG / docs / ColorOS_docs）自然落在过滤外，省掉一次构建。
+
+**编译错误怎么读（重要）**：Actions 的**日志**需要鉴权（匿名 404），但 job 页面是服务端渲染的，且 **annotation 会写进 job 页面的 HTML**。所以 workflow 在 Gradle 失败时会把关键错误行（`^e: `、`Execution failed for task`、单测断言等）grep 出来以 `::error::` 重新输出，并加 `--console=plain` 去掉 ANSI/CR 噪声——本机没有 JDK/SDK，这是唯一能读到编译错误的通道，用 `tools/watch_ci.py` 即可匿名读到。
 
 ---
 
@@ -172,7 +222,7 @@ zcode-remote.apk -> CN=ZCode Remote, OU=Mobile, O=ZCode, L=Unknown, ST=Unknown, 
 ### GitHub 仓库侧（不在文件系统里）
 
 - **4 个 Secrets**（缺失时 CI 回退 debug 签名，见上一节）：`ANDROID_KEYSTORE_BASE64`、`ANDROID_KEYSTORE_PASSWORD`、`ANDROID_KEY_PASSWORD`、`ANDROID_KEY_ALIAS`。换仓库/换密钥时必须同步更新，否则新旧包签名不一致 → 只能卸载重装。
-- 滚动预发布 tag `android-pre` 与正式版 tag 的命名空间问题见下方「决策落点」与 `HANDOVER.md` §六。
+- **正式发版的 tag 命名空间撞车（待你决策）**：`v1.0.0` 已被**鸿蒙版**的 Release 占用（资产是 `entry-default-unsigned.hap`）。同一仓库两个应用共享 tag 空间，而安卓正式发版的触发条件是 `tags: ['v*']`——给鸿蒙版打 `v1.0.1` 会**误触发安卓构建**并在那个 tag 上发布安卓 APK。建议把安卓侧改成 `tags: ['android-v*']`（发版用 `git tag android-v1.0.0`）；未擅自改，因为这会改变你的发版习惯。日常预发布侧已无此问题：滚动 tag `android-pre` 不带 `v`，与 `v*` 互不触发。
 
 ---
 
@@ -215,6 +265,26 @@ zcode-remote.apk -> CN=ZCode Remote, OU=Mobile, O=ZCode, L=Unknown, ST=Unknown, 
 9. **颜色一律用 M3 颜色角色**（`?attr/colorSurface` 等），不要新增固定色值。固定浅色会让暗色模式从构造上就是坏的——这正是本轮修掉的问题（见"界面规范"一节）。新增界面元素时也请用 M3 字阶（`?attr/textAppearance*`）而不是手写 sp。
 10. **`UploadMime.kt` 里的 `WILDCARD` 是拼接出来的，不要"顺手简化"成单个字面量。** 写成单个字面量时 `compileReleaseKotlin` 会在该列报 `Syntax error: Expecting a top level declaration`，连续三轮 CI 复现、报错逐字节相同，而文件字节是干净的纯 ASCII。Kotlin 的块注释可嵌套，嫌疑是词法器在注释深度上失手；拼接写法语义完全相同且已验证可编译。
 11. **改完 Kotlin 先跑 `python tools/check_kotlin_structure.py`**：括号配平、包名与目录一致、合并残留，一秒出结果；CI 的 Static checks job 也会跑它。
+
+---
+
+## 任务通知（这是壳存在的理由）
+
+三个渠道，**创建时**就定下重要性——Android 不允许事后改渠道重要性，所以「待确认要响、运行中要静」必须靠分渠道而不是靠切重要性：
+
+| 渠道 | 重要性 | 用途 |
+| --- | --- | --- |
+| `running_tasks` | LOW（静音） | 每个运行中任务一条常驻通知（标题=任务名，正文=`状态 · 最新进展`）+ 一条「N 个任务运行中」群组摘要 |
+| `task_attention` | DEFAULT（有声） | 任务等待确认时补发的**可拉掉**提醒 |
+| `task_completed` | DEFAULT（有声） | 任务完成/失败的提醒（D10） |
+
+- **状态词只有两个**（D9）：`运行中` / `等待确认`；正文取最新进展，过长截断。
+- **完成判定**用参考实现的跳变：上一拍 `phase ∈ 运行态` → 这一拍 `∈ 终态`。同一任务重跑后会再次触发；`prewarming` 之类的中间态不算完成。
+- **待确认按 `interactionId` 去重**，所以同一处交互不会反复响；确认后任务回到运行态，常驻通知正文随之更新。
+- **点击通知**拉起应用并尝试定位任务（D11）：按任务标题在 DOM 里找可点击祖先并派发完整指针事件序列；页面改版即失效，会**安静降级**为「仅打开应用」。这条是最脆弱的功能，别指望它永远有效。
+- 常驻通知的更新是**节流**的（约 900ms 合并一次），完成/待确认事件则立刻发（`ShellRuntime.enqueueOngoing`）——否则会被每秒数次 preview 更新淹没。
+- 流体云（ColorOS 16）只提升最多 2 张卡，见「ColorOS 16 流体云」一节。
+- 保活服务另有一条 `keepalive` 渠道（IMPORTANCE_MIN），空载时显示「连接中」。
 
 ---
 
@@ -291,6 +361,8 @@ node --test                              # 35 项：线格式、分片重组、�
 python tools/check_kotlin_structure.py   # 括号配平 / 包名与目录一致 / 合并残留（约 1 秒）
 python tools/watch_ci.py [--watch]       # 读 CI 状态与失败原因（无需 gh / 无需 token）
 ```
+
+提交时**绝不用 `git add -A`**：仓库里有 `docs/`、`ColorOS_docs/`、`scratch/` 等不入库的大目录，一律 `git add <明确路径>`。
 
 工具链实况：
 
