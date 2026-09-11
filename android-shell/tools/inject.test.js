@@ -288,9 +288,15 @@ function setupPage(options) {
     const dom = {classes: Object.create(null)};
 
     if (pageState) {
-        const root = new FakeElement('html');
-        root.appendChild(document.body);
-        document.documentElement = root;
+        const buildRoot = () => {
+            const html = new FakeElement('html');
+            html.appendChild(document.body);
+            document.documentElement = html;
+            return html;
+        };
+        // `noDocumentElement` reproduces the document-start race: the script runs
+        // before <html> exists and must retry rather than give up.
+        let root = (options && options.noDocumentElement) ? null : buildRoot();
         document.createElement = (tag) => {
             const el = new FakeElement(tag);
             el.style = {};
@@ -298,6 +304,9 @@ function setupPage(options) {
         };
         document.getElementsByClassName = (name) => {
             const out = [];
+            if (!root) {
+                return out;
+            }
             const walk = (node) => {
                 for (const child of node.children) {
                     if (String(child.getAttribute('class') || '').split(/\s+/).indexOf(name) >= 0) {
@@ -311,7 +320,15 @@ function setupPage(options) {
         };
         // Every element the page would have for a class, added/removed by name.
         dom.classes = Object.create(null);
+        dom.materialiseRoot = () => {
+            if (!root) {
+                root = buildRoot();
+            }
+        };
         dom.set = (name, present) => {
+            if (!root) {
+                return;
+            }
             const existing = document.getElementsByClassName(name);
             if (present && existing.length === 0) {
                 const el = new FakeElement('div');
@@ -324,6 +341,9 @@ function setupPage(options) {
             }
         };
         dom.setTheme = (theme) => {
+            if (!root) {
+                return;
+            }
             if (theme === null) {
                 delete root._attributes['data-zcode-browser-theme-surface'];
             } else {
@@ -341,7 +361,10 @@ function setupPage(options) {
             return mql;
         });
         FakeMutationObserver.instances = [];
-        install('MutationObserver', FakeMutationObserver);
+        // `noObserver` is the degraded engine: present document, absent API.
+        if (!(options && options.noObserver)) {
+            install('MutationObserver', FakeMutationObserver);
+        }
     }
 
     // Fresh protocol module: inject.js reads it off the global.
@@ -1021,20 +1044,54 @@ test('the native side can ask for a fresh report after a background stint', asyn
     }
 });
 
-test('a page without MutationObserver still boots, and reports no state', async () => {
-    // The default fake DOM has none of the page-state APIs. inject.js must not
-    // fail to install because of that — the window simply keeps the boot colour.
-    const page = setupPage();
+test('a page without MutationObserver still boots, and still follows its breakpoint', async () => {
+    // Degradation, not failure: without MutationObserver the DOM is no longer
+    // re-checked, but the initial read and the media-query watchers still work —
+    // so the bar is correct for the layout the page boots into and keeps up with
+    // rotation and a system theme switch.
+    const page = setupPage({pageState: true, media: {'(max-width: 767px)': true}, noObserver: true});
     try {
-        assert.deepStrictEqual(pageStates(page.posts), [], 'nothing to report without a DOM');
+        page.dom.set('bg-background-win-alt', true);
+        page.dom.setTheme('light');
+        await flush();
+        assert.deepStrictEqual(
+            pageStates(page.posts), ['main-header/light'],
+            'the state is read once even without an observer');
+        const narrow = page.mediaQueries.find((mql) => mql.query === '(max-width: 767px)');
+        narrow.setMatches(false);
+        await flush();
+        assert.deepStrictEqual(
+            pageStates(page.posts).slice(-1), ['main-surface/light'],
+            'rotation is still followed');
         assert.ok(
-            findPost(page.posts, 'ready').length === 1,
-            'the rest of the injected layer must still come up'
-        );
-        assert.ok(
-            findPost(page.posts, 'diag', (data) => data.message && data.message.indexOf('页面状态观察器不可用') === 0).length === 1,
-            'and say why the status bar will not follow the page'
-        );
+            findPost(page.posts, 'diag', (data) => String(data.message).indexOf('缺少 MutationObserver') >= 0,).length === 1,
+            'and the degradation is stated once');
+        assert.ok(findPost(page.posts, 'ready').length === 1, 'the rest of the layer still comes up');
+    } finally {
+        page.teardown();
+    }
+});
+
+test('a document-start arrival before <html> exists retries instead of giving up', async () => {
+    // The race installScrollbarWidth already guards against. Giving up here would
+    // be silent and permanent for that document: no status-bar colour at all.
+    const page = setupPage({
+        pageState: true,
+        noDocumentElement: true,
+        media: {'(max-width: 767px)': true},
+    });
+    try {
+        assert.deepStrictEqual(pageStates(page.posts), [],
+            'nothing can be read before the tree exists');
+        // <html> arrives; the page fires DOMContentLoaded.
+        page.dom.materialiseRoot();
+        page.document.dispatchEvent({type: 'DOMContentLoaded'});
+        page.dom.set('bg-background-win-alt', true);
+        page.dom.setTheme('dark');
+        FakeMutationObserver.fire();
+        await flush();
+        assert.deepStrictEqual(pageStates(page.posts), ['main-header/dark'],
+            'the reporter must install itself once the tree exists');
     } finally {
         page.teardown();
     }

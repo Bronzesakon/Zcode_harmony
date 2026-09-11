@@ -1319,23 +1319,34 @@
         if (G.__zcodeShellPageStateHooked) {
             return;
         }
-        if (!document.documentElement || !G.MutationObserver) {
-            // Debug, not warn: every WebView this shell has ever run on has a
-            // MutationObserver. Keeping it quiet at warn level is what keeps a
-            // "page is broken" warning meaningful when one appears.
-            diag('debug', '页面状态观察器不可用（缺少 MutationObserver），状态栏底色将保持默认');
+        if (!document.documentElement) {
+            // document-start can land before <html> exists — the same race
+            // installScrollbarWidth guards against. Returning here without a
+            // retry would be silent and total: the status bar would never follow
+            // the page for the whole life of the document. (Observed working on
+            // WebView 154, where the element is already there, which is exactly
+            // why this must not depend on that.)
+            document.addEventListener('DOMContentLoaded', installPageStateReporter);
             return;
         }
         G.__zcodeShellPageStateHooked = true;
-        try {
-            new G.MutationObserver(schedulePageState).observe(document.documentElement, {
-                subtree: true,
-                childList: true,
-                attributes: true,
-                attributeFilter: ['class', 'style', 'data-zcode-browser-theme-surface']
-            });
-        } catch (e) {
-            diag('warn', '页面状态观察器安装失败: ' + e);
+        if (G.MutationObserver) {
+            try {
+                new G.MutationObserver(schedulePageState).observe(document.documentElement, {
+                    subtree: true,
+                    childList: true,
+                    attributes: true,
+                    attributeFilter: ['class', 'style', 'data-zcode-browser-theme-surface']
+                });
+            } catch (e) {
+                diag('warn', '页面状态观察器安装失败: ' + e);
+            }
+        } else {
+            // Degraded, not broken: the breakpoint and the system theme are still
+            // watched, so rotation and a theme switch keep working; only a
+            // state change that mutates the DOM without crossing either query
+            // would be missed.
+            diag('debug', '页面状态观察器缺少 MutationObserver：只跟踪断点与主题，不再回头验 DOM');
         }
         watchMedia(NARROW_QUERY);
         watchMedia(DARK_QUERY);
