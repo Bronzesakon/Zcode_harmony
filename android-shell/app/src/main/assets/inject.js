@@ -185,13 +185,31 @@
         proto.send = wrappedSend;
 
         // Outbound close observation. Which side tore the connection down decides
-        // what the fix is — the desktop, the transport, or the page itself — and
-        // the close event alone cannot say. The caller line disambiguates.
+        // what the fix is — the desktop, the transport, the page itself, or our own
+        // recovery — and the close event alone cannot say. The caller does.
+        //
+        // Take frame [1] and the column of it, and you get THIS line: the wrapper
+        // builds the Error inside itself, so the naive `stack.split('\n')[1]` names
+        // the wrapper, not the caller. That is how a round of field work concluded
+        // "the page closes its own socket" from a log line that was really just
+        // pointing at itself. So: walk the frames, drop our own wrapper, and keep a
+        // few of what is left — `forceReconnect` shows up by name, the page shows
+        // up as its bundle position.
         var originalClose = proto.close;
         var wrappedClose = function () {
             try {
-                var at = String((new Error()).stack || '').split('\n')[1] || '';
-                diag('debug', 'socket.close() 被调用 ' + at.trim().substring(0, 120));
+                var lines = String((new Error()).stack || '').split('\n');
+                var frames = [];
+                for (var i = 1; i < lines.length && frames.length < 3; i += 1) {
+                    var frame = lines[i].trim();
+                    if (!frame || frame.indexOf('wrappedClose') >= 0) {
+                        continue;
+                    }
+                    frames.push(frame.substring(0, 90));
+                }
+                diag('debug', 'socket.close() 被调用' +
+                    (arguments.length ? '(' + String(arguments[0]) + ')' : '（无参）') +
+                    ' 来自 ' + (frames.join(' ← ') || '未知（只有包装函数帧）'));
             } catch (e) {
                 // observation must never break the page's close
             }

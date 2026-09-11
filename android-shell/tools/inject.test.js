@@ -329,6 +329,34 @@ test('the WebSocket wrapper keeps statics, prototype and instanceof intact', () 
     }
 });
 
+test('the close log names the real caller, not the wrapper itself', async () => {
+    const page = setupPage();
+    try {
+        const socket = new globalThis.WebSocket('wss://relay.example');
+        socket.dispatchEvent({type: 'open'});
+        await flush();
+
+        // Regression pin. The wrapper builds its Error inside itself, so the naive
+        // `stack.split('\n')[1]` names the WRAPPER on every close — and a round of
+        // field work read that as "the page closed its own socket". The caller has
+        // to survive the wrapper frames.
+        const closeFromThePage = () => socket.close(1000, 'bye');
+        closeFromThePage();
+        await flush();
+
+        const line = findPost(page.posts, 'diag')
+            .map((p) => p.data.message)
+            .filter((m) => m.indexOf('socket.close() 被调用') === 0)
+            .pop();
+        assert.ok(line, 'the close must be logged');
+        assert.ok(line.includes('closeFromThePage'), line);
+        assert.ok(!line.includes('wrappedClose'), 'the wrapper must not name itself: ' + line);
+        assert.ok(line.includes('(1000)'), 'the close code must be reported: ' + line);
+    } finally {
+        page.teardown();
+    }
+});
+
 test('the page is told it is visible and its lifecycle listeners are suppressed', () => {
     const page = setupPage();
     try {
