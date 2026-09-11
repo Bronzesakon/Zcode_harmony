@@ -2,7 +2,7 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
-发版流程：日常推 `pre` 分支（CI 自动发预发布 Release）；正式版更新本文件顶部段落（须与 `gradle.properties` 的 `zcodeBaseVersion` 一致），把 `pre` 合入 `main` 后 `git tag vX.Y.Z` 推送，CI 读取 `## [X.Y.Z]` 段落作为 Release 说明。
+发版流程：日常推 `pre` 分支（CI 把最新 APK **覆写**到滚动预发布 Release `android-pre`：固定资产名 + 移动 tag + 刷新标题/说明与推送、编译时间）；正式版更新本文件顶部段落（须与 `gradle.properties` 的 `zcodeBaseVersion` 一致），把 `pre` 合入 `main` 后 `git tag vX.Y.Z` 推送，CI 读取 `## [X.Y.Z]` 段落作为 Release 说明。
 
 ## [1.0.0] - 2026-09-10
 
@@ -49,6 +49,11 @@
 - **网页加载耗时**：原生侧 `onPageStarted/onPageFinished` 记录毫秒数，与注入层的导航计时对照，可区分「网络慢」/「relay 慢」/「页面 JS 慢」。
 - **主动订阅改为等页面空闲**：此前配对完成 1.5s 后即无条件为所有工作区开 bridge，与页面自己首屏加载会话争抢同一条 relay socket 和同一个 JS 线程（日志实测 7 个工作区约 10 秒连续握手）。现改为最后一次收帧静默 ≥800ms 才启动，页面持续繁忙时最多推迟 12s，推迟过程留 debug 记录。
 - 日志脱敏加强：除 `/remote?...` 外，任何 http(s) URL 的查询串都替换为 `?<redacted>`（网页 console 可能带出完整 URL，而日志是要交给用户分享的文件）。
+
+### Changed（本轮第三批 · 发布流程）
+- **预发布改为滚动 Release**（借鉴 sevnX 的 CI 形状）：不再每次 push 新建 `v<base>-pre.<运行号>` 的 tag 与 Release，改为固定在 tag `android-pre` 上——`gh release upload --clobber` 覆写 `zcode-remote.apk`（+`.md5`），`git push --force` 把 tag 移到本次提交（GitHub 用 tag 渲染 Release 页与源码链接，不移动就会挂着旧提交），再 `gh release edit` 刷新标题与说明。下载链接从此恒定：`…/releases/download/android-pre/zcode-remote.apk`。
+  - 标题：`ZCode 远程 预发布 · <应用内版本> · <编译时间>`；说明：`## 本轮变更`（与上一次构建之间的提交列表，单个提交时附正文）+ 推送时间 / 编译完成时间（UTC+8）/ 运行号 / 覆盖安装提示。
+  - tag 故意不带 `v` 前缀：带 `v` 会命中本工作流自己的 `tags: ['v*']` 正式发版触发条件，从而再起一次运行。
 
 ### Notes
 - 单元测试 35 项（JS 协议层与注入层）+ 20 项（Kotlin 通知判定算法），全部在 CI 运行。

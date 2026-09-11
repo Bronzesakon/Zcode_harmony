@@ -75,7 +75,7 @@
         ┌─ js     : Static checks（Node 35 项 + Kotlin 结构检查）   快，约 40 s
 推 pre ─┤
         └─ build  : release 单测 37 项 + assembleRelease + 签名校验   约 2m 45s
-                     └─► prerelease：自动打 v<base>-pre.<运行号> 并发预发布 Release
+                     └─► prerelease：覆写滚动 Release `android-pre`（固定资产名 + 移动 tag + 刷新标题/说明/时间）
 推 v* tag（正式）───► build ──► release：用 CHANGELOG 段落发正式版
 ```
 
@@ -83,6 +83,7 @@
 
 - `js` 与 `build` **并行**；`build` 用**一次 Gradle 调用**同时跑单测与打包（共享 `compileReleaseKotlin`）；`actions/setup-java` 的 `cache: gradle` 恢复 `~/.gradle`；`fetch-depth: 1`。
 - 版本号：`versionCode = 工作流运行号`（保证任何 CI 产物都能覆盖安装上一个），`versionName` 在 `pre` 上是 `<base>-pre.<运行号>`。基准在 `gradle.properties` 的 `zcodeBaseVersion`。
+- **预发布是「滚动」的（预发布 tag 不再每次新建）**：固定在 tag `android-pre` 上，`gh release upload --clobber` 覆写 `zcode-remote.apk`/`.md5`，然后 `git push --force` 把 tag 移到本次提交，再 `gh release edit` 刷新标题与说明（说明 = 与上一次构建之间的提交列表 + 推送/编译时间）。下载链接恒定：`…/releases/download/android-pre/zcode-remote.apk`。tag 不带 `v` 前缀是刻意的（带 `v` 会命中 `tags: ['v*']` 的正式发版触发条件）；改这段时注意别丢掉这个性质。形状抄自 `E:\sevnX\.github\workflows\build.yml`。
 - **`paths` 与 `paths-ignore` 不能同时用于同一事件**：GitHub 会创建一个**没有任何 job** 的 run（PyYAML 能解析，本地校验拦不住）。现在只用 `paths` 显式列出会影响 APK 的路径，纯文档改动自然不触发。
 - **失败信息怎么读（重要）**：Actions 日志需鉴权（匿名 404），所以 workflow 在 Gradle 失败时会把关键错误行 grep 成 `::error::` **annotation**，而 annotation 渲染在 job 页面 HTML 里、可匿名读取。用仓库里的 `tools/watch_ci.py` 无需 gh、无需 token 即可读状态与失败原因：
   ```bash
@@ -90,7 +91,7 @@
   python tools/watch_ci.py           # 当前状态快照
   python tools/watch_ci.py --watch   # 轮询到所有 job 结束
   ```
-- 预发布不会递归触发（CI 用 `GITHUB_TOKEN` 建的 tag 不触发工作流）；`concurrency` 的 key 含 ref，推 `pre` 不会取消 `main` 的构建。
+- 预发布不会递归触发（CI 用 `GITHUB_TOKEN` 做的 tag/Release 操作不触发工作流）；`concurrency` 的 key 含 ref，推 `pre` 不会取消 `main` 的构建。
 
 ---
 
@@ -162,11 +163,13 @@
 
 ## 六、待你决策的一件事
 
-**tag 命名空间撞车**：`v1.0.0` 这个 tag 已被**鸿蒙版**的 Release 占用（资产是 `entry-default-unsigned.hap`）。同一仓库两个应用共享 tag 空间，而安卓 workflow 的正式发版触发条件是 `v*` ——
+**正式发版的 tag 命名空间撞车**：`v1.0.0` 这个 tag 已被**鸿蒙版**的 Release 占用（资产是 `entry-default-unsigned.hap`）。同一仓库两个应用共享 tag 空间，而安卓 workflow 的正式发版触发条件是 `v*` ——
 - 若你给鸿蒙版打 `v1.0.1`，会**误触发安卓构建**并在那个 tag 上发布安卓 APK；
 - 安卓正式发版也应避开 `v1.0.0` 这类已被占用的号。
 
-建议把安卓侧改成独立命名空间（workflow 里 `tags: ['v*']` → `['android-v*']`，并在 README/CHANGELOG 写明 `git tag android-v1.0.0`）。我**没有擅自改**，因为这会改变你的发版习惯，需要你点头。
+> 日常预发布侧已经没有这个问题：滚动 Release 用 `android-pre`（不带 `v`），与 `v*` 互不触发。
+
+建议把安卓侧的**正式**发版也改成独立命名空间（workflow 里 `tags: ['v*']` → `['android-v*']`，并在 README/CHANGELOG 写明 `git tag android-v1.0.0`）。我**没有擅自改**，因为这会改变你的发版习惯，需要你点头。
 
 ---
 

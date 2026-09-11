@@ -254,11 +254,23 @@ jobs:
           retention-days: 30
 
   # ---------------------------------------------------------------------------
-  # pre branch -> automatic PRE-RELEASE. This is the everyday path: push to pre,
-  # then install straight from the Releases page.
+  # pre branch -> the ROLLING pre-release. This is the everyday path: push to
+  # pre and the same release always holds the newest APK, so installing a test
+  # build is one stable link
+  # (…/releases/download/android-pre/zcode-remote.apk) instead of a new tag per
+  # push.
+  #
+  # Why rolling instead of one v<version>-pre.<run> per push: the tag space is
+  # shared with the HarmonyOS app in this repository (a tag per run piles up
+  # near-identical releases), and the build you actually want is always the
+  # newest one. The trade-off is that the tag no longer identifies a build, so
+  # the title carries the in-app versionName AND the build time, and the notes
+  # list this round's commits plus both timestamps.
+  #
+  # Modelled on sevnX's build.yml, which uses the same shape for its main builds.
   # ---------------------------------------------------------------------------
   prerelease:
-    name: Publish pre-release
+    name: Publish rolling pre-release
     if: github.ref == 'refs/heads/pre'
     needs: [js, build]
     runs-on: ubuntu-latest
@@ -276,39 +288,133 @@ jobs:
           name: zcode-remote-apk-${{ github.sha }}
           path: dist
 
-      - name: Resolve version and notes
-        id: meta
+      # Composed in its own step (and echoed to the log) so the exact text can be
+      # read straight out of a run when a release edit ever goes wrong.
+      - name: Compose title and notes
         working-directory: android-shell
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           base=$(sed -n 's/^zcodeBaseVersion=//p' gradle.properties | tr -d '\r' | head -1)
+          if [ -z "$base" ]; then
+            echo "::error::could not read zcodeBaseVersion from gradle.properties"
+            exit 1
+          fi
           name="${base}-pre.${{ github.run_number }}"
-          {
-            echo "VERSION_TAG=v$name"
-            echo "VERSION_NAME=$name"
-          } >> "$GITHUB_ENV"
-          # The newest CHANGELOG section describes the base version; a
-          # pre-release has no section of its own, so reuse it and label clearly.
-          awk 'BEGIN{n=0} /^## \[/{n++} n==1{print}' CHANGELOG.md > ../pre-notes.md
+          # No `v` prefix on purpose: a `v*` tag would match this workflow's own
+          # release trigger and start a second run.
+          tag="android-pre"
+          notes="$GITHUB_WORKSPACE/pre-notes.md"
+          round="$GITHUB_WORKSPACE/round.txt"
+
+          # Timestamps in UTC+8, computed arithmetically rather than through
+          # TZ=Asia/Shanghai: the runner's tz database (and whether `date` honours
+          # TZ at all) is not something this should depend on.
+          cst() {  # $1 = ISO timestamp, or "" for now; $2 = date format
+            local epoch
+            if [ -n "$1" ]; then
+              epoch=$(date -u -d "$1" +%s)
+            else
+              epoch=$(date -u +%s)
+            fi
+            date -u -d "@$((epoch + 28800))" "$2"
+          }
+
+          # The push timestamp comes from the commit, not from "now", so the two
+          # numbers in the notes stay meaningful even for a re-run.
+          push_time=$(cst "$(git log -1 --pretty=%cI)" '+%Y-%m-%d %H:%M:%S')
+          build_time=$(cst '' '+%Y-%m-%d %H:%M:%S')
+          stamp=$(cst '' '+%m-%d %H:%M')
+
+          # 本轮变更 = the commits this build adds on top of the commit the
+          # rolling release currently points at. Read through the compare API
+          # because this job only has a shallow clone; on the first run (no tag
+          # yet) or after a rebase/force-push it degrades to the pushed commit.
+          prev=$(git ls-remote origin "refs/tags/$tag" | cut -f1)
+          count=0
+          if [ -n "$prev" ] && [ "$prev" != "$GITHUB_SHA" ]; then
+            gh api "repos/${{ github.repository }}/compare/$prev...$GITHUB_SHA" \
+              --jq '.commits[] | "- " + (.commit.message | split("\n")[0])' \
+              > "$round" 2>/dev/null || true
+            count=$(grep -c '^- ' "$round" || true)
+          fi
+
+          echo "## 本轮变更" > "$notes"
+          echo "" >> "$notes"
+          if [ "${count:-0}" -gt 0 ]; then
+            echo "共 ${count} 个提交（\`${GITHUB_SHA:0:7}\`）：" >> "$notes"
+            echo "" >> "$notes"
+            cat "$round" >> "$notes"
+            if [ "$count" -eq 1 ]; then
+              # A single commit is usually the whole round: keep its body too,
+              # which is where the reasoning and the verification notes live.
+              echo "" >> "$notes"
+              gh api "repos/${{ github.repository }}/commits/$GITHUB_SHA" \
+                --jq '.commit.message | split("\n")[1:] | join("\n") | sub("^\\s+"; "")' \
+                >> "$notes" 2>/dev/null || true
+            fi
+          else
+            git log -1 --pretty=%B >> "$notes"
+          fi
           {
             echo ""
             echo "---"
             echo ""
-            echo "自动预发布，对应 \`pre\` 分支提交 \`${GITHUB_SHA:0:7}\`。"
+            echo "| 项 | 值 |"
+            echo "| --- | --- |"
+            echo "| 应用内版本 | \`$name\`（versionCode ${{ github.run_number }}） |"
+            echo "| 推送时间 | $push_time（UTC+8） |"
+            echo "| 编译完成 | $build_time（UTC+8） |"
+            echo "| 来源 | \`pre\` 分支 · 运行 #${{ github.run_number }} |"
             echo ""
-            echo "versionCode 为 CI 运行号 \`${{ github.run_number }}\`，可直接覆盖安装上一个版本。"
-          } >> ../pre-notes.md
+            echo "> 滚动发布：资产名固定，下载链接 \`…/releases/download/$tag/zcode-remote.apk\` 始终指向最新构建。"
+            echo "> \`versionCode\` 取 CI 运行号，可直接覆盖安装上一个版本。"
+          } >> "$notes"
 
-      - name: Publish pre-release
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
-        with:
-          tag_name: ${{ env.VERSION_TAG }}
-          name: ${{ env.VERSION_NAME }}
-          body_path: pre-notes.md
-          prerelease: true
-          files: |
-            dist/zcode-remote.apk
-            dist/zcode-remote.apk.md5
+          {
+            echo "ROLLING_TAG=$tag"
+            echo "ROLLING_TITLE=ZCode 远程 预发布 · $name · $stamp"
+            echo "ROLLING_VERSION=$name"
+          } >> "$GITHUB_ENV"
+
+          echo "=== 标题 ==="
+          echo "ZCode 远程 预发布 · $name · $stamp"
+          echo "=== 说明 ==="
+          cat "$notes"
+
+      - name: Publish (overwrite the rolling release)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          files=(dist/zcode-remote.apk dist/zcode-remote.apk.md5)
+          for file in "${files[@]}"; do
+            if [ ! -f "$file" ]; then
+              echo "::error::missing release asset $file"
+              exit 1
+            fi
+          done
+          if gh release view "$ROLLING_TAG" >/dev/null 2>&1; then
+            # Fixed asset names + --clobber: the previous download is replaced in
+            # place, so the link users keep is never invalidated.
+            gh release upload "$ROLLING_TAG" "${files[@]}" --clobber
+            # The tag has to move too. GitHub renders the release page (and its
+            # "Source code" links) from the tag, so leaving it on the first build
+            # would advertise a commit that the asset no longer matches.
+            git push --force origin "HEAD:refs/tags/$ROLLING_TAG"
+            gh release edit "$ROLLING_TAG" \
+              --title "$ROLLING_TITLE" \
+              --notes-file pre-notes.md
+          else
+            gh release create "$ROLLING_TAG" \
+              --target "$GITHUB_SHA" \
+              --title "$ROLLING_TITLE" \
+              --notes-file pre-notes.md \
+              --prerelease \
+              "${files[@]}"
+          fi
+          echo "published $ROLLING_VERSION -> $ROLLING_TAG"
 
   # ---------------------------------------------------------------------------
   # v* tag -> formal Release, notes from the "## [X.Y.Z]" changelog section.

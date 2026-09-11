@@ -21,27 +21,29 @@
 | --- | --- | --- | --- |
 | `js` | Node 协议层 + 注入层测试（35 项），不需要 JDK/SDK | ~1 min | ~40 s |
 | `build` | 单次 Gradle 调用：release 单元测试（20 项）+ `assembleRelease` + 签名校验 | ~4 min | ~2m 45s |
-| `prerelease` | 仅 `pre` 分支：自动打 tag 并发**预发布 Release**（可直接下载安装） | ~20 s | ~20 s |
+| `prerelease` | 仅 `pre` 分支：把最新 APK **覆写**到滚动预发布 Release（固定下载链接） | ~20 s | ~20 s |
 | `release` | 仅 `v*` tag：用 CHANGELOG 段落发正式 Release | ~20 s | ~20 s |
 
 省时间的几个点：`js` 不与 Android 构建串行；`testReleaseUnitTest` 与 `assembleRelease` 放在**同一次 Gradle 调用**里（共享 `compileReleaseKotlin`，源码只编译一次、Gradle 只启动一次）；`fetch-depth: 1`；`actions/setup-java` 的 `cache: gradle` 会恢复 `~/.gradle`（依赖缓存 + 本地 build cache）；`org.gradle.configuration-cache=true` 且 `problems=warn`，所以配置缓存只可能加速、不会让构建失败。
 
 ---
 
-## 发布流程：日常走 `pre`，正式版从 `main` 打 tag
+## 发布流程：日常走 `pre`（滚动预发布），正式版从 `main` 打 tag
 
 ```
-main ──────────────────────────────────● v1.0.0  正式 Release
+main ──────────────────────────────────● v1.0.0   正式 Release
         ╲                              ╱  （你决定何时把 pre 合入）
-   pre ──●──●──●──●
-           │  │  └─ v1.0.0-pre.<run>  预发布（自动，可直接安装）
-           │  └──── v1.0.0-pre.<run>
-           └─────── v1.0.0-pre.<run>
+   pre ──●──●──●──● ──────────────────────►  android-pre   滚动预发布
+                                              （同一个 Release，资产每次覆写）
 ```
 
-- **日常开发只推 `pre`**。每次推送到 `pre`，CI 通过后自动创建 tag `v<base>-pre.<运行号>` 并发布 **pre-release**，APK 挂在 Releases 页面上——装测试包不用再去翻 Actions 的 Artifacts。
+- **日常开发只推 `pre`**。CI 通过后，最新 APK 被**覆写**到那条固定的滚动 Release（tag `android-pre`）上，不会每次 push 都堆一个新 Release：
+  - 资产名固定 `zcode-remote.apk`（+ `.md5`），下载链接永远是 `…/releases/download/android-pre/zcode-remote.apk`；
+  - 标题刷新为 `ZCode 远程 预发布 · <应用内版本> · <编译时间>`；
+  - 说明刷新为「本轮变更」（与上一次构建之间的提交列表，单个提交时附正文）+ 推送时间 / 编译完成时间（UTC+8）/ 运行号；
+  - tag 会被 force-move 到本次构建的提交 —— GitHub 用 tag 渲染 Release 页与源码链接，不移动就会挂着旧提交而资产已经是新的。
 - **正式发布**：更新 `CHANGELOG.md` 顶部段落（必须是 `## [X.Y.Z]`，且与 `gradle.properties` 的 `zcodeBaseVersion` 一致）→ 把 `pre` 合入 `main` → 在 `main` 上 `git tag vX.Y.Z` → 推送。CI 会用 changelog 段落作为 Release 说明。
-- CI 用 GITHUB_TOKEN 创建的 tag **不会**再触发一次工作流，所以预发布不会递归。
+- 滚动 tag 故意**不带 `v` 前缀**（`android-pre`）：带 `v` 会匹配本工作流自己的 `tags: ['v*']` 正式发版触发条件，从而再起一次运行。CI 用 GITHUB_TOKEN 做的操作也不会递归触发工作流。
 - `concurrency` 的 key 含 ref，所以推 `pre` 不会取消 `main` 上正在跑的构建。
 
 ### 版本号的唯一来源与覆盖安装
@@ -57,7 +59,7 @@ main ─────────────────────────
 
 ## 取 APK
 
-**推荐（pre 分支）**：推送后打开仓库 **Releases** 页面，下载最新的 `pre-release` 里的 `zcode-remote.apk`。
+**推荐（pre 分支）**：固定链接 **[`…/releases/download/android-pre/zcode-remote.apk`](https://github.com/Bronzesakon/Zcode_harmony/releases/download/android-pre/zcode-remote.apk)**（Releases 页面上的「ZCode 远程 预发布」那条，资产每次构建覆写，链接不变）。
 
 其它路径：**Actions → Android Shell Build → 最近一次运行 → Artifacts → `zcode-remote-apk-<sha>`**（同样含 `zcode-remote.apk` 与 `.md5`）。
 
