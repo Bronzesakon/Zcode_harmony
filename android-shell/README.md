@@ -142,6 +142,40 @@ zcode-remote.apk -> CN=ZCode Remote, OU=Mobile, O=ZCode, L=Unknown, ST=Unknown, 
 
 ---
 
+## 交接清单：不在 git 里、必须随项目一起带走的东西
+
+这个子项目**不是自包含的**。clone 仓库只能拿到代码，下面这些要么在父仓库根、要么只在本机——换机器、换对话、或把子项目抽成独立仓库时，逐项对照。
+
+### 在 git 里（clone 即随行）
+
+`android-shell/app/src/**`（Kotlin、资源、`assets/inject.js`、`assets/zcode-protocol.js`）、`app/src/test/**`（3 个 Kotlin 单测）、`tools/**`、`gradle/wrapper/**` + `gradlew` + `gradlew.bat`（**必须保留**，CI 靠它构建；`gradlew` 必须是 LF，`.gitattributes` 已保证）、`build.gradle.kts` / `settings.gradle.kts` / `gradle.properties`（版本基准 `zcodeBaseVersion` 在这里）、`.gitattributes` / `.gitignore` / `key.properties.example` / `CHANGELOG.md` / `README.md`。
+
+### ⚠️ 在父仓库根，不在子项目目录内（最容易漏）
+
+| 路径 | 为什么必须跟着走 |
+| --- | --- |
+| `.github/workflows/android-shell.yml` | 整个构建/签名/滚动发布流程。所有 step 都用 `working-directory: android-shell`，**路径写死**——子项目改名或换目录必须同步改 |
+| `.github/scripts/android-shell-release-notes.ps1` | 正式发版（`v*` tag）时从 `android-shell/CHANGELOG.md` 取 Release 说明 |
+
+若把子项目抽成独立仓库：把 `.github/` 一起搬过去，把 workflow 里的 `working-directory` 改成 `.`（或删掉），`paths` 过滤简化为 `**`。
+
+### ⚠️ 不在 git 里，仅本机保留（必须手动拷贝/备份）
+
+| 路径 | 大小 | 内容 | 处置 |
+| --- | --- | --- | --- |
+| `android-shell/scratch/` | 9 KB | 签名密钥：`zcode-remote-release.p12`、`keystore-password.txt`、`keystore-base64.txt` | **务必备份**——丢了就无法再给老版本做覆盖安装。CI 从 4 个 Secret 读，本地构建不需要，但要带走 |
+| `android-shell/docs/` | 32 MB | Android 官方文档快照（文件/图片选择 15 篇 + Material3 界面规范 12 篇），本轮界面与上传规范化的依据 | 手动拷贝；版权归原厂商故不入库。目录里有 `README.md`（抓取清单 + 结论摘要） |
+| `android-shell/ColorOS_docs/` | 87 MB | ColorOS/OPPO 文档 149 篇 + Android 官方 6 篇（流体云、泛在服务、Live Updates），流体云路线选型的判断依据 | 手动拷贝；同上，目录内有 `README.md` |
+| `../安卓薄壳迁移文档.md` | — | 鸿蒙→安卓的迁移决策与历史回填（§11/§12 是决策落点，§8 第 4 步是关键里程碑） | 手动拷贝；不入库 |
+| `../项目文档.md` | — | 鸿蒙侧需求与决策历史 | 手动拷贝；不入库 |
+
+### GitHub 仓库侧（不在文件系统里）
+
+- **4 个 Secrets**（缺失时 CI 回退 debug 签名，见上一节）：`ANDROID_KEYSTORE_BASE64`、`ANDROID_KEYSTORE_PASSWORD`、`ANDROID_KEY_PASSWORD`、`ANDROID_KEY_ALIAS`。换仓库/换密钥时必须同步更新，否则新旧包签名不一致 → 只能卸载重装。
+- 滚动预发布 tag `android-pre` 与正式版 tag 的命名空间问题见下方「决策落点」与 `HANDOVER.md` §六。
+
+---
+
 ## 首次真机验证：迁移文档 §8 第 4 步（关键里程碑）
 
 这一步决定整条薄壳路线是否成立，因此把它做成了一次可读出结论的测量，而不是靠感觉：
@@ -249,14 +283,57 @@ zcode-remote.apk -> CN=ZCode Remote, OU=Mobile, O=ZCode, L=Unknown, ST=Unknown, 
 
 ## 本机开发
 
-本机不安装 JDK / Android SDK，**不要尝试本地构建**。可本地运行的只有协议层测试：
+本机（这台 Windows）**不装 JDK / Android SDK**，**不要尝试本地构建**——Kotlin 编译只能由 CI 完成，改完直接推 `pre`，在 CI 的 annotation 里读编译错误（workflow 会把 Gradle 的关键错误行提升为 `::error::`）。可本地运行的只有这些：
 
 ```bash
 cd android-shell
-node --test          # 35 项：线格式、分片重组、通道客户端、会话索引、注入层
+node --test                              # 35 项：线格式、分片重组、通道客户端、会话索引、注入层
+python tools/check_kotlin_structure.py   # 括号配平 / 包名与目录一致 / 合并残留（约 1 秒）
+python tools/watch_ci.py [--watch]       # 读 CI 状态与失败原因（无需 gh / 无需 token）
 ```
 
-其余一切以 CI 为准。改完 Kotlin 直接在日志里看编译错误——这也是为什么 CI 用 `--stacktrace`。
+工具链实况：
+
+| 东西 | 位置 / 情况 |
+| --- | --- |
+| JDK | 本机唯一可用的是 DevEco Studio 自带的 JBR（`E:\DevEco Studio\jbr`）；它的 `keytool` 可以生成安卓 keystore（当前签名材料就是这么来的） |
+| Android SDK / Gradle | **没有**；Gradle 由 CI 跑，本地 `gradlew` 不具备构建条件 |
+| `hdc` | `E:\DevEco Studio\sdk\default\openharmony\toolchains`（鸿蒙侧） |
+| `gh` / `jq` | **没有**。所以读 CI 用 `tools/watch_ci.py`，发布流程全部在 CI 里用 runner 自带的 `gh` |
+
+### 真机调试（adb）
+
+安卓真机是**一加 PLC110（Android 16 / API 36 / WebView 153）**。本机不装 Android SDK，但**有可用的 adb**，不必另装：
+
+| 位置 | 版本 | 说明 |
+| --- | --- | --- |
+| `C:\Program Files\UotanToolbox\Bin\platform-tools\adb.exe` | Platform-Tools **36.0.0** | 推荐；Android 16 需要较新的 adb |
+| `E:\leidian\LDPlayer9\adb.exe` | 34.0.4 | 雷电模拟器自带，备用 |
+
+手机走**无线调试**（开发者选项 → 无线调试），局域网 IP 见手机页面（近期为 `192.168.0.185`，会变）。**Android 11+ 首次必须配对**：只做 `adb connect` 会被拒，现象是端口 TCP 通（PowerShell `Test-NetConnection` 返回 True）而 `adb connect` 报 `failed to connect`。
+
+```bash
+ADB="C:/Program Files/UotanToolbox/Bin/platform-tools/adb.exe"
+
+# 1) 手机：无线调试 → 「使用配对码配对设备」→ 得到 <配对 IP:端口> 与 6 位配对码
+MSYS_NO_PATHCONV=1 "$ADB" pair <配对 IP:端口>        # 交互输入 6 位配对码
+# 2) 手机：无线调试页面上的 <IP:端口>（与配对端口不是同一个）
+MSYS_NO_PATHCONV=1 "$ADB" connect <IP:端口>
+MSYS_NO_PATHCONV=1 "$ADB" devices -l                 # 确认出现设备
+```
+
+配对码是**一次性凭据**：不要入库，不要写进日志、文档或提交信息。配对成功后，本机就具备完整的真机闭环（本机唯一缺的 JDK/SDK 由 CI 补上）：
+
+```bash
+"$ADB" install -r zcode-remote.apk        # 覆盖安装（versionCode 单调递增，永远能盖过上一版）
+"$ADB" shell am start -n com.zcode.remote/.MainActivity
+"$ADB" shell cat /sdcard/Android/data/com.zcode.remote/files/logs/zcode-shell.log   # 诊断日志（含历史会话 + 崩溃堆栈）
+"$ADB" shell dumpsys window windows | grep -i zcode    # 窗口类型（判断「悬浮显示」这类系统弹窗）
+"$ADB" shell appops get com.zcode.remote              # 权限 / AppOps 实况
+"$ADB" logcat -d -s ZCodeRemote                        # 与日志文件同源（Diagnostics 会镜像到 logcat）
+```
+
+**鸿蒙测试机不要弄混**（与本子项目无关）：`192.168.0.82:12345`（HBN-AL80 / API 24）、`192.168.0.79:41247`，另有若干串口。本会话挂着 `dsh-hdc-bridge` MCP（`hdc_list_targets` / `hdc_shell` / `hdc_screenshot` 等），能直接操作这些鸿蒙设备，但**它连不到安卓真机**——安卓侧一律用上面的 adb。
 
 ## 目录
 

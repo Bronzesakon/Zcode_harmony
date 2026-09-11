@@ -277,18 +277,11 @@ Kotlin 编译**只能靠 CI**：推送后在 Actions 页面或 `watch_ci.py` 看
 
 本轮已改：主动订阅不再在配对后 1.5s 无条件启动（原来 7 个工作区约 10s 连续握手，正好压在页面首屏加载窗口里），改为「最后一次收帧静默 ≥800ms 才启动，最迟推迟 12s」。若下一轮日志显示这仍不够，再考虑限制并发/分批。
 
-### 本机 adb（重要新增）
-这台 Windows **有可用的 adb**，不必另装（`minSdk` 校验、装包、取日志都能做）：
-- `C:\Program Files\UotanToolbox\Bin\platform-tools\adb.exe` — Platform-Tools **36.0.0**，推荐
-- `E:\leidian\LDPlayer9\adb.exe` — 34.0.4，雷电自带，备用
-
-一加手机（无线调试）在 **192.168.0.185**：Android 11+ **首次必须配对**（TCP 通但 `adb connect` 会被拒正是这个特征）。手机「开发者选项 → 无线调试 → 使用配对码配对设备」给出 `IP:端口` + 6 位配对码：
-
-```bash
-MSYS_NO_PATHCONV=1 "/c/Program Files/UotanToolbox/Bin/platform-tools/adb.exe" pair <配对IP:端口>   # 交互输入 6 位码
-… adb connect <无线调试页显示的 IP:端口>                                                            # 配对后即可
-```
-
-配对码是一次性凭据：不要写进任何文件或提交。配对成功后整条闭环成立 —— CI 出包 → `adb install -r` → `adb shell cat /sdcard/Android/data/com.zcode.remote/files/logs/zcode-shell.log` 直接取日志，不必在手机上手动导出分享。
+### 本机 adb（**已沉淀到 README**：见「本机开发 → 真机调试（adb）」）
+要点速记，细则（命令、配对步骤、dumpsys/appops 用法）不再在本文档重复：
+- 本机**有可用 adb**：`C:\Program Files\UotanToolbox\Bin\platform-tools\adb.exe`（Platform-Tools **36.0.0**，推荐）、`E:\leidian\LDPlayer9\adb.exe`（34.0.4，备用）。
+- 一加手机走**无线调试**（近期 IP `192.168.0.185`，会变）；Android 11+ **首次必须配对** —— 端口 TCP 通但 `adb connect` 报 `failed to connect` 就是这个特征，需先用手机上的配对码 `adb pair` 一次。
+- 配对码是**一次性凭据**：不要写进任何文件、日志或提交。
+- 配对成功后闭环成立：CI 出包 → `adb install -r` → `adb shell cat .../files/logs/zcode-shell.log` 直接取诊断日志。
 
 > 注意：本机还有一台**鸿蒙**测试机（hdc 可达 `192.168.0.82:12345`，HBN-AL80/API 24），与本子项目无关，别弄混。
