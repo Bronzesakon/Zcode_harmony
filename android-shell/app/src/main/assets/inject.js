@@ -9,6 +9,9 @@
  *   4. Keep the page convinced it is visible, so it does not pause itself when
  *      the app goes to the background.
  *   5. Expose __zcodeShellLocateTask() for notification taps.
+ *   6. Adapt the desktop layout to the phone: the page's classic scrollbar
+ *      takes layout width, which pushes everything centred inside the page
+ *      left of the screen's centre.
  *
  * Installed via WebViewCompat.addDocumentStartJavaScript, i.e. BEFORE any page
  * script runs. That timing is mandatory: the page opens its WebSocket during
@@ -865,6 +868,37 @@
      * displayed at, which shows up as content sitting off-centre relative to
      * the scrollbar.
      */
+    /**
+     * Widest classic scrollbar in the page, in CSS px.
+     *
+     * offsetWidth minus clientWidth is the border plus the scrollbar; the page's
+     * scrollers have no border, so for them the difference *is* the scrollbar.
+     * Reported next to the viewport so the gutter fix can be settled by a number
+     * in the log rather than by a screenshot.
+     */
+    function scrollbarGutter() {
+        try {
+            var all = document.querySelectorAll('*');
+            var widest = 0;
+            var scrollers = 0;
+            var limit = Math.min(all.length, 4000);
+            for (var i = 0; i < limit; i++) {
+                var el = all[i];
+                if (el.scrollHeight - el.clientHeight < 8) {
+                    continue;
+                }
+                scrollers++;
+                var take = el.offsetWidth - el.clientWidth;
+                if (take > widest) {
+                    widest = take;
+                }
+            }
+            return {widest: widest, scrollers: scrollers};
+        } catch (e) {
+            return null;
+        }
+    }
+
     function reportViewport() {
         // Wrapped because it runs from a timer: by the time it fires the
         // document may be going away, and an exception here would escape into
@@ -872,6 +906,7 @@
         try {
             var doc = document.documentElement || {};
             var vv = window.visualViewport;
+            var gutter = scrollbarGutter();
             post('diag', {
                 level: 'info',
                 message: '视口 innerWidth=' + window.innerWidth +
@@ -879,7 +914,11 @@
                     ' clientWidth=' + (doc.clientWidth || 0) +
                     ' scrollWidth=' + (doc.scrollWidth || 0) +
                     ' dpr=' + (window.devicePixelRatio || 0) +
-                    ' scale=' + (vv ? Math.round(vv.scale * 100) / 100 : 'n/a')
+                    ' scale=' + (vv ? Math.round(vv.scale * 100) / 100 : 'n/a') +
+                    (gutter
+                        ? ' · 滚动条让位 ' + gutter.widest + 'px（纵向滚动容器 ' +
+                            gutter.scrollers + ' 个）'
+                        : '')
             });
         } catch (e) {
             // page torn down; nothing to report
@@ -910,8 +949,67 @@
     };
 
     // -----------------------------------------------------------------------
+    // 6. desktop scrollbar -> zero width
+    //
+    // The page ships a desktop scrollbar globally, in its own stylesheet:
+    //
+    //     *{scrollbar-width:auto;scrollbar-color:var(--color-border) transparent}
+    //     ::-webkit-scrollbar{width:14px;height:14px}
+    //     ::-webkit-scrollbar-thumb{background:var(--color-border);
+    //         background-clip:padding-box;border:3px solid #0000;border-radius:9999px}
+    //
+    // Styling ::-webkit-scrollbar is what makes Blink use a classic scrollbar
+    // instead of its zero-width overlay one, so every scroller in the page gives
+    // 14px of its client box to the bar. On a phone that reads as a layout bug
+    // rather than a browser affordance: the scroller's client box is narrower
+    // than the viewport, so everything centred inside it — the conversation and
+    // the composer with it — sits left of the screen's centre behind an empty
+    // strip down the right edge. Measured on the device: content box 1222px wide
+    // out of a 1272px screen = a 14.3 CSS px gutter at devicePixelRatio 3.5, and
+    // a thumb 8.3px wide inset 3.1px — the numbers above, to the pixel.
+    //
+    // The page already does exactly this for the scrollers it cares about
+    // (`.scrollbar-hide`, `[data-zcode-pptx-render-surface] *`), so this is the
+    // page's own idiom applied to the whole document. `scrollbar-width` is the
+    // standard property and wins over the legacy pseudo-element wherever the
+    // engine knows it; the `::-webkit-scrollbar` rule is what covers engines
+    // that predate it. Hiding the bar gives the content its 14px back — 4% of a
+    // 363px viewport — at the cost of the position indicator; the platform's own
+    // scrollbars are invisible except while scrolling anyway.
+    // -----------------------------------------------------------------------
+    var SCROLLBAR_CSS =
+        '::-webkit-scrollbar{width:0!important;height:0!important}' +
+        '*{scrollbar-width:none!important}';
+
+    function installScrollbarFix() {
+        try {
+            var parent = document.head || document.documentElement;
+            if (!parent) {
+                // document-start can land before <html> exists. Retry at the
+                // parser's first opportunity rather than let the gutter flash
+                // for a whole page load.
+                document.addEventListener('DOMContentLoaded', installScrollbarFix);
+                return false;
+            }
+            var style = document.createElement('style');
+            style.setAttribute('data-zcode-shell', 'scrollbar');
+            style.textContent = SCROLLBAR_CSS;
+            parent.appendChild(style);
+            return true;
+        } catch (e) {
+            diag('warn', '滚动条修正注入失败: ' + e);
+            return false;
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // boot
     // -----------------------------------------------------------------------
+    try {
+        installScrollbarFix();
+    } catch (e) {
+        diag('error', '滚动条修正失败: ' + e);
+    }
     try {
         installVisibilityHijack();
     } catch (e) {
