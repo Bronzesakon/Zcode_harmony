@@ -691,7 +691,7 @@ android-shell/
 
 ### 一句话状态
 
-`pre` @ `bc55168`（本轮从 `a3a57f5` 起，中间三次提交：实现 → 修 CI 资源链接 → 修 Kotlin 错误）；真机已装 **`1.0.0-pre.42`**，CI 全绿，第一批真机验收见「阶段验收记录」。**第八轮结束时的状态**：CI 全绿（JS 50 + Kotlin 42 单测），
+`pre` @ `e52a7c4`（本轮从 `a3a57f5` 起共 11 个提交，每次推送都跑 CI 且全绿）；真机最后一版装的是 **`1.0.0-pre.43`**（之后 04:00 前又推了两版修复，但设备已掉线装不上）；验收记录见「阶段验收记录」，阻塞项见「拦路石」。**第八轮结束时的状态**：CI 全绿（JS 50 + Kotlin 42 单测），
 最新预发布 `1.0.0-pre.39`，真机验证八轮（一加 PLC110 / ColorOS 16 / API 36 / WebView 153–154）。
 
 **本轮（第九轮）是一次「过夜长任务」**：用户一次性给出 11 条改动/取证要求 + 14 条流程要求（见下面的「任务清单」），
@@ -833,7 +833,28 @@ APK 已覆写到滚动预发布，真机装的是 **`1.0.0-pre.42`**（versionCo
 另外注意 02:25 那次重启后的 burst：`default` **没有** fault（`bridge ready` + `主动订阅完成：用时 10684ms`），
 说明 fault 是场景性的（页面已在别处持有该工作区时才会发生），不是每次握手必然发生。
 
-#### 阶段 5（阻塞）：视觉与交互验收
+#### 阶段 5：复审驱动的三处收口（2026-09-12 03:00–04:00，pre.44 → pre.47）
+
+设备掉线后没有真机可测，于是把时间用在**逐处复审**上。查出来的都不是 CI 能发现的东西：
+
+1. **注入层的一个静默致命点**（已修，见阶段 4 开头）：`<html>` 未就绪时观察器一次装不上就永远没有。
+2. **完成卡片可能赖在通知栏**：promoted ⇒ 必须 ongoing ⇒ 用户划不掉。进程若在 15 秒窗口内被杀，
+   `setTimeoutAfter` 来不及生效，那张「已完成」就只能靠强停应用清掉。已在 `ensureChannels()` 里
+   用 `getActiveNotifications()` 清扫落在完成卡片 id 区间、而本进程并未持有的通知
+   （不需要持久化——区间可推导，且与运行中卡片不重叠已有单测）。
+3. **设置页同一页两套蓝**：页面是 MiuiX 的 `#3482FF`，但 `MaterialSwitch` 取的是 M3 **角色**
+   （`colorPrimary` / `colorOnPrimary` / `colorSurfaceContainerHighest` / `colorOutline`），
+   Android 12+ 的动态配色会把这些角色换成壁纸派生色。**关键在优先级**：动态配色是以
+   ThemeOverlay 套在主题**之上**的，在 `themes.xml` 里显式盖没有用。所以两处一起改：
+   新增 `Theme.ZcodeRemote.Miuix`（设置页专用，四个角色指向 MiuiX 值）+ `ZcodeRemoteApp` 里用
+   `DynamicColorsOptions.setPrecondition` 把 SettingsActivity 排除出动态配色。主界面继续用动态配色。
+
+**这一轮 CI 又教了两件事**（都已记进代码注释）：
+- aapt2 的「`<item name="app:tint">`」——**style 的 item 名不写库属性的前缀**，改到使用处的 `app:tint`；
+- Material 的 `DynamicColors.Precondition` 是**两个参数**（`Activity` + `@ColorScheme int`），
+  一元 lambda 会被 CI 判 `Function1 vs Function2`。
+
+#### 阶段 6（阻塞）：视觉与交互验收
 
 **卡在安全锁屏上**，见「拦路石」第一条。解锁后要补的清单：
 
