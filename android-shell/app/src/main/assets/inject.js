@@ -663,31 +663,43 @@
     }
 
     // -----------------------------------------------------------------------
-    // 4. heartbeat + staleness recovery
+    // 4. heartbeat, staleness recovery, and the resume posture
     //
     // The page has its own heartbeat, but it is subject to the same background
-    // timer throttling as everything else in the renderer. Repeating the query
-    // (a) keeps the desktop's pairing state fresh and (b) gives us an
-    // independent liveness signal we can report and act on.
+    // suspension as everything else in the renderer — while the app is
+    // backgrounded this interval can stop firing for the whole stint. So the
+    // tick body is exposed as __zcodeShellHeartbeat and the foreground service
+    // drives it every 15s (see ShellRuntime).
     //
-    // Measured on device (2026-09-11, WebView 153 / ColorOS 16): while the app
-    // is backgrounded the WebView suspends this page's timer queue outright —
-    // the interval below stops firing completely (observed gaps: 10m40s with
-    // zero executions, and single "windows" of 842s / 1201s). The desktop then
-    // stops seeing our heartbeat, and both the page's own ack watchdog and the
-    // staleness branch below declare the link stale the moment the renderer
-    // wakes up. So the tick body is exposed as __zcodeShellHeartbeat for the
-    // native side to drive: the foreground service pumps it while the app is
-    // backgrounded, and an evaluateJavascript round trip is a message task, not
-    // a timer task, so it runs where the interval cannot.
+    // Two rules govern when this layer may tear the socket down. Both are
+    // conservative on purpose: closing the socket is the heaviest thing we can
+    // do — recovery belongs to the page, and a rebuild costs a full re-open of
+    // workspaces and tasks.
+    //
+    //   1. One stale reading is not a verdict. The first tick that finds the
+    //      ack stale only logs and probes again; the second consecutive one
+    //      rebuilds.
+    //   2. On return to the foreground the decision is made on whether frames
+    //      were still arriving, not on the ack clock. A link that was still
+    //      delivering is left alone (ack clock reset, one probe sent); only a
+    //      link that has been silent for a minute is rebuilt. Before this, every
+    //      return from a long background closed a socket the page was about to
+    //      recover on its own, turning one self-heal into a full re-open.
     // -----------------------------------------------------------------------
     var HEARTBEAT_MS = 10000;
     var STALE_MS = 90000;
+    /** Floor between two forced rebuilds, so a dead desktop cannot make us churn. */
+    var RECONNECT_MIN_GAP_MS = 180000;
+    /** Consecutive stale readings required before the socket is rebuilt. */
+    var STALE_PROBES = 2;
+    /** A foreground return with the link silent this long is treated as dead. */
+    var RESUME_DEAD_LINK_MS = 60000;
     /** Ticks closer together than this are dropped so the timer and the pump cannot double up. */
     var MIN_TICK_GAP_MS = 5000;
     var lastPairAckAt = 0;
     var lastForcedReconnectAt = 0;
     var lastTickAt = 0;
+    var staleTicks = 0;
 
     /**
      * Liveness counters.
@@ -705,10 +717,8 @@
         outboundFrames: 0,
         socketsOpened: 0,
         socketsClosed: 0,
-        /** Heartbeat ticks executed at all, and how many of them the native pump drove. */
+        /** Heartbeat ticks this layer executed, and the wall clock of the last one. */
         heartbeatTicks: 0,
-        nativeTicks: 0,
-        /** Wall clock of the most recent executed tick: the resume burst is visible here. */
         lastTickWallMs: 0,
         startedAt: Date.now(),
         lastInboundAt: 0
@@ -723,7 +733,6 @@
             socketsOpened: liveness.socketsOpened,
             socketsClosed: liveness.socketsClosed,
             heartbeatTicks: liveness.heartbeatTicks,
-            nativeTicks: liveness.nativeTicks,
             lastTickWallMs: liveness.lastTickWallMs,
             lastInboundAgoMs: liveness.lastInboundAt ?
                 Date.now() - liveness.lastInboundAt : -1,
@@ -736,7 +745,7 @@
 
     function startHeartbeat() {
         setInterval(function () {
-            heartbeatTick('timer');
+            heartbeatTick();
         }, HEARTBEAT_MS);
     }
 
@@ -744,12 +753,9 @@
      * One heartbeat: report the counters, then keep the desktop's pairing state
      * warm with a pair_status_query.
      *
-     * [source] is 'timer' when the page's own interval ran it and 'native' when
-     * the foreground service drove it (see __zcodeShellHeartbeat). Both paths
-     * are counted separately because "did the tick run at all while the app was
-     * backgrounded" is the one question the survival verdict turns on.
+     * Returns false when the tick was dropped by the gap guard.
      */
-    function heartbeatTick(source) {
+    function heartbeatTick() {
         var nowMs = Date.now();
         if (nowMs - lastTickAt < MIN_TICK_GAP_MS) {
             return false;
@@ -757,14 +763,6 @@
         lastTickAt = nowMs;
         liveness.heartbeatTicks += 1;
         liveness.lastTickWallMs = nowMs;
-        if (source === 'native') {
-            liveness.nativeTicks += 1;
-            // Logged per tick on purpose: the timestamps are what separate "the
-            // pump works while the app is in the background" from "the renderer
-            // deferred every evaluateJavascript and ran them all in a burst at
-            // resume" — the end-of-window counters look identical either way.
-            diag('debug', '原生泵心跳 #' + liveness.nativeTicks + ' 已执行');
-        }
         reportLiveness();
         reportPerf();
         if (client && client.reportPageRpcWindow) {
@@ -781,24 +779,20 @@
             return true;
         }
         if (lastPairAckAt && nowMs - lastPairAckAt > STALE_MS) {
-            diag('warn', 'relay 心跳超时 ' + Math.round((nowMs - lastPairAckAt) / 1000) + 's');
-            // Rate limited: closing the socket hands control to the page's
-            // own reconnect logic, which is the only recovery available to
-            // us (we do not own the socket's lifecycle).
-            if (nowMs - lastForcedReconnectAt > 180000) {
-                lastForcedReconnectAt = nowMs;
-                var socket = activeSocket;
-                if (socket && socket.readyState === 1) {
-                    diag('warn', '强制重建 relay 连接以恢复');
-                    try {
-                        socket.close();
-                    } catch (e) {
-                        // ignore
-                    }
-                }
+            staleTicks += 1;
+            if (staleTicks < STALE_PROBES) {
+                diag('warn', 'relay 心跳陈旧 ' +
+                    Math.round((nowMs - lastPairAckAt) / 1000) + 's，先探测再决定（第 ' +
+                    staleTicks + ' 次）');
+            } else {
+                forceReconnect('心跳陈旧 ' + Math.round((nowMs - lastPairAckAt) / 1000) + 's');
             }
-            return true;
+        } else {
+            staleTicks = 0;
         }
+        // Sent on both branches on purpose: the probe is the recovery path for a
+        // merely-stale link, and the desktop's ack is also what keeps the page's
+        // own ack watchdog from declaring the connection dead.
         injectPayload({
             type: 'pair_status_query',
             device_sid: deviceSid,
@@ -808,11 +802,36 @@
     }
 
     /**
-     * Native-driven heartbeat (foreground service while the app is
-     * backgrounded). Returns true when the tick was accepted.
+     * Rebuilds the relay socket by closing it: the recovery itself belongs to
+     * the page, which is the only party that owns the socket's lifecycle. Rate
+     * limited so a dead desktop cannot make us churn. Returns true when the
+     * socket was actually closed.
+     */
+    function forceReconnect(reason) {
+        if (Date.now() - lastForcedReconnectAt <= RECONNECT_MIN_GAP_MS) {
+            return false;
+        }
+        var socket = activeSocket;
+        if (!socket || socket.readyState !== 1) {
+            return false;
+        }
+        lastForcedReconnectAt = Date.now();
+        staleTicks = 0;
+        diag('warn', '强制重建 relay 连接以恢复（' + reason + '）');
+        try {
+            socket.close();
+        } catch (e) {
+            // ignore
+        }
+        return true;
+    }
+
+    /**
+     * Native-driven heartbeat (the foreground service drives this while the app
+     * is backgrounded, where the interval above cannot run).
      */
     G.__zcodeShellHeartbeat = function () {
-        return heartbeatTick('native');
+        return heartbeatTick();
     };
 
     // -----------------------------------------------------------------------
@@ -945,20 +964,32 @@
     /** Called by the native side when the app's foreground state changes. */
     G.__zcodeShellSetAppForeground = function (foreground) {
         diag('info', 'app foreground = ' + (foreground ? 'true' : 'false'));
-        if (foreground && relayPaired) {
-            // Give the link one full round trip before the stale branch is
-            // allowed to act. Coming back from a long background, the first tick
-            // used to run against an ack timestamp that was minutes old and
-            // therefore closed the page's socket at the exact moment the page
-            // was about to recover by itself — turning one self-heal into a full
-            // workspace re-open. The native pump keeps acks fresh while
-            // backgrounded; this is the belt for the case where it cannot.
-            lastPairAckAt = Date.now();
-            var socket = activeSocket;
-            if (socket && socket.readyState !== 1) {
-                diag('warn', 'socket 非 OPEN，交由页面自动重连');
-            }
+        if (!foreground) {
+            return;
         }
+        if (!relayPaired || !deviceSid) {
+            diag('info', '回前台时链路未就绪，交由页面自行重连');
+            return;
+        }
+        // An unbounded background stint is the one thing this layer cannot see
+        // from the inside (its own timers stop), so the native side tells us we
+        // are back — and the verdict is made on the frames that were still
+        // arriving, not on the ack clock. A live link is left alone; a silent
+        // one is rebuilt now rather than waiting for the stale branch.
+        var silence = liveness.lastInboundAt ? Date.now() - liveness.lastInboundAt : -1;
+        if (silence < 0 || silence > RESUME_DEAD_LINK_MS) {
+            forceReconnect(silence < 0 ?
+                '回前台且从未收到帧' :
+                '回前台时已静默 ' + Math.round(silence / 1000) + 's');
+            return;
+        }
+        lastPairAckAt = Date.now();
+        staleTicks = 0;
+        injectPayload({
+            type: 'pair_status_query',
+            device_sid: deviceSid,
+            client_ts: Date.now()
+        });
     };
 
     /**

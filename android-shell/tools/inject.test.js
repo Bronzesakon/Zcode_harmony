@@ -639,7 +639,42 @@ test('the native pump can drive a heartbeat, and the tick is rate limited', asyn
         await flush();
         const last = findPost(page.posts, 'liveness').pop().data;
         assert.strictEqual(last.heartbeatTicks, 1, 'the survival verdict reads this counter');
-        assert.strictEqual(last.nativeTicks, 1, 'pumped ticks must be distinguishable from timer ticks');
+        assert.ok(last.lastTickWallMs > 0, 'a tick must be stamped so a resume burst can be told apart');
+    } finally {
+        page.teardown();
+    }
+});
+
+// The resume posture (borrowed from the reference client): the decision is made
+// on the frames that were still arriving, not on the ack clock. Closing the
+// socket is the heaviest thing this layer can do — the page's own recovery is
+// what follows it, and that costs a full re-open of workspaces and tasks — so it
+// must never happen to a link that is demonstrably alive.
+test('a foreground return with frames still arriving leaves the socket alone', async () => {
+    const page = setupPage();
+    try {
+        const socket = new globalThis.WebSocket('wss://relay.example');
+        socket.dispatchEvent({type: 'open'});
+        socket.send(JSON.stringify({type: 'auth_init', role: 'terminal', device_sid: 'sid-1'}));
+        socket.receive({type: 'pair_status_ack', pair_status: 'matched'});
+        await wait(1700);
+
+        const before = socket.sent.length;
+        globalThis.__zcodeShellSetAppForeground(false);
+        globalThis.__zcodeShellSetAppForeground(true);
+        await flush();
+
+        assert.strictEqual(socket.readyState, FakeWebSocket.OPEN, 'a live link must not be torn down');
+        const probes = socket.sent.slice(before)
+            .map((raw) => {
+                try {
+                    return JSON.parse(raw);
+                } catch (e) {
+                    return null;
+                }
+            })
+            .filter((frame) => frame && frame.payload && frame.payload.type === 'pair_status_query');
+        assert.strictEqual(probes.length, 1, 'the resume must probe the link once');
     } finally {
         page.teardown();
     }

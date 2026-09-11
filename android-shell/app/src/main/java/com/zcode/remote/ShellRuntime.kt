@@ -70,14 +70,12 @@ object ShellRuntime {
         val socketsOpened: Int,
         val socketsClosed: Int,
         /**
-         * Heartbeat ticks the page executed, and how many of them the native
-         * pump drove. This pair is what decides whether the pump worked: a
-         * background window that shows dispatches from here but no growth in
-         * [heartbeatTicks] means the renderer defers evaluateJavascript too.
+         * Heartbeat ticks the page executed, and the wall clock of the last one.
+         * A tick stamped at the resume instant is one of the overdue timers
+         * firing late, not a tick that happened while the app was away — the
+         * verdict below needs the timestamp to tell those apart.
          */
         val heartbeatTicks: Int,
-        val nativeTicks: Int,
-        /** Wall clock of the most recent executed tick, so the resume burst is detectable. */
         val lastTickWallMs: Long,
         /** Uptime timestamp of the most recent inbound frame (0 = none yet). */
         val lastInboundAtElapsed: Long,
@@ -92,7 +90,6 @@ object ShellRuntime {
     private var backgroundFrameBase = 0
     private var backgroundAckBase = 0
     private var backgroundTickBase = 0
-    private var backgroundNativeTickBase = 0
 
     /** Set on return to foreground; the next liveness report resolves it. */
     @Volatile
@@ -116,7 +113,6 @@ object ShellRuntime {
             socketsOpened = data.optInt("socketsOpened"),
             socketsClosed = data.optInt("socketsClosed"),
             heartbeatTicks = data.optInt("heartbeatTicks"),
-            nativeTicks = data.optInt("nativeTicks"),
             lastTickWallMs = data.optLong("lastTickWallMs"),
             lastInboundAtElapsed = if (ago >= 0) receivedAt - ago else 0,
             paired = data.optBoolean("paired"),
@@ -130,7 +126,6 @@ object ShellRuntime {
             val frames = current.inboundFrames - backgroundFrameBase
             val acks = current.pairAcks - backgroundAckBase
             val ticks = current.heartbeatTicks - backgroundTickBase
-            val pumpedTicks = current.nativeTicks - backgroundNativeTickBase
             // A tick stamped at (or after) the moment the app came back did not
             // happen "during" the background: it is one of the overdue timers and
             // messages that all fire at once on resume. Counting those as survival
@@ -152,7 +147,7 @@ object ShellRuntime {
             val duration = formatDuration(backgroundEndedAt - backgroundStartedForVerdict)
             Diagnostics.info(
                 "后台存活检查：时长 $duration，期间注入层心跳 $ticks 次" +
-                    "（其中原生泵驱动 $pumpedTicks 次、原生共发令 $pumpDispatchesForVerdict 次$tickAge）、" +
+                    "（原生泵发令 $pumpDispatchesForVerdict 次$tickAge）、" +
                     "收到 $frames 帧、配对确认 $acks 次 → $verdict"
             )
         }
@@ -196,30 +191,37 @@ object ShellRuntime {
             backgroundFrameBase = snapshot?.inboundFrames ?: 0
             backgroundAckBase = snapshot?.pairAcks ?: 0
             backgroundTickBase = snapshot?.heartbeatTicks ?: 0
-            backgroundNativeTickBase = snapshot?.nativeTicks ?: 0
         }
     }
 
     // ------------------------------------------------------------ heartbeat pump
     //
-    // Measured on device (2026-09-11, WebView 153 / ColorOS 16): while the app
-    // is backgrounded the WebView suspends the page's timer queue outright — the
-    // injected layer's 10s heartbeat executed zero times across 10+ minute
-    // background windows. The desktop then stops seeing us, and both the page's
-    // ack watchdog and our own staleness branch declare the link dead the moment
-    // the renderer wakes up, which is the reconnect the user sees on return.
+    // The injected layer's own interval cannot be relied on while the app is
+    // backgrounded: on this device the page's timer queue stops for the whole
+    // stint (measured: zero ticks across 10-minute windows), the desktop stops
+    // hearing from us, and the page then declares the link dead the moment the
+    // renderer wakes up — which is the reconnect seen on return. Driving the
+    // same tick from here keeps the pairing warm instead, and the desktop's acks
+    // also keep the page's own watchdog quiet.
     //
-    // An evaluateJavascript round trip is a message task, not a timer task, so
-    // driving the very same tick from here gets it running again. The interval
-    // is comfortably inside the page's own 30s ack timeout, and the injected
-    // side drops ticks that arrive closer than 5s apart, so the two drivers
-    // cannot double the traffic.
+    // Two properties are load-bearing and easy to undo by simplifying:
+    //
+    //  * The handler is asynchronous (API 28+). Ordinary messages posted to the
+    //    main looper are NOT delivered while the window is invisible — measured:
+    //    a dispatch due at +15s arrived 3m26s late, at the instant the app came
+    //    back to the foreground. Asynchronous messages are not blocked by the
+    //    Choreographer's sync barrier, which is what starves them.
+    //  * None of this helps if the platform gives the process no execution at
+    //    all: with ColorOS's default battery policy the app is frozen/killed
+    //    while backgrounded (o-kill/o-stop at importance=FOREGROUND_SERVICE, and
+    //    a 15s dispatch still not delivered after 10 minutes). The per-app
+    //    "allow full background behaviour" switch is what makes the pump real.
 
-    /** How often the pump drives one heartbeat tick. */
+    /** How often the pump drives one heartbeat tick; inside the desktop's 30s ack window. */
     private const val PUMP_INTERVAL_MS = 15_000L
 
     /** Every Nth dispatch is logged; the first one always is. */
-    private const val PUMP_LOG_EVERY = 10
+    private const val PUMP_LOG_EVERY = 20
 
     @Volatile
     private var appIsForeground = true
@@ -227,16 +229,7 @@ object ShellRuntime {
     private var pumpDispatches = 0
     private var pumpDispatchesForVerdict = 0
 
-    /**
-     * The pump runs on an ASYNCHRONOUS main-thread handler, which is the whole
-     * point: while the window is invisible the Choreographer's sync barrier is
-     * never removed (no vsync is delivered to a window that is not visible), and
-     * a synchronous message — which is what `postDelayed` on an ordinary Handler
-     * produces — is not delivered while a barrier is pending. Measured on device:
-     * a dispatch due at +15s was delivered 3m26s late, at the instant the app came
-     * back to the foreground, so the pump never actually ran while backgrounded.
-     * Asynchronous messages bypass the barrier.
-     */
+    /** See the class comment above: asynchronous is the point, not a detail. */
     private val pumpHandler: Handler =
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
             Handler.createAsync(Looper.getMainLooper())
@@ -251,10 +244,7 @@ object ShellRuntime {
                     pumpDispatches += 1
                     evaluateJs("window.__zcodeShellHeartbeat && window.__zcodeShellHeartbeat();")
                     if (pumpDispatches == 1 || pumpDispatches % PUMP_LOG_EVERY == 0) {
-                        Diagnostics.log(
-                            "debug",
-                            "注入心跳泵 #$pumpDispatches（网页定时器在后台被挂起，改由原生驱动）",
-                        )
+                        Diagnostics.log("debug", "后台心跳泵 #$pumpDispatches 次发令")
                     }
                 }
                 pumpHandler.postDelayed(this, PUMP_INTERVAL_MS)
