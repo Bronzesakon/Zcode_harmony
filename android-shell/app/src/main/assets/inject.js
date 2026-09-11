@@ -708,6 +708,8 @@
         /** Heartbeat ticks executed at all, and how many of them the native pump drove. */
         heartbeatTicks: 0,
         nativeTicks: 0,
+        /** Wall clock of the most recent executed tick: the resume burst is visible here. */
+        lastTickWallMs: 0,
         startedAt: Date.now(),
         lastInboundAt: 0
     };
@@ -722,6 +724,7 @@
             socketsClosed: liveness.socketsClosed,
             heartbeatTicks: liveness.heartbeatTicks,
             nativeTicks: liveness.nativeTicks,
+            lastTickWallMs: liveness.lastTickWallMs,
             lastInboundAgoMs: liveness.lastInboundAt ?
                 Date.now() - liveness.lastInboundAt : -1,
             paired: relayPaired,
@@ -753,6 +756,7 @@
         }
         lastTickAt = nowMs;
         liveness.heartbeatTicks += 1;
+        liveness.lastTickWallMs = nowMs;
         if (source === 'native') {
             liveness.nativeTicks += 1;
             // Logged per tick on purpose: the timestamps are what separate "the

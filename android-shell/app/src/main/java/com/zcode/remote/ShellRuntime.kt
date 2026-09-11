@@ -77,6 +77,8 @@ object ShellRuntime {
          */
         val heartbeatTicks: Int,
         val nativeTicks: Int,
+        /** Wall clock of the most recent executed tick, so the resume burst is detectable. */
+        val lastTickWallMs: Long,
         /** Uptime timestamp of the most recent inbound frame (0 = none yet). */
         val lastInboundAtElapsed: Long,
         val paired: Boolean,
@@ -115,6 +117,7 @@ object ShellRuntime {
             socketsClosed = data.optInt("socketsClosed"),
             heartbeatTicks = data.optInt("heartbeatTicks"),
             nativeTicks = data.optInt("nativeTicks"),
+            lastTickWallMs = data.optLong("lastTickWallMs"),
             lastInboundAtElapsed = if (ago >= 0) receivedAt - ago else 0,
             paired = data.optBoolean("paired"),
             socketState = data.optInt("socketState", -1),
@@ -128,24 +131,28 @@ object ShellRuntime {
             val acks = current.pairAcks - backgroundAckBase
             val ticks = current.heartbeatTicks - backgroundTickBase
             val pumpedTicks = current.nativeTicks - backgroundNativeTickBase
-            // The decisive question is NOT "did frames arrive" — they can arrive
-            // without a single timer running — but "did a heartbeat tick run at
-            // all". Measured on device: the WebView suspends the page's timer
-            // queue while the app is backgrounded, so before the native pump this
-            // number was always zero even on a link that was still delivering.
-            // `pumpedTicks` is the stricter number: it counts ticks the page
-            // actually executed in response to a dispatch from here, which is what
-            // separates "the pump works" from "the dispatches queued up and ran in
-            // a burst when the app came back".
+            // A tick stamped at (or after) the moment the app came back did not
+            // happen "during" the background: it is one of the overdue timers and
+            // messages that all fire at once on resume. Counting those as survival
+            // is exactly how this readout lied — a 10-minute background window
+            // reported "心跳在跑" off a single tick stamped at the resume instant.
+            val lastTickAtResume = current.lastTickWallMs > 0 &&
+                current.lastTickWallMs >= backgroundEndedWallMs - RESUME_BURST_WINDOW_MS
+            val tickAge = if (current.lastTickWallMs > 0) {
+                "，末次心跳距回前台 " +
+                    "${(backgroundEndedWallMs - current.lastTickWallMs).coerceAtLeast(0L)}ms"
+            } else {
+                ""
+            }
             val verdict = when {
-                ticks > 0 -> "保活成立（后台心跳在跑）"
-                frames > 0 -> "心跳未跑（后台定时器仍被挂起），链接可能已断"
-                else -> "后台期间未收到任何帧，连接很可能已断"
+                ticks <= 0 -> "后台期间心跳未执行（定时器与原生发令都没跑）"
+                lastTickAtResume -> "心跳只在恢复瞬间补跑，后台期间很可能没执行"
+                else -> "保活成立（后台心跳在跑）"
             }
             val duration = formatDuration(backgroundEndedAt - backgroundStartedForVerdict)
             Diagnostics.info(
                 "后台存活检查：时长 $duration，期间注入层心跳 $ticks 次" +
-                    "（其中原生泵驱动 $pumpedTicks 次、原生共发令 $pumpDispatchesForVerdict 次）、" +
+                    "（其中原生泵驱动 $pumpedTicks 次、原生共发令 $pumpDispatchesForVerdict 次$tickAge）、" +
                     "收到 $frames 帧、配对确认 $acks 次 → $verdict"
             )
         }
@@ -153,6 +160,7 @@ object ShellRuntime {
 
     private var backgroundStartedForVerdict = 0L
     private var backgroundEndedAt = 0L
+    private var backgroundEndedWallMs = 0L
 
     /**
      * Records the background window and, on return, writes the milestone-4
@@ -174,6 +182,7 @@ object ShellRuntime {
             if (endedAt - startedAt < VERDICT_MIN_BACKGROUND_MS) return
             backgroundStartedForVerdict = startedAt
             backgroundEndedAt = endedAt
+            backgroundEndedWallMs = System.currentTimeMillis()
             pumpDispatchesForVerdict = pumpDispatches
             // Resolved by the first fresh liveness report, so the numbers are
             // measured after the renderer resumed rather than cached before it
@@ -338,6 +347,13 @@ object ShellRuntime {
 
     /** Shortest background window that produces a meaningful verdict. */
     private const val VERDICT_MIN_BACKGROUND_MS = 60_000L
+
+    /**
+     * A tick stamped within this of the resume instant is treated as part of the
+     * resume burst (overdue timers and messages all fire at once), not as a tick
+     * that happened during the background.
+     */
+    private const val RESUME_BURST_WINDOW_MS = 500L
 
     /** A quiet link for longer than this is called out in the readout. */
     private const val STALE_READOUT_MS = 120_000L
