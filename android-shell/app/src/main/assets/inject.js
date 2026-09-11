@@ -547,11 +547,19 @@
             }
             var quietFor = liveness.lastInboundAt ?
                 Date.now() - liveness.lastInboundAt : Number.MAX_VALUE;
-            if (Date.now() < deadline && quietFor < ACTIVE_START_QUIET_MS) {
+            var inFlight = (client.inFlightPageRpcs && client.inFlightPageRpcs()) || 0;
+            // Two conditions, not one. "The page stopped receiving frames" was
+            // not enough: opening a task leaves a request in flight for seconds,
+            // and the handshake burst then queues on the same relay socket right
+            // in front of it. Now the burst also waits until the page has no
+            // request outstanding. The 12s cap still bounds the wait, so a page
+            // that always has something pending cannot postpone this forever.
+            if (Date.now() < deadline && (quietFor < ACTIVE_START_QUIET_MS || inFlight > 0)) {
                 if (deferredLogs < 3) {
                     deferredLogs += 1;
-                    diag('debug', '页面仍在收帧（最后一次 ' + Math.round(quietFor) +
-                        'ms 前），推迟主动订阅');
+                    diag('debug', '推迟主动订阅：收帧于 ' +
+                        (quietFor === Number.MAX_VALUE ? '∞' : Math.round(quietFor)) +
+                        'ms 前，在飞页面请求 ' + inFlight + ' 个');
                 }
                 setTimeout(attempt, ACTIVE_START_RETRY_MS);
                 return;

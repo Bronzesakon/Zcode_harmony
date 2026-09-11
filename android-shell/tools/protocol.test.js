@@ -586,3 +586,73 @@ test('page RPCs are traced: slow calls, errors and a per-window summary', () => 
         'the window summary must count calls and failures'
     );
 });
+
+test('a page-held workspace is dropped, not reopened, when the desktop refuses our bridge', async () => {
+    const logs = [];
+    const {client, desktop} = makeClient({log: (message) => logs.push(message)});
+    desktop.workspaces = [{workspacePath: '/repo/page', workspaceIdentity: 'ws-page'}];
+    await client.start();
+    const ours = client._bridges['ws-page'];
+    assert.ok(ours, 'we opened a bridge for it first');
+
+    // The page opens its own bridge for the same workspace: a ready frame for an
+    // id we never requested is the only way to tell the two apart.
+    client.acceptObservedPayload({
+        zcode_type: 'workspace-bridge-ready',
+        bridgeSessionId: 'page-bridge-1',
+        bridge: {bridgeSessionId: 'page-bridge-1', workspaceKey: 'ws-page'}
+    }, false);
+
+    // Then the desktop refuses ours. Page-held AND refused is the evidence pair;
+    // a bare fault must not be treated as proof (that would lose coverage).
+    client.acceptPayload({
+        zcode_type: 'bridge-degraded',
+        bridgeSessionId: ours.bridgeSessionId,
+        reason: 'rpc-transport-fault'
+    });
+
+    assert.strictEqual(client._pageOwned['ws-page'], true, 'marked page-owned');
+    assert.strictEqual(Object.keys(client._bridges).length, 0, 'our duplicate was dropped');
+    assert.ok(logs.some((m) => m.includes('桌面端拒绝我们的重复 bridge')));
+    assert.ok(!logs.some((m) => m.indexOf('reopening') === 0), 'no reopen loop');
+});
+
+test('a workspace that keeps faulting is dropped instead of reopened forever', async () => {
+    const logs = [];
+    // maxReopensPerBridge: 0 makes the first fault give up, without waiting out
+    // the reopen delay.
+    const {client, desktop} = makeClient({
+        log: (message) => logs.push(message),
+        maxReopensPerBridge: 0
+    });
+    desktop.workspaces = [{workspacePath: '/repo/flaky'}];
+    await client.start();
+    const ours = client._bridges['/repo/flaky'];
+
+    client.acceptPayload({
+        zcode_type: 'bridge-degraded',
+        bridgeSessionId: ours.bridgeSessionId,
+        reason: 'rpc-transport-fault'
+    });
+
+    assert.strictEqual(Object.keys(client._bridges).length, 0, 'forgotten, not retried');
+    assert.ok(logs.some((m) => m.includes('本次连接放弃重开')));
+    assert.ok(!logs.some((m) => m.indexOf('reopening') === 0), 'and it did not reopen');
+});
+
+test('in-flight page RPCs are visible, so the burst can wait for them', () => {
+    const {client} = makeClient();
+    const bridge = 'page-bridge-9';
+
+    const request = encodeBody([P.REQ_PROMISE, 1, 'zcode-agent', 'openConversationV4'], {});
+    for (const payload of fragment(request, bridge, 1)) {
+        client.acceptObservedPayload(payload, true);
+    }
+    assert.strictEqual(client.inFlightPageRpcs(), 1, 'the open request is in flight');
+
+    const ok = encodeBody([P.RES_PROMISE_SUCCESS, 1], {ok: true});
+    for (const payload of fragment(ok, bridge, 2)) {
+        client.acceptObservedPayload(payload, false);
+    }
+    assert.strictEqual(client.inFlightPageRpcs(), 0, 'and it clears when answered');
+});

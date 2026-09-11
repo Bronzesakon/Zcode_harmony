@@ -74,6 +74,15 @@
     var PAGE_RPC_SLOW_MS = 1000;
     var PAGE_RPC_SLOW_LOG_MAX = 20;
     var PAGE_RPC_METHODS_MAX = 6;
+    // A page call whose reply never comes (abandoned, or a long-lived stream)
+    // would otherwise pin `inFlightPageRpcs()` above zero forever — which now
+    // also means "the handshake burst always waits out its cap" — and grow the
+    // pending map without bound.
+    var PAGE_RPC_PENDING_MAX = 200;
+
+    // How many times one workspace may fault and be reopened within a single
+    // relay connection before we stop trying (see _handleDegraded).
+    var MAX_REOPENS_PER_BRIDGE = 2;
 
     // V4 capabilities (notably sessions-index) are gated on the desktop's
     // protocol version negotiation: a 0.x value here silently disables them.
@@ -986,6 +995,29 @@
         this._passive = (this._shared && this._shared.passive) || {};
         this._outboundListenIds = (this._shared && this._shared.outboundListenIds) || {};
         this._bridgeWorkspace = (this._shared && this._shared.bridgeWorkspace) || {};
+        // Workspaces we know the PAGE has a bridge for. `_passive` only covers
+        // the ones where the page also streams a sessions-index; the page's
+        // conversation bridge does not send that listen, so keying "do not
+        // duplicate this" on `_passive` alone missed it.
+        this._pageBridges = (this._shared && this._shared.pageBridges) || {};
+        // Workspaces we have given up on because the page holds them and the
+        // desktop refused our duplicate. Only ever set on that evidence, so a
+        // transient fault can never silently cost us notification coverage.
+        this._pageOwned = (this._shared && this._shared.pageOwned) || {};
+        // bridgeSessionIds WE asked for, so a `workspace-bridge-ready` can be
+        // attributed to the shell or to the page. Needed because ownership is
+        // decided from that reply, and our own reply arrives before the bridge
+        // is registered in _bridgesById.
+        this._requestedBridgeIds = {};
+        // Faults counted per relay connection, deliberately NOT shared: after a
+        // reconnect the desktop's state is different, so the workspace gets one
+        // more chance. Within one connection a workspace that keeps faulting is
+        // not going to be accepted, and every reopen costs 4 RPCs on the socket
+        // the page is using. Injectable so a test does not have to wait out the
+        // reopen delay.
+        this._maxReopens = typeof options.maxReopensPerBridge === 'number' ?
+            options.maxReopensPerBridge : MAX_REOPENS_PER_BRIDGE;
+        this._faultCounts = {};
         this._started = false;
         this._lastStatus = null;
 
@@ -1020,8 +1052,36 @@
         return {
             passive: this._passive,
             outboundListenIds: this._outboundListenIds,
-            bridgeWorkspace: this._bridgeWorkspace
+            bridgeWorkspace: this._bridgeWorkspace,
+            pageBridges: this._pageBridges,
+            pageOwned: this._pageOwned
         };
+    };
+
+    /** How many page RPCs are awaiting a reply right now (0 when idle). */
+    RemoteClient.prototype.inFlightPageRpcs = function () {
+        var count = 0;
+        for (var slot in this._pageRpc.pending) {
+            count += 1;
+        }
+        return count;
+    };
+
+    /**
+     * Records that the page opened its own bridge for a workspace.
+     *
+     * On its own this is not enough to drop ours: the page holding a bridge does
+     * not prove it streams that workspace's sessions-index, and dropping on a
+     * guess would silently cost notification coverage. The decision is made in
+     * `_handleDegraded`, where this evidence is combined with the desktop
+     * actually refusing our bridge.
+     */
+    RemoteClient.prototype._notePageBridge = function (key) {
+        if (!key || this._pageBridges[key]) {
+            return;
+        }
+        this._pageBridges[key] = true;
+        this._log('页面自己持有 bridge：' + key);
     };
 
     RemoteClient.prototype._emitStatus = function (reason) {
@@ -1133,12 +1193,38 @@
 
     RemoteClient.prototype._handleDegraded = function (payload) {
         var bridgeSessionId = payload.bridgeSessionId;
+        var reason = payload.reason || 'unknown';
         for (var key in this._bridges) {
             var bridge = this._bridges[key];
-            if (bridge.bridgeSessionId === bridgeSessionId) {
-                this._log('bridge degraded for ' + key + ': ' + (payload.reason || 'unknown'));
-                this._scheduleReopen(key, 1);
+            if (bridge.bridgeSessionId !== bridgeSessionId) {
+                continue;
             }
+            this._log('bridge degraded for ' + key + ': ' + reason);
+            // Two pieces of evidence together mean "we cannot have this one":
+            // the page opened its own bridge for the workspace, AND the desktop
+            // is refusing ours. Only then do we give up on it for good — a bare
+            // fault is not proof, and treating it as proof would silently cost
+            // notification coverage for a healthy workspace.
+            if (this._pageBridges[key] && !this._pageOwned[key]) {
+                this._pageOwned[key] = true;
+                this._log('放弃 ' + key + '：页面自己持有该工作区，桌面端拒绝我们的重复 bridge（通知改由页面侧覆盖）');
+                this._forgetBridge(key);
+                this._emitStatus('degraded ' + key);
+                return;
+            }
+            this._faultCounts[key] = (this._faultCounts[key] || 0) + 1;
+            if (this._faultCounts[key] > this._maxReopens) {
+                // No alternative evidence, but the desktop keeps rejecting it on
+                // this relay connection (observed on `default`: once every ~47s,
+                // on and on). Every reopen costs 4 RPCs on the socket the page is
+                // using, so stop for this connection; the next relay connection
+                // gives it one more chance, since the desktop's state may differ.
+                this._log('本次连接放弃重开 ' + key + '（已 fault ' + this._faultCounts[key] + ' 次）');
+                this._forgetBridge(key);
+                this._emitStatus('degraded ' + key);
+                return;
+            }
+            this._scheduleReopen(key, 1);
         }
     };
 
@@ -1194,6 +1280,7 @@
         // Start buffering before the request goes out: the desktop may push
         // Initialize before this promise resolves.
         this._pendingBridgePayloads[bridgeSessionId] = [];
+        this._requestedBridgeIds[bridgeSessionId] = true;
         this._inflightOpens += 1;
         return this._request(payload, function (reply) {
             if (reply.bridgeSessionId !== bridgeSessionId) {
@@ -1270,6 +1357,12 @@
         this._inflightOpens = Math.max(0, this._inflightOpens - 1);
         if (this._inflightOpens === 0) {
             delete this._pendingBridgePayloads['*'];
+        }
+        // Stop claiming this id: anything that arrives for it now belongs to a
+        // bridge whose ownership is already settled.
+        delete this._requestedBridgeIds[requestedId];
+        if (actualId) {
+            delete this._requestedBridgeIds[actualId];
         }
         return out;
     };
@@ -1416,7 +1509,7 @@
         var delay = Math.min(30000, 2000 * Math.pow(2, attempt - 1));
         this._log('reopening ' + key + ' in ' + delay + 'ms (attempt ' + attempt + ')');
         setTimeout(function () {
-            if (!self.subscribeAll || self._passive[key]) {
+            if (!self.subscribeAll || self._passive[key] || self._pageOwned[key]) {
                 return;
             }
             self.openBridge(workspace, ++self._bridgeGeneration, bridge.recoveryId)
@@ -1458,10 +1551,11 @@
                 if (!key || targets.length >= self._maxWorkspaces) {
                     continue;
                 }
-                if (self._passive[key] || self._activeKeys[key]) {
-                    // The page already streams this one; do not duplicate it.
-                    // Opening a second bridge for a workspace the page owns is
-                    // what the desktop answers with rpc-transport-fault.
+                if (self._passive[key] || self._pageOwned[key] || self._activeKeys[key]) {
+                    // The page already has a bridge for this one; do not
+                    // duplicate it. Opening a second bridge for a workspace the
+                    // page owns is what the desktop answers with
+                    // rpc-transport-fault, over and over.
                     skipped += 1;
                     continue;
                 }
@@ -1560,6 +1654,12 @@
             var info = payload.bridge;
             if (info.workspaceKey) {
                 this._bridgeWorkspace[payload.bridgeSessionId] = info.workspaceKey;
+                // A ready frame for an id we never requested is the page opening
+                // its own bridge. Recorded, not acted on: dropping ours on this
+                // alone could lose coverage (see _notePageBridge).
+                if (!this._requestedBridgeIds[payload.bridgeSessionId]) {
+                    this._notePageBridge(info.workspaceKey);
+                }
             }
         }
     };
@@ -1582,7 +1682,20 @@
         }
         var name = String(header[2] === undefined ? '?' : header[2]) + '.' +
             String(header[3] === undefined ? '?' : header[3]);
-        this._pageRpc.pending[bridgeSessionId + '#' + id] = {name: name, at: Date.now()};
+        var pending = this._pageRpc.pending;
+        var size = 0;
+        var oldest = null;
+        for (var slot in pending) {
+            size += 1;
+            if (oldest === null || pending[slot].at < pending[oldest].at) {
+                oldest = slot;
+            }
+        }
+        if (size >= PAGE_RPC_PENDING_MAX && oldest !== null) {
+            // Bound the map: whatever never came back is not going to.
+            delete pending[oldest];
+        }
+        pending[bridgeSessionId + '#' + id] = {name: name, at: Date.now()};
         this._pageRpc.calls += 1;
         this._pageRpc.windowCalls += 1;
         var methods = this._pageRpc.windowMethods;
