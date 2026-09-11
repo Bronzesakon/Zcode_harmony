@@ -480,3 +480,109 @@ test('active mode skips a workspace the page already streams', async () => {
         'the page-covered workspace must not be duplicated'
     );
 });
+
+// ---------------------------------------------------------------------------
+// RemoteClient — relay reconnect / page-RPC tracing
+//
+// These pin the two things the first field log could not answer: why the shell
+// kept re-opening a bridge for the workspace the page was already showing (a
+// relay reconnect used to wipe that knowledge), and what the page itself asks
+// the desktop for when a task is opened.
+// ---------------------------------------------------------------------------
+
+test('page coverage survives a relay reconnect (shared state)', async () => {
+    const pageScope = {workspacePath: '/repo/page', workspaceIdentity: 'ws-page'};
+    const first = makeClient();
+    const listenBody = encodeBody(
+        [P.REQ_EVENT_LISTEN, 1, 'zcode-agent', P.EVENT_SESSIONS_INDEX],
+        pageScope
+    );
+    for (const payload of fragment(listenBody, 'page-bridge-1', 1)) {
+        first.client.acceptObservedPayload(payload, true);
+    }
+
+    // A relay disconnect rebuilds the client, exactly like inject.js does. The
+    // learned coverage has to come along, or the page's own workspace is
+    // duplicated and the desktop answers rpc-transport-fault in a loop.
+    const second = makeClient({sharedState: first.client.sharedState()});
+    second.desktop.workspaces = [
+        pageScope,
+        {workspacePath: '/repo/other', workspaceIdentity: 'ws-other'}
+    ];
+    await second.client.start();
+
+    assert.deepStrictEqual(
+        second.desktop.subscriptions.map((s) => s.scope.workspaceIdentity),
+        ['ws-other'],
+        'the rebuilt client must not duplicate the workspace the page still owns'
+    );
+});
+
+test('a bridge is dropped once the page proves it streams that workspace', async () => {
+    const logs = [];
+    const {client, desktop} = makeClient({log: (message) => logs.push(message)});
+    desktop.workspaces = [{workspacePath: '/repo/page', workspaceIdentity: 'ws-page'}];
+    await client.start();
+    assert.strictEqual(Object.keys(client._bridges).length, 1, 'opened before the page was seen');
+
+    const listenBody = encodeBody(
+        [P.REQ_EVENT_LISTEN, 1, 'zcode-agent', P.EVENT_SESSIONS_INDEX],
+        {workspacePath: '/repo/page', workspaceIdentity: 'ws-page'}
+    );
+    for (const payload of fragment(listenBody, 'page-bridge-77', 1)) {
+        client.acceptObservedPayload(payload, true);
+    }
+
+    assert.strictEqual(Object.keys(client._bridges).length, 0,
+        'the duplicate bridge must be closed, not left to fault');
+    assert.ok(logs.some((m) => m.includes('页面已接管')), 'and the reason must be logged');
+});
+
+test('page RPCs are traced: slow calls, errors and a per-window summary', () => {
+    const logs = [];
+    // pageRpcSlowMs: 0 makes every completed call "slow" without sleeping.
+    const {client} = makeClient({log: (message) => logs.push(message), pageRpcSlowMs: 0});
+    const bridge = 'page-bridge-5';
+
+    const request = encodeBody(
+        [P.REQ_PROMISE, 42, 'zcode-agent', 'openConversationV4'],
+        {sessionId: 's1'}
+    );
+    for (const payload of fragment(request, bridge, 1)) {
+        client.acceptObservedPayload(payload, true);
+    }
+    assert.strictEqual(client._pageRpc.calls, 1, 'the page call must be recorded when sent');
+
+    const ok = encodeBody([P.RES_PROMISE_SUCCESS, 42], {ok: true});
+    for (const payload of fragment(ok, bridge, 2)) {
+        client.acceptObservedPayload(payload, false);
+    }
+    assert.ok(
+        logs.some((m) => m.includes('页面调用慢') && m.includes('openConversationV4')),
+        'a slow page call must name the method'
+    );
+
+    // A failing call is the other half of "content never loads": it has to be
+    // surfaced with the desktop's own message, not swallowed as a non-event.
+    const failing = encodeBody(
+        [P.REQ_PROMISE, 43, 'zcode-agent', 'getConversationV4'],
+        {}
+    );
+    for (const payload of fragment(failing, bridge, 3)) {
+        client.acceptObservedPayload(payload, true);
+    }
+    const error = encodeBody([P.RES_PROMISE_ERROR, 43], {message: 'workspace not ready'});
+    for (const payload of fragment(error, bridge, 4)) {
+        client.acceptObservedPayload(payload, false);
+    }
+    assert.ok(
+        logs.some((m) => m.includes('页面调用失败') && m.includes('workspace not ready')),
+        'a failed page call must carry the error message'
+    );
+
+    client.reportPageRpcWindow();
+    assert.ok(
+        logs.some((m) => m.includes('页面 RPC 10s') && m.includes('2 个') && m.includes('失败 1')),
+        'the window summary must count calls and failures'
+    );
+});

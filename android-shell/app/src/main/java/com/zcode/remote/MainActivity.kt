@@ -82,6 +82,13 @@ class MainActivity : AppCompatActivity() {
     /** Uptime at onPageStarted, for the "how long did the page take" line. */
     private var pageStartedAt = 0L
 
+    /**
+     * onPageFinished callbacks seen for the current document. WebView fires it
+     * more than once (SPA history changes, late subframes), and only the first
+     * one can be compared against the load start — see onPageFinished.
+     */
+    private var finishCallbacks = 0
+
     private val scanLauncher = registerForActivityResult(ScanContract()) { result ->
         val contents = result.contents
         if (contents.isNullOrEmpty()) {
@@ -222,6 +229,7 @@ class MainActivity : AppCompatActivity() {
             override fun onPageStarted(view: WebView, url: String, favicon: android.graphics.Bitmap?) {
                 super.onPageStarted(view, url, favicon)
                 consoleLines = 0
+                finishCallbacks = 0
                 pageStartedAt = SystemClock.elapsedRealtime()
                 Diagnostics.info("网页开始加载")
                 fallbackScript?.let { script ->
@@ -234,15 +242,29 @@ class MainActivity : AppCompatActivity() {
 
             override fun onPageFinished(view: WebView, url: String) {
                 super.onPageFinished(view, url)
-                if (pageStartedAt > 0L) {
-                    // The number to compare against the injected layer's own
-                    // navigation timing: a page that reports a fast load here but
-                    // a slow conversation is waiting on the relay, not on the
-                    // network.
-                    Diagnostics.info(
-                        "网页加载完成，用时 ${SystemClock.elapsedRealtime() - pageStartedAt} ms"
-                    )
+                finishCallbacks += 1
+                val elapsed = if (pageStartedAt > 0L) {
+                    SystemClock.elapsedRealtime() - pageStartedAt
+                } else {
+                    -1L
                 }
+                // Only the FIRST finish callback can be measured against the load
+                // start. Later ones (SPA route changes, late frames) share that
+                // start point, so measuring them produced absurd numbers like
+                // "用时 736007 ms" for a document whose own timing said ttfb=397 ms.
+                // Report the index instead and let the number stand alone.
+                if (elapsed >= 0L) {
+                    pageStartedAt = 0L
+                }
+                // The console count is printed on purpose: it is the one number
+                // that says whether the page's own logs are reaching the file at
+                // all, which a silent "0 行" makes obvious.
+                Diagnostics.info(
+                    "网页加载完成(第 ${finishCallbacks} 次回调)" +
+                        (if (elapsed >= 0L) "，用时 $elapsed ms" else "") +
+                        " · ${RemoteUrl.toDisplayString(url)}" +
+                        " · 控制台已捕获 $consoleLines 行",
+                )
                 hideError()
                 maybeRequestNotificationPermission()
                 tryLocate()

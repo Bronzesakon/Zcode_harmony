@@ -68,6 +68,13 @@
     var METHOD_UNSUBSCRIBE_SI = 'unsubscribeSessionsIndexV4';
     var METHOD_RESYNC_SI = 'resyncSessionsIndexV4';
 
+    // Page-RPC tracing budgets (see RemoteClient.prototype._tracePageCall).
+    // A page call slower than this is what "opening a task takes forever" looks
+    // like from the wire, so it earns its own line; the rest is summarised.
+    var PAGE_RPC_SLOW_MS = 1000;
+    var PAGE_RPC_SLOW_LOG_MAX = 20;
+    var PAGE_RPC_METHODS_MAX = 6;
+
     // V4 capabilities (notably sessions-index) are gated on the desktop's
     // protocol version negotiation: a 0.x value here silently disables them.
     // The page's own clientHello is observed at runtime and preferred over
@@ -969,13 +976,53 @@
         this._bridgeGeneration = 0;
         this._clientHello = null;
 
-        // passive side
-        this._passive = {};
-        this._outboundListenIds = {};
-        this._bridgeWorkspace = {};
+        // Passive side. What the page streams is a fact about the PAGE, not about
+        // this client instance, so callers that rebuild the client on a relay
+        // reconnect can hand in a state object that outlives it. Losing it was
+        // expensive: a fresh client re-opened an active bridge for the very
+        // workspace the page was already showing, and the desktop answered with
+        // bridge-degraded/rpc-transport-fault in a loop.
+        this._shared = options.sharedState || null;
+        this._passive = (this._shared && this._shared.passive) || {};
+        this._outboundListenIds = (this._shared && this._shared.outboundListenIds) || {};
+        this._bridgeWorkspace = (this._shared && this._shared.bridgeWorkspace) || {};
         this._started = false;
         this._lastStatus = null;
+
+        // Page-RPC trace: what the page itself asks the desktop for, and how
+        // long the desktop takes to answer. The shell's own bridges say nothing
+        // about "opening a task hangs", because the conversation request belongs
+        // to the page — this is the only place it can be observed.
+        // The threshold is injectable so the Node tests do not have to sleep.
+        this._pageRpcSlowMs = typeof options.pageRpcSlowMs === 'number' ?
+            options.pageRpcSlowMs : PAGE_RPC_SLOW_MS;
+        this._pageRpc = {
+            pending: {},
+            calls: 0,
+            errors: 0,
+            slow: 0,
+            slowLogged: 0,
+            windowCalls: 0,
+            windowErrors: 0,
+            windowSlow: 0,
+            windowMethods: {},
+            methodsLogged: 0
+        };
     }
+
+    /** True once start() has run and will not run again on its own. */
+    RemoteClient.prototype.isStarted = function () {
+        return this._started === true;
+    };
+
+    /** The state a caller must carry across relay reconnects (see constructor). */
+    RemoteClient.prototype.sharedState = function () {
+        return {
+            passive: this._passive,
+            outboundListenIds: this._outboundListenIds,
+            bridgeWorkspace: this._bridgeWorkspace
+        };
+    };
 
     RemoteClient.prototype._emitStatus = function (reason) {
         if (!this.onStatus) {
@@ -1401,8 +1448,10 @@
             this._emitStatus('passive only (subscribe-all off)');
             return Promise.resolve();
         }
+        var startedAt = Date.now();
         return this.listWorkspaces().then(function (list) {
             var targets = [];
+            var skipped = 0;
             for (var i = 0; i < list.length; i++) {
                 var workspace = list[i];
                 var key = workspaceKeyOf(workspace);
@@ -1411,11 +1460,15 @@
                 }
                 if (self._passive[key] || self._activeKeys[key]) {
                     // The page already streams this one; do not duplicate it.
+                    // Opening a second bridge for a workspace the page owns is
+                    // what the desktop answers with rpc-transport-fault.
+                    skipped += 1;
                     continue;
                 }
                 targets.push(workspace);
             }
-            self._log('active subscribe: ' + targets.length + ' workspace(s) of ' + list.length);
+            self._log('active subscribe: ' + targets.length + ' workspace(s) of ' + list.length +
+                (skipped ? '（跳过 ' + skipped + ' 个页面已覆盖）' : ''));
             // Sequential with a small gap: opening a dozen RPC bridges at once
             // hammers the desktop and makes failures hard to attribute.
             return targets.reduce(function (chain, workspace) {
@@ -1428,6 +1481,10 @@
                 });
             }, Promise.resolve());
         }).then(function () {
+            // The wall-clock cost of the whole burst is the number that matters:
+            // every one of those RPCs is queued on the same relay socket the
+            // page is using to open whatever the user just tapped.
+            self._log('主动订阅完成：用时 ' + (Date.now() - startedAt) + 'ms');
             self._emitStatus('active started');
         }).catch(function (err) {
             self._log('active subscribe failed: ' + err);
@@ -1507,6 +1564,124 @@
         }
     };
 
+    /**
+     * 页面自身 RPC 的追踪（见构造函数里的 `_pageRpc`）。
+     *
+     * 一次页面 promise 请求就是一个重组后的 ChannelClient body：
+     * [REQ_PROMISE, id, channel, method] + args；回复是 [201|202|203, id] + value，
+     * 用 (bridgeSessionId, id) 配对——这条路径上桌面端不回显我们的 requestId，
+     * 且 id 只在单个 bridge 内唯一。
+     *
+     * 壳自己的 bridge 永远回答不了「点进任务为什么半天不出内容」，因为那个
+     * 会话请求属于页面。这是唯一能看到它的地方。
+     */
+    RemoteClient.prototype._tracePageCall = function (bridgeSessionId, header) {
+        var id = header[1];
+        if (typeof id !== 'number') {
+            return;
+        }
+        var name = String(header[2] === undefined ? '?' : header[2]) + '.' +
+            String(header[3] === undefined ? '?' : header[3]);
+        this._pageRpc.pending[bridgeSessionId + '#' + id] = {name: name, at: Date.now()};
+        this._pageRpc.calls += 1;
+        this._pageRpc.windowCalls += 1;
+        var methods = this._pageRpc.windowMethods;
+        methods[name] = (methods[name] || 0) + 1;
+    };
+
+    RemoteClient.prototype._tracePageResult = function (bridgeSessionId, type, header, data) {
+        var id = header[1];
+        if (typeof id !== 'number') {
+            return;
+        }
+        var slot = bridgeSessionId + '#' + id;
+        var call = this._pageRpc.pending[slot];
+        if (!call) {
+            return;
+        }
+        delete this._pageRpc.pending[slot];
+        var cost = Date.now() - call.at;
+        if (type !== RES_PROMISE_SUCCESS) {
+            this._pageRpc.errors += 1;
+            this._pageRpc.windowErrors += 1;
+            var message = '';
+            try {
+                message = data && typeof data === 'object' && data.message ?
+                    String(data.message) : (typeof data === 'string' ? data : JSON.stringify(data));
+            } catch (e) {
+                message = '';
+            }
+            this._log('页面调用失败 ' + cost + 'ms：' + call.name +
+                (message ? ' · ' + String(message).substring(0, 160) : ''));
+            return;
+        }
+        if (cost >= this._pageRpcSlowMs) {
+            this._pageRpc.slow += 1;
+            this._pageRpc.windowSlow += 1;
+            if (this._pageRpc.slowLogged < PAGE_RPC_SLOW_LOG_MAX) {
+                this._pageRpc.slowLogged += 1;
+                this._log('页面调用慢 ' + cost + 'ms：' + call.name +
+                    (this._pageRpc.slowLogged === PAGE_RPC_SLOW_LOG_MAX ?
+                        '（后续慢调用只计入窗口汇总）' : ''));
+            }
+        }
+    };
+
+    /** 每个心跳窗口一条有上限的汇总；这一窗口没有任何页面调用时保持安静。 */
+    RemoteClient.prototype.reportPageRpcWindow = function () {
+        var rpc = this._pageRpc;
+        if (rpc.windowCalls === 0 && rpc.windowErrors === 0 && rpc.windowSlow === 0) {
+            return;
+        }
+        var names = [];
+        for (var name in rpc.windowMethods) {
+            names.push({name: name, count: rpc.windowMethods[name]});
+        }
+        names.sort(function (a, b) {
+            return b.count - a.count;
+        });
+        var shown = [];
+        for (var i = 0; i < names.length && i < PAGE_RPC_METHODS_MAX; i++) {
+            shown.push(names[i].name + ' ' + names[i].count);
+        }
+        if (names.length > shown.length) {
+            shown.push('…共 ' + names.length + ' 种');
+        }
+        this._log('页面 RPC 10s：' + rpc.windowCalls + ' 个（慢 ' + rpc.windowSlow +
+            '，失败 ' + rpc.windowErrors + '）' + (shown.length ? ' · ' + shown.join(' · ') : ''));
+        rpc.windowCalls = 0;
+        rpc.windowErrors = 0;
+        rpc.windowSlow = 0;
+        rpc.windowMethods = {};
+    };
+
+    /**
+     * 页面确实在流这个工作区，那我们自己的 bridge 就是重复的。桌面端会用
+     * rpc-transport-fault 拒掉重复项，而那个 fault 会触发重开循环——循环打的正是
+     * 用户此刻正在看的工作区。所以一旦页面证明它自己覆盖了这个工作区，就撤掉我们的。
+     * 通知覆盖不会丢：被动侧继续从页面的流量里读 sessions-index。
+     */
+    RemoteClient.prototype._dropRedundantBridge = function (key) {
+        var bridge = this._bridges[key];
+        if (!bridge || bridge.closed) {
+            return;
+        }
+        var sub = this._subs ? this._subs[key] : null;
+        if (sub) {
+            delete this._subs[key];
+            try {
+                var done = sub.dispose();
+                if (done && typeof done.catch === 'function') {
+                    done.catch(function () {});
+                }
+            } catch (e) {
+                // 无论如何都要撤掉这个 bridge，取消失败不影响结论
+            }
+        }
+        this._forgetBridge(key);
+        this._log('页面已接管 ' + key + '，关闭重复 bridge');
+    };
+
     RemoteClient.prototype._observeOutboundRpc = function (payload) {
         if (this._bridgesById[payload.bridgeSessionId]) {
             return;
@@ -1524,19 +1699,28 @@
         } catch (e) {
             return;
         }
-        if (!Array.isArray(header) || header[0] !== REQ_EVENT_LISTEN) {
-            if (Array.isArray(header) && header[0] === REQ_PROMISE) {
-                // Learn the page's clientHello so our own handshake agrees with
-                // whatever protocol version the desktop negotiated with it.
-                if (header[3] === 'initializeConversationV4' && Array.isArray(args) &&
-                    args[0] && args[0].kind === 'clientHello') {
-                    this._clientHello = {
-                        protocolVersion: args[0].protocolVersion,
-                        appVersion: args[0].appVersion,
-                        clientKind: args[0].clientKind
-                    };
-                }
+        if (!Array.isArray(header) || typeof header[0] !== 'number') {
+            return;
+        }
+        if (header[0] === REQ_PROMISE) {
+            // Learn the page's clientHello so our own handshake agrees with
+            // whatever protocol version the desktop negotiated with it.
+            if (header[3] === 'initializeConversationV4' && Array.isArray(args) &&
+                args[0] && args[0].kind === 'clientHello') {
+                this._clientHello = {
+                    protocolVersion: args[0].protocolVersion,
+                    appVersion: args[0].appVersion,
+                    clientKind: args[0].clientKind
+                };
             }
+            this._tracePageCall(payload.bridgeSessionId, header);
+            return;
+        }
+        if (header[0] === REQ_PROMISE_CANCEL) {
+            delete this._pageRpc.pending[payload.bridgeSessionId + '#' + header[1]];
+            return;
+        }
+        if (header[0] !== REQ_EVENT_LISTEN) {
             return;
         }
         if (header[3] !== EVENT_SESSIONS_INDEX) {
@@ -1558,14 +1742,11 @@
             this._log('passive: following sessions-index of ' + key);
             this._emitStatus('passive tracking ' + key);
         }
+        this._dropRedundantBridge(key);
     };
 
     RemoteClient.prototype._observeInboundRpc = function (payload) {
         if (this._bridgesById[payload.bridgeSessionId]) {
-            return;
-        }
-        var key = this._bridgeWorkspace[payload.bridgeSessionId];
-        if (!key) {
             return;
         }
         var bytes = this._tryAssemble(payload, false);
@@ -1581,7 +1762,21 @@
         } catch (e) {
             return;
         }
-        if (!Array.isArray(header) || header[0] !== RES_EVENT_FIRE) {
+        if (!Array.isArray(header) || typeof header[0] !== 'number') {
+            return;
+        }
+        if (header[0] === RES_PROMISE_SUCCESS || header[0] === RES_PROMISE_ERROR ||
+            header[0] === RES_PROMISE_ERROR_OBJ) {
+            // 页面 bridge 的回复一律配对，哪怕还没学到它属于哪个工作区：
+            // 配对键就是 (bridgeSessionId, id)。
+            this._tracePageResult(payload.bridgeSessionId, header[0], header, data);
+            return;
+        }
+        if (header[0] !== RES_EVENT_FIRE) {
+            return;
+        }
+        var key = this._bridgeWorkspace[payload.bridgeSessionId];
+        if (!key) {
             return;
         }
         if (this._outboundListenIds[payload.bridgeSessionId + '#' + header[1]] !== key) {
@@ -1677,8 +1872,11 @@
         CHANNEL_CONVERSATION: CHANNEL_CONVERSATION,
         EVENT_SESSIONS_INDEX: EVENT_SESSIONS_INDEX,
         REQ_PROMISE: REQ_PROMISE,
+        REQ_PROMISE_CANCEL: REQ_PROMISE_CANCEL,
         REQ_EVENT_LISTEN: REQ_EVENT_LISTEN,
         RES_INITIALIZE: RES_INITIALIZE,
+        RES_PROMISE_SUCCESS: RES_PROMISE_SUCCESS,
+        RES_PROMISE_ERROR: RES_PROMISE_ERROR,
         RES_EVENT_FIRE: RES_EVENT_FIRE,
         DEFAULT_CLIENT_HELLO: DEFAULT_CLIENT_HELLO,
         // helpers (exported for the Node tests)
