@@ -47,11 +47,11 @@
 
 ## 项目现状（先读这一节）
 
-**一句话**：功能已全部落地、CI 全绿（JS 42 项 + Kotlin 37 项单测），`pre` 每次推送都把最新 APK **覆写**到滚动预发布 [android-pre](https://github.com/Bronzesakon/Zcode_harmony/releases/tag/android-pre)（固定链接 `…/releases/download/android-pre/zcode-remote.apk`，可直接覆盖安装）——**真机验证已过四轮**（一加 PLC110 / ColorOS 16 / API 36 / WebView 153，含 adb 闭环、网页滚动条方案 A 与「会话加载慢」的逐项实测），下面这些还没有结论：
+**一句话**：功能已全部落地、CI 全绿（JS 47 项 + Kotlin 42 项单测），`pre` 每次推送都把最新 APK **覆写**到滚动预发布 [android-pre](https://github.com/Bronzesakon/Zcode_harmony/releases/tag/android-pre)（固定链接 `…/releases/download/android-pre/zcode-remote.apk`，可直接覆盖安装）——**真机验证已过四轮**（一加 PLC110 / ColorOS 16 / API 36 / WebView 153，含 adb 闭环、网页滚动条方案 A 与「会话加载慢」的逐项实测），下面这些还没有结论：
 
 | # | 待验证 / 待排查 | 现状 | 怎么看 |
 | --- | --- | --- | --- |
-| P0 | 后台存活 30 分钟（迁移文档 §8 第 4 步，决定整条路线成立与否） | **已测出结论：可行，但前置条件是 ColorOS 放行**——放行后息屏 14 分 5 秒的后台窗口里心跳 71 次／原生泵发令 55 次／收 744 帧／配对确认 56 次，全部连续；**放行前同样 10 分钟里泵一次都发不出** | 见「交接文本区 → 一句话状态」与「首次真机验证」的判读口径 |
+| P0 | 后台存活 30 分钟（迁移文档 §8 第 4 步，决定整条路线成立与否） | **结论：保活成立，前置条件是 ColorOS 放行**。放行后泵每 15s 驱动一次注入层心跳，息屏窗口内节奏连续（实测 `页面开销` 精确 15.00 秒一次）。**注意判据本身此前是坏的**：回前台那一瞬常有 2ms 的「前台→后台→前台」抖动，而注入层在收到「进后台」时会清零自己的计数，于是判定行被清零后读成「心跳 0 次」——pre.28/pre.30 两轮都这么误报过。pre.33 起计数改为单调、判定用原生侧基准做 delta（与 frames/acks 同法），**待真机复验** | 见「交接文本区 → 一句话状态」与「首次真机验证」的判读口径 |
 | P1 | 键盘弹出时输入框上抬 | 已修（`padForSystemBarsAndIme`），**待真机确认** | 点开会话底部输入框，输入框应贴在键盘上方；日志里 `视口 … innerHeight=…` 应随键盘变化 |
 | P1 | ColorOS 弹「“ZCode 远程”正在当前页面悬浮显示…是否关闭该应用？」 | **未定位**（性质已定性，见下） | 见「已知问题 A」 |
 | P2 | 会话加载慢（连标题都要半天） | **壳侧已修完并逐项实测**（重复 bridge 循环收敛、页面持有判定生效、burst 让路生效）；**A/B 已证明剩余延迟不在壳**——关掉全部 bridge 后同样慢（`subscribeConversationV4` 4.7s、`readSession` 报 `Session is not active`），属桌面端 | 见「已知问题 B」 |
@@ -99,6 +99,24 @@ adb shell dumpsys activity activities | grep -i zcode          # 是否被系统
 
 **桌面端侧的可疑点（不是本仓库的代码，供排查参考）**：打开任务时一批 RPC 同时落在 1.5–2.0s，像是被同一把锁串住——`git.refresh`(1.8s)、`readWorkspaceState`(1.9s)、`usage-stats.getEntitlementSnapshot`(2.0s)、`model-provider.refreshCodingPlanApiKey`(2.0s×2)、`setting.update`(1.8s)、`subscribeSessionsIndexV4`(1.6s)；`zcode-agent.subscribeConversationV4` 2.9–4.7s；并且 `zcode-session.readSession` **失败**：`Session is not active: sess_…`（完成态任务的会话在桌面端不是 active；页面能回退到历史，所以内容最终仍会出来）。
 
+### 已知问题 C：后台期间页面自己把 relay socket 关掉（约每 95–120 秒一次）
+
+**这是用户看到的「正在尝试重连」的来源**（前一轮只查到「整条 socket 每约 2 分钟被重建」，现在查到了是谁关的）。
+
+取证（pre.30，退后台 + 息屏 9 分 49 秒）：
+
+```
+18:43:51.575  socket.close() 被调用 at WebSocket.wrappedClose [as close] (<anonymous>:2247:34)
+18:43:51.708  relay socket closed (code=1005 clean=true)
+18:45:29 / 18:47:04 / 18:48:57 …  同一形态、同一调用点
+```
+
+- **是页面自己的代码调的 `close()`**：调用栈落在页面 bundle 的文件内（`<anonymous>:<行>:34`），`code=1005`（未带关闭码）+ `clean=true`（干净关闭）正是 JS 无参 `close()` 的特征。我们自己的 `forceReconnect` 会先记 `强制重建 relay 连接以恢复（原因）`，日志里没有。
+- **只在后台出现**：前台 10 分钟里 socket #1 全程未断，一次都没有。
+- 页面侧机制（从公开 bundle `assets/index-<hash>.js` 读到的，不需凭证）：relay 客户端有 `heartbeatAckWatchdogTimer`，超时 `heartbeatAckTimeoutMs = 30s`，到期走 `reconnectAfterStaleWaiting()` → `socket.close()` + 重连；而 `applyPairStatus()` 在**收到任意 `pair_status_ack` 时就 `armHeartbeatAckWatchdog()`**（先 clear 再重装，**不按 id 配对**），所以理论上桌面端只要 30 秒内回过一次 ack 就不会触发。
+- **尚未解释的矛盾（下一步从这里接）**：pre.32 实测后台窗口里泵在跑（`页面开销` 精确 15.00s 一次，页面自己的定时器是 10s）、`配对确认` 每 ~14s 到一次，按上面的机制 watchdog 不该响，但页面仍每 ~95–120 秒关一次 socket。**所以「我们的探针能安抚页面 watchdog」这个推论目前不成立，别当成已知结论。** 待查方向：探针是否真的落在页面当前那条 socket 上、页面是否另有 `desktopOfflineFailureTimer`/`waitingTimer` 路径、以及页面 bundle 是否已改版（调用点行号曾由 `:2247` 变为 `:2340`）。
+- **我们这一侧的止损已经生效**：每次 socket 重建都会触发 `default` 工作区的重开（见「实现要点」13），pre.31 起改为**跨连接冷却**——同一工作区连续 3 条 relay 连接都 fault 就冷却 10 分钟。真机已验证：`19:35:35 冷却 C:\Users\wdn32\.zcode\workspace\default：连续 3 条 relay 连接都被桌面端 fault…`，随后的订阅 burst 记 `（冷却中 1 个）`。冷却到期会自动重试，不是永久放弃。
+
 ---
 
 ## 一次构建要多快
@@ -107,12 +125,12 @@ adb shell dumpsys activity activities | grep -i zcode          # 是否被系统
 
 | job | 内容 | 首次 | 有缓存 |
 | --- | --- | --- | --- |
-| `js` | Node 协议层 + 注入层测试（35 项），不需要 JDK/SDK | ~1 min | ~40 s |
+| `js` | Node 协议层 + 注入层测试（47 项），不需要 JDK/SDK | ~1 min | ~40 s |
 | `build` | 单次 Gradle 调用：release 单元测试（37 项）+ `assembleRelease` + 签名校验 | ~4 min | ~2m 45s |
 | `prerelease` | 仅 `pre` 分支：把最新 APK **覆写**到滚动预发布 Release（固定下载链接） | ~20 s | ~20 s |
 | `release` | 仅 `v*` tag：用 CHANGELOG 段落发正式 Release | ~20 s | ~20 s |
 
-测试构成：JS 35 项（`tools/protocol.test.js` 22 + `tools/inject.test.js` 13，含手算黄金字节）；Kotlin 37 项（`NotifyStateTest` 22 + `PromotionPolicyTest` 7 + `UploadMimeTest` 8）。**这些是唯一能在无设备条件下验证的东西**，真机行为一律以设备为准。
+测试构成：JS 47 项（`tools/protocol.test.js` 32 + `tools/inject.test.js` 15，含手算黄金字节）；Kotlin 42 项（`NotifyStateTest` 22 + `PromotionPolicyTest` 7 + `UploadMimeTest` 8 + `SurvivalVerdictTest` 5）。**这些是唯一能在无设备条件下验证的东西**，真机行为一律以设备为准。
 
 省时间的几个点：`js` 不与 Android 构建串行；`testReleaseUnitTest` 与 `assembleRelease` 放在**同一次 Gradle 调用**里（共享 `compileReleaseKotlin`，源码只编译一次、Gradle 只启动一次）；`fetch-depth: 1`；`actions/setup-java` 的 `cache: gradle` 会恢复 `~/.gradle`（依赖缓存 + 本地 build cache）；`org.gradle.configuration-cache=true` 且 `problems=warn`，所以配置缓存只可能加速、不会让构建失败。
 
@@ -284,13 +302,16 @@ zcode-remote.apk -> CN=ZCode Remote, OU=Mobile, O=ZCode, L=Unknown, ST=Unknown, 
 后台存活检查：时长 30 分 4 秒，后台期间注入层心跳 118 次（首次在退后台后 12s，原生泵发令 120 次）、收到 214 帧、配对确认 178 次 → 保活成立（后台心跳在跑）
 ```
 
-判读方式（`89470c4` 起按**首次后台心跳的延迟**判定：`>60s` 即说明是恢复瞬间的补跑）：
+判读方式（计数是**原生侧基准的 delta**，首跳延迟 `>60s` 即说明是恢复瞬间的补跑）：
 
 | 结论 | 含义 |
 | --- | --- |
 | `保活成立（后台心跳在跑）` | 后台期间心跳真的执行了（首次心跳出现在退后台后几秒内），通知有真实数据来源 |
+| `后台心跳在跑（首次延迟未知：窗口末尾有前后台抖动）` | 计数>0，但回前台那一瞬出现过一次 2ms 的「前台→后台→前台」抖动，注入层的首跳延迟被重置。**这是正常结果**，不是失败——判定改用计数负责 |
 | `心跳只在恢复瞬间补跑，后台期间很可能没执行` | 逾期的定时器/消息在回前台那一瞬一起补跑；**先看 ColorOS 电池策略有没有放行**，不要在壳里找原因 |
-| `后台期间心跳未执行（定时器与原生发令都没跑）` | 同上且一次都没跑；先确认 `后台心跳泵已启动` 之后 15 秒内有没有 `后台心跳泵 #1 次发令` |
+| `后台期间心跳未执行（定时器与原生发令都没跑）` | 计数为 0；先确认 `后台心跳泵已启动` 之后 15 秒内有没有 `后台心跳泵 #1 次发令` |
+
+> **别被 0 次骗过第二次**：pre.28/pre.30 两轮都报「心跳未执行」，而泵其实一直在跑——原因是回前台的瞬时抖动把页面侧的计数清零了，判定在 16ms 后读到 0。判据已改为原生侧 delta 并抽成可单测的 `core/SurvivalVerdict.kt`；若再看到 0 次，请同时看 `页面开销` 的时间间隔（15s = 泵在驱动、20s+ 或断档 = 真的没跑）。
 
 同一行的下方还有「保留服务 / 注入脚本 / 工作区数量 / 日志文件路径」。要完整日志就点 **分享 / 导出日志文件**——日志写在应用外部存储目录并带崩溃堆栈，进程被杀也留得下，不需要电脑。
 
@@ -299,11 +320,14 @@ zcode-remote.apk -> CN=ZCode Remote, OU=Mobile, O=ZCode, L=Unknown, ST=Unknown, 
 ## 实现要点（改代码前先读）
 
 1. **document-start 注入是硬性前提。** `WebViewCompat.addDocumentStartJavaScript` 必须在 `loadUrl` 之前装好，晚了就漏掉页面的首个 WebSocket 连接。系统 WebView 不支持时会回退到 `onPageStarted` 并在日志里警告「可能漏首帧」。
-2. **协议层比预期深一层。** 通知要的 `sessions-index` 不在明文的 relay 载荷里，而是包在 `rpc-frame`（base64 + crc32 + 分片）里的 ChannelClient 值流；`assets/zcode-protocol.js` 实现了这一层，并有 42 项 Node 测试钉住线格式（含手算的黄金字节）。
+2. **协议层比预期深一层。** 通知要的 `sessions-index` 不在明文的 relay 载荷里，而是包在 `rpc-frame`（base64 + crc32 + 分片）里的 ChannelClient 值流；`assets/zcode-protocol.js` 实现了这一层，并有 47 项 Node 测试钉住线格式与注入层（含手算的黄金字节）。
 3. **不要调用 `webView.onPause()`。** 它会挂起 WebView 的定时器，正好掐掉页面的 relay 心跳。
 4. **返回键不销毁进程**，`moveTaskToBack(true)` 退到后台，保住连接。
 5. **`_bridges` 与 `_bridgesById` 是两个索引**：前者按工作区键（生命周期/状态），后者按 `bridgeSessionId`（入站帧路由）。混用会让所有响应被静默丢弃——这个 bug 已被 Node 测试抓到过一次。
-6. **可见性劫持救不了后台定时器，前台服务也救不了——只有 ROM 放行能救。** 劫持只让页面「以为自己可见」，从而不主动暂停；但应用在后台**整体可能拿不到执行权**（ColorOS 实测：计划 +15s 的定时消息迟到 10 分 30 秒、进程 CPU 十分钟零 tick，而同期进程未被冻结、系统未休眠、主线程空闲）。前台服务 + renderer priority 只保证**进程**活着，不让 **JS 定时器**跑起来。所以心跳改由前台服务每 15s 用 `evaluateJavascript` 原生驱动（异步消息，见 `ShellRuntime` 的 pump），而这套东西**只有在「设置 → 电池 → 应用耗电管理」放行之后才有意义**。详见「交接文本区」。
+6. **可见性劫持救不了后台定时器，前台服务也救不了——只有 ROM 放行能救。** 劫持只让页面「以为自己可见」，从而不主动暂停；但应用在后台**整体可能拿不到执行权**（ColorOS 实测：计划 +15s 的定时消息迟到 10 分 30 秒、进程 CPU 十分钟零 tick，而同期进程未被冻结、系统未休眠、主线程空闲）。前台服务 + renderer priority 只保证**进程**活着，不让 **JS 定时器**跑起来。所以心跳改由前台服务每 15s 用 `evaluateJavascript` 原生驱动，而这套东西**只有在「设置 → 电池 → 应用耗电管理」放行之后才有意义**。三条踩过的坑，改这段前必读：
+   - **两条跳都必须是异步消息**：泵自己的定时器、以及它触发的 JS 求值（`ShellRuntime.mainHandler`）。普通主线程消息在窗口不可见时会被 Choreographer 同步屏障饿死（早期实测：+15s 的投递迟到 3 分 26 秒，恰好在回前台那一瞬补跑）。
+   - **页面自己的 10 秒定时器在后台确实停**：后台日志里 `页面开销` 的时间间隔变成 15 秒（只剩泵在驱动），回前台后又回到 10 秒——这是判断「谁在驱动心跳」的现成指纹。
+   - **判定行要按「原生侧 delta」看，不要相信页面侧的绝对值**：注入层在收到「进后台」时不再清零自己的计数（清零会被回前台的瞬时抖动利用，把判定读成 0 次，见「已知问题」与 `core/SurvivalVerdict.kt`）。详见「交接文本区」。
 7. **主动订阅（D7）会带来一处副作用**：我们为其它工作区开的 bridge，其 rpc-frame 会被页面当成未知 bridge 缓存（参考实现的 `_pendingBridgePayloads`），长时间会有内存增长。设置里的「订阅所有工作区」开关可随时退回纯被动模式；每条连接的帧量很小，实测可接受。
 8. **凭据不外泄。** 远程链接的 `sid/hash/mid` 严禁进日志/文档/输出；`Diagnostics.redact` 会剥掉 `/remote` 之后的查询串，`device_sid` 只学不用、绝不记录。
 9. **颜色一律用 M3 颜色角色**（`?attr/colorSurface` 等），不要新增固定色值。固定浅色会让暗色模式从构造上就是坏的——这正是本轮修掉的问题（见"界面规范"一节）。新增界面元素时也请用 M3 字阶（`?attr/textAppearance*`）而不是手写 sp。
@@ -312,7 +336,7 @@ zcode-remote.apk -> CN=ZCode Remote, OU=Mobile, O=ZCode, L=Unknown, ST=Unknown, 
 12. **网页那条 14px 滚动条与"内容居中"在安卓上不可兼得，且**当前一律不碰**——不要再往注入层加滚动条 CSS。** 事实链：页面自己的样式表里有全局的 `*{scrollbar-width:auto;scrollbar-color:var(--color-border) transparent}` + `::-webkit-scrollbar{width:14px;height:14px}`（thumb `border:3px solid transparent` + `background-clip:padding-box`，可见部分 8px 圆角胶囊）；真机量到内容盒 1222px / 屏幕 1272px（dpr 3.5），thumb 29 设备像素宽、两侧内缩 3px——与上述规则逐像素吻合，所以底部输入框左右留白 16 vs 30 CSS px、中心偏左 7px。**Chrome 官方文档**明确："给 `::-webkit-scrollbar` 设 `width`/`height`，会把它变成 classic（占位）滚动条"。**Android WebView 更近一步**：它在引擎层把 overlay 滚动条渲染整体关掉了（WebView 负责人 torne@chromium.org 在 [issue 40226034](https://issues.chromium.org/issues/40226034)："WebView makes the blink scrollbars transparent [layer_tree_settings.cc:415] … This disables *all* rendering of overlay scrollbars in WebView"；该请求至今 P3/New），因为根滚动条约定由 Android View/主题绘制；也因此 `scrollbar-width:thin` 这类标准属性在真机上不生效（pre.17 实测无变化），唯一的把手是把 legacy 轨道宽度改小/改没（pre.16 零宽时滚动条消失、pre.18 2px 时中心偏移降到 0.86px）。鸿蒙 ArkWeb 没做这个关闭，所以同一页面在那边是 overlay、内容居中。
     **当前做法（方案 A，已实现）**：注入层 `§6` 做两件事——① 一条 `::-webkit-scrollbar{width:0!important;height:0!important}` 把网页那条轨道压成 0（**唯一动到网页的地方，且只动宽度**），内容盒随即回到满宽（真机复核：卡片左右留白 59/59、中心 635.5 = 屏幕中心）；② 自绘 overlay 指示条：`document` 上装**捕获阶段**的 passive `scroll` 监听（scroll 不冒泡但捕获路径照走，`event.target` 即滚动容器，因此不依赖任何选择器），一个复用 `position:fixed` 胶囊按容器矩形定位——可见 8px、距右缘内缩 3px、圆角 9999px、最短 32px（全是网页 thumb 自己的数值），颜色在每个滚动 burst 起始时从容器上读一次网页 token `--color-border`，滚动时显示、停止 700ms 后淡出；网页刻意隐藏滚动条处（`[class*=scrollbar-hide]`、pptx 渲染面、xterm 视口）跳过。性能：空闲零成本，滚动中每帧只写一次 transform，容器矩形每 burst 只量一次。**v1 只做指示、不可拖拽，只处理纵向**。
     **顺带一条取证捷径**：这类"网页布局为何如此"不必靠真机截图猜——静态资源是公开的（不带凭证），`curl -s https://zcode.z.ai/remote/v4/assets/index-<hash>.css` 就能读到页面自己的规则；hash 随构建变化，可从旧记录里取，或先从带凭证的 `/remote/v4` 页面里找（该 URL 含凭证，别回显）。
-13. **页面自身的 RPC 要和我们的 bridge 分开看，且「页面覆盖情况」必须活过 relay 重连。** 被动观测不只读 sessions-index：它现在也记录页面自己的 promise 调用/回复（`_tracePageCall` / `_tracePageResult` → 日志里的 `页面调用慢`、`页面调用失败`、`页面 RPC 10s`），因为「点进任务不出内容」那个请求是**页面的**，壳自己的 bridge 永远看不到。四条硬约束：① 桌面端在一条 relay socket 上按序处理，我们的握手风暴会排在页面请求前面——所以**页面已覆盖的工作区绝不重复开 bridge**，而这份认知必须由 `inject.js` 的 `pageCoverage` 跨 `resetClient()` 存活（第一轮正是它在重连后丢失，导致重复 bridge 与 `rpc-transport-fault` 死循环，见「已知问题 B」）；② `_observeInboundRpc` 里 promise 回复按 `(bridgeSessionId, id)` 配对，**不要求先学到工作区**，否则页面 bridge 的回复会被静默丢掉——那样第 3/4 条日志永远为空；③ **「页面拥有某工作区」不能只凭一个证据**：页面开了 bridge（入站 `workspace-bridge-ready` 且 id 不在 `_requestedBridgeIds` 里）**且** 桌面端确实拒掉我们的 bridge，两个同时成立才永久放弃（`_pageOwned`）。只有前者就撤会静默丢掉通知覆盖（页面有 bridge ≠ 它在流 sessions-index）；只有后者就永久放弃则会把瞬时故障当成结论。另外任何工作区在**同一条 relay 连接**内 fault 超过 `_maxReopens`（默认 2）就停止重开，下次连接再试一次；④ burst 的每一站之前都 `awaitPageIdle()`：页面有未回请求时暂停，让用户刚点开的请求先走；让路预算整个 burst 共享（8s），所以再忙的页面也只能把 burst 拉长有限时间——**这也意味着 `主动订阅完成：用时` 可能到 ~19s，是刻意的**。
+13. **页面自身的 RPC 要和我们的 bridge 分开看，且「页面覆盖情况」必须活过 relay 重连。** 被动观测不只读 sessions-index：它现在也记录页面自己的 promise 调用/回复（`_tracePageCall` / `_tracePageResult` → 日志里的 `页面调用慢`、`页面调用失败`、`页面 RPC 10s`），因为「点进任务不出内容」那个请求是**页面的**，壳自己的 bridge 永远看不到。四条硬约束：① 桌面端在一条 relay socket 上按序处理，我们的握手风暴会排在页面请求前面——所以**页面已覆盖的工作区绝不重复开 bridge**，而这份认知必须由 `inject.js` 的 `pageCoverage` 跨 `resetClient()` 存活（第一轮正是它在重连后丢失，导致重复 bridge 与 `rpc-transport-fault` 死循环，见「已知问题 B」）；② `_observeInboundRpc` 里 promise 回复按 `(bridgeSessionId, id)` 配对，**不要求先学到工作区**，否则页面 bridge 的回复会被静默丢掉——那样第 3/4 条日志永远为空；③ **「页面拥有某工作区」不能只凭一个证据**：页面开了 bridge（入站 `workspace-bridge-ready` 且 id 不在 `_requestedBridgeIds` 里）**且** 桌面端确实拒掉我们的 bridge，两个同时成立才永久放弃（`_pageOwned`）。只有前者就撤会静默丢掉通知覆盖（页面有 bridge ≠ 它在流 sessions-index）；只有后者就永久放弃则会把瞬时故障当成结论。另外任何工作区在**同一条 relay 连接**内 fault 超过 `_maxReopens`（默认 2）就停止重开；而**跨连接**的重复 fault 另有一套冷却（`FAULT_COOLDOWN_CONNECTIONS=3` / `FAULT_COOLDOWN_MS=10 分钟`）：同一条连接只算一记 strike，连续 3 条连接都 fault 就冷却 10 分钟、`start()` 与 `_scheduleReopen` 都不再为它开 bridge，到期自动重试。这一条是必需的——每次 socket 重建都会把「本连接内放弃」的预算清零，没有跨连接记忆时 `default` 这种「每条连接都被拒」的工作区会永远重开下去（真机已验收，见「已知问题 C」）。④ burst 的每一站之前都 `awaitPageIdle()`：页面有未回请求时暂停，让用户刚点开的请求先走；让路预算整个 burst 共享（8s），所以再忙的页面也只能把 burst 拉长有限时间——**这也意味着 `主动订阅完成：用时` 可能到 ~19s，是刻意的**。
 
 ---
 
@@ -451,7 +475,7 @@ zcode-remote.apk -> CN=ZCode Remote, OU=Mobile, O=ZCode, L=Unknown, ST=Unknown, 
 
 ```bash
 cd android-shell
-node --test                              # 42 项：线格式、分片重组、通道客户端、会话索引、注入层、页面 RPC 取证
+node --test                              # 47 项：线格式、分片重组、通道客户端、会话索引、注入层、页面 RPC 取证
 python tools/check_kotlin_structure.py   # 括号配平 / 包名与目录一致 / 合并残留（约 1 秒）
 python tools/watch_ci.py [--watch]       # 读 CI 状态与失败原因（无需 gh / 无需 token）
 python tools/doc_snapshot.py --probe     # 官方文档快照（docs/）的状态；详见脚本头部 docstring
@@ -558,104 +582,99 @@ android-shell/
 
 ### 一句话状态
 
-`pre` @ `28ad612`，CI 全绿（JS 44 + Kotlin 37 单测）；最新构建 **`1.0.0-pre.30`**
+`pre` @ `3b643b4`，CI 全绿（JS 47 + Kotlin 42 单测）；最新构建 **`1.0.0-pre.33`**
 挂在滚动预发布 [`android-pre`](https://github.com/Bronzesakon/Zcode_harmony/releases/tag/android-pre)（固定下载链接，可直接覆盖安装）。
-**真机验证已过六轮**（一加 PLC110 / ColorOS 16 / API 36 / WebView 153）。前三轮（adb 闭环、网页滚动条方案 A、
-「会话加载慢」壳侧收口）结论不变，见「已知问题 B」。**本轮是后台保活专轮，两条结论：**
+**真机验证已过七轮**（一加 PLC110 / ColorOS 16 / API 36 / WebView 153）。前三轮（adb 闭环、网页滚动条方案 A、
+「会话加载慢」壳侧收口）结论不变，见「已知问题 B」。**本轮（第七轮）四条结论：**
 
-1. **后台保活走通了，前置条件是 ColorOS 放行，而且只有用户能改。** 把「ZCode 远程」的电池策略设为
-   **「允许完全后台行为」**（Android 原生那侧的"始终允许后台运行"本来开着）之后：**息屏 + Dozing** 状态下退后台
-   **14 分 5 秒**，注入层心跳 71 次、原生泵发令 55 次、收到 744 帧、配对确认 56 次，节奏连续无断档，回前台也没触发
-   我们自己的强制重连。**同一套代码在放行之前，同样 10 分钟里泵一次都发不出来**（计划 +15s 的定时消息迟到了 10 分 30 秒）。
-2. **暴露出一个此前被掩盖的真问题：后台期间整条 relay socket 每约 2 分钟被重建一次。** 链条是
-   `default` 的 `rpc-transport-fault` → 壳重开 bridge → 约 9 秒后 socket 被关 → 页面重连 → 壳重放一轮订阅 burst。
-   **这就是用户看到的「正在尝试重连」**；此前看不到它，是因为后台整个应用都不执行（没有流量、没有 fault、socket 静默躺着）。
+1. **后台保活确实成立；此前两轮报的「心跳 0 次」是判定行的 bug，不是保活失败。** 证据链：pre.32 息屏退后台
+   12 分 44 秒、泵发令 50 次，同期注入层 `页面开销` 是**精确 15.00 秒**一次（页面自己的定时器是 10s，只有 15s 的泵
+   能产生这个节奏）→ `heartbeatTick` 一直在执行；而日志里 `app foreground = false` 紧跟在 `= true` 后 **2ms**，
+   那次瞬时抖动触发了 `setAppForeground(false)` 里的 `liveness.backgroundTicks = 0`，判定在 16ms 后读到 0。
+   唤醒一台息屏手机（或 `am start`、用户解锁）都会产生这个抖动——**这就是它骗过两轮的原因**。
+2. **跨连接冷却已实现并真机验收**（上一轮遗留的「重开循环」）：`default` 在每条 relay 连接上都被桌面端 fault，
+   而每次 socket 重建都把「本连接内放弃重开」的预算清零。现在按连接记 strike，连续 3 条连接都 fault 就冷却
+   10 分钟、到期自动重试。真机日志（路径为 Windows 反斜杠形式）：`19:35:35 冷却 …\workspace\default：连续 3 条
+   relay 连接都被桌面端 fault，10 分钟内不再为它开 bridge`，随后的 burst 记 `（冷却中 1 个）`。
+3. **「正在尝试重连」定位到是谁关的 socket：页面自己。** `socket.close()` 的调用栈落在页面 bundle 内
+   （`<anonymous>:<行>:34`），`code=1005 clean=true`，只在后台出现（前台 10 分钟一次都没断），约每 95–120 秒一次。
+   机制从公开 bundle 读出：页面 relay 客户端的 `heartbeatAckWatchdogTimer` 是 30s，而 `applyPairStatus()` 收到
+   **任意** `pair_status_ack` 就会重装该表。**但矛盾未解**：pre.32 后台窗口里泵在跑、`配对确认` 每 ~14s 到一次，
+   按该机制 watchdog 不该响，页面却照关——**所以「我们的探针能安抚它」目前不成立**，别当结论用，见「已知问题 C」。
+4. **顺带修掉一处静默 bug**：`pageBridges`/`pageOwned` 用 `shared.x || {}` 读取，调用方对象还没有该键时会给客户端
+   一份**私有** map，于是「页面已覆盖」的认知在真机上根本活不过 `resetClient()`（单测因为显式构造 state 对象才没
+   暴露）。构造函数现在会把全部共享 map 补到 shared 对象上。
 
-### 本轮做了什么（2026-09-11 深夜，后台保活专轮，pre.24 → pre.30）
+### 本轮做了什么（2026-09-11 夜，后台保活专轮第二段，pre.31 → pre.33）
 
-1. **取证：把「重载」与「正在尝试重连」拆成两个独立机制**（证据来自 `zcode-shell.log`、`dumpsys activity exit-info/processes`、`logcat`）：
-   - 「重载」= **ColorOS 在退后台那一刻杀进程**：`reason=13 (OTHER KILLS BY SYSTEM)`、`importance=125`
-     （就是 `IMPORTANCE_FOREGROUND_SERVICE`，**保活服务在前台也被杀**）、`description=stop com.zcode.remote due to o-stop(40)`；
-     日志里 `应用进入后台` 与这笔退出**只隔 285ms**。Doze 白名单挡不住（`dumpsys deviceidle whitelist` 已含本包），
-     系统里另有 ColorOS 自己的冻结服务 `oplus_freeze: [com.oplus.app.IOplusHansFreezeManager]`，而 AOSP 的 `isFrozen` 始终报 false
-     ——**OEM 冻结不体现在标准标记里**，这就是它前几轮一直没被认出来的原因。
-   - 「正在尝试重连」= **应用在后台拿不到执行权时的必然结果，不是网页按可见性断链**：可见性劫持是有效的；
-     公开的 `index-*.js` 里 `document.hidden/visibilityState` 只有 8 处，用途全是"可见才轮询 / 重新可见补拉"，**没有一处关 socket**；
-     而页面自带的 relay 客户端是 `heartbeatIntervalMs=10000` + `heartbeatAckTimeoutMs=30000` 的看门狗
-     （`heartbeatAckWatchdogTimer` → `reconnectAfterStaleWaiting`）：定时器停摆 → 心跳不发 → 恢复瞬间逾期的 `setTimeout` 补跑 →
-     判 ack 陈旧 → 自己重连。
-2. **实现方案 2（`4b27ed3`+`c973cbb`+`22e0f61`）：心跳改由前台服务原生驱动。** 注入层把 tick 抽成 `heartbeatTick()` 并以
-   `__zcodeShellHeartbeat` 暴露；前台服务在应用处于后台期间每 15s 用 `evaluateJavascript` 驱动它，注入层用 5s 间隔门保证不与自带的 10s 定时器叠加。
-3. **踩到并修掉一个 Android 坑（`22e0f61`）：主线程的普通消息在窗口不可见时送不出去。** 实测计划 +15s 的第 1 次发令迟到
-   **3 分 26 秒**，恰好卡在回前台那一瞬；同期进程未被冻结、系统未休眠、主线程空闲。改用**异步消息**
-   （`Handler.createAsync`——异步消息不受 Choreographer 同步屏障约束）。注意这条**只在 ColorOS 放行之后才有意义**：不放行时进程整体没有执行权，异步与否都白搭。
-4. **恢复姿态借鉴参考客户端 zemote**（`cfad2b0`；想法来自 `zemote/lib/protocol/relay_client.dart`）：
-   ① **两击制**——第一次发现 ack 陈旧只记日志并继续探测，连续第二次才重建 socket（此前一次可疑就 `socket.close()`，
-   而关 socket 是本层最重的动作：恢复要由页面重开工作区/任务）；② **回前台按"帧"判而不是按 ack 判**——`lastInboundAt` 距今不足 60s
-   就认为链路还活着（重置 ack 时钟 + 发一次探测，什么都不拆），确实静默超 60s 才立刻重建。
-   顺带把 zemote 核对了一遍：它**没有任何保活手段**（前台服务只在有任务运行时起、无 wakelock、无电池优化申请），
-   其进程退出史里同样是 `o-kill(401x)` / `o-stop(40)`，**包括前台服务在跑的时候（importance=125）**——它靠的是"断了就快速静默修复"。
-5. **判据修正（`89470c4`）**：存活结论行原本会误报——它只看"末次心跳距回前台 <500ms"，而泵每 15s 一次，末次心跳本来就容易落在几百毫秒内
-   （pre.28 实测就误判成「心跳只在恢复瞬间补跑」，而当时泵明明发了 27 次令）。改为按**首次后台心跳的延迟**判定（>60s 即视为恢复瞬间补跑），
-   结论行打印「首次在退后台后 Ns」。同时删掉已被取代的验证脚手架（`nativeTicks` / `heartbeatTicks` / `lastTickWallMs` / 逐次留痕日志）。
-6. **关闭归因诊断（`28ad612`）**：socket close 现在记录**关闭码 / `wasClean` / 调用栈一行**，用来把"桌面端正常关的""网络层异常断的(1006)""页面自己重连关的"分开
-   ——这是修第 2 条那个 2 分钟循环的前提。
-7. **单测 44 项**（新增两条：泵入口与速率门；"回前台时链路还活着就不许拆"）。
+1. `c57aee7` **跨连接故障冷却**（`zcode-protocol.js`）：strike 按 relay 连接记，连续 3 条连接 fault 即冷却 10 分钟；
+   `start()` 与 `_scheduleReopen` 都跳过冷却中的工作区，到期自动重试（不是永久放弃）。降级日志开始带上桌面端可能
+   给出的 `message/error/detail`。新增 3 项单测，其中「pageOwned 跨重建存活」钉住上面第 4 条的静默 bug。
+2. `6aaa03c` **原生泵的 JS 求值改走异步 handler**。⚠️ 这一条的**归因是错的**，已在 `363b4e6` 更正：当时把
+   「39 次发令 0 次执行」当作同步 handler 饿死 JS 的证据，那个 0 其实来自被清零的读数。改动保留（本文件早先确实
+   实测过同步消息被饿死：+15s 的投递迟到 3 分 26 秒），但理由降级为「风险加固」，代码注释已写明。
+3. `363b4e6` **存活判据改写**：注入层计数改为单调递增（不再清零）；原生侧记 `backgroundTickBase`、判定用 delta
+   （与 frames/acks 同一套做法）；首跳延迟未知（-1）不再等同于「一次都没执行」；判定与文案抽成
+   `core/SurvivalVerdict.kt`，配 5 项单测——这行字骗过两轮，不能再只靠真机读。
+4. 真机取证（pre.30 / pre.31 / pre.32 三次安装，约 40 分钟后台窗口 + 若干次强制重建）：socket 关闭归因（谁关、
+   关闭码、是否干净）、`页面开销` 节奏指纹、冷却生效、判定行误报的逐行证据。
 
 ### 下一步（按优先级）
 
-1. **装 `1.0.0-pre.30` 复验后台**（判据现在准了）。退后台（息屏也行）10 分钟以上再回前台，读两样：
-   ① `后台存活检查：… 后台期间注入层心跳 N 次（首次在退后台后 Ys，原生泵发令 K 次）… → 保活成立（后台心跳在跑）`；
-   ② 关闭归因：`relay socket closed (code=… clean=…)` 与 `socket.close() 被调用 <调用栈>`。
-2. **修那个 2 分钟重建的循环**——用户能直接感知的「正在尝试重连」就来自它。起点是 `default` 工作区的重复 bridge：
-   壳一直没学到"页面已持有 `default`"（`workspace-bridge-ready` 若在注入脚本就位前就发生，我们是看不到的），于是走"重开 N 次"那条路；
-   而**每 2 分钟的 socket 重建又把"本连接内放弃重开"的预算清零**，循环永远结束不了。
-   倾向的做法：把「反复 fault 的工作区」从"本连接内放弃"升级为**跨连接冷却**（连续 N 条连接都 fault → 冷却一段时间再试），
-   既保住"瞬时故障要重试"的原意（见「实现要点」13·③），又打断死循环。**先读关闭归因，谁关的 socket 可能改变修法。**
-3. **「会话加载慢」的剩余部分在桌面端**（「已知问题 B」末尾的可疑点）：打开任务时一批 RPC 同时落在 1.5–2.0s（像被同一把锁串住）、
-   `subscribeConversationV4` 2.9–4.7s、`zcode-session.readSession` 报 `Session is not active`。
+1. **装 `1.0.0-pre.33` 复验判定行**：退后台（息屏也行）10 分钟以上再回前台，第一行应为
+   `后台存活检查：… 后台期间注入层心跳 N 次（首次在退后台后 Ys，原生泵发令 K 次）… → 保活成立（后台心跳在跑）`
+   （N ≈ 时长/15s；若回前台恰好有抖动会显示「首次延迟未知」，那也是通过）。
+2. **查「页面为何在后台仍自关 socket」**（「已知问题 C」的矛盾）：先确认探针是否真落在页面当前那条 socket 上
+   （可给 `injectPayload` 加一条一次性的 socket 身份日志），再核对页面 bundle 是否改版（调用点行号曾由 `:2247`
+   变 `:2340`）。这是用户能直接感知的「正在尝试重连」。
+3. 「会话加载慢」的剩余部分在桌面端（「已知问题 B」末尾的可疑点）：一批 RPC 同时落在 1.5–2.0s、
+   `subscribeConversationV4` 2.9–4.7s、`readSession` 报 `Session is not active`。
 4. 详见「项目现状」表格：P1 键盘上抬待验 / P1 悬浮弹窗四条 `dumpsys` / P3 流体云 / P4 上传与通知细节。
 
 ### 拦路石 / 待决策
 
-- **ColorOS 的电池策略是前置条件，而且只有用户能改**：不放行时后台**完全拿不到执行权**（实测计划 +15s 的定时消息迟到 10 分 30 秒、
-   进程 CPU 十分钟零 tick），此时**任何架构都无效**——包括"把 relay 客户端搬到原生侧"（zemote 就是现成的原生客户端样本，它同样被 `o-kill/o-stop` 杀）。
-  已放行：设置 → 电池 → 应用耗电管理 → 「ZCode 远程」→ 允许完全后台行为 + 自启动。**Doze 白名单不够**，走的是 ColorOS 自己那套。
-- **手机控制端单占**：另一台控制端接入时本端会被踢，页面进入**终态**「已被其他设备接管 / Relay 返回 KICKED」且**不自动重连**
-  （本轮 17:09:59 遇到过一次，靠页面上的「重新连接」按钮恢复）。要复核安卓侧，需在桌面端**重新扫码**。
-- **正式版 tag 命名空间**：安卓 `tags: ['v*']` 与鸿蒙版共用空间，建议改成 `android-v*`——等用户点头（见「决策落点」）。
+- **ColorOS 电池策略是前置条件，只有用户能改**：设置 → 电池 → 应用耗电管理 →「ZCode 远程」→ 允许完全后台行为
+  + 自启动。**Doze 白名单不够**，走的是 ColorOS 自己那套。
+- **手机控制端单占**：另一台控制端接入时本端被踢进终态（`已被其他设备接管 / KICKED`）且不自动重连。页面上的
+  「重新连接」按钮在桌面端仍持有会话时点一下就能回来（本轮实测两次都回来了），否则要在桌面端重新扫码。
+- **本机到 `github.com` 的连接间歇不可达**（`api.github.com` 正常）：`git push` 与 `releases/download` 固定链接会
+  随机失败，重试即可（本轮最长连续失败 6 次后成功）；取包可改走 API，见下。
+- **正式版 tag 命名空间**：安卓 `tags: ['v*']` 与鸿蒙版共用空间，建议改成 `android-v*`——等用户点头。
 
 ### 本轮最常用的几条命令
 
 ```bash
 cd android-shell
-python tools/watch_ci.py                # 看 CI（无需 gh/token）；单次读就够，别配 sleep 白等
+python tools/check_kotlin_structure.py     # 一秒出结果：括号配平 / 包名与目录一致 / 合并残留
+node --test                                # 47 项（protocol 32 + inject 15）
 ADB="C:/Program Files/UotanToolbox/Bin/platform-tools/adb.exe"
-S=adb-3B6F5RE8GCL3LYY7-qqFhCE._adb-tls-connect._tcp   # 无线调试端口每次重开都会变；同局域网时 adb 会自建 mDNS 传输，用 adb devices -l 取实际 serial
+S=3B6F5RE8GCL3LYY7                          # 有线；无线时用 adb devices -l 取实际 serial
 L=/sdcard/Android/data/com.zcode.remote/files/logs/zcode-shell.log
-curl -sL -o zcode-remote.apk https://github.com/Bronzesakon/Zcode_harmony/releases/download/android-pre/zcode-remote.apk
 MSYS_NO_PATHCONV=1 "$ADB" -s "$S" install -r -g zcode-remote.apk
-MSYS_NO_PATHCONV=1 "$ADB" -s "$S" shell "rm -f $L*"                      # 每轮验证前清日志，判读才干净
+MSYS_NO_PATHCONV=1 "$ADB" -s "$S" shell "rm -f $L*"                      # 每轮验证前清日志
 MSYS_NO_PATHCONV=1 "$ADB" -s "$S" shell 'am start -n com.zcode.remote/.MainActivity'
-MSYS_NO_PATHCONV=1 "$ADB" -s "$S" shell 'input keyevent KEYCODE_HOME'    # 退后台（别用 BACK：会被网页历史的 goBack 吃掉）
-# 后台期间
-MSYS_NO_PATHCONV=1 "$ADB" -s "$S" shell "grep -E '后台心跳泵|relay socket|心跳陈旧|强制重建|注入失败' $L"
-# 回前台后
-MSYS_NO_PATHCONV=1 "$ADB" -s "$S" shell "grep -E '后台存活检查' $L"
-MSYS_NO_PATHCONV=1 "$ADB" -s "$S" shell 'dumpsys activity exit-info com.zcode.remote'   # 有没有被 o-kill/o-stop
+MSYS_NO_PATHCONV=1 "$ADB" -s "$S" shell 'input keyevent KEYCODE_HOME'    # 退后台（别用 BACK）
+MSYS_NO_PATHCONV=1 "$ADB" -s "$S" shell 'input keyevent KEYCODE_POWER'   # 息屏；会同时锁屏，人离机时不要用
+# 后台期间 / 回前台后
+MSYS_NO_PATHCONV=1 "$ADB" -s "$S" shell "grep -E '后台心跳泵|socket closed|被调用|冷却|degraded' $L | tail -20"
+MSYS_NO_PATHCONV=1 "$ADB" -s "$S" shell "grep -E '后台存活检查|页面开销' $L | tail -5"
+# github.com 不通时取包（api.github.com 可用）
+curl -s "https://api.github.com/repos/Bronzesakon/Zcode_harmony/releases/tags/android-pre"   # 读 assets[].url
+curl -sL -H "Accept: application/octet-stream" -o a.apk "<assets[].url>"
 ```
 
-**判后端「后台到底有没有执行权」的唯一可靠信号**：`后台心跳泵已启动` 之后 15 秒内有没有
-`后台心跳泵 #1 次发令`。有 → 应用在后台真的在跑（此时才谈得上保活）；没有 → 被 ROM 冻住/挂起，
-先去设置里放行电池策略，不要在代码里找原因。
+**判「后台到底有没有执行权」**：现在有两把尺子——① `后台心跳泵已启动` 之后 15 秒内有没有
+`后台心跳泵 #1 次发令`；② 后台期间 `页面开销` 的时间间隔是不是 15s（回前台后回到 10s，因为页面自己的定时器
+是 10s）。两把都没有 → 被 ROM 冻住/挂起，先去设置里放行电池策略，不要在代码里找原因。
 
 **判「慢是壳还是桌面端」的 A/B（第三轮用过，决定性）**：设置里关掉「订阅所有工作区」→ 日志出现
 `订阅状态 active=false bridges=0` 后再去点开一个**没打开过的**任务，对比 `页面调用慢` 的数值。
 两边一样慢就说明与壳无关（第三轮实测：bridges=0 时 `subscribeConversationV4` 反而 4.7s）。**测完记得开回去**。
 
-
 > 全量命令、配对步骤与两个本机坑（`MSYS_NO_PATHCONV`、双 adb server 冲突）都在「本机开发 → 真机调试（adb）」。
 
 **更新记录**：2026-09-11 建立本区；同日第二轮（滚动条方案 A 验收）、第三轮（pre.21 复核结论）、
 第四轮（pre.22/23 三轮迭代的实测结论 + A/B 证明剩余延迟在桌面端）、
-第五轮（后台保活专轮，pre.24–pre.30：ColorOS 放行后的后台实测、方案 2 与异步消息坑、zemote 恢复姿态、2 分钟 socket 重建的发现）——每轮都是就地改写。
+第五轮（后台保活专轮，pre.24–pre.30：ColorOS 放行后的后台实测、方案 2 与异步消息坑、zemote 恢复姿态）、
+第六轮（pre.31–pre.32：跨连接冷却、关闭归因、判定行误报的取证）、
+第七轮即本轮（pre.33：判据改原生 delta + 单测、冷却真机验收、页面自关 socket 定位）——每轮都是就地改写。
