@@ -875,6 +875,13 @@ APK 已覆写到滚动预发布，真机装的是 **`1.0.0-pre.42`**（versionCo
 
 1. **先恢复设备，再跑一键验收**：唤醒解锁 → 重开「无线调试」（或插 USB）→
    `bash tools/device_check.sh`（自动取最新 APK、覆盖安装、清日志、跑起来、打印全部判据）。
+   **端口每次都变，别照抄旧端口**——让 mDNS 自己报（这是 2026-09-12 半夜掉线后总结出来的）：
+
+   ```bash
+   ADB="C:/Program Files/UotanToolbox/Bin/platform-tools/adb.exe"
+   addr=$(MSYS_NO_PATHCONV=1 "$ADB" mdns services | awk '/adb-tls-connect/{print $NF; exit}')
+   MSYS_NO_PATHCONV=1 "$ADB" connect "$addr" && MSYS_NO_PATHCONV=1 "$ADB" devices
+   ```
    装之前先把息屏超时设长（`settings put system screen_off_timeout 86400000`）并插电，
    否则息屏 = 断 Wi-Fi = 整条链路消失（02:27 就是这么掉的，见「拦路石」）。
 2. **补"用眼睛看"的六项**（脚本末尾会列）：状态栏与网页顶面有无接缝、MiuiX 设置页两种主题观感、
