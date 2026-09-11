@@ -33,7 +33,12 @@ class TaskStore {
         val status: TaskStatus,
         val body: String,
     ) {
-        val title: String get() = task.displayTitle
+        /**
+         * The card's title row: `状态 · 任务名` (D15 — the status word is a prefix
+         * of the title, not of the progress line, so the live progress keeps the
+         * whole body of the card).
+         */
+        val title: String get() = NotifyState.formatTitle(status.label, task.displayTitle)
     }
 
     /** Everything that changed because of one update. */
@@ -114,10 +119,7 @@ class TaskStore {
                         workspaceTitle = workspace.title,
                         task = task,
                         status = notifyState.statusOf(task),
-                        body = NotifyState.formatBody(
-                            notifyState.statusOf(task),
-                            task.preview,
-                        ),
+                        body = NotifyState.formatBody(task.preview, workspace.title),
                     )
                 )
             }

@@ -324,6 +324,31 @@ object ShellRuntime {
         }
     }
 
+    // ------------------------------------------------------- page state -> bar
+    //
+    // The main screen has no app bar, so the strip behind the status bar must
+    // carry the remote page's top-surface colour. The injected layer reports the
+    // state and theme by NAME (see inject.js section 6); only the Activity can
+    // paint, and it is not always alive, so the report is dropped when it is not.
+
+    /** (page state token, theme token) -> the Activity that paints the strip. */
+    @Volatile
+    private var pageStateListener: ((String, String) -> Unit)? = null
+
+    fun setPageStateListener(listener: ((String, String) -> Unit)?) {
+        pageStateListener = listener
+    }
+
+    private fun onPageState(state: String, theme: String) {
+        if (state.isEmpty()) return
+        try {
+            pageStateListener?.invoke(state, theme)
+        } catch (e: Exception) {
+            // A listener that throws must not break the WebView's JS bridge.
+            Diagnostics.log("warn", "应用页面状态失败: ${e.message}")
+        }
+    }
+
     /** One-line readout for the settings screen. */
     fun livenessSummary(): String {
         val snapshot = liveness ?: return "尚未收到注入层数据（网页可能还没加载完）"
@@ -389,6 +414,13 @@ object ShellRuntime {
                 "diag" -> {
                     val data = root.optJSONObject("data") ?: return
                     Diagnostics.log(data.optString("level", "info"), data.optString("message", ""))
+                }
+                "pagestate" -> {
+                    // Which visual state the page is in, and which theme it
+                    // resolved for itself. Names only — the colour table lives in
+                    // core/PageBarColor.kt and the Activity applies it.
+                    val data = root.optJSONObject("data") ?: return
+                    onPageState(data.optString("state"), data.optString("theme"))
                 }
                 "ready" -> {
                     val data = root.optJSONObject("data") ?: return
@@ -541,7 +573,7 @@ object ShellRuntime {
                     workspaceTitle = workspace.title,
                     task = task,
                     status = status,
-                    body = com.zcode.remote.core.NotifyState.formatBody(status, task.preview),
+                    body = com.zcode.remote.core.NotifyState.formatBody(task.preview, workspace.title),
                 )
             }
         }

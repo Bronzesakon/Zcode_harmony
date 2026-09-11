@@ -19,9 +19,17 @@
     <string name="error_no_scanner">这台设备没有可用的扫码组件，请改用粘贴或手动输入</string>
     <string name="error_network">网页加载失败，请检查网络后重试</string>
 
-    <string name="menu_scan">重新扫码</string>
-    <string name="menu_reload">刷新网页</string>
+    <!-- The three former overflow-menu entries. 刷新网页 still lives in the load-failure
+         panel and in settings; the other two are on the launcher long-press menu now
+         (res/xml/shortcuts.xml), which is why only 设置 is still an in-app string. -->
     <string name="menu_settings">设置</string>
+
+    <!-- Launcher long-press (static shortcuts). Short = what the popup row shows,
+         long = the tooltip. -->
+    <string name="shortcut_scan_short">重新扫码</string>
+    <string name="shortcut_scan_long">重新扫描桌面端的二维码</string>
+    <string name="shortcut_settings_short">设置</string>
+    <string name="shortcut_settings_long">打开「ZCode 远程」设置</string>
 
     <string name="action_back">返回</string>
     <string name="action_reload">重试</string>
@@ -39,6 +47,7 @@
     <string name="settings_section_connection">连接</string>
     <string name="settings_current_url">当前链接</string>
     <string name="settings_change_url">重新扫码 / 换链接</string>
+    <string name="settings_change_url_hint">扫描桌面端新的二维码，或手动输入链接</string>
     <string name="settings_reload">重新加载网页</string>
     <string name="settings_section_notifications">通知</string>
     <string name="settings_notification_permission">通知权限</string>

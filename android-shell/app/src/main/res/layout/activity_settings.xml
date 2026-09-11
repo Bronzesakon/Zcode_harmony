@@ -1,79 +1,54 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- 设置页。每个小节一张 Material 3 卡片（filled card / 12dp 圆角 / 低强调表面容器），
-     行高 56dp 保证触达区，分隔线用 outlineVariant 角色，字色与字阶全部走角色与 M3 字阶。
-     颜色为何不用固定值：见 values/colors.xml。 -->
-<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+<!-- 设置页，按 MiuiX 设计语言重排（规格与取值来源见 values/miuix_styles.xml）。
+
+     结构：SmallTopAppBar（返回箭头 + 标题）→ 可滚动区，区内每个小节一段
+     SmallTitle（14sp Bold、onBackgroundVariant）+ 一张 Card（16dp 圆角、
+     surfaceContainer 底色、左右 12dp），卡片里是若干 BasicComponent 行
+     （标题 17sp Medium + 摘要 14sp summary 色，行尾箭头 10x16dp actions 色），
+     行与行之间是 0.75dp 的 dividerLine 分隔线。
+
+     没有用 MaterialCardView / 主题色角色：MiuiX 的取色表已经逐项落在
+     @color/miuix_* 上，这里直接引用，避免同一页出现两套蓝。 -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
+    style="@style/MiuixPage"
     android:layout_width="match_parent"
-    android:layout_height="match_parent"
-    android:background="?android:attr/colorBackground"
-    android:fillViewport="true">
+    android:layout_height="match_parent">
 
-    <LinearLayout
+    <LinearLayout style="@style/MiuixAppBar">
+
+        <ImageView
+            android:id="@+id/btnBack"
+            style="@style/MiuixAppBarIcon"
+            android:src="@drawable/ic_back"
+            app:tint="@color/miuix_on_background" />
+
+        <TextView
+            style="@style/MiuixAppBarTitle"
+            android:text="@string/settings_title" />
+    </LinearLayout>
+
+    <ScrollView
         android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:orientation="vertical"
-        android:paddingBottom="32dp">
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:fillViewport="true"
+        android:scrollbars="none">
 
-        <com.google.android.material.appbar.MaterialToolbar
-            android:id="@+id/toolbar"
+        <LinearLayout
             android:layout_width="match_parent"
-            android:layout_height="?attr/actionBarSize"
-            app:navigationContentDescription="@string/action_back"
-            app:navigationIcon="@drawable/ic_back"
-            app:title="@string/settings_title" />
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:paddingBottom="32dp">
 
-        <!-- ===== 连接 ===== -->
-        <TextView
-            style="@style/SettingsSection"
-            android:text="@string/settings_section_connection" />
+            <!-- ===== 连接 ===== -->
+            <TextView
+                style="@style/MiuixSection"
+                android:text="@string/settings_section_connection" />
 
-        <com.google.android.material.card.MaterialCardView style="@style/SettingsCard">
+            <LinearLayout style="@style/MiuixCard">
 
-            <LinearLayout style="@style/SettingsCardContent">
-
-                <TextView
-                    style="@style/SettingsRowTitle"
-                    android:layout_marginTop="8dp"
-                    android:text="@string/settings_current_url" />
-
-                <TextView
-                    android:id="@+id/currentUrl"
-                    style="@style/SettingsRowSubtitle"
-                    android:textIsSelectable="true" />
-
-                <com.google.android.material.button.MaterialButton
-                    android:id="@+id/btnChangeUrl"
-                    style="@style/Widget.Material3.Button.OutlinedButton"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="16dp"
-                    android:minHeight="48dp"
-                    android:text="@string/settings_change_url" />
-
-                <com.google.android.material.button.MaterialButton
-                    android:id="@+id/btnReloadWeb"
-                    style="@style/Widget.Material3.Button.TextButton"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:minHeight="48dp"
-                    android:text="@string/settings_reload" />
-            </LinearLayout>
-        </com.google.android.material.card.MaterialCardView>
-
-        <!-- ===== 通知 ===== -->
-        <TextView
-            style="@style/SettingsSection"
-            android:text="@string/settings_section_notifications" />
-
-        <com.google.android.material.card.MaterialCardView style="@style/SettingsCard">
-
-            <LinearLayout style="@style/SettingsCardContent">
-
-                <LinearLayout
-                    android:id="@+id/rowNotificationPermission"
-                    style="@style/SettingsRow"
-                    android:orientation="horizontal">
+                <LinearLayout style="@style/MiuixRow">
 
                     <LinearLayout
                         android:layout_width="0dp"
@@ -82,42 +57,111 @@
                         android:orientation="vertical">
 
                         <TextView
-                            style="@style/SettingsRowTitle"
+                            style="@style/MiuixRowTitle"
+                            android:text="@string/settings_current_url" />
+
+                        <TextView
+                            android:id="@+id/currentUrl"
+                            style="@style/MiuixRowSummary"
+                            android:textIsSelectable="true" />
+                    </LinearLayout>
+                </LinearLayout>
+
+                <View style="@style/MiuixDivider" />
+
+                <LinearLayout
+                    android:id="@+id/rowChangeUrl"
+                    style="@style/MiuixRow">
+
+                    <LinearLayout
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:orientation="vertical">
+
+                        <TextView
+                            style="@style/MiuixRowTitle"
+                            android:text="@string/settings_change_url" />
+
+                        <TextView
+                            style="@style/MiuixRowSummary"
+                            android:text="@string/settings_change_url_hint" />
+                    </LinearLayout>
+
+                    <ImageView style="@style/MiuixRowChevron" />
+                </LinearLayout>
+
+                <View style="@style/MiuixDivider" />
+
+                <LinearLayout
+                    android:id="@+id/rowReloadWeb"
+                    style="@style/MiuixRow">
+
+                    <TextView
+                        style="@style/MiuixRowTitle"
+                        android:layout_width="0dp"
+                        android:layout_weight="1"
+                        android:text="@string/settings_reload" />
+
+                    <ImageView style="@style/MiuixRowChevron" />
+                </LinearLayout>
+            </LinearLayout>
+
+            <!-- ===== 通知 ===== -->
+            <TextView
+                style="@style/MiuixSection"
+                android:text="@string/settings_section_notifications" />
+
+            <LinearLayout style="@style/MiuixCard">
+
+                <LinearLayout
+                    android:id="@+id/rowNotificationPermission"
+                    style="@style/MiuixRow">
+
+                    <LinearLayout
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:orientation="vertical">
+
+                        <TextView
+                            style="@style/MiuixRowTitle"
                             android:text="@string/settings_notification_permission" />
 
                         <TextView
                             android:id="@+id/notificationPermissionState"
-                            style="@style/SettingsRowSubtitle" />
+                            style="@style/MiuixRowSummary" />
                     </LinearLayout>
+
+                    <ImageView style="@style/MiuixRowChevron" />
                 </LinearLayout>
 
-                <View style="@style/SettingsDivider" />
+                <View style="@style/MiuixDivider" />
 
                 <LinearLayout
                     android:id="@+id/rowClearNotifications"
-                    style="@style/SettingsRow"
-                    android:orientation="horizontal">
+                    style="@style/MiuixRow">
 
                     <TextView
-                        style="@style/SettingsRowTitle"
+                        style="@style/MiuixRowTitle"
+                        android:layout_width="0dp"
+                        android:layout_weight="1"
                         android:text="@string/settings_clear_notifications" />
+
+                    <ImageView style="@style/MiuixRowChevron" />
                 </LinearLayout>
             </LinearLayout>
-        </com.google.android.material.card.MaterialCardView>
 
-        <!-- ===== 后台保活 ===== -->
-        <TextView
-            style="@style/SettingsSection"
-            android:text="@string/settings_section_keepalive" />
+            <!-- ===== 后台保活 ===== -->
+            <TextView
+                style="@style/MiuixSection"
+                android:text="@string/settings_section_keepalive" />
 
-        <com.google.android.material.card.MaterialCardView style="@style/SettingsCard">
-
-            <LinearLayout style="@style/SettingsCardContent">
+            <LinearLayout style="@style/MiuixCard">
 
                 <LinearLayout
                     android:id="@+id/rowBattery"
-                    style="@style/SettingsRow"
-                    android:orientation="horizontal">
+                    style="@style/MiuixRow">
 
                     <LinearLayout
                         android:layout_width="0dp"
@@ -126,118 +170,150 @@
                         android:orientation="vertical">
 
                         <TextView
-                            style="@style/SettingsRowTitle"
+                            style="@style/MiuixRowTitle"
                             android:text="@string/settings_battery_optimization" />
 
                         <TextView
                             android:id="@+id/batteryState"
-                            style="@style/SettingsRowSubtitle" />
+                            style="@style/MiuixRowSummary" />
                     </LinearLayout>
+
+                    <ImageView style="@style/MiuixRowChevron" />
                 </LinearLayout>
             </LinearLayout>
-        </com.google.android.material.card.MaterialCardView>
 
-        <!-- ===== 高级 ===== -->
-        <TextView
-            style="@style/SettingsSection"
-            android:text="@string/settings_section_advanced" />
+            <!-- ===== 高级 ===== -->
+            <TextView
+                style="@style/MiuixSection"
+                android:text="@string/settings_section_advanced" />
 
-        <com.google.android.material.card.MaterialCardView style="@style/SettingsCard">
+            <LinearLayout style="@style/MiuixCard">
 
-            <LinearLayout style="@style/SettingsCardContent">
+                <LinearLayout
+                    android:id="@+id/rowSubscribeAll"
+                    style="@style/MiuixRow">
 
-                <com.google.android.material.materialswitch.MaterialSwitch
-                    android:id="@+id/switchSubscribeAll"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:minHeight="56dp"
-                    android:text="@string/settings_subscribe_all"
-                    android:textAppearance="?attr/textAppearanceBodyLarge"
-                    android:textColor="?attr/colorOnSurface" />
+                    <LinearLayout
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:orientation="vertical">
 
-                <TextView
-                    android:id="@+id/subscribeAllState"
-                    style="@style/SettingsRowSubtitle" />
+                        <TextView
+                            style="@style/MiuixRowTitle"
+                            android:text="@string/settings_subscribe_all" />
 
-                <View
-                    style="@style/SettingsDivider"
-                    android:layout_marginTop="12dp" />
+                        <TextView
+                            android:id="@+id/subscribeAllState"
+                            style="@style/MiuixRowSummary" />
+                    </LinearLayout>
+
+                    <com.google.android.material.materialswitch.MaterialSwitch
+                        android:id="@+id/switchSubscribeAll"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:layout_marginStart="12dp"
+                        android:contentDescription="@string/settings_subscribe_all" />
+                </LinearLayout>
+
+                <View style="@style/MiuixDivider" />
 
                 <LinearLayout
                     android:id="@+id/rowDiagnostics"
-                    style="@style/SettingsRow"
-                    android:orientation="horizontal">
+                    style="@style/MiuixRow">
 
                     <TextView
-                        style="@style/SettingsRowTitle"
+                        style="@style/MiuixRowTitle"
+                        android:layout_width="0dp"
+                        android:layout_weight="1"
                         android:text="@string/settings_inject_diagnostics" />
+
+                    <ImageView style="@style/MiuixRowChevron" />
                 </LinearLayout>
 
-                <View style="@style/SettingsDivider" />
+                <View style="@style/MiuixDivider" />
 
                 <LinearLayout
                     android:id="@+id/rowShareLog"
-                    style="@style/SettingsRow"
-                    android:orientation="horizontal">
+                    style="@style/MiuixRow">
 
                     <TextView
-                        style="@style/SettingsRowTitle"
+                        style="@style/MiuixRowTitle"
+                        android:layout_width="0dp"
+                        android:layout_weight="1"
                         android:text="@string/settings_share_log" />
+
+                    <ImageView style="@style/MiuixRowChevron" />
                 </LinearLayout>
 
-                <View style="@style/SettingsDivider" />
+                <View style="@style/MiuixDivider" />
 
                 <LinearLayout
                     android:id="@+id/rowClearDiagnostics"
-                    style="@style/SettingsRow"
-                    android:orientation="horizontal">
+                    style="@style/MiuixRow">
 
                     <TextView
-                        style="@style/SettingsRowTitle"
+                        style="@style/MiuixRowTitle"
+                        android:layout_width="0dp"
+                        android:layout_weight="1"
                         android:text="@string/settings_clear_diagnostics" />
+
+                    <ImageView style="@style/MiuixRowChevron" />
                 </LinearLayout>
             </LinearLayout>
-        </com.google.android.material.card.MaterialCardView>
 
-        <!-- ===== 诊断（真机调试） ===== -->
-        <TextView
-            style="@style/SettingsSection"
-            android:text="@string/settings_section_diagnostics" />
+            <!-- ===== 诊断（真机调试） ===== -->
+            <TextView
+                style="@style/MiuixSection"
+                android:text="@string/settings_section_diagnostics" />
 
-        <com.google.android.material.card.MaterialCardView style="@style/SettingsCard">
+            <LinearLayout style="@style/MiuixCard">
 
-            <LinearLayout style="@style/SettingsCardContent">
+                <LinearLayout style="@style/MiuixRow">
 
-                <TextView
-                    style="@style/SettingsRowTitle"
-                    android:layout_marginTop="8dp"
-                    android:text="@string/settings_survival" />
+                    <LinearLayout
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:orientation="vertical">
 
-                <TextView
-                    android:id="@+id/survivalText"
-                    style="@style/SettingsRowSubtitle"
-                    android:text="@string/settings_survival_loading" />
+                        <TextView
+                            style="@style/MiuixRowTitle"
+                            android:text="@string/settings_survival" />
+
+                        <TextView
+                            android:id="@+id/survivalText"
+                            style="@style/MiuixRowSummary"
+                            android:text="@string/settings_survival_loading" />
+                    </LinearLayout>
+                </LinearLayout>
             </LinearLayout>
-        </com.google.android.material.card.MaterialCardView>
 
-        <!-- ===== 关于 ===== -->
-        <TextView
-            style="@style/SettingsSection"
-            android:text="@string/settings_section_about" />
+            <!-- ===== 关于 ===== -->
+            <TextView
+                style="@style/MiuixSection"
+                android:text="@string/settings_section_about" />
 
-        <com.google.android.material.card.MaterialCardView style="@style/SettingsCard">
+            <LinearLayout style="@style/MiuixCard">
 
-            <LinearLayout style="@style/SettingsCardContent">
+                <LinearLayout style="@style/MiuixRow">
 
-                <TextView
-                    style="@style/SettingsRowTitle"
-                    android:layout_marginTop="8dp"
-                    android:text="@string/settings_version" />
+                    <LinearLayout
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:orientation="vertical">
 
-                <TextView
-                    android:id="@+id/versionText"
-                    style="@style/SettingsRowSubtitle" />
+                        <TextView
+                            style="@style/MiuixRowTitle"
+                            android:text="@string/settings_version" />
+
+                        <TextView
+                            android:id="@+id/versionText"
+                            style="@style/MiuixRowSummary" />
+                    </LinearLayout>
+                </LinearLayout>
             </LinearLayout>
-        </com.google.android.material.card.MaterialCardView>
-    </LinearLayout>
-</ScrollView>
+        </LinearLayout>
+    </ScrollView>
+</LinearLayout>

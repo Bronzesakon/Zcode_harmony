@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- MiuiX 设计语言的浅色取色表。
+
+     来源：docs/miuix（compose-miuix-ui/miuix，Apache-2.0，本机快照）的
+     miuix-ui/src/commonMain/.../theme/Colors.kt `lightColorScheme()` / `darkColorScheme()`
+     默认值，逐项照抄，不改数值。深色同名文件在 values-night/。
+
+     为什么是复刻而不是依赖 miuix 库本身：miuix 只有 Compose 实现，且要求
+     Kotlin 2.4.20 / AGP 9.4.0 / compileSdk 37，本工程是 Kotlin 2.1.0 / AGP 8.7.3 /
+     compileSdk 35、界面层是 XML/Views，且本机没有 JDK/SDK（只能靠 CI 编译）。
+     一次过夜里把工具链整体抬两档、同时把设置页转 Compose，风险远大于收益；
+     所以这里只搬它的取色与度量（本文件的数值即规格），界面仍用 Views 拼。
+     要真正换成 miuix 组件库时，替换的是这一层的实现，规格不动。 -->
+<resources>
+    <!-- 主色 / 错误 -->
+    <color name="miuix_primary">#FF3482FF</color>
+    <color name="miuix_on_primary">#FFFFFFFF</color>
+    <color name="miuix_error">#FFE94634</color>
+    <color name="miuix_tertiary_container">#FFEAF2FF</color>
+    <color name="miuix_on_tertiary_container">#FF3482FF</color>
+
+    <!-- 页面与文字 -->
+    <color name="miuix_background">#FFFFFFFF</color>
+    <color name="miuix_on_background">#FF000000</color>
+    <color name="miuix_on_background_variant">#FF8C93B0</color>
+    <color name="miuix_surface">#FFF7F7F7</color>
+    <color name="miuix_on_surface">#FF000000</color>
+    <color name="miuix_surface_variant">#FFFFFFFF</color>
+    <color name="miuix_on_surface_secondary">#CC000000</color>
+    <color name="miuix_on_surface_summary">#99000000</color>
+    <color name="miuix_on_surface_actions">#66000000</color>
+    <color name="miuix_disabled_on_surface">#FFB2B2B2</color>
+
+    <!-- 卡片 / 描边 / 分隔 -->
+    <color name="miuix_surface_container">#FFFFFFFF</color>
+    <color name="miuix_on_surface_container">#FF000000</color>
+    <color name="miuix_on_surface_container_variant">#FF959595</color>
+    <color name="miuix_outline">#FFD9D9D9</color>
+    <color name="miuix_divider">#FFE0E0E0</color>
+
+    <!-- 次级容器：既有的 MaterialSwitch 等控件靠主题角色取色，给它们一组
+         MiuiX 化的角色，避免同一页上出现两套蓝。 -->
+    <color name="miuix_secondary_container">#FFF0F0F0</color>
+    <color name="miuix_on_secondary_container">#FFA9A9A9</color>
+</resources>

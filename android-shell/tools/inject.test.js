@@ -133,6 +133,67 @@ class FakeDocument extends FakeEventTarget {
     }
 }
 
+/**
+ * Minimal MutationObserver: records its targets and lets a test deliver one
+ * batch by hand. Only installed for tests that opt into the page-state harness —
+ * inject.js must also survive a page where the API is missing, and that is the
+ * default (no-option) shape of setupPage().
+ */
+class FakeMutationObserver {
+    constructor(callback) {
+        this.callback = callback;
+        this.targets = [];
+        FakeMutationObserver.instances.push(this);
+    }
+
+    observe(target, options) {
+        this.targets.push({target, options});
+    }
+
+    disconnect() {
+        this.targets = [];
+    }
+
+    /** Test helper: run the callback once for every live observer. */
+    static fire() {
+        for (const observer of FakeMutationObserver.instances.slice()) {
+            observer.callback([], observer);
+        }
+    }
+}
+
+FakeMutationObserver.instances = [];
+
+/**
+ * matchMedia stand-in: one instance per query, so a test can flip `matches` and
+ * have the change listeners fire — which is how rotation / a system theme switch
+ * reach the script.
+ */
+class FakeMediaQueryList {
+    constructor(query, matches) {
+        this.query = query;
+        this.matches = matches;
+        this.listeners = [];
+    }
+
+    addEventListener(type, listener) {
+        if (type === 'change') {
+            this.listeners.push(listener);
+        }
+    }
+
+    removeEventListener(type, listener) {
+        this.listeners = this.listeners.filter((fn) => fn !== listener);
+    }
+
+    setMatches(matches) {
+        this.matches = matches;
+        for (const listener of this.listeners.slice()) {
+            listener({matches});
+        }
+    }
+}
+
 class FakeWindow extends FakeEventTarget {}
 
 class FakeWebSocket extends FakeEventTarget {
@@ -214,6 +275,75 @@ function setupPage(options) {
         }
     });
 
+    // ---------------------------------------------------------------------
+    // Opt-in page-state harness.
+    //
+    // The page-state reporter needs a DOM the default fake does not have
+    // (documentElement, getElementsByClassName, MutationObserver, matchMedia).
+    // It is opt-in so the other tests keep exercising the *bare* page they were
+    // written for — inject.js has to degrade quietly when those APIs are absent.
+    // ---------------------------------------------------------------------
+    const pageState = (options && options.pageState) || null;
+    let mediaQueries = [];
+    const dom = {classes: Object.create(null)};
+
+    if (pageState) {
+        const root = new FakeElement('html');
+        root.appendChild(document.body);
+        document.documentElement = root;
+        document.createElement = (tag) => {
+            const el = new FakeElement(tag);
+            el.style = {};
+            return el;
+        };
+        document.getElementsByClassName = (name) => {
+            const out = [];
+            const walk = (node) => {
+                for (const child of node.children) {
+                    if (String(child.getAttribute('class') || '').split(/\s+/).indexOf(name) >= 0) {
+                        out.push(child);
+                    }
+                    walk(child);
+                }
+            };
+            walk(root);
+            return out;
+        };
+        // Every element the page would have for a class, added/removed by name.
+        dom.classes = Object.create(null);
+        dom.set = (name, present) => {
+            const existing = document.getElementsByClassName(name);
+            if (present && existing.length === 0) {
+                const el = new FakeElement('div');
+                el.setAttribute('class', name);
+                root.appendChild(el);
+            } else if (!present) {
+                for (const el of existing) {
+                    root.children = root.children.filter((child) => child !== el);
+                }
+            }
+        };
+        dom.setTheme = (theme) => {
+            if (theme === null) {
+                delete root._attributes['data-zcode-browser-theme-surface'];
+            } else {
+                root.setAttribute('data-zcode-browser-theme-surface', theme);
+            }
+        };
+        const media = (options && options.media) || {};
+        mediaQueries = [];
+        install('matchMedia', (query) => {
+            let mql = mediaQueries.find((candidate) => candidate.query === query);
+            if (!mql) {
+                mql = new FakeMediaQueryList(query, media[query] === true);
+                mediaQueries.push(mql);
+            }
+            return mql;
+        });
+        FakeMutationObserver.instances = [];
+        install('MutationObserver', FakeMutationObserver);
+    }
+
     // Fresh protocol module: inject.js reads it off the global.
     delete require.cache[require.resolve(PROTOCOL_PATH)];
     const protocol = require(PROTOCOL_PATH);
@@ -247,9 +377,11 @@ function setupPage(options) {
         delete globalThis.__zcodeShellSetAppForeground;
         delete globalThis.__zcodeShellSetSubscribeAll;
         delete globalThis.__zcodeShellHeartbeat;
+        delete globalThis.__zcodeShellReportPageState;
+        delete globalThis.__zcodeShellPageStateHooked;
     };
 
-    return {document, window, posts, protocol, configValue, teardown};
+    return {document, window, posts, protocol, configValue, dom, mediaQueries, teardown};
 }
 
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
@@ -788,9 +920,121 @@ test('a throwing DOM query is contained, never propagated', async () => {
         };
         globalThis.__zcodeShellLocateTask('s1', 'x');
         await wait(400);
-        assert.strictEqual(
-            findPost(page.posts, 'diag', (data) => data.level === 'warn').length, 1,
-            'the failure must be downgraded to a warning');
+        // Matched on the message, not just the level: the assertion is about the
+        // locator containing its own failure, and counting every warning made it
+        // fail the moment an unrelated one was added.
+        const warned = findPost(page.posts, 'diag', (data) =>
+            data.level === 'warn' && String(data.message).indexOf('定位脚本出错') === 0);
+        assert.strictEqual(warned.length, 1, 'the failure must be downgraded to a warning');
+    } finally {
+        page.teardown();
+    }
+});
+
+// ---------------------------------------------------------------------------
+// page visual state -> native status bar surface
+//
+// The strip behind the status bar is painted natively from a fixed table, so the
+// only thing this layer owes it is the state *name* (and the theme the page
+// resolved), kept in step with the DOM as the page boots, navigates, rotates and
+// switches theme.
+// ---------------------------------------------------------------------------
+
+/** The `pagestate` reports the shell received, in order. */
+function pageStates(posts) {
+    return findPost(posts, 'pagestate').map((p) => p.data.state + '/' + p.data.theme);
+}
+
+test('the page reports its visual state, and only when it changes', async () => {
+    const page = setupPage({pageState: true, media: {'(max-width: 767px)': true}});
+    try {
+        // While the boot shell is up there is no control view: 'boot'.
+        page.dom.set('zcode-boot-loading', true);
+        page.dom.setTheme('light');
+        FakeMutationObserver.fire();
+        await flush();
+        assert.deepStrictEqual(pageStates(page.posts), ['boot/light'],
+            'the boot shell is the first state');
+
+        // React mounts: the boot shell goes away and the control view appears.
+        page.dom.set('zcode-boot-loading', false);
+        page.dom.set('bg-background-win-alt', true);
+        FakeMutationObserver.fire();
+        await flush();
+        assert.deepStrictEqual(pageStates(page.posts), ['boot/light', 'main-header/light'],
+            'a narrow page puts its own title bar under the status bar');
+
+        // A second mutation with nothing changed must not report again.
+        FakeMutationObserver.fire();
+        await flush();
+        assert.strictEqual(pageStates(page.posts).length, 2, 'unchanged state is not re-reported');
+
+        // The page's theme is the page's own decision, not the system's.
+        page.dom.setTheme('dark');
+        FakeMutationObserver.fire();
+        await flush();
+        assert.deepStrictEqual(pageStates(page.posts).slice(-1), ['main-header/dark']);
+    } finally {
+        page.teardown();
+    }
+});
+
+test('crossing the page\'s breakpoint without a DOM change is still reported', async () => {
+    // Rotation, split screen and foldables change the layout without mutating the
+    // DOM, so the media query has to be watched in its own right.
+    const page = setupPage({pageState: true, media: {'(max-width: 767px)': true}});
+    try {
+        page.dom.set('bg-background-win-alt', true);
+        page.dom.setTheme('light');
+        FakeMutationObserver.fire();
+        await flush();
+        assert.deepStrictEqual(pageStates(page.posts), ['main-header/light']);
+
+        const narrow = page.mediaQueries.find((mql) => mql.query === '(max-width: 767px)');
+        assert.ok(narrow, 'the reporter must watch the page\'s own breakpoint');
+        narrow.setMatches(false);
+        await flush();
+        assert.deepStrictEqual(pageStates(page.posts).slice(-1), ['main-surface/light'],
+            'wide layout means the shell area is the top surface');
+    } finally {
+        page.teardown();
+    }
+});
+
+test('the native side can ask for a fresh report after a background stint', async () => {
+    const page = setupPage({pageState: true, media: {'(max-width: 767px)': true}});
+    try {
+        page.dom.set('bg-background-win-alt', true);
+        page.dom.setTheme('light');
+        FakeMutationObserver.fire();
+        await flush();
+        assert.strictEqual(pageStates(page.posts).length, 1);
+
+        // A system theme switch while the app was away leaves the DOM untouched,
+        // so nothing would have been reported: the forced read is the only way.
+        page.dom.setTheme('light');
+        globalThis.__zcodeShellReportPageState();
+        await flush();
+        assert.strictEqual(pageStates(page.posts).length, 2, 'a forced report bypasses the dedupe');
+    } finally {
+        page.teardown();
+    }
+});
+
+test('a page without MutationObserver still boots, and reports no state', async () => {
+    // The default fake DOM has none of the page-state APIs. inject.js must not
+    // fail to install because of that — the window simply keeps the boot colour.
+    const page = setupPage();
+    try {
+        assert.deepStrictEqual(pageStates(page.posts), [], 'nothing to report without a DOM');
+        assert.ok(
+            findPost(page.posts, 'ready').length === 1,
+            'the rest of the injected layer must still come up'
+        );
+        assert.ok(
+            findPost(page.posts, 'diag', (data) => data.message && data.message.indexOf('页面状态观察器不可用') === 0).length === 1,
+            'and say why the status bar will not follow the page'
+        );
     } finally {
         page.teardown();
     }

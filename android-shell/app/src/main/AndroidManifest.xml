@@ -59,6 +59,13 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+
+            <!-- The launcher long-press menu (重新扫码 / 打开设置). Static, so it
+                 exists before the app has ever run, and it must be declared on
+                 the MAIN/LAUNCHER activity. -->
+            <meta-data
+                android:name="android.app.shortcuts"
+                android:resource="@xml/shortcuts" />
         </activity>
 
         <activity

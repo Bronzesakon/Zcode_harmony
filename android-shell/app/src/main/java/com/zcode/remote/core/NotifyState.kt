@@ -22,10 +22,18 @@ data class TaskSnapshot(
     val isWaitingForUser: Boolean get() = pendingInteractionId.isNotEmpty()
 }
 
-/** The two status words the ongoing notification is allowed to show (D9). */
+/**
+ * The status words the shell can show.
+ *
+ * [RUNNING] / [WAITING] are the two a *live* task is allowed to carry (D9 — a
+ * third live state was considered and rejected). [COMPLETED] is not a third live
+ * state: it exists only for the transient card that pops when a task finishes
+ * (D15). [statusOf] never returns it, which is what keeps the D9 rule intact.
+ */
 enum class TaskStatus(val label: String) {
     RUNNING("运行中"),
     WAITING("等待确认"),
+    COMPLETED("已完成"),
 }
 
 /**
@@ -136,7 +144,9 @@ class NotifyState {
 
     /**
      * Which status word the ongoing notification shows for a task (D9). Only
-     * two values exist on purpose: a third state was considered and rejected.
+     * two values exist on purpose, and [TaskStatus.COMPLETED] is deliberately not
+     * one of them — it belongs to the transient completion card, not to a live
+     * task.
      */
     fun statusOf(task: TaskSnapshot): TaskStatus =
         if (task.isWaitingForUser) TaskStatus.WAITING else TaskStatus.RUNNING
@@ -161,13 +171,42 @@ class NotifyState {
         fun isRunning(phase: String): Boolean = phase in RUNNING_PHASES
 
         /**
-         * The ongoing notification body: `状态 · 最新进展` (D8). The preview is
-         * dropped when empty rather than leaving a dangling separator.
+         * The notification title: `状态 · 任务名`.
+         *
+         * The status word is a **prefix of the title row**, not of the progress
+         * line (D15). Two reasons, both about what the fluid cloud card shows:
+         * the card's title row is the one line the user reads at a glance, and
+         * keeping the status there leaves the whole body to the live progress —
+         * which is the part that has to have room to breathe.
+         *
+         * The title is forced onto one line because the body below it is the
+         * live conversation: a two-line title steals lines from it. Note this is
+         * the *only* place the title is flattened — [TaskSnapshot.displayTitle]
+         * stays verbatim, because the notification-tap locator matches it against
+         * text in the page and must not tolerate a rewritten string.
          */
-        fun formatBody(status: TaskStatus, preview: String): String {
+        fun formatTitle(label: String, title: String): String =
+            if (title.isEmpty()) label else "$label · ${singleLine(title)}"
+
+        /**
+         * The notification body: the latest progress, with the workspace name as
+         * the fallback when a task has not produced a preview yet. No status word
+         * here any more — it moved to the title (see [formatTitle]).
+         */
+        fun formatBody(preview: String, fallback: String): String {
             val trimmed = preview.trim()
-            return if (trimmed.isEmpty()) status.label else "${status.label} · $trimmed"
+            return if (trimmed.isEmpty()) singleLine(fallback) else singleLine(trimmed)
         }
+
+        /**
+         * Collapses every run of whitespace — newlines included — into one space.
+         * A notification title is drawn on a single line by the platform, so an
+         * embedded newline would otherwise be shown as a hard break in some
+         * renderings (and would silently eat a body line in the fluid cloud card).
+         */
+        fun singleLine(text: String): String = text.replace(WHITESPACE, " ").trim()
+
+        private val WHITESPACE = Regex("\\s+")
 
         /** Notification id for a live task, stable within a run (D8/§5.6). */
         fun notificationIdFor(workspaceKey: String, sessionId: String): Int {
@@ -175,7 +214,23 @@ class NotifyState {
             return ONGOING_ID_BASE + (hash and 0x7FFFFFFF) % ONGOING_ID_RANGE
         }
 
+        /**
+         * Notification id of the transient card posted when a task finishes.
+         *
+         * A separate id on purpose: the live card for the same task is being
+         * cancelled in the same update, and reusing the id would race the two
+         * (whichever landed last would win). The two ranges do not overlap, so a
+         * completion card can never be confused with — or cancel — a live one.
+         */
+        fun completionCardIdFor(workspaceKey: String, sessionId: String): Int {
+            val hash = 31 * workspaceKey.hashCode() + sessionId.hashCode()
+            return COMPLETION_CARD_BASE + (hash and 0x7FFFFFFF) % COMPLETION_CARD_RANGE
+        }
+
         const val ONGOING_ID_BASE = 100_000
         const val ONGOING_ID_RANGE = 800_000
+
+        const val COMPLETION_CARD_BASE = 900_001
+        const val COMPLETION_CARD_RANGE = 99_000
     }
 }

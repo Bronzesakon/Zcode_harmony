@@ -82,7 +82,19 @@
 
     // How many times one workspace may fault and be reopened within a single
     // relay connection before we stop trying (see _handleDegraded).
-    var MAX_REOPENS_PER_BRIDGE = 2;
+    //
+    // Zero, on field evidence: reopening does not help a workspace the desktop
+    // refuses. A 2026-09-12 round logged `default` and `Mimo` faulting every
+    // 40–75 s, each time with the reopen "succeeding" and faulting again — every
+    // reopen costs 4 RPCs (hello / initialize / subscribeSessionsIndex / listen)
+    // on the SAME relay socket the page is using to open whatever the user just
+    // tapped. With 5–7 bridged workspaces that is the churn the user sees as
+    // "tapping a task after a long background loads forever". One strike per
+    // connection, then the key waits for the next relay connection (or the
+    // cross-connection cooldown below). The evidence for the refusal is the fault
+    // itself; a workspace that was merely unlucky gets its retry one connection
+    // later, which is exactly what the cooldown math is for.
+    var MAX_REOPENS_PER_BRIDGE = 0;
 
     // A workspace that faults once is a transient transport problem and deserves
     // a retry. One that faults again on the NEXT connection is the desktop

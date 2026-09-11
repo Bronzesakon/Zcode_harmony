@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- MiuiX 设计语言的深色取色表。同名浅色文件在 values/。
+
+     来源与理由见 values/miuix_colors.xml；数值同样逐项照抄
+     `darkColorScheme()` 的默认值。 -->
+<resources>
+    <color name="miuix_primary">#FF277AF7</color>
+    <color name="miuix_on_primary">#FFFFFFFF</color>
+    <color name="miuix_error">#FFF12522</color>
+    <color name="miuix_tertiary_container">#FF2B3B54</color>
+    <color name="miuix_on_tertiary_container">#FF99C7F1</color>
+
+    <color name="miuix_background">#FF242424</color>
+    <color name="miuix_on_background">#E6FFFFFF</color>
+    <color name="miuix_on_background_variant">#FF787E96</color>
+    <color name="miuix_surface">#FF000000</color>
+    <color name="miuix_on_surface">#FFF2F2F2</color>
+    <color name="miuix_surface_variant">#FF242424</color>
+    <color name="miuix_on_surface_secondary">#CCFFFFFF</color>
+    <color name="miuix_on_surface_summary">#80FFFFFF</color>
+    <color name="miuix_on_surface_actions">#66FFFFFF</color>
+    <color name="miuix_disabled_on_surface">#FF666666</color>
+
+    <color name="miuix_surface_container">#FF242424</color>
+    <color name="miuix_on_surface_container">#E6FFFFFF</color>
+    <color name="miuix_on_surface_container_variant">#FF737373</color>
+    <color name="miuix_outline">#FF404040</color>
+    <color name="miuix_divider">#FF393939</color>
+
+    <color name="miuix_secondary_container">#FF505050</color>
+    <color name="miuix_on_secondary_container">#FFA9A9A9</color>
+</resources>

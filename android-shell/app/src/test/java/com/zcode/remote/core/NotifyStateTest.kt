@@ -178,7 +178,7 @@ class NotifyStateTest {
     // ------------------------------------------------------------- status words
 
     @Test
-    fun `only two status words exist`() {
+    fun `only two status words exist for a live task`() {
         val state = NotifyState()
         assertEquals(TaskStatus.RUNNING, state.statusOf(task("a", "running")))
         assertEquals(TaskStatus.RUNNING, state.statusOf(task("a", "prewarming")))
@@ -186,14 +186,64 @@ class NotifyStateTest {
     }
 
     @Test
-    fun `the body is status dot preview`() {
+    fun `the completed word belongs to the card, never to a live task`() {
+        // D15: 已完成 is a third label, but it must never leak into statusOf —
+        // that is what keeps D9's two-word rule for live tasks intact.
+        val state = NotifyState()
+        for (task in listOf(
+            task("a", "running"),
+            task("b", "running", interactionId = "i"),
+            task("c", "completed"),
+            task("d", "prewarming"),
+        )) {
+            assertNotEquals(TaskStatus.COMPLETED, state.statusOf(task))
+        }
+        assertEquals("已完成", TaskStatus.COMPLETED.label)
+    }
+
+    // ------------------------------------------------------------- title / body
+
+    @Test
+    fun `the title carries the status word as a prefix`() {
         assertEquals(
-            "运行中 · 已修改 auth_service",
-            NotifyState.formatBody(TaskStatus.RUNNING, "已修改 auth_service"),
+            "运行中 · 重构登录",
+            NotifyState.formatTitle(TaskStatus.RUNNING.label, "重构登录"),
         )
-        assertEquals("运行中", NotifyState.formatBody(TaskStatus.RUNNING, ""))
-        assertEquals("运行中", NotifyState.formatBody(TaskStatus.RUNNING, "   "))
-        assertEquals("等待确认 · 需要授权读取 test/", NotifyState.formatBody(TaskStatus.WAITING, "需要授权读取 test/"))
+        assertEquals(
+            "等待确认 · 重构登录",
+            NotifyState.formatTitle(TaskStatus.WAITING.label, "重构登录"),
+        )
+        assertEquals(
+            "已完成 · 重构登录",
+            NotifyState.formatTitle(TaskStatus.COMPLETED.label, "重构登录"),
+        )
+    }
+
+    @Test
+    fun `an untitled task shows the status word alone, without a dangling separator`() {
+        assertEquals("运行中", NotifyState.formatTitle(TaskStatus.RUNNING.label, ""))
+    }
+
+    @Test
+    fun `the title is collapsed onto one line`() {
+        // A newline in a task title would otherwise wrap the title row and take a
+        // line away from the live progress, which is the part that needs room.
+        assertEquals("第一行 第二行", NotifyState.singleLine("第一行\n第二行"))
+        assertEquals("a b", NotifyState.singleLine("  a \t\n  b  "))
+        assertEquals(
+            "运行中 · a b",
+            NotifyState.formatTitle(TaskStatus.RUNNING.label, "a\nb"),
+        )
+    }
+
+    @Test
+    fun `the body is the progress, with the workspace name as the fallback`() {
+        assertEquals("已修改 auth_service", NotifyState.formatBody("已修改 auth_service", "仓库"))
+        assertEquals("仓库", NotifyState.formatBody("", "仓库"))
+        assertEquals("仓库", NotifyState.formatBody("   ", "仓库"))
+        // Newlines collapse here too: the body is drawn by the platform's
+        // BigTextStyle, which is happy with one line as well as several.
+        assertEquals("a b", NotifyState.formatBody("a\nb", "仓库"))
     }
 
     @Test
@@ -203,12 +253,39 @@ class NotifyStateTest {
     }
 
     @Test
+    fun `displayTitle is left verbatim for the locator`() {
+        // The notification-tap locator matches displayTitle against text in the
+        // page, so it must not be collapsed the way the notification title is.
+        assertEquals("a\nb", task("s", "running", title = "a\nb").displayTitle)
+    }
+
+    @Test
     fun `notification ids are stable and workspace scoped`() {
         val first = NotifyState.notificationIdFor("ws-1", "s-1")
         assertEquals(first, NotifyState.notificationIdFor("ws-1", "s-1"))
         assertNotEquals(first, NotifyState.notificationIdFor("ws-2", "s-1"))
         assertNotEquals(first, NotifyState.notificationIdFor("ws-1", "s-2"))
         assertTrue(first >= NotifyState.ONGOING_ID_BASE)
+    }
+
+    @Test
+    fun `the completion card id never collides with a live one`() {
+        // The live card is cancelled in the same update that posts the completion
+        // card; overlapping ranges would let one cancel the other.
+        val ongoingMax = NotifyState.ONGOING_ID_BASE + NotifyState.ONGOING_ID_RANGE - 1
+        val cardMin = NotifyState.COMPLETION_CARD_BASE
+        assertTrue("card range must start above the live range", cardMin > ongoingMax)
+        for (key in listOf("ws-1", "ws-2", "C:\\Users\\x\\.zcode\\workspace\\default")) {
+            for (session in listOf("s-1", "s-2", "")) {
+                val card = NotifyState.completionCardIdFor(key, session)
+                assertTrue(card in cardMin until (cardMin + NotifyState.COMPLETION_CARD_RANGE))
+                assertNotEquals(NotifyState.notificationIdFor(key, session), card)
+            }
+        }
+        assertEquals(
+            NotifyState.completionCardIdFor("ws-1", "s-1"),
+            NotifyState.completionCardIdFor("ws-1", "s-1"),
+        )
     }
 
     // ------------------------------------------------------------------- store
@@ -226,8 +303,9 @@ class NotifyStateTest {
         assertEquals(2, added.running.size)
         assertTrue(added.removedIds.isEmpty())
         val first = added.running.first { it.task.sessionId == "a" }
-        assertEquals("重构登录", first.title)
-        assertEquals("运行中 · 已改 auth", first.body)
+        // D15: the status word prefixes the *title*, and the body is progress only.
+        assertEquals("运行中 · 重构登录", first.title)
+        assertEquals("已改 auth", first.body)
 
         // 'a' finishes, 'b' keeps running: one added, one cancelled, one event.
         val next = store.applyWorkspace(
@@ -238,6 +316,17 @@ class NotifyStateTest {
         assertEquals("b", next.running[0].task.sessionId)
         assertEquals(listOf(first.id), next.removedIds)
         assertEquals(listOf("a"), next.completed.map { it.task.sessionId })
+    }
+
+    @Test
+    fun `a running task with no progress yet shows its workspace name instead`() {
+        val store = TaskStore()
+        val update = store.applyWorkspace(
+            key = "/repo/x", title = "学习周报", path = "/repo/x", identity = "ws", source = "active",
+            tasks = listOf(task("a", "running", title = "写周报", preview = "")),
+        )
+        assertEquals("运行中 · 写周报", update.running[0].title)
+        assertEquals("学习周报", update.running[0].body)
     }
 
     @Test

@@ -56,6 +56,8 @@
 | P2 | 会话加载慢（连标题都要半天） | **壳侧已修完并逐项实测**（重复 bridge 循环收敛、页面持有判定生效、burst 让路生效）；**A/B 已证明剩余延迟不在壳**——关掉全部 bridge 后同样慢（`subscribeConversationV4` 4.7s、`readSession` 报 `Session is not active`），属桌面端 | 见「已知问题 B」 |
 | P3 | 流体云是否真的出卡 | 未验证（需 API 36） | 设置 → 诊断里的 `流体云: 可用 / 系统已关闭本应用的推广通知` |
 | P4 | 上传链路（相册 / SAF / 取消不卡住）与通知细节（分组、点击定位、完成提示音） | 未验证 | 见「网页文件上传」与「实现要点」 |
+| P5 | 标题回退「新建对话」（用户 2026-09-12 报） | **已定位，属页面 + 桌面端**：`readSession` 静默吞失败 + 该会话在桌面端非 active → 标题只能靠任务列表；壳侧已把争抢同一 socket 的握手减到 1/3 | 见「已知问题 D·1」 |
+| P6 | 长后台后点进任务长时间不出内容（用户 2026-09-12 报） | **已定位并落地壳侧收敛**：回前台页面自恢复期间，壳为页面已持有的工作区重开 bridge → `rpc-transport-fault` → 每次重开 4 条 RPC 压在页面的 socket 上，持续约 2.5 分钟。`MAX_REOPENS_PER_BRIDGE` 2 → 0 | 见「已知问题 D·2」 |
 | — | `MODE_SAVE`（网页请求保存文件） | **未实现**，返回 false 并记 warn | — |
 
 ### 已知问题 A：ColorOS「悬浮显示」弹窗
@@ -149,6 +151,59 @@ this.heartbeatAckWatchdogTimer = void 0,
 **五、影响评估（决定要不要继续投入）**
 
 只发生在后台；前台 10 分钟零重连。每次代价是一次干净关闭 + 约 1–2 秒重连 + 我们重放一轮订阅 burst（后台因定时器节流可能被拉长到 20–90 秒，这是「主动订阅完成：用时」偏大的原因）。后台期间通知的数据来源不断（帧与 ack 都在跑），所以用户可感知的只有回前台后页面上短暂出现过「正在尝试重连」。**除非改页面或换到能控制渲染器节流的位置，否则这一项就是接受现状 + 记录证据。**
+
+### 已知问题 D：用户报的两条症状，机制与壳侧能动的部分（2026-09-12）
+
+两条都是**页面/桌面端决定的现象**，壳只能减少自己造成的干扰。写在这里是为了下次不必重新查一遍。
+
+#### D1「点进会话，标题拿不到，回退成『新建对话』」
+
+**同「已知问题 B」第 1 条，机械原因在页面代码里，两处证据链：**
+
+1. **标题只有两条来源，且两条都可能空。** 快照 `assets/index-nOVzQNKW.js` 偏移 `@345935`：
+   `activeTaskTitle: u?.title?.trim() ? u.title : formatMessage({id: taskList.newThread})`
+   ——即「两处都没有」时回退成「新建对话」。`u` 来自 `resolvedActiveTaskMeta`，其兜底由 `D_e()`
+   （`@342149`）提供，里面有 `readSession({…, messageLimit:1})`，而它的
+   `.catch(() => { n || s(null) })` **把失败静默吞成 null**，用户看不到任何报错。
+2. **兜底那条路对「已完成」的会话本来就失败**：桌面端回 `Session is not active: sess_…`
+   （这句话在页面代码里搜不到，是桌面端返回的）。真机日志反复出现这一行。
+   于是**标题正确的唯一前提变成「该工作区的任务列表 / sessions-index 已就绪」**——
+   列表没到，标题就停在回退值，而且**不会有任何报错**。
+
+壳侧能改的只有「任务列表多快就绪」这一件事：我们的 burst 与页面的会话请求共用同一条 relay socket，
+桌面端又按序处理（快照文档 §3/§5），**我们的每一发握手都排在用户刚点的那个任务前面**。
+本次的收敛（见 D2）把这条干扰降到约 1/3。**剩下的部分要桌面端回答**：非 active 会话为什么 `readSession`
+读不到，以及打开任务时任务列表为什么要等那么久。
+
+#### D2「长时间后台后点进某个任务，长时间不出内容；刷新网页或重启 app 就好了」
+
+真机日志（`pre.39`，2026-09-12 00:12 退后台 → 00:42:05 回前台，29 分 26 秒）：
+
+| 时间 | 事件（`zcode-shell.log`） |
+| --- | --- |
+| 00:42:05 | 回前台，`后台存活检查 … 保活成立`；链路健康（`paired true`、`链路 ack 1`/10s、收帧持续） |
+| 00:42:28 / 00:43:16 / 00:44:04 | `bridge degraded for E:\Mimo: rpc-transport-fault` → 各 `reopening … (attempt 1)` → `recovered`，第三次才 `本次连接放弃重开（已 fault 3 次）` |
+| 00:42:28–00:44:04 | `default` 同样反复 fault / 重开 |
+| 00:44:14 | `收帧 0 · 链路 ack 0` ——链路静默（页面正在自己重建） |
+| 00:44:22–00:44:40 | 一连串 `网页加载完成(第 N 次回调)`，随后 `页面自己持有 bridge: …\default`、`passive: following sessions-index of …\default` |
+| 00:44:41–00:44:55 | 页面自己的请求终于走通：`readWorkspaceState 1490ms`、`subscribeConversationV4 2441ms`（`readSession` 仍失败） |
+
+**机制**：回前台后页面自己在做一次全量恢复（重连 + 重开工作区/任务），而壳同时在为「页面已经持有的工作区」
+开重复 bridge → 桌面端 `rpc-transport-fault` → 壳重开（每次 4 条 RPC：hello / initialize /
+subscribeSessionsIndex / listen）→ 这些 RPC 全部排在**同一条 socket** 上，压在页面恢复用的请求前面。
+字段里这一串持续了**约 2.5 分钟**，期间用户看到的就是「点进去一直不出内容」。刷新网页（重开 socket、
+清掉双方状态）或重启 app 都能立刻恢复，正符合「重试循环被外部打断就自愈」的形态。
+
+**本次落地的壳侧收敛**：`zcode-protocol.js` 的 `MAX_REOPENS_PER_BRIDGE` 2 → **0**。
+理由就是上表：重开**从来没有真正修好过**一个被拒的工作区（每次都 recovered，然后 40–75 秒后再 fault），
+却每次都要在页面正忙的那条 socket 上插 4 条 RPC。改成「一条连接一次机会」后，同一窗口的干扰从 3 轮降到 1 轮；
+重试交给下一条 relay 连接（**实测前台页面约 45–60 秒就会自建一条新连接**，所以最坏等一分钟），
+跨连接的 `FAULT_COOLDOWN_CONNECTIONS=3` 冷却仍在，长期被拒的工作区 10 分钟后彻底让路。
+
+**没有做、也不打算做的**：回前台后给页面一段「静默窗口」（推迟 burst）。实测页面恢复要 ~2.5 分钟，
+任何合理长度的静默窗口都盖不住它，却会让**每次回前台**都可能丢掉刚完成任务的实时通知——这与壳存在的
+理由冲突。要真正解决，得让桌面端能同时接受两条 bridge，或让页面别为同一工作区握手两次。
+
 
 ## 一次构建要多快
 
@@ -396,7 +451,17 @@ zcode-remote.apk -> CN=ZCode Remote, OU=Mobile, O=ZCode, L=Unknown, ST=Unknown, 
 
 ## 界面规范（Material 3）
 
-本轮把界面从「手写固定浅色」改成按 M3 规范：
+> **2026-09-12 补充：设置页改成 MiuiX 设计语言，主界面不再有应用栏。**
+> 设置页的取色/度量逐项照抄 `docs/miuix`（compose-miuix-ui/miuix，Apache-2.0 本地快照）里
+> `Colors.kt` / `Card.kt` / `Component.kt` / `SmallTitle.kt` / `TopAppBar.kt` 的默认值，
+> 落在 `values/miuix_colors.xml`（+ `values-night/`）与 `values/miuix_styles.xml`；
+> **没有引入 miuix 库本身**（它只有 Compose 实现，且要 Kotlin 2.4.20 / AGP 9.4.0 / compileSdk 37，
+> 而本工程是 XML/Views + Kotlin 2.1.0 / AGP 8.7.3 / compileSdk 35，本机又不能编译，一次过夜把工具链
+> 抬两档风险太大）。要真正换成 miuix 组件时，替换的是这一层的实现，规格不动。
+> **主界面**则只剩网页：顶部那条带子的颜色由注入层回推的「页面状态 + 主题」查固定表得到
+> （`core/PageBarColor.kt`），见「已知问题 D」与「实现要点」。
+
+本轮（2026-09-11）把界面从「手写固定浅色」改成按 M3 规范：
 
 | 维度 | 做法 |
 | --- | --- |
@@ -605,64 +670,108 @@ android-shell/
 ```
 
 ---
-
 ## 交接文本区（新会话从这里开始）
 
 > **约定：本区每次会话收尾时**就地改写**，不是追加。**
 > 改写时删掉已完成的条目、把现状改成新的、只保留仍然成立的信息——追加会让下一个会话先读到已经过期的结论
 > （本项目此前就是因为这个才删掉了独立的交接文档，只留这一处）。
-> **细节不要往这里堆**：架构与实现 → 「实现要点」；待验证项与判读口径 → 「项目现状 / 已知问题 A·B」；
-> 环境、adb 与取日志的约定 → 「本机开发」；发版 → 「发布流程」。本区只留：状态、本轮做了什么、下一步、拦路石。
+> **细节不要往这里堆**：架构与实现 → 「实现要点」；待验证项与判读口径 → 「项目现状 / 已知问题 A·B·C·D」；
+> 环境、adb 与取日志的约定 → 「本机开发」；发版 → 「发布流程」。本区只留：状态、任务清单、下一步、拦路石。
 
 ### 一句话状态
 
-`pre` @ `18c2c62`，CI 全绿（JS 50 + Kotlin 42 单测）；最新构建 **`1.0.0-pre.39`**
-挂在滚动预发布 [`android-pre`](https://github.com/Bronzesakon/Zcode_harmony/releases/tag/android-pre)（固定下载链接，可直接覆盖安装）。
-**真机验证已过八轮**（一加 PLC110 / ColorOS 16 / API 36 / WebView 153）。前三轮（adb 闭环、网页滚动条方案 A、
-「会话加载慢」壳侧收口）结论不变，见「已知问题 B」。**本轮（第八轮）两条结论：**
+`pre` @ `TODO_SHA`（本轮从 `a3a57f5` 起）。**第八轮结束时的状态**：CI 全绿（JS 50 + Kotlin 42 单测），
+最新预发布 `1.0.0-pre.39`，真机验证八轮（一加 PLC110 / ColorOS 16 / API 36 / WebView 153–154）。
 
-1. **P0 达成：后台存活测满 30 分钟，保活成立。** pre.39 实测 `时长 29 分 26 秒 / 注入层心跳 176 次（首次在退后台后 6s，
-   原生泵发令 176 次）/ 收 1428 帧 / 配对确认 121 次 → 保活成立（后台心跳在跑）`。数字自洽（176 = 泵发令 176 =
-   10s × 176 = 29.3 分钟），且首跳 6 秒即到，说明不是回前台补跑。判据此前会误报（回前台的瞬时抖动清零页面侧计数），
-   pre.33 起改为**原生侧基准的 delta**（`core/SurvivalVerdict.kt`，5 项单测）——本行就是该修法的最终复验。
-   早前两次较短窗口（pre.34 的 14 分 28 秒、pre.35 的 11 分 44 秒）同为「保活成立」。
-2. **留下一套后台取证手段，并修掉一处会骗人的仪表。** `页面开销` 行尾现在有三把尺子
-   `链路 ack / 探针 / 页面心跳`，分别回答「桌面端有没有回」「我们有没有发」「页面自己的定时器有没有停」；
-   而 `socket.close()` 的「谁调用了」原先**永远只报包装函数自己**（在包装函数里构造 Error，取 `stack[1]` 只能拿到
-   自己那行），现在会遍历栈帧、丢弃包装帧并保留 3 帧带实参——归因调用方的日志以后别再用 frame[1] 这种写法。
+**本轮（第九轮）是一次「过夜长任务」**：用户一次性给出 11 条改动/取证要求 + 14 条流程要求（见下面的「任务清单」），
+要求全程走 GitHub `pre` 分支 → CI 编译 → 从 release 下载 → 真机调试的闭环，**禁止本地编译**（本机无 JDK/SDK），
+每一步阶段验收成功都要回到本区更新状态。
 
-### 本轮做了什么（2026-09-12 凌晨，后台保活专轮第三段，pre.34 → pre.39）
+### 本轮任务清单（用户原话整理 + 验收口径 + 状态）
 
-1. `3758522` + `18c2c62` **后台取证三把尺子**：`页面开销` 行尾加 `链路 ack N · 探针 M · paired <bool> socket <state>
-   · 页面心跳 N`。`探针` 只在真正走到 `injectPayload` 时 +1（0 就是没发出去，不会与「发了没人回」混淆）；
-   `页面心跳` 只数页面**发出**的 `pair_status_query`（我们自己的探针在 `injecting` 期间不进入观测）。
-2. `1749fa2` **修 close 归因**：遍历栈帧、丢弃 `wrappedClose`、保留 3 帧并带上实参；单测钉住「必须指向真实调用方」。
-3. `40e0c6b` **泵 15s → 10s**：顶替页面那条被隐藏页面节流掉的 10 秒心跳，按 10 秒才算等价
-   （前台实测 `页面心跳` 1 次/10 秒，后台降到 ~20–25 秒一次）。与后台重连没有因果关系，见「已知问题 C」。
-4. `5161448` → `18c2c62` **引擎层可见性实验及其撤回**：`WebView.setWindowVisibility` 是隐藏 API，
-   CI 直接给出 `Unresolved reference 'setWindowVisibility'`，已撤回，不留半成品。
-5. 单测 JS 47 → 50（链路计数、页面心跳只数页面的、close 归因必须指向真实调用方）。
+> 这份清单是**上下文被压缩后的召回锚点**：用户的要求逐条列在这里，不要凭印象重述。
+> 状态取值：`未开始` / `进行中` / `已实现待 CI` / `CI 绿` / `真机已验证`。
+
+#### A. 两条故障的定位（用户要求「查找定位为什么」）
+
+| # | 用户原话（摘） | 验收口径 | 状态 |
+| --- | --- | --- | --- |
+| A1 | 「手机端点击进入会话时，会话标题不能获取，回退到『新建对话』的错误兜底状态……工作区有网页代码嗅探下来的本地文件可供分析」 | 给出机制级结论 + 证据（快照偏移 / 真机日志行） | **已定位**，见「已知问题 D·1」 |
+| A2 | 「长时间后台时，点进某一个任务会出现长时间无法加载内容的情况，此时重新刷新网页或重启 app 都可以恢复」 | 给出机制级结论 + 壳侧可动的那一部分并落地 | **已定位 + 已落修复**，见「已知问题 D·2」 |
+
+#### B. 界面改动
+
+| # | 用户原话（摘） | 验收口径 | 状态 |
+| --- | --- | --- | --- |
+| B1 | 「按照 miuix 重构设置页」 | 设置页按 MiuiX 设计语言重排（规格取自本机 `docs/miuix` 源码） | **已实现待 CI** |
+| B2 | 「取消现在的顶部标题和右侧下拉进入设置/刷新网页/重新扫码的菜单行」 | 主界面不再有工具栏与溢出菜单；那三个入口改由长按菜单 + 原生面板承担 | **已实现待 CI** |
+| B3 | 「直接就是仿照鸿蒙项目的监听页面刷新状态然后动态给状态栏赋值背景色」 | 注入层回推「状态名 + 主题名」，原生查固定色表换色（运行时零取色） | **已实现待 CI** |
+| B4 | 「注意状态栏的底部边距作为网页的顶部边距，即注意避让不要冲到屏幕顶端」 | 网页顶部 padding = 状态栏（含挖孔）inset，那条带子由状态栏底色填充 | **已实现待 CI** |
+| B5 | 「设置底部的手势横条沉浸，网页直接底部对齐屏幕底部边距，导航条原位置悬浮在底部即可」 | 底部 inset 不消费（键盘除外）：网页贴到屏幕底边，手势条悬浮其上 | **已实现待 CI** |
+| B6 | 「新增桌面端 Shortcut 即应用长按出现的菜单，将重新扫码和打开设置作为按钮」 | `res/xml/shortcuts.xml` 两条静态快捷方式，走 MainActivity | **已实现待 CI** |
+| B7 | 「图标都去找 Android 的原生图标库不要自己瞎画」 | 用 Google 官方 Material Icons 字形（`ic_shortcut_scan` / `ic_shortcut_settings`），路径逐字照抄 | **已实现待 CI** |
+
+#### C. 通知 / 流体云
+
+| # | 用户原话（摘） | 验收口径 | 状态 |
+| --- | --- | --- | --- |
+| C1 | 「把流体云的状态如运行中的前提字样移动到标题行（显示工作区对话任务名称）的开头」 | 卡片标题 = `运行中 · 任务名`；正文只留实时进展 | **已实现待 CI** |
+| C2 | 「任务完成后，流体云立即显式从屏幕顶端的横条弹出展开为方框，强提示任务已完成（即把运行中状态改为已完成三个字标记然后其他按正常通知内容来）」 | 完成瞬间额外发一张 promoted（ongoing）卡片，标题 `已完成 · 任务名`，正文照旧；15 秒后自动收 | **已实现待 CI** |
+| C3 | 「希望标题限制在一行内，从状态提示的分割点往后的标题文字显示如果空间不够就无限单行滚动显示，留出尽可能多的空间给下面的实时对话」 | 标题强制单行（折叠所有空白/换行）；滚动由系统卡片渲染器负责，**真机截图核验** | **部分实现**：单行已做，滚动待真机确认（见「拦路石」） |
+
+#### D. 流程 / 环境要求（用户原话）
+
+| # | 要求 | 状态 |
+| --- | --- | --- |
+| D1 | 「全程走 github 的 pre 分支推送触发的 ci 流程编译，从 release 下载安装并调试形成闭环，切勿本地编译」 | 进行中 |
+| D2 | 「adb bridge 可用，192.168.0.185:45903 链接网络 adb，屏幕常亮，禁止息屏测试因为会困在锁屏状态」 | 遵守中（用 `mcp__adb-bridge__*`，显式传 target） |
+| D3 | 「可以退出应用回到后台测试」 | 遵守中 |
+| D4 | 「每推进一个阶段的任务都要跑通 ci 构建和测试验证，正好做提交的快照管理」 | 进行中 |
+| D5 | 「把所有发给你的话详细整理落盘任务清单到 readme 文档的末尾交接区，便于召回；每一个阶段验收成功，也立即在交接区更新状态」 | **本节即该落盘**，每阶段回来更新 |
+| D6 | 「我早醒希望能看到一个符合我上述需求的应用（七点半是最晚交付时间），和一份最终早晨任务报告」 | 进行中 |
+
+### 本轮的实现落点（改了哪些文件）
+
+| 文件 | 改了什么 |
+| --- | --- |
+| `assets/inject.js` | 新增第 6 节「页面状态 → 原生状态栏表面」：DOM 存在性检查 + 同源媒体查询（`max-width:767px` / `prefers-color-scheme`）判态，`MutationObserver` + matchMedia change 事件驱动，去重后回推 `pagestate{状态名,主题名}`；`__zcodeShellReportPageState()` 供原生回前台时强制重读；心跳探针落到 socket 空档时降为 debug（原先是 warn） |
+| `assets/zcode-protocol.js` | `MAX_REOPENS_PER_BRIDGE` 2 → **0**：一个工作区在一条 relay 连接上首次 fault 就不再重开（字段证据见「已知问题 D·2」） |
+| `core/PageBarColor.kt`（新） | 三态 × 深浅的固定色表 + `stateOf/themeOf` 名字解析 + `describe` 日志行 + `appearanceLightStatusBars` |
+| `core/WindowInsets.kt` | `padForSystemBarsAndIme` → `padForStatusBarAndIme`：顶部照旧（状态栏 + 挖孔），**底部只留键盘**，手势条不再消费 |
+| `MainActivity.kt` | 删掉工具栏与溢出菜单；接 `pagestate` 回推 → 换状态栏底色 + 图标明暗；`ACTION_SCAN` 快捷方式；`onPageStarted` 回落 boot 面 |
+| `activity_main.xml` | 去掉 `MaterialToolbar`；根布局底色 = 状态栏那条带子的颜色（运行时赋值）；失败面板补「设置」按钮 |
+| `SettingsActivity.kt` + `activity_settings.xml` | 按 MiuiX 重排（无 MaterialToolbar，改用自带小应用栏 + 卡片列表） |
+| `values/miuix_colors.xml` + `values-night/` + `values/miuix_styles.xml` + `drawable/miuix_card_background.xml` | MiuiX 取色表（逐项照抄 `Colors.kt`）、度量与行样式 |
+| `res/xml/shortcuts.xml` + 两个 `ic_shortcut_*.xml` + `ic_chevron_right.xml` | 长按菜单与官方图标字形 |
+| `core/NotifyState.kt` / `core/TaskStore.kt` / `notify/Notifier.kt` | 标题 = `状态 · 任务名`（D15，状态字样进标题行）、正文只留进展、标题强制单行、完成后额外发一张 promoted 的 `已完成` 卡片（15s） |
+| 单测 | JS 50 → 54（页面状态四则）；Kotlin 42 → 约 55（标题/正文新语义、完成卡片 id 不重叠、状态栏色表 6 则） |
 
 ### 下一步（按优先级）
 
-1. 「会话加载慢」的剩余部分在桌面端（「已知问题 B」末尾的可疑点）：一批 RPC 同时落在 1.5–2.0s、
-   `subscribeConversationV4` 2.9–4.7s、`readSession` 报 `Session is not active`。
-2. 「项目现状」里其余从未验证过的项：悬浮弹窗的四条 `dumpsys`（已知问题 A）、流体云是否真的出卡（P3，
-   需 API 36）、上传链路与通知细节（P4）。
+1. 推 `pre` 跑 CI（本地已绿：`node --test` 54/54、`tools/check_kotlin_structure.py` OK）→ 从 `android-pre` 直链下载 → 真机装。
+2. 真机核验清单（逐项截图/日志）：状态栏三态换色 + 图标明暗、网页顶部避让、底部沉浸（网页贴底 + 手势条悬浮）、键盘上抬仍正常、
+   长按菜单两项与图标、MiuiX 设置页两种主题、`已完成` 卡片弹出与 15 秒收起、标题单行（长标题是否滚动）。
+3. 真机复核 A2 的修复：后台 ≥10 分钟 → 回前台点开一个任务，看 `页面开销` / `bridge degraded` 行是否还成串。
+4. 「项目现状」里其余从未验证过的项：悬浮弹窗的四条 `dumpsys`（已知问题 A）、流体云是否真的出卡（P3）、上传链路与通知细节（P4）。
 
 ### 拦路石 / 待决策
 
+- **C3 的「无限单行滚动」不是壳能决定的事**：promoted/流体云卡片是系统渲染的，应用只能给字符串。
+  自定义 `RemoteViews` 能拿到 `ellipsize="marquee"`，但**会失去提升资格**（官方明确要求「无自定义视图」），
+  等于放弃流体云。所以本次只做「标题单行」这一半，滚动留给真机截图确认；若系统不滚动，需要在
+  「要滚动」与「要流体云」之间二选一，**这条要用户拍板**。
+- **`已完成` 卡片的 15 秒窗口**：promoted 要求 `ongoing`，而结束态又要能自动消失，所以用了
+  `setTimeoutAfter` + 本地 Handler 双保险。若真机上系统不认 `setTimeoutAfter`（AOSP 对 FGS 通知有豁免，
+  我们这张不是 FGS），本地那一路仍会清掉，但进程被杀时会留下一张「已完成」常驻卡片——真机要专门试一次。
+- **fault 收敛的代价**：`MAX_REOPENS_PER_BRIDGE=0` 之后，一个被桌面端拒掉的工作区在**下一条 relay 连接**
+  才会重试（字段实测前台页面约 45–60 秒就会自建一条新连接，所以最坏是等一分钟）。若真机上发现某工作区
+  的通知长时间不来，先看 `本次连接放弃重开` 与 `冷却 …` 两行，再决定要不要把「重试窗口」做短。
 - **ColorOS 电池策略是前置条件，只有用户能改**：设置 → 电池 → 应用耗电管理 →「ZCode 远程」→ 允许完全后台行为
-  + 自启动。**Doze 白名单不够**，走的是 ColorOS 自己那套。另注意：**每次重装 APK 都可能重置这个策略**，
-  验证「后台不行」之前先确认它还在。
-- **手机控制端单占**：另一台控制端接入时本端被踢进终态（`已被其他设备接管 / KICKED`）且不自动重连。页面上的
-  「重新连接」按钮在桌面端仍持有会话时点一下就能回来（本轮实测三次都回来了），否则要在桌面端重新扫码。
-- **进程会在后台被外部事件杀掉**：本轮就遇到一次 `reason=16 (PACKAGE UPDATED)`——不是 ColorOS 杀我们，而是
-  **Google WebView 被 Play 商店更新**，`description=stop com.google.android.webview due to installPackageLI`。
-  判读后台日志前先看 `dumpsys activity exit-info com.zcode.remote`，别把这种外来中断当成保活失败。
-- **本机网络**：`github.com` 间歇不可达（`git push` 需重试，最长连续失败 10 次后成功）；`api.github.com`
-  匿名额度是 60 次/小时，**本轮被限流过**（`API rate limit exceeded`）——取包优先用直链
-  `…/releases/download/android-pre/zcode-remote.apk`，API 只用来读版本名与资产号。
+  + 自启动。**Doze 白名单不够**。另注意：**每次重装 APK 都可能重置这个策略**。
+- **手机控制端单占**：另一台控制端接入时本端被踢进终态（`已被其他设备接管 / KICKED`）且不自动重连。
+  页面上的「重新连接」按钮在桌面端仍持有会话时点一下就能回来，否则要在桌面端重新扫码。
+- **本机网络**：`github.com` 间歇不可达（`git push` 需重试）；`api.github.com` 匿名额度 60 次/小时，
+  取包优先用直链 `…/releases/download/android-pre/zcode-remote.apk`。
 - **正式版 tag 命名空间**：安卓 `tags: ['v*']` 与鸿蒙版共用空间，建议改成 `android-v*`——等用户点头。
 
 ### 本轮最常用的几条命令
@@ -670,38 +779,28 @@ android-shell/
 ```bash
 cd android-shell
 python tools/check_kotlin_structure.py     # 一秒出结果：括号配平 / 包名与目录一致 / 合并残留
-node --test                                # 50 项（protocol 32 + inject 18）
-ADB="C:/Program Files/UotanToolbox/Bin/platform-tools/adb.exe"
-S=192.168.0.185:45903                       # 无线（端口每次重开都变）；有线时用 3B6F5RE8GCL3LYY7
-L=/sdcard/Android/data/com.zcode.remote/files/logs/zcode-shell.log
+node --test                                # 54 项（protocol 32 + inject 22）
+python tools/watch_ci.py --watch           # 匿名读 CI 状态与编译错误注解
 curl -sL -o zcode-remote.apk https://github.com/Bronzesakon/Zcode_harmony/releases/download/android-pre/zcode-remote.apk
-MSYS_NO_PATHCONV=1 "$ADB" -s "$S" install -r -g zcode-remote.apk
-MSYS_NO_PATHCONV=1 "$ADB" -s "$S" shell "rm -f $L*"                      # 每轮验证前清日志
-MSYS_NO_PATHCONV=1 "$ADB" -s "$S" shell 'am start -n com.zcode.remote/.MainActivity'
-MSYS_NO_PATHCONV=1 "$ADB" -s "$S" shell 'input keyevent KEYCODE_HOME'    # 退后台（别用 BACK）
-# 后台期间 / 回前台后：三把尺子 + 归因
-MSYS_NO_PATHCONV=1 "$ADB" -s "$S" shell "grep -E '页面开销' $L | tail -8"
-MSYS_NO_PATHCONV=1 "$ADB" -s "$S" shell "grep -E '被调用|relay socket closed|冷却|degraded' $L | tail -10"
-MSYS_NO_PATHCONV=1 "$ADB" -s "$S" shell "grep -E '后台存活检查' $L | tail -2"
-MSYS_NO_PATHCONV=1 "$ADB" -s "$S" shell 'dumpsys activity exit-info com.zcode.remote | head -12'
 ```
 
-**判「后台到底有没有执行权」**：① `后台心跳泵已启动` 之后 10 秒内有没有 `后台心跳泵 #1 次发令`；
-② 后台期间 `页面开销` 行有没有持续出现、`探针` 是不是每行 1（`页面心跳` 在后台降到 ~20–25 秒一次是正常的）。
-都没有 → 被 ROM 冻住/挂起，先放行电池策略，不要在代码里找原因；但**先看 `exit-info` 排除外来杀进程**
-（WebView 更新、重装、用户划掉）。
+真机侧用 `mcp__adb-bridge__*`（`adb_status` 先拿 adbPath；`target` 一律显式传 `192.168.0.185:45903`；
+屏幕上一切用 `adb_screenshot` 看，不要凭猜）：
 
-**判「慢是壳还是桌面端」的 A/B（第三轮用过，决定性）**：设置里关掉「订阅所有工作区」→ 日志出现
-`订阅状态 active=false bridges=0` 后再去点开一个**没打开过的**任务，对比 `页面调用慢` 的数值。
-两边一样慢就说明与壳无关（第三轮实测：bridges=0 时 `subscribeConversationV4` 反而 4.7s）。**测完记得开回去**。
+```
+adb(args=["install","-r","-g","zcode-remote.apk"])
+adb(args=["shell","rm -f /sdcard/Android/data/com.zcode.remote/files/logs/zcode-shell.log*"])
+adb(args=["shell","am start -n com.zcode.remote/.MainActivity"])
+adb(args=["shell","input keyevent KEYCODE_HOME"])          # 退后台（别用 BACK）
+adb(args=["shell","grep -E '页面开销|状态栏底色|pagestate' /sdcard/Android/data/com.zcode.remote/files/logs/zcode-shell.log | tail -20"])
+```
 
-> 全量命令、配对步骤与两个本机坑（`MSYS_NO_PATHCONV`、双 adb server 冲突）都在「本机开发 → 真机调试（adb）」。
+**判「状态栏换色有没有生效」**：日志里每次换色一行 `状态栏底色: <state>/<theme> → #RRGGBB`。
+手机（窄屏）进入控制页应看到 `main-header/light → #FFFFFF`（暗色 `main-header/dark → #202020`），
+开屏与状态页应是 `boot/… → #F8F8F8` / `#161616`。**一行都不出现** → 注入层没回推，先查
+`页面状态观察器`（缺失时是 debug 行）与 document-start 注入是否成功。
 
-**更新记录**：2026-09-11 建立本区；同日第二轮（滚动条方案 A 验收）、第三轮（pre.21 复核）、
-第四轮（pre.22/23 实测结论 + A/B 证明剩余延迟在桌面端）、
-第五轮（后台保活专轮，pre.24–pre.30：ColorOS 放行后的后台实测、方案 2 与异步消息坑、zemote 恢复姿态）、
-第六轮（pre.31–pre.32：跨连接冷却、关闭归因、判定行误报的取证）、
-第七轮（pre.33：判据改原生 delta + 单测、冷却真机验收、页面自关 socket 定位）、
-第八轮即本轮（pre.34–pre.39：**后台存活测满 29 分 26 秒并判定保活成立**、修掉会骗人的 close 归因、
-新增后台三把尺子）。同日收尾时用户确认两件事、本区随之删除：**后台期间的「正在尝试重连」结案为「无需干预」**
-（取证留在正文「已知问题 C（已结案）」，不再进本区），**键盘上抬确认真机正常**——每轮都是就地改写。
+**更新记录**：2026-09-11 建立本区；同日第二至七轮见 git 历史。
+第八轮（pre.34–pre.39）：后台存活测满 29 分 26 秒并判定保活成立、修掉会骗人的 close 归因、新增后台三把尺子。
+第九轮即本轮：**过夜长任务**——两条故障定位（A1/A2）、主界面去工具栏 + 状态栏动态取色、MiuiX 设置页、
+长按快捷方式、通知标题/完成卡片改版；任务清单与阶段状态就在上面，**每阶段验收后回来就地更新**。

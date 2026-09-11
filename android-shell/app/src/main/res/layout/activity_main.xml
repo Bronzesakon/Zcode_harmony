@@ -1,141 +1,141 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- 主界面：工具栏 + WebView，两种原生状态（首次接入 / 加载失败）。
+<!-- 主界面：只有网页，加上两个完全原生的状态（首次接入 / 加载失败）。
 
-     颜色全部走 Material 3 角色（?attr/…）而不是固定色值，原因见 values/colors.xml：
-     固定浅色会让暗色模式从构造上就是坏的。工具栏也不再显式设色，MaterialToolbar
-     在 Material3 主题下自带正确的 colorSurface / colorOnSurface。
+     没有工具栏，也没有溢出菜单：顶部的状态栏那一条由根布局的底色充当，颜色是
+     网页自己的顶面表面色（core/PageBarColor.kt 的固定表，由注入层回推「状态名 +
+     主题名」查表得到）。设置 / 重新扫码改从桌面长按图标进入（res/xml/shortcuts.xml）。
 
-     两个状态面板都用 M3 字阶（headlineSmall 标题 + bodyMedium 说明），并给空态加了
-     图标与主行动按钮，避免首次打开只有一行字。 -->
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+     因此根布局的 background 不是主题色而是运行时赋值的：那一条在状态栏下方、
+     WebView 上方，就是"网页顶部避让状态栏"之后露出来的那条带子，它必须与网页
+     顶面同色，否则会看出一条接缝。默认值 = boot 面的固定色（原生状态页用同一个）。
+
+     两个原生状态面板仍用 M3 字阶与角色色，但底色跟着根布局走（boot 面），
+     所以暗色模式下也是对的。 -->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:id="@+id/root"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:background="?android:attr/colorBackground"
-    android:orientation="vertical">
+    android:background="#FFF8F8F8">
 
-    <com.google.android.material.appbar.MaterialToolbar
-        android:id="@+id/toolbar"
+    <WebView
+        android:id="@+id/webview"
         android:layout_width="match_parent"
-        android:layout_height="?attr/actionBarSize"
-        app:title="@string/app_name" />
+        android:layout_height="match_parent"
+        android:background="@android:color/transparent"
+        android:visibility="gone" />
 
-    <FrameLayout
+    <!-- 首次接入：这是唯一完全原生的界面，所以给它一个像样的空态。 -->
+    <ScrollView
+        android:id="@+id/setupPanel"
         android:layout_width="match_parent"
-        android:layout_height="0dp"
-        android:layout_weight="1">
+        android:layout_height="match_parent"
+        android:fillViewport="true"
+        android:visibility="gone">
 
-        <WebView
-            android:id="@+id/webview"
-            android:layout_width="match_parent"
-            android:layout_height="match_parent"
-            android:background="?android:attr/colorBackground"
-            android:visibility="gone" />
-
-        <!-- 首次接入：这是唯一完全原生的界面，所以给它一个像样的空态。 -->
-        <ScrollView
-            android:id="@+id/setupPanel"
-            android:layout_width="match_parent"
-            android:layout_height="match_parent"
-            android:fillViewport="true"
-            android:visibility="gone">
-
-            <LinearLayout
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:gravity="center_horizontal"
-                android:orientation="vertical"
-                android:paddingHorizontal="28dp"
-                android:paddingVertical="48dp">
-
-                <ImageView
-                    android:layout_width="56dp"
-                    android:layout_height="56dp"
-                    android:importantForAccessibility="no"
-                    android:src="@drawable/ic_setup_link"
-                    app:tint="?attr/colorPrimary" />
-
-                <TextView
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="20dp"
-                    android:gravity="center"
-                    android:text="@string/setup_title"
-                    android:textAppearance="?attr/textAppearanceHeadlineSmall"
-                    android:textColor="?attr/colorOnSurface" />
-
-                <TextView
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="10dp"
-                    android:gravity="center"
-                    android:lineSpacingExtra="4dp"
-                    android:text="@string/setup_hint"
-                    android:textAppearance="?attr/textAppearanceBodyMedium"
-                    android:textColor="?attr/colorOnSurfaceVariant" />
-
-                <com.google.android.material.button.MaterialButton
-                    android:id="@+id/btnScan"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="32dp"
-                    android:minHeight="48dp"
-                    android:text="@string/setup_scan" />
-
-                <com.google.android.material.button.MaterialButton
-                    android:id="@+id/btnPaste"
-                    style="@style/Widget.Material3.Button.OutlinedButton"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="12dp"
-                    android:minHeight="48dp"
-                    android:text="@string/setup_paste" />
-
-                <com.google.android.material.button.MaterialButton
-                    android:id="@+id/btnManual"
-                    style="@style/Widget.Material3.Button.TextButton"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="4dp"
-                    android:minHeight="48dp"
-                    android:text="@string/setup_manual" />
-            </LinearLayout>
-        </ScrollView>
-
-        <!-- 加载失败态：给一个可操作的出口，而不是停在空白页。 -->
         <LinearLayout
-            android:id="@+id/errorPanel"
             android:layout_width="match_parent"
-            android:layout_height="match_parent"
-            android:gravity="center"
+            android:layout_height="wrap_content"
+            android:gravity="center_horizontal"
             android:orientation="vertical"
             android:paddingHorizontal="28dp"
-            android:visibility="gone">
+            android:paddingVertical="48dp">
+
+            <ImageView
+                android:layout_width="56dp"
+                android:layout_height="56dp"
+                android:importantForAccessibility="no"
+                android:src="@drawable/ic_setup_link"
+                app:tint="?attr/colorPrimary" />
 
             <TextView
-                android:id="@+id/errorText"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
+                android:layout_marginTop="20dp"
                 android:gravity="center"
-                android:text="@string/error_network"
-                android:textAppearance="?attr/textAppearanceBodyLarge"
+                android:text="@string/setup_title"
+                android:textAppearance="?attr/textAppearanceHeadlineSmall"
                 android:textColor="?attr/colorOnSurface" />
 
-            <com.google.android.material.button.MaterialButton
-                android:id="@+id/btnRetry"
-                android:layout_width="wrap_content"
+            <TextView
+                android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="24dp"
-                android:minHeight="48dp"
-                android:text="@string/action_reload" />
+                android:layout_marginTop="10dp"
+                android:gravity="center"
+                android:lineSpacingExtra="4dp"
+                android:text="@string/setup_hint"
+                android:textAppearance="?attr/textAppearanceBodyMedium"
+                android:textColor="?attr/colorOnSurfaceVariant" />
 
             <com.google.android.material.button.MaterialButton
-                android:id="@+id/btnChangeUrl"
-                style="@style/Widget.Material3.Button.TextButton"
-                android:layout_width="wrap_content"
+                android:id="@+id/btnScan"
+                android:layout_width="match_parent"
                 android:layout_height="wrap_content"
+                android:layout_marginTop="32dp"
                 android:minHeight="48dp"
-                android:text="@string/action_change_url" />
+                android:text="@string/setup_scan" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnPaste"
+                style="@style/Widget.Material3.Button.OutlinedButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:minHeight="48dp"
+                android:text="@string/setup_paste" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnManual"
+                style="@style/Widget.Material3.Button.TextButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:minHeight="48dp"
+                android:text="@string/setup_manual" />
         </LinearLayout>
-    </FrameLayout>
-</LinearLayout>
+    </ScrollView>
+
+    <!-- 加载失败态：给一个可操作的出口，而不是停在空白页。 -->
+    <LinearLayout
+        android:id="@+id/errorPanel"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:gravity="center"
+        android:orientation="vertical"
+        android:paddingHorizontal="28dp"
+        android:visibility="gone">
+
+        <TextView
+            android:id="@+id/errorText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center"
+            android:text="@string/error_network"
+            android:textAppearance="?attr/textAppearanceBodyLarge"
+            android:textColor="?attr/colorOnSurface" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btnRetry"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="24dp"
+            android:minHeight="48dp"
+            android:text="@string/action_reload" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btnChangeUrl"
+            style="@style/Widget.Material3.Button.TextButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:minHeight="48dp"
+            android:text="@string/action_change_url" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btnSettings"
+            style="@style/Widget.Material3.Button.TextButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:minHeight="48dp"
+            android:text="@string/menu_settings" />
+    </LinearLayout>
+</FrameLayout>

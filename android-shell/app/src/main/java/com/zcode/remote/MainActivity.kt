@@ -6,6 +6,7 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -30,16 +31,20 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import com.zcode.remote.core.Diagnostics
+import com.zcode.remote.core.PageBarColor
+import com.zcode.remote.core.PageBarState
+import com.zcode.remote.core.PageTheme
 import com.zcode.remote.core.Prefs
 import com.zcode.remote.core.RemoteUrl
 import com.zcode.remote.core.UploadMime
 import com.zcode.remote.core.enableThemeEdgeToEdge
-import com.zcode.remote.core.padForSystemBarsAndIme
+import com.zcode.remote.core.padForStatusBarAndIme
 import com.zcode.remote.databinding.ActivityMainBinding
 
 /**
@@ -55,11 +60,23 @@ import com.zcode.remote.databinding.ActivityMainBinding
  *     background-survival shell wants.
  *  3. Back does not finish the Activity: it backgrounds the task, so the
  *     connection survives the way it does in the HarmonyOS build.
+ *
+ * There is no app bar. The page starts directly under the status bar, and the
+ * strip above it is painted with the page's own top-surface colour, which the
+ * injected layer reports by name (see core/PageBarColor.kt). The former overflow
+ * menu's three actions live on the launcher long-press menu instead
+ * (res/xml/shortcuts.xml) plus the two native panels.
  */
 class MainActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityMainBinding
     private lateinit var prefs: Prefs
+
+    /** Which page state the status-bar strip is currently painted for. */
+    private var pageBarState: PageBarState = PageBarState.DEFAULT
+
+    /** The theme the page resolved for itself; null until it says. */
+    private var pageTheme: PageTheme? = null
 
     /** Script used when the WebView lacks document-start support (fallback). */
     private var fallbackScript: String? = null
@@ -145,29 +162,37 @@ class MainActivity : AppCompatActivity() {
 
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
-        // targetSdk 35 forces edge-to-edge, so the toolbar would otherwise sit
-        // under the status bar (clipping its overflow button) and the page under
-        // the navigation bar — and, once the keyboard is up, the page's composer
-        // under the keyboard (see padForSystemBarsAndIme).
-        binding.root.padForSystemBarsAndIme()
-        setSupportActionBar(binding.toolbar)
+        // targetSdk 35 forces edge-to-edge. The top inset becomes the page's top
+        // padding so the page's own header is not covered by the status bar's
+        // clock; the bottom is left immersed on purpose (see the function).
+        binding.root.padForStatusBarAndIme()
+        // Before the page says anything, the strip takes the boot surface for the
+        // *current* system appearance, so there is never a frame with light icons
+        // on a light strip.
+        applyStatusBarSurface()
 
         binding.btnScan.setOnClickListener { startScan() }
         binding.btnPaste.setOnClickListener { pasteFromClipboard() }
         binding.btnManual.setOnClickListener { showManualEntry() }
         binding.btnRetry.setOnClickListener { reloadPage() }
         binding.btnChangeUrl.setOnClickListener { showSetup() }
+        binding.btnSettings.setOnClickListener { openSettings() }
 
         configureWebView()
         installBackHandling()
-        handleIntent(intent)
+        // The intent may already have decided what the screen should be — asking
+        // for a new link must not be undone by the automatic load right below.
+        val intentHandled = handleIntent(intent)
         ShellRuntime.setJsEvaluator { script -> binding.webview.evaluateJavascript(script, null) }
+        ShellRuntime.setPageStateListener { state, theme -> onPageStateReported(state, theme) }
 
-        val stored = prefs.remoteUrl
-        if (stored == null) {
-            showSetup()
-        } else {
-            applyUrl(stored)
+        if (!intentHandled) {
+            val stored = prefs.remoteUrl
+            if (stored == null) {
+                showSetup()
+            } else {
+                applyUrl(stored)
+            }
         }
     }
 
@@ -232,6 +257,11 @@ class MainActivity : AppCompatActivity() {
                 finishCallbacks = 0
                 pageStartedAt = SystemClock.elapsedRealtime()
                 Diagnostics.info("网页开始加载")
+                // A fresh document boots with the page background at the top (the
+                // boot shell), so drop back to that surface until the new document
+                // reports otherwise. Without this a reload keeps the *previous*
+                // document's header colour under the status bar.
+                onPageStateReported(PageBarState.BOOT.token, null)
                 fallbackScript?.let { script ->
                     // No document-start support: inject as early as we can. The
                     // page may already have opened its socket, which is exactly
@@ -476,26 +506,54 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
-    // ------------------------------------------------------------- notification
+    // ------------------------------------------------------- status bar surface
+    //
+    // The app bar is gone, so the strip behind the status bar *is* the top of the
+    // page's own chrome and has to be painted with the page's top-surface colour.
+    // The injected layer reports names (which page state, which theme) and the
+    // fixed table in core/PageBarColor.kt turns them into literals — the shell
+    // never reads a colour out of the page at runtime, same rule as the
+    // HarmonyOS build.
 
-    override fun onCreateOptionsMenu(menu: android.view.Menu): Boolean {
-        menuInflater.inflate(R.menu.menu_main, menu)
-        return true
+    /**
+     * Called from the WebView's bridge thread. Hop to the main thread before
+     * touching views; the state is deduped there too, because a busy page emits
+     * several reports per second.
+     */
+    private fun onPageStateReported(stateToken: String?, themeToken: String?) {
+        runOnUiThread {
+            val state = PageBarColor.stateOf(stateToken)
+            val theme = PageBarColor.themeOf(themeToken)
+            if (state == pageBarState && theme == pageTheme) {
+                return@runOnUiThread
+            }
+            pageBarState = state
+            pageTheme = theme
+            applyStatusBarSurface()
+        }
     }
 
-    override fun onOptionsItemSelected(item: android.view.MenuItem): Boolean {
-        return when (item.itemId) {
-            R.id.action_reload -> {
-                reloadPage(); true
-            }
-            R.id.action_scan -> {
-                startScan(); true
-            }
-            R.id.action_settings -> {
-                startActivity(Intent(this, SettingsActivity::class.java)); true
-            }
-            else -> super.onOptionsItemSelected(item)
-        }
+    private fun applyStatusBarSurface() {
+        val dark = pageTheme?.let { it == PageTheme.DARK } ?: isSystemDark()
+        val color = PageBarColor.resolve(pageBarState, dark)
+        // The strip is the root's own background: the root is padded down by the
+        // status bar inset, so this colour shows exactly in that strip and
+        // nowhere else (the WebView covers everything below it).
+        binding.root.setBackgroundColor(color)
+        val controller = WindowInsetsControllerCompat(window, binding.root)
+        controller.isAppearanceLightStatusBars = PageBarColor.appearanceLightStatusBars(pageTheme)
+        // The gesture bar floats over the page, so its icons have to agree with
+        // the page too. Only matters for 3-button navigation (API 26+).
+        controller.isAppearanceLightNavigationBars = PageBarColor.appearanceLightStatusBars(pageTheme)
+        Diagnostics.info(PageBarColor.describe(pageBarState, pageTheme, color))
+    }
+
+    private fun isSystemDark(): Boolean =
+        (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
+            Configuration.UI_MODE_NIGHT_YES
+
+    private fun openSettings() {
+        startActivity(Intent(this, SettingsActivity::class.java))
     }
 
     override fun onResume() {
@@ -504,6 +562,12 @@ class MainActivity : AppCompatActivity() {
         // Ask the injected layer for fresh counters: if we just came back from a
         // long background stint, this is what resolves the survival verdict.
         ShellRuntime.requestLivenessReport()
+        // The page's theme can have changed while the app was away, and a system
+        // dark-mode switch does not mutate its DOM — so ask for a fresh report
+        // instead of waiting for the observer.
+        ShellRuntime.evaluateJs(
+            "window.__zcodeShellReportPageState && window.__zcodeShellReportPageState();"
+        )
     }
 
     override fun onPause() {
@@ -537,6 +601,7 @@ class MainActivity : AppCompatActivity() {
         pendingFileCallback = null
         // Drop the evaluator: it closes over this Activity's binding.
         ShellRuntime.setJsEvaluator(null)
+        ShellRuntime.setPageStateListener(null)
         super.onDestroy()
     }
 
@@ -571,24 +636,49 @@ class MainActivity : AppCompatActivity() {
 
     // ------------------------------------------------------- notification tap
 
-    private fun handleIntent(intent: Intent?) {
+    /**
+     * Acts on the intent the Activity was started (or re-started) with.
+     *
+     * @return true when the intent has already put the screen into the state the
+     *   user asked for, so [onCreate] must not run its automatic "load the stored
+     *   URL" step on top of it. The two shortcut actions return opposite values
+     *   on purpose: 换个链接 replaces the screen (so it must win), while 打开设置
+     *   just pushes a screen on top (so the page still has to load underneath).
+     */
+    private fun handleIntent(intent: Intent?): Boolean {
         if (intent?.action == ACTION_RELOAD) {
             reloadPage()
-            return
+            return prefs.remoteUrl != null
+        }
+        if (intent?.action == ACTION_SCAN) {
+            // Launcher long-press -> 重新扫码. With no stored link the setup panel
+            // *is* the scanner entry, so going there is the same action; with one
+            // stored, the page keeps loading behind the scanner.
+            if (prefs.remoteUrl == null) {
+                showSetup()
+                return true
+            }
+            startScan()
+            return false
+        }
+        if (intent?.action == ACTION_OPEN_SETTINGS) {
+            openSettings()
+            return false
         }
         if (intent?.action == SettingsActivity.ACTION_CHANGE_URL) {
             // The settings screen asked for a new link.
             showSetup()
-            return
+            return true
         }
-        if (intent?.action != ACTION_LOCATE_TASK) return
+        if (intent?.action != ACTION_LOCATE_TASK) return false
         val sessionId = intent.getStringExtra(EXTRA_SESSION_ID).orEmpty()
         val title = intent.getStringExtra(EXTRA_TASK_TITLE).orEmpty()
-        if (title.isEmpty() && sessionId.isEmpty()) return
+        if (title.isEmpty() && sessionId.isEmpty()) return false
         pendingLocate = sessionId to title
         locateAttempts = 0
         Diagnostics.info("通知点击: 尝试定位任务")
         tryLocate()
+        return false
     }
 
     /**
@@ -720,6 +810,12 @@ class MainActivity : AppCompatActivity() {
     companion object {
         const val ACTION_LOCATE_TASK = "com.zcode.remote.action.LOCATE_TASK"
         const val ACTION_RELOAD = "com.zcode.remote.action.RELOAD"
+
+        /** Launcher long-press shortcut: rescan the desktop's QR code. */
+        const val ACTION_SCAN = "com.zcode.remote.action.SCAN"
+
+        /** Launcher long-press shortcut: open the settings screen. */
+        const val ACTION_OPEN_SETTINGS = "com.zcode.remote.action.OPEN_SETTINGS"
         const val EXTRA_SESSION_ID = "session_id"
         const val EXTRA_TASK_TITLE = "task_title"
         const val EXTRA_WORKSPACE_KEY = "workspace_key"

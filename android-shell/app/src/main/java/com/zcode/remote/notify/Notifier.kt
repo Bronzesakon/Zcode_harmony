@@ -5,6 +5,9 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import com.zcode.remote.MainActivity
@@ -12,8 +15,11 @@ import com.zcode.remote.R
 import com.zcode.remote.core.AttentionEvent
 import com.zcode.remote.core.CompletionEvent
 import com.zcode.remote.core.Diagnostics
+import com.zcode.remote.core.NotifyState
 import com.zcode.remote.core.PromotionPolicy
+import com.zcode.remote.core.TaskStatus
 import com.zcode.remote.core.TaskStore
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * All notification rendering.
@@ -34,6 +40,24 @@ import com.zcode.remote.core.TaskStore
 class Notifier(private val context: Context) {
 
     private val manager = NotificationManagerCompat.from(context)
+
+    /**
+     * Removes the transient completion cards when their window is up.
+     *
+     * Asynchronous on API 28+, for the same reason ShellRuntime's handler is: an
+     * ordinary message posted to the main looper is not delivered while the
+     * window is invisible (the Choreographer's sync barrier starves it), and a
+     * task finishing while the phone sits in a pocket is the *normal* case here.
+     */
+    private val mainHandler: Handler =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            Handler.createAsync(Looper.getMainLooper())
+        } else {
+            Handler(Looper.getMainLooper())
+        }
+
+    /** Ids of the completion cards currently showing, so cleanup does not race. */
+    private val completionCards: MutableSet<Int> = ConcurrentHashMap.newKeySet()
 
     /** True when the user has not granted POST_NOTIFICATIONS (API 33+). */
     fun notificationsEnabled(): Boolean = manager.areNotificationsEnabled()
@@ -198,7 +222,18 @@ class Notifier(private val context: Context) {
 
     // -------------------------------------------------------------- completion
 
-    /** D10: audible, dismissible, one per completion. */
+    /**
+     * D10: audible, dismissible, one per completion.
+     *
+     * Two notifications go out, deliberately:
+     *
+     *  1. this one — the durable record in the 任务完成 channel, dismissible, with
+     *     the task name and the last progress;
+     *  2. [postCompletionCard] — a *promoted* card in the running-tasks channel
+     *     whose status word is 已完成 (D15). That is what ColorOS's 流体云 pops
+     *     out of the top strip and expands when a task finishes, which is the
+     *     whole point of the shell being installed.
+     */
     fun notifyCompleted(event: CompletionEvent) {
         if (!notificationsEnabled()) return
         val task = event.task
@@ -224,6 +259,58 @@ class Notifier(private val context: Context) {
         } catch (e: SecurityException) {
             Diagnostics.log("warn", "发送完成通知失败: ${e.message}")
         }
+        postCompletionCard(event)
+    }
+
+    /**
+     * The transient 已完成 card (D15).
+     *
+     * Cannot be a *state change* of the live card: a promoted notification must
+     * be `ongoing`, and cancelling it is what makes the card collapse. So the
+     * live card is cancelled by the ordinary running-task sync and this one takes
+     * its place for [COMPLETION_CARD_MS], carrying the same task name with the
+     * status word flipped to 已完成 — same content as the running card, only the
+     * marker changes, which is what makes it read as "this task just finished"
+     * rather than as a new, unrelated notification.
+     *
+     * Bounded twice on purpose: `setTimeoutAfter` is enforced by the system, so
+     * the card still goes away if this process is killed during the window, and
+     * the local handler removes it without waiting for the system.
+     */
+    private fun postCompletionCard(event: CompletionEvent) {
+        val task = event.task
+        val id = NotifyState.completionCardIdFor(event.workspaceKey, task.sessionId)
+        // The same body the live card had. The fallback is the workspace's own
+        // name (not the task title, which is already in the title row): a
+        // completion card with no progress to show still says which workspace it
+        // came from.
+        val body = NotifyState.formatBody(task.preview, workspaceNameOf(event.workspaceKey))
+        val pending = taskIntent(event.workspaceKey, task.sessionId, task.displayTitle, index = id)
+        val builder = NotificationCompat.Builder(context, CHANNEL_RUNNING)
+            .setSmallIcon(R.drawable.ic_stat_zcode)
+            .setContentTitle(NotifyState.formatTitle(TaskStatus.COMPLETED.label, task.displayTitle))
+            .setContentText(body)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(body))
+            .setContentIntent(pending)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .setShowWhen(false)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setSilent(true)
+            .setTimeoutAfter(COMPLETION_CARD_MS)
+        LiveUpdate.requestPromotion(builder, TaskStatus.COMPLETED.label)
+        try {
+            manager.notify(id, builder.build())
+        } catch (e: SecurityException) {
+            Diagnostics.log("warn", "发送完成卡片失败: ${e.message}")
+            return
+        }
+        completionCards.add(id)
+        mainHandler.postDelayed({
+            if (completionCards.remove(id)) {
+                manager.cancel(id)
+            }
+        }, COMPLETION_CARD_MS + CARD_CLEANUP_SLACK_MS)
     }
 
     // --------------------------------------------------------------- attention
@@ -259,6 +346,7 @@ class Notifier(private val context: Context) {
 
     fun clearAll() {
         manager.cancelAll()
+        completionCards.clear()
         Diagnostics.info("已清除全部通知")
     }
 
@@ -291,6 +379,16 @@ class Notifier(private val context: Context) {
      */
     private var lastPromotedCount = -1
 
+    /**
+     * The last path segment of a workspace key — "default", "Mimo", … Used as the
+     * body fallback on a card that has no progress text, where the full path
+     * would not fit and the task title is already in the title row.
+     */
+    private fun workspaceNameOf(key: String): String {
+        val name = key.trimEnd('/', '\\').substringAfterLast('/').substringAfterLast('\\')
+        return name.ifEmpty { key }
+    }
+
     /** Ids for the transient (completion / attention) notifications. */
     private var transientId = ID_TRANSIENT_BASE
 
@@ -316,11 +414,25 @@ class Notifier(private val context: Context) {
         /** The "N 个任务运行中" group summary. */
         const val ID_GROUP_SUMMARY = 2
 
+        /**
+         * How long the 已完成 card stays up. Long enough to be noticed and read
+         * after the phone buzzes, short enough not to look like a stuck
+         * notification on a task that is over.
+         */
+        private const val COMPLETION_CARD_MS = 15_000L
+
+        /** Grace before the local cleanup, so it never races the system's own timeout. */
+        private const val CARD_CLEANUP_SLACK_MS = 1_000L
+
         private const val ID_TRANSIENT_BASE = 2_000_000
 
         private const val REQUEST_SERVICE = 10
 
-        /** Describes a running task for the service notification body. */
+        /**
+         * Describes a running task for the service notification body. Uses
+         * [TaskStore.RunningNotification.title], which already carries the status
+         * prefix — the body must not repeat it.
+         */
         fun runningBody(tasks: List<TaskStore.RunningNotification>): String {
             if (tasks.isEmpty()) return ""
             val lines = tasks.take(5).map { "• ${it.title} — ${it.body}" }

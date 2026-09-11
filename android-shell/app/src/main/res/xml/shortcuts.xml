@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 应用长按菜单（桌面 Shortcut）。
+
+     为什么要它：主界面按需求去掉了顶部标题栏与右侧溢出菜单，原本藏在那里的三个
+     入口随之消失。这里补上其中两个，另一个（刷新网页）留在加载失败面板与设置页里。
+
+     两个 intent 都显式指向 MainActivity 而不是各走各的 Activity：
+       * 冷启动时 MainActivity 先建起来，设置页/扫码器压在它上面，返回键有落点；
+       * 已经在前台/后台时走 onNewIntent（launchMode=singleTop），UI 不会重建。
+     图标用 Google 官方 Material Icons 字形（res/drawable/ic_shortcut_*.xml），不自绘。 -->
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <shortcut
+        android:enabled="true"
+        android:icon="@drawable/ic_shortcut_scan"
+        android:shortcutId="shortcut_scan"
+        android:shortcutLongLabel="@string/shortcut_scan_long"
+        android:shortcutShortLabel="@string/shortcut_scan_short">
+        <intent
+            android:action="com.zcode.remote.action.SCAN"
+            android:targetClass="com.zcode.remote.MainActivity"
+            android:targetPackage="com.zcode.remote" />
+    </shortcut>
+
+    <shortcut
+        android:enabled="true"
+        android:icon="@drawable/ic_shortcut_settings"
+        android:shortcutId="shortcut_settings"
+        android:shortcutLongLabel="@string/shortcut_settings_long"
+        android:shortcutShortLabel="@string/shortcut_settings_short">
+        <intent
+            android:action="com.zcode.remote.action.OPEN_SETTINGS"
+            android:targetClass="com.zcode.remote.MainActivity"
+            android:targetPackage="com.zcode.remote" />
+    </shortcut>
+</shortcuts>

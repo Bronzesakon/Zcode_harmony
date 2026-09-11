@@ -617,14 +617,14 @@ test('a page-held workspace is dropped, not reopened, when the desktop refuses o
     assert.ok(!logs.some((m) => m.indexOf('reopening') === 0), 'no reopen loop');
 });
 
-test('a workspace that keeps faulting is dropped instead of reopened forever', async () => {
+test('the first fault on a workspace is not reopened (the shipped default)', async () => {
     const logs = [];
-    // maxReopensPerBridge: 0 makes the first fault give up, without waiting out
-    // the reopen delay.
-    const {client, desktop} = makeClient({
-        log: (message) => logs.push(message),
-        maxReopensPerBridge: 0
-    });
+    // No maxReopensPerBridge override: the default is 0, i.e. one strike per
+    // relay connection. Field evidence (2026-09-12) is that reopening does not
+    // help a refused workspace — it "recovers" and faults again 40–75 s later, at
+    // 4 RPCs per attempt, on the socket the page is using. The retry belongs to
+    // the next relay connection, not to this one.
+    const {client, desktop} = makeClient({log: (message) => logs.push(message)});
     desktop.workspaces = [{workspacePath: '/repo/flaky'}];
     await client.start();
     const ours = client._bridges['/repo/flaky'];

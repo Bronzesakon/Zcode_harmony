@@ -9,7 +9,10 @@
  *   4. Keep the page convinced it is visible, so it does not pause itself when
  *      the app goes to the background.
  *   5. Expose __zcodeShellLocateTask() for notification taps.
- *   6. Stand in for the page's scrollbar: zero its space-taking rail and draw an
+ *   6. Report which visual state the page is in (boot / control view, narrow or
+ *      wide, light or dark) so the native strip behind the status bar can take
+ *      the matching fixed surface colour. Names only, never colours.
+ *   7. Stand in for the page's scrollbar: zero its space-taking rail and draw an
  *      overlay bar, so the page's content is centred and the position indicator
  *      survives (Android WebView will not render overlay scrollbars itself).
  *
@@ -641,8 +644,16 @@
         setTimeout(attempt, ACTIVE_START_DELAY_MS);
     }
 
-    /** Sends a business payload on the socket the page has open. */
-    function injectPayload(payload) {
+    /**
+     * Sends a business payload on the socket the page has open.
+     *
+     * [quiet] downgrades "no socket is open right now" from a warning to a debug
+     * line. The heartbeat probe uses it: a probe that lands in the gap between
+     * the page closing its socket and opening the next one is routine (the page
+     * rebuilds the connection on its own), whereas the same message from our own
+     * protocol client means a request was actually lost.
+     */
+    function injectPayload(payload, quiet) {
         var socket = activeSocket;
         if (!socket || socket.readyState !== 1) {
             socket = null;
@@ -653,7 +664,11 @@
                 }
             }
             if (!socket) {
-                diag('warn', '注入失败: 没有可用的 relay socket');
+                if (quiet) {
+                    diag('debug', '暂无可用的 relay socket（等页面重连后由下一次心跳补上）');
+                } else {
+                    diag('warn', '注入失败: 没有可用的 relay socket');
+                }
                 return;
             }
             activeSocket = socket;
@@ -890,7 +905,7 @@
             type: 'pair_status_query',
             device_sid: deviceSid,
             client_ts: nowMs
-        });
+        }, true);
         linkWindow.probes += 1;
         return true;
     }
@@ -1074,6 +1089,7 @@
         }
         if (!relayPaired || !deviceSid) {
             diag('info', '回前台时链路未就绪，交由页面自行重连');
+            reportPageState();
             return;
         }
         // An unbounded background stint is the one thing this layer cannot see
@@ -1086,6 +1102,7 @@
             forceReconnect(silence < 0 ?
                 '回前台且从未收到帧' :
                 '回前台时已静默 ' + Math.round(silence / 1000) + 's');
+            reportPageState();
             return;
         }
         lastPairAckAt = Date.now();
@@ -1094,8 +1111,22 @@
             type: 'pair_status_query',
             device_sid: deviceSid,
             client_ts: Date.now()
-        });
+        }, true);
+        reportPageState();
     };
+
+    /**
+     * Re-reports the page's visual state. Called on every return to the
+     * foreground: the native strip behind the status bar must agree with the page
+     * that is under it, and both the theme and the page's own breakpoint can have
+     * changed while the app was away (a system theme switch does not mutate the
+     * DOM, so the observer alone would miss it).
+     */
+    function reportPageState() {
+        if (typeof G.__zcodeShellReportPageState === 'function') {
+            G.__zcodeShellReportPageState();
+        }
+    }
 
     /**
      * Reports the CSS viewport metrics.
@@ -1151,7 +1182,175 @@
     };
 
     // -----------------------------------------------------------------------
-    // 6. overlay scrollbar
+    // 6. page visual state -> native status bar surface
+    //
+    // The app bar is gone; the strip behind the status bar is painted by the
+    // native side with one of the remote page's own fixed surface colours, and
+    // it must not read colours at runtime. So this layer reports NAMES: which
+    // visual state the DOM is in, and which theme the page resolved for itself.
+    // The native side looks both up in a table (core/PageBarColor.kt).
+    //
+    // The state is derived the way the page derives its own layout, not from the
+    // device's screen size:
+    //   * `.zcode-boot-loading`   the pre-rendered boot shell (removed once the
+    //                             app mounts) and every status page (KICKED,
+    //                             takeover) — all of them put the page background
+    //                             at the top, so they all map to 'boot';
+    //   * `.bg-background-win-alt` the control view's root;
+    //   * `(max-width: 767px)`    the page's own breakpoint for the phone shell.
+    //                             Narrow means the page's own title bar sits
+    //                             directly under the status bar (bg-header), wide
+    //                             means the shell area does (win-alt).
+    //
+    // Theme: the page stamps `data-zcode-browser-theme-surface` on <html> when it
+    // resolves its theme (inline bootstrap in index.html, `syncBrowserThemeSurface`),
+    // which is authoritative — the page's theme can differ from the system's. The
+    // prefers-color-scheme query is only the fallback, and the only signal that
+    // exists while the boot shell is up.
+    // -----------------------------------------------------------------------
+    var NARROW_QUERY = '(max-width: 767px)';
+    var DARK_QUERY = '(prefers-color-scheme: dark)';
+
+    function mediaMatches(query) {
+        try {
+            return !!(G.matchMedia && G.matchMedia(query).matches);
+        } catch (e) {
+            return false;
+        }
+    }
+
+    function pageStateName() {
+        try {
+            if (!document.documentElement) {
+                return '';
+            }
+            if (document.getElementsByClassName('zcode-boot-loading').length > 0) {
+                return 'boot';
+            }
+            if (document.getElementsByClassName('bg-background-win-alt').length === 0) {
+                return 'boot';
+            }
+            return mediaMatches(NARROW_QUERY) ? 'main-header' : 'main-surface';
+        } catch (e) {
+            return '';
+        }
+    }
+
+    function pageThemeName() {
+        try {
+            var root = document.documentElement;
+            var stamped = root && root.getAttribute
+                ? root.getAttribute('data-zcode-browser-theme-surface')
+                : null;
+            if (stamped === 'dark' || stamped === 'light') {
+                return stamped;
+            }
+            // The same bootstrap also writes `style.colorScheme`, so a page that
+            // is mid-boot still answers before the attribute lands.
+            var inline = root && root.style ? String(root.style.colorScheme || '') : '';
+            if (inline.indexOf('dark') >= 0) {
+                return 'dark';
+            }
+            if (inline.indexOf('light') >= 0) {
+                return 'light';
+            }
+        } catch (e) {
+            // fall through to the media query below
+        }
+        return mediaMatches(DARK_QUERY) ? 'dark' : 'light';
+    }
+
+    var lastPageState = '';
+    var pageStateScheduled = false;
+
+    function pushPageState() {
+        pageStateScheduled = false;
+        var state = pageStateName();
+        if (!state) {
+            return;
+        }
+        var theme = pageThemeName();
+        var token = state + '|' + theme;
+        if (token === lastPageState) {
+            return;
+        }
+        lastPageState = token;
+        post('pagestate', {state: state, theme: theme});
+    }
+
+    /**
+     * React renders in bursts, and the boot shell is removed in the same frame the
+     * control view mounts — so coalesce to one report per settled tick instead of
+     * one per mutation.
+     */
+    function schedulePageState() {
+        if (pageStateScheduled) {
+            return;
+        }
+        pageStateScheduled = true;
+        setTimeout(pushPageState, 0);
+    }
+
+    function watchMedia(query) {
+        try {
+            var mq = G.matchMedia && G.matchMedia(query);
+            if (!mq) {
+                return;
+            }
+            var handler = function () {
+                schedulePageState();
+            };
+            if (mq.addEventListener) {
+                mq.addEventListener('change', handler);
+            } else if (mq.addListener) {
+                mq.addListener(handler);
+            }
+        } catch (e) {
+            // An old engine without matchMedia simply keeps the last state.
+        }
+    }
+
+    /**
+     * Rotation, split screen and foldables cross the page's breakpoint without
+     * any DOM mutation, so the query itself is watched as well; a theme switch
+     * does mutate the attribute and is caught by the observer.
+     */
+    function installPageStateReporter() {
+        if (G.__zcodeShellPageStateHooked) {
+            return;
+        }
+        if (!document.documentElement || !G.MutationObserver) {
+            // Debug, not warn: every WebView this shell has ever run on has a
+            // MutationObserver. Keeping it quiet at warn level is what keeps a
+            // "page is broken" warning meaningful when one appears.
+            diag('debug', '页面状态观察器不可用（缺少 MutationObserver），状态栏底色将保持默认');
+            return;
+        }
+        G.__zcodeShellPageStateHooked = true;
+        try {
+            new G.MutationObserver(schedulePageState).observe(document.documentElement, {
+                subtree: true,
+                childList: true,
+                attributes: true,
+                attributeFilter: ['class', 'style', 'data-zcode-browser-theme-surface']
+            });
+        } catch (e) {
+            diag('warn', '页面状态观察器安装失败: ' + e);
+        }
+        watchMedia(NARROW_QUERY);
+        watchMedia(DARK_QUERY);
+        schedulePageState();
+    }
+
+    /** Native asks for a fresh report, e.g. when the app returns to the foreground. */
+    G.__zcodeShellReportPageState = function () {
+        lastPageState = '';
+        schedulePageState();
+        return true;
+    };
+
+    // -----------------------------------------------------------------------
+    // 7. overlay scrollbar
     //
     // The page ships a classic, space-taking scrollbar in its own stylesheet
     // (`::-webkit-scrollbar{width:14px;height:14px}` with a 3px-inset pill
@@ -1377,6 +1576,11 @@
     // -----------------------------------------------------------------------
     installScrollbarWidth();
     installOverlayScrollbar();
+    try {
+        installPageStateReporter();
+    } catch (e) {
+        diag('error', '页面状态观察器安装失败: ' + e);
+    }
     try {
         installVisibilityHijack();
     } catch (e) {

@@ -1,0 +1,168 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 设置页的 MiuiX 度量与控件样式。
+
+     数值来源同 values/miuix_colors.xml（docs/miuix 的组件源码）：
+       * Card：cornerRadius 16dp，InsideMargin 0（内容自己留边），页面上左右各 12dp；
+       * BasicComponent：insideMargin 16dp，行最小高度按 56dp 给触达区；
+       * SmallTitle：subtitle 字阶 = 14sp Bold，onBackgroundVariant，
+         内边距 (28dp, 8dp)；
+       * HorizontalDivider：厚 0.75dp，dividerLine 色；
+       * SmallTopAppBar：折叠高 52dp，标题左内边距 26dp，导航图标左内边距 16dp，
+         标题字阶 headline1 = 17sp Medium。
+
+     字重 Medium 只有 API 28+ 的 textFontWeight 能表达；26/27 上退化成常规，
+     这是可接受的降级，不为了三个版本号去塞字体文件。 -->
+<resources xmlns:app="http://schemas.android.com/apk/res-auto">
+
+    <dimen name="miuix_card_corner">16dp</dimen>
+    <dimen name="miuix_card_margin">12dp</dimen>
+    <dimen name="miuix_row_inside">16dp</dimen>
+    <dimen name="miuix_row_min_height">56dp</dimen>
+    <dimen name="miuix_section_padding_start">28dp</dimen>
+    <dimen name="miuix_section_padding_vertical">8dp</dimen>
+    <dimen name="miuix_divider_thickness">0.75dp</dimen>
+    <dimen name="miuix_appbar_height">52dp</dimen>
+    <dimen name="miuix_appbar_title_padding">26dp</dimen>
+    <dimen name="miuix_appbar_icon_padding">16dp</dimen>
+    <dimen name="miuix_chevron_width">10dp</dimen>
+    <dimen name="miuix_chevron_height">16dp</dimen>
+
+    <!-- 页面容器：底部留白，免得最后一张卡片贴着手势条 -->
+    <style name="MiuixPage" parent="">
+        <item name="android:layout_width">match_parent</item>
+        <item name="android:layout_height">match_parent</item>
+        <item name="android:orientation">vertical</item>
+        <item name="android:background">@color/miuix_surface</item>
+    </style>
+
+    <!-- ===== 顶部应用栏（SmallTopAppBar 的 Views 版） ===== -->
+    <style name="MiuixAppBar" parent="">
+        <item name="android:layout_width">match_parent</item>
+        <item name="android:layout_height">@dimen/miuix_appbar_height</item>
+        <item name="android:orientation">horizontal</item>
+        <item name="android:gravity">center_vertical</item>
+        <item name="android:background">@color/miuix_surface</item>
+    </style>
+
+    <style name="MiuixAppBarIcon" parent="">
+        <item name="android:layout_width">48dp</item>
+        <item name="android:layout_height">48dp</item>
+        <item name="android:layout_marginStart">@dimen/miuix_appbar_icon_padding</item>
+        <item name="android:padding">12dp</item>
+        <item name="android:background">?attr/selectableItemBackgroundBorderless</item>
+        <item name="android:scaleType">fitCenter</item>
+        <item name="android:contentDescription">@string/action_back</item>
+    </style>
+
+    <style name="MiuixAppBarTitle" parent="">
+        <item name="android:layout_width">0dp</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:layout_weight">1</item>
+        <item name="android:layout_marginStart">10dp</item>
+        <item name="android:layout_marginEnd">@dimen/miuix_appbar_title_padding</item>
+        <item name="android:ellipsize">end</item>
+        <item name="android:maxLines">1</item>
+        <item name="android:textColor">@color/miuix_on_surface</item>
+        <item name="android:textSize">17sp</item>
+        <item name="android:textFontWeight">500</item>
+    </style>
+
+    <!-- ===== 小节标题（SmallTitle） ===== -->
+    <style name="MiuixSection" parent="">
+        <item name="android:layout_width">match_parent</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:paddingStart">@dimen/miuix_section_padding_start</item>
+        <item name="android:paddingEnd">@dimen/miuix_section_padding_start</item>
+        <item name="android:paddingTop">@dimen/miuix_section_padding_vertical</item>
+        <item name="android:paddingBottom">@dimen/miuix_section_padding_vertical</item>
+        <item name="android:textColor">@color/miuix_on_background_variant</item>
+        <item name="android:textSize">14sp</item>
+        <item name="android:textStyle">bold</item>
+    </style>
+
+    <!-- ===== 卡片（Card，16dp 圆角） =====
+         LinearLayout + 圆角背景而不是 MaterialCardView：MiuiX 的卡片是纯色块、无
+         阴影无描边，用 CardView 反而要一层层关掉它的 elevation/stroke。
+         clipToOutline 是必需的：行内的水波纹要按圆角裁掉，否则会在四个角上溢出。 -->
+    <style name="MiuixCard" parent="">
+        <item name="android:layout_width">match_parent</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:layout_marginStart">@dimen/miuix_card_margin</item>
+        <item name="android:layout_marginEnd">@dimen/miuix_card_margin</item>
+        <item name="android:orientation">vertical</item>
+        <item name="android:background">@drawable/miuix_card_background</item>
+        <item name="android:clipToOutline">true</item>
+    </style>
+
+    <!-- ===== 列表行（BasicComponent） ===== -->
+    <style name="MiuixRow" parent="">
+        <item name="android:layout_width">match_parent</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:minHeight">@dimen/miuix_row_min_height</item>
+        <item name="android:orientation">horizontal</item>
+        <item name="android:gravity">center_vertical</item>
+        <item name="android:paddingStart">@dimen/miuix_row_inside</item>
+        <item name="android:paddingEnd">@dimen/miuix_row_inside</item>
+        <item name="android:paddingTop">12dp</item>
+        <item name="android:paddingBottom">12dp</item>
+        <item name="android:background">?attr/selectableItemBackground</item>
+    </style>
+
+    <style name="MiuixRowTitle" parent="">
+        <item name="android:layout_width">match_parent</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:textColor">@color/miuix_on_background</item>
+        <item name="android:textSize">17sp</item>
+        <item name="android:textFontWeight">500</item>
+    </style>
+
+    <style name="MiuixRowSummary" parent="">
+        <item name="android:layout_width">match_parent</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:layout_marginTop">2dp</item>
+        <item name="android:textColor">@color/miuix_on_surface_summary</item>
+        <item name="android:textSize">14sp</item>
+    </style>
+
+    <!-- 行尾的值文本（endActions 里的 body2 + actions 角色） -->
+    <style name="MiuixRowValue" parent="">
+        <item name="android:layout_width">wrap_content</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:layout_marginEnd">8dp</item>
+        <item name="android:textColor">@color/miuix_on_surface_actions</item>
+        <item name="android:textSize">14sp</item>
+    </style>
+
+    <!-- 行尾箭头：10x16dp，actions 角色着色（ArrowPreference 的 ArrowRight） -->
+    <style name="MiuixRowChevron" parent="">
+        <item name="android:layout_width">@dimen/miuix_chevron_width</item>
+        <item name="android:layout_height">@dimen/miuix_chevron_height</item>
+        <item name="android:src">@drawable/ic_chevron_right</item>
+        <item name="android:scaleType">fitXY</item>
+        <item name="app:tint">@color/miuix_on_surface_actions</item>
+        <item name="android:importantForAccessibility">no</item>
+    </style>
+
+    <!-- 卡片内分隔线：左右都内缩 16dp -->
+    <style name="MiuixDivider" parent="">
+        <item name="android:layout_width">match_parent</item>
+        <item name="android:layout_height">@dimen/miuix_divider_thickness</item>
+        <item name="android:layout_marginStart">@dimen/miuix_row_inside</item>
+        <item name="android:layout_marginEnd">@dimen/miuix_row_inside</item>
+        <item name="android:background">@color/miuix_divider</item>
+    </style>
+
+    <!-- 次级按钮（MiuiX Button 的 TextButton 观感）：圆角胶囊 + secondary 容器色。
+         backgroundTint / cornerRadius / inset 都是 MaterialButton 的库属性，必须带
+         app: 前缀，否则会被当成当前包里的同名 attr（编译期直接报找不到）。 -->
+    <style name="MiuixButton" parent="Widget.Material3.Button.TextButton">
+        <item name="android:layout_width">match_parent</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:minHeight">48dp</item>
+        <item name="android:textColor">@color/miuix_primary</item>
+        <item name="app:backgroundTint">@color/miuix_secondary_container</item>
+        <item name="app:cornerRadius">14dp</item>
+        <item name="android:insetTop">0dp</item>
+        <item name="android:insetBottom">0dp</item>
+    </style>
+</resources>
