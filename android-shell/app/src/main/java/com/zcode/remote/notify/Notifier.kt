@@ -98,6 +98,39 @@ class Notifier(private val context: Context) {
             setSound(null, null)
         }
         manager.createNotificationChannels(listOf(running, attention, completed, keepAlive))
+        sweepStaleCompletionCards()
+    }
+
+    /**
+     * Removes a 已完成 card left behind by a process that died inside its window.
+     *
+     * The card is promoted, so it must be `ongoing` — and an ongoing notification
+     * cannot be swiped away by the user. `setTimeoutAfter` covers the normal case
+     * (the system enforces it even if this process is gone), but if the process is
+     * killed before the system's timer fires, the card would sit in the shade
+     * until the user force-stopped the app. This sweep is the belt to that
+     * brace, and it needs no persisted state: the ids we own are derivable, and
+     * anything in that range which this process is *not* currently showing can
+     * only be a leftover.
+     */
+    private fun sweepStaleCompletionCards() {
+        val platform = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+            ?: return
+        val active = try {
+            platform.activeNotifications
+        } catch (e: Exception) {
+            Diagnostics.log("debug", "读取活动通知失败: ${e.message}")
+            return
+        }
+        val base = NotifyState.COMPLETION_CARD_BASE
+        val end = base + NotifyState.COMPLETION_CARD_RANGE
+        for (notification in active) {
+            val id = notification.id
+            if (id in base until end && !completionCards.contains(id)) {
+                Diagnostics.info("清理上次进程遗留的完成卡片 (id=$id)")
+                manager.cancel(id)
+            }
+        }
     }
 
     // ------------------------------------------------------------ service state
