@@ -14,6 +14,37 @@
 
 ---
 
+## 参考库与离线资料索引（本机，不入库）
+
+`docs/` 与 `ColorOS_docs/` 都在 `.gitignore` 里，clone 仓库拿不到，换机器要手动拷贝。
+
+| 目录 | 内容 | 用途 |
+| --- | --- | --- |
+| `docs/` | Android 官方文档快照（文件/图片选择 + M3 与 Android 16 界面规范） | 上传链路与界面规范的依据；清单见 `docs/README.md` |
+| **`docs/miuix/`** | **miuix 组件库源码**（Compose Multiplatform，Apache-2.0） | **后续界面重写要用的组件库**，约束见下 |
+| `ColorOS_docs/` | ColorOS/OPPO 文档 149 篇 + Android 官方 6 篇 | 流体云路线选型的依据；清单见 `ColorOS_docs/README.md` |
+
+### `docs/miuix/`：后续界面重写的组件库
+
+[`compose-miuix-ui/miuix`](https://github.com/compose-miuix-ui/miuix)，小米 MiuiX 设计语言的 Compose Multiplatform 实现。
+抓于 **2026-09-11**（HEAD `5157b50`），浅克隆 + 全部 tag——可 `git checkout v0.9.3` 与已发布稳定版对照。
+
+- **模块**：`miuix-ui`（核心组件，`basic/` 下 34 个：Button / Card / TextField / SearchBar / TabRow / TopAppBar / Scaffold / PullToRefresh / Snackbar / Slider / FloatingToolbar…）、`miuix-preference`、`miuix-icons`、`miuix-blur`、`miuix-squircle`、`miuix-nav`、`miuix-shader`。库自带的 VitePress 文档站在 `docs/`（`zh_CN/` 是中文）。
+- **许可 Apache-2.0**，与 `docs/` 里那些「仅供本地查阅」的厂商快照不同——它是允许随仓库分发的，放在 `docs/` 下只是沿用既有约定。库自身标注 **experimental**（"APIs may change without notice"）。
+- **Maven Central 最新发布是 `0.9.4-rc01`（2026-08-13），比这份 HEAD 旧**：想用未发布的新组件只能照着源码改，这是把源码留在本地的理由；只要稳定版可直接依赖 `top.yukonga.miuix.kmp:miuix-ui:<version>`。
+
+**采用前三件硬约束**（不是取舍，是必须先解决的前置）：
+
+| 项 | 本工程现状 | miuix 要求 |
+| --- | --- | --- |
+| 界面技术 | **XML / Views**（D3：原生 Kotlin + MDC-Android） | **只有 Compose**：采用即界面层转 Compose。可用 `ComposeView` 增量接入、不必一次性重写，但 M3 主题体系要换 |
+| 工具链 | Kotlin 2.1.0 / AGP 8.7.3 / Gradle 8.9 / compileSdk 35 | Kotlin 2.4.20 / AGP 9.4.0 / Compose MP 1.12.0 / compileSdk 37 → 要升一档，且**本机不能构建**，只能推 CI 验 |
+| minSdk | 26 | 主体 24（更宽松）；但 **`miuix-blur` 要 33** → 用模糊要么抬 minSdk，要么做条件分支 |
+
+> 与「界面规范（Material 3）」不冲突：现有界面照旧按 M3 角色写；miuix 是**下一次重写**的备选，尚未成为决策（D1–D14 里没有它）。
+
+---
+
 ## 项目现状（先读这一节）
 
 **一句话**：功能已全部落地、CI 全绿（JS 42 项 + Kotlin 37 项单测），`pre` 每次推送都把最新 APK **覆写**到滚动预发布 [android-pre](https://github.com/Bronzesakon/Zcode_harmony/releases/tag/android-pre)（固定链接 `…/releases/download/android-pre/zcode-remote.apk`，可直接覆盖安装）——**真机验证已过四轮**（一加 PLC110 / ColorOS 16 / API 36 / WebView 153，含 adb 闭环、网页滚动条方案 A 与「会话加载慢」的逐项实测），下面这些还没有结论：
@@ -227,7 +258,7 @@ zcode-remote.apk -> CN=ZCode Remote, OU=Mobile, O=ZCode, L=Unknown, ST=Unknown, 
 | 路径 | 大小 | 内容 | 处置 |
 | --- | --- | --- | --- |
 | `android-shell/scratch/` | 13 KB | 签名密钥：`zcode-remote-release.p12`、`keystore-password.txt`、`keystore-base64.txt`；另有一份 `zemote-planB.patch`（已放弃的 zemote CI 改造，仅供回溯，可随时删） | **务必备份密钥那三个**——丢了就无法再给老版本做覆盖安装。CI 从 4 个 Secret 读，本地构建不需要，但要带走 |
-| `android-shell/docs/` | 32 MB | Android 官方文档快照（文件/图片选择 15 篇 + Material3 界面规范 12 篇），本轮界面与上传规范化的依据 | 手动拷贝；版权归原厂商故不入库。目录里有 `README.md`（抓取清单 + 结论摘要） |
+| `android-shell/docs/` | 124 MB | ① Android 官方文档快照（文件/图片选择 + M3 与 Android 16 界面规范），界面与上传规范化的依据；② **`docs/miuix/`：Compose Multiplatform 组件库源码（Apache-2.0，含全部 tag），后续界面重写用**——见「参考库与离线资料索引」 | 手动拷贝；厂商快照因版权不入库（miuix 本身是 Apache-2.0）。目录里有 `README.md`（抓取清单 + 结论摘要） |
 | `android-shell/ColorOS_docs/` | 87 MB | ColorOS/OPPO 文档 149 篇 + Android 官方 6 篇（流体云、泛在服务、Live Updates），流体云路线选型的判断依据 | 手动拷贝；同上，目录内有 `README.md` |
 | `../安卓薄壳迁移文档.md` | 50 KB | 迁移调研与历史回填的**完整归档**（§1–§12：技术事实清单、被推翻的三处假设、决策往返、CI 反馈回路）。耐久结论已全部并入本 README，**本文件不再依赖它**，留作细节出处 | 手动拷贝；不入库。原 `android-shell/` 下的旧快照已删（缺 §12） |
 | `../项目文档.md` | 20 KB | 鸿蒙侧需求与决策历史 | 手动拷贝；不入库 |
