@@ -8,6 +8,7 @@ import android.os.Looper
 import android.os.SystemClock
 import com.zcode.remote.core.Diagnostics
 import com.zcode.remote.core.Prefs
+import com.zcode.remote.core.SurvivalVerdict
 import com.zcode.remote.core.TaskSnapshot
 import com.zcode.remote.core.TaskStatus
 import com.zcode.remote.core.TaskStore
@@ -38,15 +39,19 @@ object ShellRuntime {
     /**
      * Main-thread handler for everything this class schedules.
      *
-     * Asynchronous on API 28+, and that is load-bearing rather than a detail.
-     * An ordinary message posted to the main looper is NOT delivered while the
-     * window is invisible: the Choreographer's sync barrier starves it. Measured
-     * on the field device — the background heartbeat pump logged 39 dispatches
-     * across a 10-minute screen-off window and `__zcodeShellHeartbeat()` ran
-     * ZERO times, while a dispatch due at +15s was once delivered 3m26s late, at
-     * the instant the app came back to the foreground. Fixing the pump's own
-     * handler was not enough: the pump handed the JS evaluation to this handler,
-     * so it starved one hop later. Both hops are asynchronous now.
+     * Asynchronous on API 28+, because an ordinary message posted to the main
+     * looper is NOT delivered while the window is invisible: the Choreographer's
+     * sync barrier starves it (measured earlier on this device — a dispatch due
+     * at +15s arrived 3m26s late, at the instant the app returned to the
+     * foreground). The pump's own timer was made asynchronous for that reason;
+     * this handler schedules the JS evaluation the pump triggers, so it is the
+     * same hazard one hop later.
+     *
+     * Note on the evidence: a 2026-09-11 field round logged 39 pump dispatches
+     * with a 0-tick verdict, which first looked like this starvation. It was not
+     * — see `SurvivalVerdict`. The 15.00s cadence of the injected layer's own
+     * perf reports proves the evaluation was running. This change is made on the
+     * starvation risk above, not on that reading.
      */
     private val mainHandler: Handler =
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
@@ -109,6 +114,7 @@ object ShellRuntime {
     private var backgroundStartedAt = 0L
     private var backgroundFrameBase = 0
     private var backgroundAckBase = 0
+    private var backgroundTickBase = 0
 
     /** Set on return to foreground; the next liveness report resolves it. */
     @Volatile
@@ -144,23 +150,21 @@ object ShellRuntime {
             val current = liveness ?: return
             val frames = current.inboundFrames - backgroundFrameBase
             val acks = current.pairAcks - backgroundAckBase
-            val ticks = current.backgroundTicks
+            // Delta against the base recorded when the window opened, exactly like
+            // frames/acks. Reading the page's absolute counter was the bug: a
+            // foreground flap at the moment of return zeroed it (see
+            // SurvivalVerdict).
+            val ticks = (current.backgroundTicks - backgroundTickBase).coerceAtLeast(0)
             val firstDelay = current.backgroundFirstTickDelayMs
-            val firstTick = if (firstDelay >= 0) {
-                "首次在退后台后 ${firstDelay / 1000}s"
-            } else {
-                "退后台后一次都没执行"
-            }
-            val verdict = when {
-                ticks <= 0 -> "后台期间心跳未执行（定时器与原生发令都没跑）"
-                firstDelay > RESUMED_BURST_DELAY_MS -> "心跳只在恢复瞬间补跑，后台期间很可能没执行"
-                else -> "保活成立（后台心跳在跑）"
-            }
-            val duration = formatDuration(backgroundEndedAt - backgroundStartedForVerdict)
             Diagnostics.info(
-                "后台存活检查：时长 $duration，后台期间注入层心跳 $ticks 次" +
-                    "（$firstTick，原生泵发令 $pumpDispatchesForVerdict 次）、" +
-                    "收到 $frames 帧、配对确认 $acks 次 → $verdict"
+                SurvivalVerdict.describe(
+                    duration = formatDuration(backgroundEndedAt - backgroundStartedForVerdict),
+                    ticks = ticks,
+                    firstTickDelayMs = firstDelay,
+                    pumpDispatches = pumpDispatchesForVerdict,
+                    frames = frames,
+                    acks = acks,
+                )
             )
         }
     }
@@ -200,6 +204,7 @@ object ShellRuntime {
             val snapshot = liveness
             backgroundFrameBase = snapshot?.inboundFrames ?: 0
             backgroundAckBase = snapshot?.pairAcks ?: 0
+            backgroundTickBase = snapshot?.backgroundTicks ?: 0
         }
     }
 
@@ -207,18 +212,22 @@ object ShellRuntime {
     //
     // The injected layer's own interval cannot be relied on while the app is
     // backgrounded: the renderer throttles a hidden page's timers, so the tick
-    // stops, the desktop stops hearing from us, and the page's own ack watchdog
-    // (30s, re-armed by every pair_status_ack) declares the link dead and
-    // reconnects. Driving the same tick from here keeps the pairing warm, and
-    // because that watchdog re-arms on ANY pair_status_ack, our probe is also
-    // what stops the page from tearing its socket down every ~95s.
+    // stops and the desktop stops hearing from us. Driving the same tick from
+    // here keeps the pairing warm.
+    //
+    // Open question, measured but not yet explained: the page's own relay client
+    // reconnects on its own while backgrounded. Its ack watchdog is 30s and
+    // `applyPairStatus` re-arms it on ANY `pair_status_ack` (no id correlation),
+    // so the pump's probe *should* pin it — but a screen-off window still showed
+    // the page calling `close()` every ~95–120s (`code=1005 clean=true`, from the
+    // page's own bundle), while the pump was demonstrably ticking and acks were
+    // arriving every ~14s. Do not assume the probe covers it.
     //
     // Two properties are load-bearing and easy to undo by simplifying:
     //
     //  * Both hops are asynchronous (see `mainHandler`): the pump's own timer AND
-    //    the JS evaluation it triggers. A sync post on either hop is starved by
-    //    the Choreographer's sync barrier while the window is invisible —
-    //    measured: 39 dispatch logs, zero executions.
+    //    the JS evaluation it triggers, since either sync hop is starved by the
+    //    Choreographer's sync barrier while the window is invisible.
     //  * None of this helps if the platform gives the process no execution at
     //    all: with ColorOS's default battery policy the app is frozen/killed
     //    while backgrounded (o-kill/o-stop at importance=FOREGROUND_SERVICE, and
@@ -337,14 +346,6 @@ object ShellRuntime {
 
     /** Shortest background window that produces a meaningful verdict. */
     private const val VERDICT_MIN_BACKGROUND_MS = 60_000L
-
-    /**
-     * A first "background" tick arriving later than this did not happen while
-     * the app was away: it is one of the overdue timers and messages that all
-     * fire at once on resume. A heartbeat that really runs in the background
-     * starts ticking within one interval, i.e. seconds.
-     */
-    private const val RESUMED_BURST_DELAY_MS = 60_000L
 
     /** A quiet link for longer than this is called out in the readout. */
     private const val STALE_READOUT_MS = 120_000L

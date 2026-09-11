@@ -1007,8 +1007,14 @@
         appForeground = foreground;
         if (!foreground) {
             // A fresh window: the survival verdict is about ticks from here on.
+            // The COUNT deliberately keeps its value — the native side records a
+            // base per window and subtracts it. Zeroing it here looked harmless
+            // and was not: waking a screen-off phone produces a foreground →
+            // background → foreground flap within a few ms (`am start` does it
+            // too), and that zeroed the counter 2ms before the verdict was read,
+            // so two field rounds reported "心跳未执行" while the pump was
+            // demonstrably ticking every 15s.
             backgroundStartedWallMs = Date.now();
-            liveness.backgroundTicks = 0;
             liveness.backgroundFirstTickDelayMs = -1;
             return;
         }
