@@ -755,6 +755,11 @@
         liveness.heartbeatTicks += 1;
         if (source === 'native') {
             liveness.nativeTicks += 1;
+            // Logged per tick on purpose: the timestamps are what separate "the
+            // pump works while the app is in the background" from "the renderer
+            // deferred every evaluateJavascript and ran them all in a burst at
+            // resume" — the end-of-window counters look identical either way.
+            diag('debug', '原生泵心跳 #' + liveness.nativeTicks + ' 已执行');
         }
         reportLiveness();
         reportPerf();
