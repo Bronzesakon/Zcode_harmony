@@ -652,6 +652,35 @@ test('the perf line carries the link counters that judge background reconnects',
         assert.ok(line, 'one window must show both the probe and the ack: ' + lines.join(' | '));
         assert.ok(line.includes('paired true'), line);
         assert.ok(line.includes('socket 1'), line);
+        assert.ok(line.includes('页面心跳 '), line);
+    } finally {
+        page.teardown();
+    }
+});
+
+test('the page-heartbeat counter sees the page and not our own probe', async () => {
+    const page = setupPage();
+    try {
+        const socket = new globalThis.WebSocket('wss://relay.example');
+        socket.dispatchEvent({type: 'open'});
+        socket.send(JSON.stringify({type: 'auth_init', role: 'terminal', device_sid: 'sid-1'}));
+        socket.receive({type: 'pair_status_ack', pair_status: 'matched'});
+        await wait(1700);
+
+        // The page's own heartbeat, then ours from the native pump. Ours is sent
+        // while `injecting` is set, so it must not inflate the page's count — the
+        // whole point is to tell whether the PAGE's timer is still running while
+        // hidden.
+        socket.send(JSON.stringify({type: 'pair_status_query', device_sid: 'sid-1', client_ts: 1}));
+        globalThis.__zcodeShellHeartbeat();
+        await flush();
+
+        const line = findPost(page.posts, 'diag')
+            .map((p) => p.data.message)
+            .filter((m) => m.indexOf('页面开销') === 0)
+            .pop();
+        assert.ok(line.includes('页面心跳 1'), line);
+        assert.ok(line.includes('探针 0'), 'our probe is counted only after the report: ' + line);
     } finally {
         page.teardown();
     }

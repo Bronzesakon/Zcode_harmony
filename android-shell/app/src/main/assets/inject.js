@@ -326,14 +326,15 @@
     /**
      * Per-window link counters reported on the perf line.
      *
-     * These exist to answer one question the field log could not: while the app is
-     * backgrounded, is the desktop still sending pair acks, and are OUR probes
-     * actually going out? The page's own ack watchdog (30s, re-armed by any
-     * pair_status_ack) is re-armed by our probe's ack too, so if both numbers are
-     * non-zero and the page still closes its socket every ~120s, the watchdog is
-     * not the explanation and the search moves on.
+     * These exist to answer questions the field log could not: while the app is
+     * backgrounded, is the desktop still sending pair acks, are OUR probes actually
+     * going out, and is the PAGE's own heartbeat still beating? The last one is the
+     * crux for the page's ~2-minute reconnect: its ack watchdog is armed from its
+     * own relay client, so "the page stopped beating because the renderer throttles
+     * hidden-page timers" and "the page is still beating and something else arms the
+     * watchdog" need different fixes and look identical from the outside.
      */
-    var linkWindow = {acks: 0, probes: 0};
+    var linkWindow = {acks: 0, probes: 0, pageBeats: 0};
 
     function now() {
         try {
@@ -426,9 +427,11 @@
         var longTasks = perf.longTasks - perf.windowLongTasks;
         var acks = linkWindow.acks;
         var probes = linkWindow.probes;
+        var pageBeats = linkWindow.pageBeats;
         linkWindow.acks = 0;
         linkWindow.probes = 0;
-        if (frames === 0 && longTasks === 0 && acks === 0 && probes === 0) {
+        linkWindow.pageBeats = 0;
+        if (frames === 0 && longTasks === 0 && acks === 0 && probes === 0 && pageBeats === 0) {
             return;
         }
         var elapsed = Date.now() - perf.windowStartedAt;
@@ -442,7 +445,8 @@
             '长任务 ' + longTasks + ' 个（合计 ' + Math.round(longTaskMs) +
             'ms，最长 ' + Math.round(perf.longTaskMaxMs) + 'ms）· ' +
             '链路 ack ' + acks + ' · 探针 ' + probes + ' · paired ' + relayPaired +
-            ' socket ' + (socket ? socket.readyState : -1));
+            ' socket ' + (socket ? socket.readyState : -1) +
+            ' · 页面心跳 ' + pageBeats);
         perf.windowStartedAt = Date.now();
         perf.windowFrames = perf.decodedFrames;
         perf.windowChars = perf.inboundChars;
@@ -701,6 +705,17 @@
                 maybeStartActive();
             } else {
                 resetClient();
+            }
+            return;
+        }
+        if (frame.type === 'pair_status_query') {
+            if (outbound) {
+                // The PAGE's own heartbeat — the timer the native pump stands in
+                // for. Our own probe is sent while `injecting` is set, so it never
+                // reaches this branch. Counting the page's beats is how we tell
+                // "its timer is throttled away while hidden" (no beats) from "it is
+                // still beating and something else is arming the watchdog".
+                linkWindow.pageBeats += 1;
             }
             return;
         }

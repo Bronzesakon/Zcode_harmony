@@ -161,25 +161,7 @@ class MainActivity : AppCompatActivity() {
         configureWebView()
         installBackHandling()
         handleIntent(intent)
-        ShellRuntime.setJsEvaluator { script ->
-            // Every native-driven tick re-asserts that the window is visible.
-            //
-            // This is the visibility hijack (D12) at the only layer that can still
-            // matter. Faking `document.visibilityState` in JS stops the PAGE from
-            // pausing itself, but it does nothing about Chromium's own hidden-page
-            // timer throttling — and that is what the field log shows biting: the
-            // page's 30s ack watchdog was measured firing ~121s late, so it
-            // reconnects the relay every ~2 minutes while backgrounded, no matter
-            // how often our probes are acked. Everything else about the injected
-            // layer already works in that state (our synchronous frame parsing runs
-            // every 10s), so the throttling is the remaining lever.
-            try {
-                binding.webview.setWindowVisibility(View.VISIBLE)
-            } catch (e: Exception) {
-                Diagnostics.log("debug", "重申窗口可见性失败: ${e.message}")
-            }
-            binding.webview.evaluateJavascript(script, null)
-        }
+        ShellRuntime.setJsEvaluator { script -> binding.webview.evaluateJavascript(script, null) }
 
         val stored = prefs.remoteUrl
         if (stored == null) {
