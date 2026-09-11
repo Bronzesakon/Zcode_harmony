@@ -32,7 +32,11 @@ class ZcodeRemoteApp : Application() {
         DynamicColors.applyToActivitiesIfAvailable(
             this,
             DynamicColorsOptions.Builder()
-                .setPrecondition { activity -> activity !is SettingsActivity }
+                // Two parameters, not one: Material's Precondition is
+                // `shouldApplyDynamicColors(Activity, @ColorScheme int)`. The
+                // scheme argument is the one it would have used, which this app
+                // has no opinion about.
+                .setPrecondition { activity, _ -> activity !is SettingsActivity }
                 .build(),
         )
         ShellLog.init(this)
