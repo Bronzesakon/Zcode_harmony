@@ -945,46 +945,48 @@
     //
     //     *{scrollbar-width:auto;scrollbar-color:var(--color-border) transparent}
     //     ::-webkit-scrollbar{width:14px;height:14px}
+    //     ::-webkit-scrollbar-thumb{background:var(--color-border);
+    //         background-clip:padding-box;border:3px solid #0000;border-radius:9999px}
     //
     // Styling ::-webkit-scrollbar is what makes Blink lay the bar out as a
     // classic one, so every scroller hands 14px of its client box to it.
-    // Measured on the device: content box 1222px of a 1272px screen at dpr 3.5,
+    // Measured on the device: content box 1222px of a 1272px screen at dpr 3.5
+    // (thumb 29 device px wide with 3px insets — the rule above, to the pixel),
     // i.e. the conversation — composer included — sits 7 CSS px left of centre
     // behind an empty strip. ArkWeb does not lay that styling out, which is why
-    // the same page is centred in the HarmonyOS shell and shows its bar as an
-    // overlay while scrolling; this brings Android to the same behaviour.
+    // the same page is centred in the HarmonyOS shell with its bar drawn as an
+    // overlay while scrolling. This asks Android for the same, with two levers
+    // because one of them is not known to be honoured on every WebView build:
     //
-    // Specifying the standard `scrollbar-width` with a value other than `auto`
-    // is what makes Chromium ignore the legacy ::-webkit-scrollbar declarations,
-    // so the bar becomes the platform's: overlay (zero layout width) and tinted
-    // by the page's own `scrollbar-color` — the page keeps its look, it just
-    // stops reserving width. No !important, and no properties other than the
-    // one: appended after the page's sheet, an ordinary universal rule beats the
-    // page's `*{scrollbar-width:auto}` while still losing to its
-    // higher-specificity `.scrollbar-hide` / `[data-zcode-pptx-render-surface] *`
-    // rules, so the scrollers the page deliberately keeps bar-less stay that
-    // way. Nothing here reads the DOM at runtime; it is one stylesheet, once.
+    //   * `scrollbar-width` other than `auto` is what makes Chromium ignore the
+    //     legacy ::-webkit-scrollbar declarations and use the platform bar —
+    //     overlay, zero layout width, tinted by the page's own `scrollbar-color`.
+    //   * If the engine keeps the classic path anyway, the legacy rail is capped
+    //     at 2px (thumb border reduced to match, since the page insets it by 3px)
+    //     so the reservation left over is ~1 CSS px of centre offset instead of 7.
+    //
+    // `!important` is needed to outrank the page's own `*{scrollbar-width:auto}`
+    // and `::-webkit-scrollbar` width; the page's `.scrollbar-hide` utilities
+    // carry it too and are more specific, so the scrollers it hides on purpose
+    // stay hidden. Nothing here reads the DOM at runtime: one stylesheet, once.
     // -----------------------------------------------------------------------
-    var SCROLLBAR_CSS = '*{scrollbar-width:thin}';
-    var scrollbarStyleEl = null;
+    var SCROLLBAR_CSS =
+        '*{scrollbar-width:thin!important}' +
+        '::-webkit-scrollbar{width:2px!important;height:2px!important}' +
+        '::-webkit-scrollbar-thumb{border-width:0!important}';
 
     function installScrollbarWidth() {
         try {
             var parent = document.head || document.documentElement;
             if (!parent) {
-                // document-start can land before <html> exists; boot's
-                // DOMContentLoaded listener runs this again.
+                // document-start can land before <html> exists.
+                document.addEventListener('DOMContentLoaded', installScrollbarWidth);
                 return;
             }
-            if (!scrollbarStyleEl) {
-                scrollbarStyleEl = document.createElement('style');
-                scrollbarStyleEl.setAttribute('data-zcode-shell', 'scrollbar-width');
-                scrollbarStyleEl.textContent = SCROLLBAR_CSS;
-            }
-            // appendChild on an already-attached node MOVES it, so running this
-            // again on DOMContentLoaded puts the rule after the page's own
-            // stylesheet, which is what the cascade above relies on.
-            parent.appendChild(scrollbarStyleEl);
+            var style = document.createElement('style');
+            style.setAttribute('data-zcode-shell', 'scrollbar-width');
+            style.textContent = SCROLLBAR_CSS;
+            parent.appendChild(style);
         } catch (e) {
             diag('warn', '滚动条宽度修正失败: ' + e);
         }
@@ -994,7 +996,6 @@
     // boot
     // -----------------------------------------------------------------------
     installScrollbarWidth();
-    document.addEventListener('DOMContentLoaded', installScrollbarWidth);
     try {
         installVisibilityHijack();
     } catch (e) {
