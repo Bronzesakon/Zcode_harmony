@@ -4,6 +4,7 @@ import android.app.Activity
 import android.app.Application
 import android.os.Bundle
 import com.google.android.material.color.DynamicColors
+import com.google.android.material.color.DynamicColorsOptions
 import com.zcode.remote.core.Diagnostics
 import com.zcode.remote.core.ShellLog
 
@@ -22,7 +23,18 @@ class ZcodeRemoteApp : Application() {
         // Material 3 推荐做法：Android 12+ 采用系统/壁纸派生的动态配色，低版本回落到
         // 主题里的基础配色。这一步同时解决两件事——配色对比度符合无障碍标准，以及
         // 暗色模式自动正确（基础配色是 DayNight 的，两套都齐全）。
-        DynamicColors.applyToActivitiesIfAvailable(this)
+        //
+        // 设置页是唯一的例外：它整页是 MiuiX 调色板，而动态配色会把 colorPrimary /
+        // colorOnPrimary / colorSurfaceContainerHighest / colorOutline 这些**角色**换成
+        // 壁纸派生色——按角色取色的控件（MaterialSwitch 等）于是又变回另一套蓝，一页两种蓝。
+        // 动态配色是以 ThemeOverlay 形式套在主题**之上**的，优先级高于主题里显式写的角色值，
+        // 所以在 themes.xml 里对着盖没有用，只能在源头排除这一页。
+        DynamicColors.applyToActivitiesIfAvailable(
+            this,
+            DynamicColorsOptions.Builder()
+                .setPrecondition { activity -> activity !is SettingsActivity }
+                .build(),
+        )
         ShellLog.init(this)
         ShellRuntime.init(this)
         Diagnostics.info("ZCode 远程启动")

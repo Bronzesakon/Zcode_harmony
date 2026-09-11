@@ -15,6 +15,23 @@
          core/WindowInsets.kt. -->
     <style name="Theme.ZcodeRemote" parent="Theme.Material3.DayNight.NoActionBar" />
 
+    <!-- 设置页专用：把 Material 控件真正取色的那几个 M3 角色换成 MiuiX 的值。
+
+         `MaterialSwitch` 取的是 colorPrimary / colorOnPrimary /
+         colorSurfaceContainerHighest / colorOutline 这些**角色**，而不是页面里那些显式的
+         @color/miuix_*。不覆盖的话同一页会出现两套蓝：页面是 MiuiX 的 #3482FF，开关却是
+         Android 12+ 从壁纸派生的动态色。覆盖角色比逐个控件染色稳——该 Activity 里任何 M3
+         控件（含以后新增的）都会自动跟着走。
+
+         **光写这里不够**：动态配色是以 ThemeOverlay 套在主题之上的，优先级更高，所以
+         `ZcodeRemoteApp` 里把 SettingsActivity 从动态配色中排除了（见那里的注释）。两处缺一不可。 -->
+    <style name="Theme.ZcodeRemote.Miuix" parent="Theme.ZcodeRemote">
+        <item name="colorPrimary">@color/miuix_primary</item>
+        <item name="colorOnPrimary">@color/miuix_on_primary</item>
+        <item name="colorSurfaceContainerHighest">@color/miuix_secondary</item>
+        <item name="colorOutline">@color/miuix_outline</item>
+    </style>
+
     <!-- Shown while the process starts, before the WebView has anything to
          paint: the themed background avoids a white/black flash. -->
     <style name="Theme.ZcodeRemote.Splash" parent="Theme.ZcodeRemote">

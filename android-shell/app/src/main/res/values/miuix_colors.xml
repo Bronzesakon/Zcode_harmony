@@ -38,8 +38,6 @@
     <color name="miuix_outline">#FFD9D9D9</color>
     <color name="miuix_divider">#FFE0E0E0</color>
 
-    <!-- 次级容器：既有的 MaterialSwitch 等控件靠主题角色取色，给它们一组
-         MiuiX 化的角色，避免同一页上出现两套蓝。 -->
-    <color name="miuix_secondary_container">#FFF0F0F0</color>
-    <color name="miuix_on_secondary_container">#FFA9A9A9</color>
+    <!-- 次级容器（MiuiX `secondary`）：开关未选中时的轨道色。 -->
+    <color name="miuix_secondary">#FFE6E6E6</color>
 </resources>

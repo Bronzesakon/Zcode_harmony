@@ -73,7 +73,7 @@
             android:exported="false"
             android:label="@string/settings_title"
             android:parentActivityName=".MainActivity"
-            android:theme="@style/Theme.ZcodeRemote" />
+            android:theme="@style/Theme.ZcodeRemote.Miuix" />
 
         <!-- Keeps the process (and therefore the WebView + its relay socket)
              alive while backgrounded, and owns the ongoing "running tasks"
