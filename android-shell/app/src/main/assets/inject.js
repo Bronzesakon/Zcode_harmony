@@ -700,6 +700,8 @@
     var lastForcedReconnectAt = 0;
     var lastTickAt = 0;
     var staleTicks = 0;
+    var appForeground = true;
+    var backgroundStartedWallMs = 0;
 
     /**
      * Liveness counters.
@@ -717,9 +719,16 @@
         outboundFrames: 0,
         socketsOpened: 0,
         socketsClosed: 0,
-        /** Heartbeat ticks this layer executed, and the wall clock of the last one. */
-        heartbeatTicks: 0,
-        lastTickWallMs: 0,
+        /**
+         * Ticks executed while the app was backgrounded, and how long after
+         * going background the first one came. The delay is the whole point: a
+         * heartbeat that runs in the background starts ticking at once, while a
+         * link that only came back with the foreground produces its "background"
+         * ticks in one burst right at the end of the window — the counters alone
+         * cannot tell those apart.
+         */
+        backgroundTicks: 0,
+        backgroundFirstTickDelayMs: -1,
         startedAt: Date.now(),
         lastInboundAt: 0
     };
@@ -732,8 +741,8 @@
             outboundFrames: liveness.outboundFrames,
             socketsOpened: liveness.socketsOpened,
             socketsClosed: liveness.socketsClosed,
-            heartbeatTicks: liveness.heartbeatTicks,
-            lastTickWallMs: liveness.lastTickWallMs,
+            backgroundTicks: liveness.backgroundTicks,
+            backgroundFirstTickDelayMs: liveness.backgroundFirstTickDelayMs,
             lastInboundAgoMs: liveness.lastInboundAt ?
                 Date.now() - liveness.lastInboundAt : -1,
             paired: relayPaired,
@@ -761,8 +770,12 @@
             return false;
         }
         lastTickAt = nowMs;
-        liveness.heartbeatTicks += 1;
-        liveness.lastTickWallMs = nowMs;
+        if (!appForeground) {
+            liveness.backgroundTicks += 1;
+            if (liveness.backgroundFirstTickDelayMs < 0 && backgroundStartedWallMs > 0) {
+                liveness.backgroundFirstTickDelayMs = nowMs - backgroundStartedWallMs;
+            }
+        }
         reportLiveness();
         reportPerf();
         if (client && client.reportPageRpcWindow) {
@@ -964,7 +977,12 @@
     /** Called by the native side when the app's foreground state changes. */
     G.__zcodeShellSetAppForeground = function (foreground) {
         diag('info', 'app foreground = ' + (foreground ? 'true' : 'false'));
+        appForeground = foreground;
         if (!foreground) {
+            // A fresh window: the survival verdict is about ticks from here on.
+            backgroundStartedWallMs = Date.now();
+            liveness.backgroundTicks = 0;
+            liveness.backgroundFirstTickDelayMs = -1;
             return;
         }
         if (!relayPaired || !deviceSid) {

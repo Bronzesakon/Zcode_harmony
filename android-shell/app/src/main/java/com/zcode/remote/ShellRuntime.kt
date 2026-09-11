@@ -70,13 +70,15 @@ object ShellRuntime {
         val socketsOpened: Int,
         val socketsClosed: Int,
         /**
-         * Heartbeat ticks the page executed, and the wall clock of the last one.
-         * A tick stamped at the resume instant is one of the overdue timers
-         * firing late, not a tick that happened while the app was away — the
-         * verdict below needs the timestamp to tell those apart.
+         * Heartbeat ticks the injected layer ran while the app was backgrounded,
+         * and how long after going background the first one came. The delay is
+         * what makes the verdict decidable: a heartbeat that really runs in the
+         * background starts ticking at once, whereas a link that only came back
+         * with the foreground produces its "background" ticks in one burst at the
+         * very end of the window — identical counters, opposite meaning.
          */
-        val heartbeatTicks: Int,
-        val lastTickWallMs: Long,
+        val backgroundTicks: Int,
+        val backgroundFirstTickDelayMs: Long,
         /** Uptime timestamp of the most recent inbound frame (0 = none yet). */
         val lastInboundAtElapsed: Long,
         val paired: Boolean,
@@ -89,7 +91,6 @@ object ShellRuntime {
     private var backgroundStartedAt = 0L
     private var backgroundFrameBase = 0
     private var backgroundAckBase = 0
-    private var backgroundTickBase = 0
 
     /** Set on return to foreground; the next liveness report resolves it. */
     @Volatile
@@ -112,8 +113,8 @@ object ShellRuntime {
             pairAcks = data.optInt("pairAcks"),
             socketsOpened = data.optInt("socketsOpened"),
             socketsClosed = data.optInt("socketsClosed"),
-            heartbeatTicks = data.optInt("heartbeatTicks"),
-            lastTickWallMs = data.optLong("lastTickWallMs"),
+            backgroundTicks = data.optInt("backgroundTicks"),
+            backgroundFirstTickDelayMs = data.optLong("backgroundFirstTickDelayMs", -1),
             lastInboundAtElapsed = if (ago >= 0) receivedAt - ago else 0,
             paired = data.optBoolean("paired"),
             socketState = data.optInt("socketState", -1),
@@ -125,29 +126,22 @@ object ShellRuntime {
             val current = liveness ?: return
             val frames = current.inboundFrames - backgroundFrameBase
             val acks = current.pairAcks - backgroundAckBase
-            val ticks = current.heartbeatTicks - backgroundTickBase
-            // A tick stamped at (or after) the moment the app came back did not
-            // happen "during" the background: it is one of the overdue timers and
-            // messages that all fire at once on resume. Counting those as survival
-            // is exactly how this readout lied — a 10-minute background window
-            // reported "心跳在跑" off a single tick stamped at the resume instant.
-            val lastTickAtResume = current.lastTickWallMs > 0 &&
-                current.lastTickWallMs >= backgroundEndedWallMs - RESUME_BURST_WINDOW_MS
-            val tickAge = if (current.lastTickWallMs > 0) {
-                "，末次心跳距回前台 " +
-                    "${(backgroundEndedWallMs - current.lastTickWallMs).coerceAtLeast(0L)}ms"
+            val ticks = current.backgroundTicks
+            val firstDelay = current.backgroundFirstTickDelayMs
+            val firstTick = if (firstDelay >= 0) {
+                "首次在退后台后 ${firstDelay / 1000}s"
             } else {
-                ""
+                "退后台后一次都没执行"
             }
             val verdict = when {
                 ticks <= 0 -> "后台期间心跳未执行（定时器与原生发令都没跑）"
-                lastTickAtResume -> "心跳只在恢复瞬间补跑，后台期间很可能没执行"
+                firstDelay > RESUMED_BURST_DELAY_MS -> "心跳只在恢复瞬间补跑，后台期间很可能没执行"
                 else -> "保活成立（后台心跳在跑）"
             }
             val duration = formatDuration(backgroundEndedAt - backgroundStartedForVerdict)
             Diagnostics.info(
-                "后台存活检查：时长 $duration，期间注入层心跳 $ticks 次" +
-                    "（原生泵发令 $pumpDispatchesForVerdict 次$tickAge）、" +
+                "后台存活检查：时长 $duration，后台期间注入层心跳 $ticks 次" +
+                    "（$firstTick，原生泵发令 $pumpDispatchesForVerdict 次）、" +
                     "收到 $frames 帧、配对确认 $acks 次 → $verdict"
             )
         }
@@ -155,7 +149,6 @@ object ShellRuntime {
 
     private var backgroundStartedForVerdict = 0L
     private var backgroundEndedAt = 0L
-    private var backgroundEndedWallMs = 0L
 
     /**
      * Records the background window and, on return, writes the milestone-4
@@ -177,7 +170,6 @@ object ShellRuntime {
             if (endedAt - startedAt < VERDICT_MIN_BACKGROUND_MS) return
             backgroundStartedForVerdict = startedAt
             backgroundEndedAt = endedAt
-            backgroundEndedWallMs = System.currentTimeMillis()
             pumpDispatchesForVerdict = pumpDispatches
             // Resolved by the first fresh liveness report, so the numbers are
             // measured after the renderer resumed rather than cached before it
@@ -190,7 +182,6 @@ object ShellRuntime {
             val snapshot = liveness
             backgroundFrameBase = snapshot?.inboundFrames ?: 0
             backgroundAckBase = snapshot?.pairAcks ?: 0
-            backgroundTickBase = snapshot?.heartbeatTicks ?: 0
         }
     }
 
@@ -339,11 +330,12 @@ object ShellRuntime {
     private const val VERDICT_MIN_BACKGROUND_MS = 60_000L
 
     /**
-     * A tick stamped within this of the resume instant is treated as part of the
-     * resume burst (overdue timers and messages all fire at once), not as a tick
-     * that happened during the background.
+     * A first "background" tick arriving later than this did not happen while
+     * the app was away: it is one of the overdue timers and messages that all
+     * fire at once on resume. A heartbeat that really runs in the background
+     * starts ticking within one interval, i.e. seconds.
      */
-    private const val RESUME_BURST_WINDOW_MS = 500L
+    private const val RESUMED_BURST_DELAY_MS = 60_000L
 
     /** A quiet link for longer than this is called out in the readout. */
     private const val STALE_READOUT_MS = 120_000L

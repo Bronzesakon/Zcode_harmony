@@ -622,6 +622,7 @@ test('the native pump can drive a heartbeat, and the tick is rate limited', asyn
         );
 
         const before = socket.sent.length;
+        globalThis.__zcodeShellSetAppForeground(false);
         assert.strictEqual(globalThis.__zcodeShellHeartbeat(), true, 'the first pumped tick must be accepted');
         const queries = socket.sent.slice(before)
             .map((raw) => {
@@ -638,8 +639,11 @@ test('the native pump can drive a heartbeat, and the tick is rate limited', asyn
         globalThis.__zcodeShellReportLiveness();
         await flush();
         const last = findPost(page.posts, 'liveness').pop().data;
-        assert.strictEqual(last.heartbeatTicks, 1, 'the survival verdict reads this counter');
-        assert.ok(last.lastTickWallMs > 0, 'a tick must be stamped so a resume burst can be told apart');
+        assert.strictEqual(last.backgroundTicks, 1, 'the survival verdict reads this counter');
+        assert.ok(
+            last.backgroundFirstTickDelayMs >= 0,
+            'the delay of the first background tick is what separates a real background heartbeat from a resume burst'
+        );
     } finally {
         page.teardown();
     }
