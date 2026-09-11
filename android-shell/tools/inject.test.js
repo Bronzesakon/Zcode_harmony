@@ -590,6 +590,45 @@ test('liveness counters report inbound frames, pairing acks and socket churn', a
     }
 });
 
+test('the perf line carries the link counters that judge background reconnects', async () => {
+    const page = setupPage();
+    try {
+        const socket = new globalThis.WebSocket('wss://relay.example');
+        socket.dispatchEvent({type: 'open'});
+        socket.send(JSON.stringify({type: 'auth_init', role: 'terminal', device_sid: 'sid-1'}));
+        socket.receive({type: 'pair_status_ack', pair_status: 'matched'});
+        await wait(1700);
+
+        // One pump-driven tick while backgrounded. Both numbers have to end up on
+        // the line: the probe is what should keep the page's own ack watchdog
+        // quiet, and the ack is what proves the desktop still answers — a field
+        // log without these counters could not tell "we stopped probing" from
+        // "the page reconnected anyway".
+        globalThis.__zcodeShellSetAppForeground(false);
+        globalThis.__zcodeShellHeartbeat();
+        // The counters are reported BEFORE the tick sends its probe, so the window
+        // that contains both a probe and an ack is the next one. Waiting past the
+        // rate gate (5s) is what lets a second tick through at all.
+        await wait(5100);
+        socket.receive({type: 'pair_status_ack', pair_status: 'matched'});
+        globalThis.__zcodeShellHeartbeat();
+        await flush();
+
+        const lines = findPost(page.posts, 'diag')
+            .map((p) => p.data.message)
+            .filter((m) => m.indexOf('页面开销') === 0);
+        assert.ok(lines.length >= 2, 'a perf line per tick, even when only the link was active');
+        const line = lines.filter(
+            (m) => m.includes('链路 ack 1') && m.includes('探针 1')
+        )[0];
+        assert.ok(line, 'one window must show both the probe and the ack: ' + lines.join(' | '));
+        assert.ok(line.includes('paired true'), line);
+        assert.ok(line.includes('socket 1'), line);
+    } finally {
+        page.teardown();
+    }
+});
+
 test('liveness reporting is safe before any socket exists', () => {
     const page = setupPage();
     try {

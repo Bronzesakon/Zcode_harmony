@@ -305,6 +305,18 @@
         longTasksLogged: 0
     };
 
+    /**
+     * Per-window link counters reported on the perf line.
+     *
+     * These exist to answer one question the field log could not: while the app is
+     * backgrounded, is the desktop still sending pair acks, and are OUR probes
+     * actually going out? The page's own ack watchdog (30s, re-armed by any
+     * pair_status_ack) is re-armed by our probe's ack too, so if both numbers are
+     * non-zero and the page still closes its socket every ~120s, the watchdog is
+     * not the explanation and the search moves on.
+     */
+    var linkWindow = {acks: 0, probes: 0};
+
     function now() {
         try {
             return (G.performance && G.performance.now) ?
@@ -394,18 +406,25 @@
     function reportPerf() {
         var frames = perf.decodedFrames - perf.windowFrames;
         var longTasks = perf.longTasks - perf.windowLongTasks;
-        if (frames === 0 && longTasks === 0) {
+        var acks = linkWindow.acks;
+        var probes = linkWindow.probes;
+        linkWindow.acks = 0;
+        linkWindow.probes = 0;
+        if (frames === 0 && longTasks === 0 && acks === 0 && probes === 0) {
             return;
         }
         var elapsed = Date.now() - perf.windowStartedAt;
         var chars = perf.inboundChars - perf.windowChars;
         var decodeMs = perf.decodeMs - perf.windowDecodeMs;
         var longTaskMs = perf.longTaskMs - perf.windowLongTaskMs;
+        var socket = activeSocket;
         diag('debug', '页面开销 ' + Math.round(elapsed / 1000) + 's：收帧 ' + frames +
             ' 个（' + Math.round(chars / 1024) + 'K 字符，解码合计 ' +
             Math.round(decodeMs) + 'ms，单帧最长 ' + Math.round(perf.decodeMsMax) + 'ms）· ' +
             '长任务 ' + longTasks + ' 个（合计 ' + Math.round(longTaskMs) +
-            'ms，最长 ' + Math.round(perf.longTaskMaxMs) + 'ms）');
+            'ms，最长 ' + Math.round(perf.longTaskMaxMs) + 'ms）· ' +
+            '链路 ack ' + acks + ' · 探针 ' + probes + ' · paired ' + relayPaired +
+            ' socket ' + (socket ? socket.readyState : -1));
         perf.windowStartedAt = Date.now();
         perf.windowFrames = perf.decodedFrames;
         perf.windowChars = perf.inboundChars;
@@ -658,6 +677,7 @@
             relayPaired = frame.pair_status === 'matched';
             lastPairAckAt = Date.now();
             liveness.pairAcks += 1;
+            linkWindow.acks += 1;
             if (relayPaired) {
                 ensureClient();
                 maybeStartActive();
@@ -838,6 +858,7 @@
             device_sid: deviceSid,
             client_ts: nowMs
         });
+        linkWindow.probes += 1;
         return true;
     }
 
