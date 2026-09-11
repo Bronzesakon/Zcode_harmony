@@ -22,7 +22,7 @@ import com.zcode.remote.core.Diagnostics
 import com.zcode.remote.core.RemoteUrl
 import com.zcode.remote.core.ShellLog
 import com.zcode.remote.core.enableThemeEdgeToEdge
-import com.zcode.remote.core.padForSystemBars
+import com.zcode.remote.core.padForSystemBarsAndIme
 import com.zcode.remote.databinding.ActivitySettingsBinding
 
 /**
@@ -47,7 +47,7 @@ class SettingsActivity : AppCompatActivity() {
         ShellRuntime.init(this)
         binding = ActivitySettingsBinding.inflate(layoutInflater)
         setContentView(binding.root)
-        binding.root.padForSystemBars()
+        binding.root.padForSystemBarsAndIme()
 
         setSupportActionBar(binding.toolbar)
         binding.toolbar.setNavigationOnClickListener { finish() }

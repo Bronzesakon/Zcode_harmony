@@ -11,7 +11,9 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.view.View
+import android.webkit.ConsoleMessage
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
@@ -37,7 +39,7 @@ import com.zcode.remote.core.Prefs
 import com.zcode.remote.core.RemoteUrl
 import com.zcode.remote.core.UploadMime
 import com.zcode.remote.core.enableThemeEdgeToEdge
-import com.zcode.remote.core.padForSystemBars
+import com.zcode.remote.core.padForSystemBarsAndIme
 import com.zcode.remote.databinding.ActivityMainBinding
 
 /**
@@ -69,6 +71,16 @@ class MainActivity : AppCompatActivity() {
     private var locateAttempts = 0
     /** The host the injected script was installed for, if any. */
     private var injectedHost: String? = null
+
+    /**
+     * Console lines captured from the page for this load. The page is a chatty
+     * production SPA and this log is also written to a file that the user is
+     * expected to share, so the capture is capped per load rather than endless.
+     */
+    private var consoleLines = 0
+
+    /** Uptime at onPageStarted, for the "how long did the page take" line. */
+    private var pageStartedAt = 0L
 
     private val scanLauncher = registerForActivityResult(ScanContract()) { result ->
         val contents = result.contents
@@ -128,8 +140,9 @@ class MainActivity : AppCompatActivity() {
         setContentView(binding.root)
         // targetSdk 35 forces edge-to-edge, so the toolbar would otherwise sit
         // under the status bar (clipping its overflow button) and the page under
-        // the navigation bar.
-        binding.root.padForSystemBars()
+        // the navigation bar — and, once the keyboard is up, the page's composer
+        // under the keyboard (see padForSystemBarsAndIme).
+        binding.root.padForSystemBarsAndIme()
         setSupportActionBar(binding.toolbar)
 
         binding.btnScan.setOnClickListener { startScan() }
@@ -208,6 +221,9 @@ class MainActivity : AppCompatActivity() {
 
             override fun onPageStarted(view: WebView, url: String, favicon: android.graphics.Bitmap?) {
                 super.onPageStarted(view, url, favicon)
+                consoleLines = 0
+                pageStartedAt = SystemClock.elapsedRealtime()
+                Diagnostics.info("网页开始加载")
                 fallbackScript?.let { script ->
                     // No document-start support: inject as early as we can. The
                     // page may already have opened its socket, which is exactly
@@ -218,6 +234,15 @@ class MainActivity : AppCompatActivity() {
 
             override fun onPageFinished(view: WebView, url: String) {
                 super.onPageFinished(view, url)
+                if (pageStartedAt > 0L) {
+                    // The number to compare against the injected layer's own
+                    // navigation timing: a page that reports a fast load here but
+                    // a slow conversation is waiting on the relay, not on the
+                    // network.
+                    Diagnostics.info(
+                        "网页加载完成，用时 ${SystemClock.elapsedRealtime() - pageStartedAt} ms"
+                    )
+                }
                 hideError()
                 maybeRequestNotificationPermission()
                 tryLocate()
@@ -239,6 +264,45 @@ class MainActivity : AppCompatActivity() {
         // File uploads. WebView ships no default chooser, so without this the
         // page's <input type="file"> silently does nothing.
         webView.webChromeClient = object : WebChromeClient() {
+            /**
+             * The page's own console, routed into the shell's diagnostics.
+             *
+             * This exists because the questions that matter here — "why does a
+             * conversation take ten seconds to open", "what did the app do when
+             * the fluid cloud showed up" — are answered by the page's own logs,
+             * and the shell has no other way to see them: without adb there is no
+             * remote inspector, and the log file is the only channel the phone
+             * can hand back. The injected script reports its own numbers the same
+             * way (see assets/inject.js), so both land in one timeline.
+             */
+            override fun onConsoleMessage(msg: ConsoleMessage): Boolean {
+                val level = when (msg.messageLevel()) {
+                    ConsoleMessage.MessageLevel.ERROR -> "error"
+                    ConsoleMessage.MessageLevel.WARNING -> "warn"
+                    else -> "web"
+                }
+                if (consoleLines > MAX_CONSOLE_LINES) {
+                    return true
+                }
+                consoleLines += 1
+                if (consoleLines == MAX_CONSOLE_LINES + 1) {
+                    Diagnostics.log(
+                        "info",
+                        "[web] 控制台输出已达 ${MAX_CONSOLE_LINES} 行上限，本次加载后续省略",
+                    )
+                    return true
+                }
+                Diagnostics.log(level, "[web:${msg.lineNumber()}] ${condense(msg.message())}")
+                return true
+            }
+
+            override fun onProgressChanged(view: WebView, newProgress: Int) {
+                super.onProgressChanged(view, newProgress)
+                if (newProgress == 100) {
+                    Diagnostics.info("网页渲染进度 100%")
+                }
+            }
+
             override fun onShowFileChooser(
                 webView: WebView,
                 filePathCallback: ValueCallback<Array<Uri>>,
@@ -617,6 +681,20 @@ class MainActivity : AppCompatActivity() {
         Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
     }
 
+    /**
+     * One line, bounded. A page console message can carry a whole stack trace or
+     * a multi-line object dump, and both the ring buffer and the shared log file
+     * are meant to stay readable.
+     */
+    private fun condense(message: String): String {
+        val single = message.replace('\n', ' ').replace('\r', ' ').trim()
+        return if (single.length > MAX_CONSOLE_CHARS) {
+            single.take(MAX_CONSOLE_CHARS) + "…(共 ${single.length} 字符)"
+        } else {
+            single
+        }
+    }
+
     companion object {
         const val ACTION_LOCATE_TASK = "com.zcode.remote.action.LOCATE_TASK"
         const val ACTION_RELOAD = "com.zcode.remote.action.RELOAD"
@@ -628,6 +706,10 @@ class MainActivity : AppCompatActivity() {
         private const val ALLOWED_ROOT = "z.ai"
         private const val LOCATE_RETRY_MS = 600L
         private const val MAX_LOCATE_ATTEMPTS = 40
+
+        /** Console capture budget for one page load (see onConsoleMessage). */
+        private const val MAX_CONSOLE_LINES = 200
+        private const val MAX_CONSOLE_CHARS = 400
 
         /** Mirrors the HarmonyOS build's PhotoViewPicker maxSelectNumber. */
         private const val MAX_UPLOAD_ITEMS = 5

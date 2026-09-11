@@ -40,6 +40,16 @@
 - edge-to-edge 的系统栏图标此前被无条件强化为「浅色背景深色图标」，暗色模式下不可见；改为按 `uiMode` 在 `SystemBarStyle.light/dark` 间切换。
 - 恢复 `action_back` 字符串（此前误判未使用而删除，设置页返回键标题要用）。
 
+### Fixed（本轮第三批 · 真机第一轮反馈）
+- **输入法弹出时页面输入框不上抬**：`targetSdk 35` 强制 edge-to-edge 后 `decorFitsSystemWindows=false`，`adjustResize` 不再改变窗口大小，键盘只以 inset 形式送达；根布局此前只消费 systemBars/displayCutout，键盘 inset 无人处理，页面测量到的视口高度从未变化。改为 `padForSystemBarsAndIme()`：底部按 `max(系统栏, 键盘)` 加内边距，WebView 随之变矮 → `innerHeight` 下降 → 贴底输入框随键盘上抬。返回 `CONSUMED` 是刻意的：放行原始 inset 会让 Chromium 以为自身顶部被状态栏遮住（实际工具栏已在它上面），从而错移视觉视口。
+
+### Added（本轮第三批 · 为定位问题而加的取证）
+- **网页控制台接入诊断日志**：`WebChromeClient.onConsoleMessage` 把页面自己的 console 写进 `Diagnostics`（错误/警告分级、单行折叠、每次加载上限 200 行 × 400 字符），于是「会话加载慢」这类只能由页面回答的问题不再依赖 adb。
+- **注入层性能计时**：每个入站帧的解码开销（`JSON.parse` + rpc-frame 重组，全在页面主线程）、`longtask` 计数/最长值、页面自身导航计时（ttfb / DOMContentLoaded / load / 资源数与体积 / 最慢资源）。每 10 秒输出一行「页面开销」（仅当该窗口有流量），与收帧计数在同一条时间线上。
+- **网页加载耗时**：原生侧 `onPageStarted/onPageFinished` 记录毫秒数，与注入层的导航计时对照，可区分「网络慢」/「relay 慢」/「页面 JS 慢」。
+- **主动订阅改为等页面空闲**：此前配对完成 1.5s 后即无条件为所有工作区开 bridge，与页面自己首屏加载会话争抢同一条 relay socket 和同一个 JS 线程（日志实测 7 个工作区约 10 秒连续握手）。现改为最后一次收帧静默 ≥800ms 才启动，页面持续繁忙时最多推迟 12s，推迟过程留 debug 记录。
+- 日志脱敏加强：除 `/remote?...` 外，任何 http(s) URL 的查询串都替换为 `?<redacted>`（网页 console 可能带出完整 URL，而日志是要交给用户分享的文件）。
+
 ### Notes
 - 单元测试 35 项（JS 协议层与注入层）+ 20 项（Kotlin 通知判定算法），全部在 CI 运行。
 - 仅中文界面；`minSdk 26`，`compileSdk/targetSdk 35`；纯 Kotlin/Java 无 native 库，单一通用 APK。

@@ -234,3 +234,58 @@ Kotlin 编译**只能靠 CI**：推送后在 Actions 页面或 `watch_ci.py` 看
 | ColorOS/OPPO + Android Live Updates 官方依据 | `android-shell/ColorOS_docs/`（先读其 `README.md`） | ❌ 本地保留，87 MB |
 | Android 文件/图片选择 + Material3 界面规范 | `android-shell/docs/`（先读其 `README.md`） | ❌ 本地保留，32 MB |
 | 签名密钥与 Secrets 步骤 | `../zemote/独立项目文档.md` §1-2（另一把密钥的流程可参考） | ❌ 本地保留 |
+
+---
+
+## 十一、真机第一轮反馈（一加 PLC110 / API 36 / WebView 153）
+
+有人在 `pre.13` 上真跑了一轮，报了三件事。处理状态与**下一轮怎么接着做**：
+
+| # | 现象 | 状态 |
+| --- | --- | --- |
+| 1 | 键盘弹出，页面输入框不随之上抬 | **已修**（`core/WindowInsets.kt` → `padForSystemBarsAndIme()`） |
+| 2 | ColorOS 弹「“ZCode 远程”正在当前页面悬浮显示，可能造成部分操作无响应，是否关闭该应用？」 | **未定位**，见下文 2 |
+| 3 | 任务对话加载很慢，连标题都要半天 | **已加取证**，未定论，见下文 3 |
+
+### 1) 输入法（已修）
+`decorFitsSystemWindows=false` 之后 `adjustResize` 不再改变窗口大小，键盘只以 `Type.ime()` inset 送达，而根布局此前只消费 systemBars/displayCutout。现在底部内边距取 `max(系统栏, 键盘)`，WebView 变矮 → `innerHeight` 下降 → 贴底输入框上抬。真机验证：点开会话底部输入框，输入框应贴在键盘上方；注入层的 `视口 … innerHeight=…` 行（resize 后 300ms 上报）可用来核对数值是否真的变了。
+
+### 2) ColorOS「悬浮显示」弹窗（待取证，优先做）
+已知事实：
+- 这是 ColorOS 的**悬浮窗/叠加层保护**，不是我们的崩溃或 ANR。社区反馈里它常在**退出应用时**出现（例：`bbs.tatans.cn/topic/122248` 豆包/QQ 同类现象），按「关掉该应用的悬浮窗权限」即不再弹。
+- 我们的源码与清单**没有** `SYSTEM_ALERT_WINDOW`，也没有 `TYPE_APPLICATION_OVERLAY` / `TYPE_TOAST` 窗口；`KeepAliveService` 只发通知不开窗。所以它要么来自依赖库往清单里合并了权限，要么是系统把流体云提升出来的胶囊/卡片算在应用头上，要么与我们无关（用户把它拖成了自由浮窗）。
+- 下一步（有 adb 后 5 分钟能定性）：
+  ```bash
+  adb shell dumpsys window windows | grep -i -A3 zcode   # 有没有 TYPE_APPLICATION_OVERLAY 之类的窗口
+  adb shell appops get com.zcode.remote                    # SYSTEM_ALERT_WINDOW 是否被开启
+  adb shell dumpsys notification --noredact | grep -i -A5 zcode   # 是否有提升(promoted)的通知在显示
+  adb shell dumpsys activity activities | grep -i zcode    # 是否被系统置于浮窗/分屏
+  ```
+  若确认是流体云提升触发，取舍是：只在「等待确认」时提升（运行中不提升），或去掉提升；`LiveUpdate.requestPromotion` 是唯一开关点。
+
+### 3) 会话加载慢（已加取证，待判读）
+本轮新增的判读顺序（日志里都已出现，无需再改代码）：
+1. `网页开始加载` / `网页加载完成，用时 N ms`（原生）与 `页面加载计时：ttfb=… load=… 资源 N 个 / KB`（注入层导航计时）→ 网络/文档层面的耗时；
+2. `active subscribe start（页面已空闲 Xms）` → 我们的 bridge 何时开始握手（本轮已改为等页面静默 ≥800ms，上限 12s，见下）；
+3. `页面开销 10s：收帧 N 个（解码合计 Yms，单帧最长 Zms）· 长任务 …` → **我们自己的主线程开销**；
+4. `[web:行号] …` → 页面自己的 console（新增，错误/警告分级）。
+
+若 1 小、3 大 → 是我们的解码/订阅挤占主线程，继续降载（例如限制并发 bridge 数、跳过大快照）；若 1 大 → 网络或 relay/桌面侧，往协议层加 RPC 往返计时。
+
+本轮已改：主动订阅不再在配对后 1.5s 无条件启动（原来 7 个工作区约 10s 连续握手，正好压在页面首屏加载窗口里），改为「最后一次收帧静默 ≥800ms 才启动，最迟推迟 12s」。若下一轮日志显示这仍不够，再考虑限制并发/分批。
+
+### 本机 adb（重要新增）
+这台 Windows **有可用的 adb**，不必另装（`minSdk` 校验、装包、取日志都能做）：
+- `C:\Program Files\UotanToolbox\Bin\platform-tools\adb.exe` — Platform-Tools **36.0.0**，推荐
+- `E:\leidian\LDPlayer9\adb.exe` — 34.0.4，雷电自带，备用
+
+一加手机（无线调试）在 **192.168.0.185**：Android 11+ **首次必须配对**（TCP 通但 `adb connect` 会被拒正是这个特征）。手机「开发者选项 → 无线调试 → 使用配对码配对设备」给出 `IP:端口` + 6 位配对码：
+
+```bash
+MSYS_NO_PATHCONV=1 "/c/Program Files/UotanToolbox/Bin/platform-tools/adb.exe" pair <配对IP:端口>   # 交互输入 6 位码
+… adb connect <无线调试页显示的 IP:端口>                                                            # 配对后即可
+```
+
+配对码是一次性凭据：不要写进任何文件或提交。配对成功后整条闭环成立 —— CI 出包 → `adb install -r` → `adb shell cat /sdcard/Android/data/com.zcode.remote/files/logs/zcode-shell.log` 直接取日志，不必在手机上手动导出分享。
+
+> 注意：本机还有一台**鸿蒙**测试机（hdc 可达 `192.168.0.82:12345`，HBN-AL80/API 24），与本子项目无关，别弄混。

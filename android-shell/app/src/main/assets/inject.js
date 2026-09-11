@@ -225,18 +225,214 @@
     function observeMessage(data) {
         liveness.inboundFrames += 1;
         liveness.lastInboundAt = Date.now();
+        var startedAt = now();
         if (typeof data === 'string') {
             observeText(data, false);
+            recordDecode(startedAt, data.length);
         } else if (data && typeof data.text === 'function') {
             data.text().then(function (text) {
+                var started = now();
                 observeText(text, false);
+                recordDecode(started, text.length);
             }).catch(function () {});
         } else if (data instanceof ArrayBuffer) {
             try {
-                observeText(new TextDecoder('utf-8').decode(data), false);
+                var decoded = new TextDecoder('utf-8').decode(data);
+                observeText(decoded, false);
+                recordDecode(startedAt, data.byteLength);
             } catch (e) {
                 // ignore
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 2b. main-thread cost instrumentation
+    //
+    // "A conversation takes forever to open" cannot be answered from the native
+    // side: the shell only sees the bridge callbacks it asked for. The numbers
+    // below separate the two candidate explanations — our own frame decoding
+    // hogging the page's thread, versus the page waiting on its own network/RPC —
+    // and they are reported into the same diagnostics log as everything else, so
+    // one exported file tells the whole story.
+    //
+    // One inbound frame costs `JSON.parse` plus the rpc-frame assembler (base64,
+    // crc32, chunk reassembly), all of it on the page's thread, so the whole
+    // observation is measured rather than just the parse. Long tasks are counted
+    // as well: if our frame bursts correlate with 300 ms main-thread stalls, the
+    // subscription itself is the problem.
+    // -----------------------------------------------------------------------
+
+    /** A long task is worth a line of its own above this; a few per window, max. */
+    var LONG_TASK_LOG_MS = 200;
+    var LONG_TASK_LOG_MAX = 5;
+
+    var perf = {
+        windowStartedAt: Date.now(),
+        windowFrames: 0,
+        windowChars: 0,
+        windowDecodeMs: 0,
+        windowLongTasks: 0,
+        windowLongTaskMs: 0,
+        decodedFrames: 0,
+        inboundChars: 0,
+        decodeMs: 0,
+        decodeMsMax: 0,
+        longTasks: 0,
+        longTaskMs: 0,
+        longTaskMaxMs: 0,
+        longTasksLogged: 0
+    };
+
+    function now() {
+        try {
+            return (G.performance && G.performance.now) ?
+                G.performance.now() : Date.now();
+        } catch (e) {
+            return Date.now();
+        }
+    }
+
+    /**
+     * A URL or name with its query string removed and its length bounded.
+     *
+     * The remote page's URLs carry `sid`/`hash`/`mid` in the query string, and
+     * these strings end up in a log file the user is asked to share. Only the
+     * path is ever useful for diagnostics, so only the path is kept.
+     */
+    function safePath(value) {
+        var text = String(value === undefined || value === null ? '' : value);
+        var cut = text.indexOf('?');
+        if (cut >= 0) {
+            text = text.substring(0, cut);
+        }
+        cut = text.indexOf('#');
+        if (cut >= 0) {
+            text = text.substring(0, cut);
+        }
+        return text.length > 80 ? text.substring(0, 77) + '...' : text;
+    }
+
+    function recordDecode(startedAt, chars) {
+        var cost = now() - startedAt;
+        perf.decodedFrames += 1;
+        perf.inboundChars += chars || 0;
+        perf.decodeMs += cost;
+        if (cost > perf.decodeMsMax) {
+            perf.decodeMsMax = cost;
+        }
+    }
+
+    function longTaskAttribution(entry) {
+        try {
+            var list = entry.attribution || [];
+            if (list.length && list[0]) {
+                var first = list[0];
+                var where = first.containerName ? ':' + safePath(first.containerName) : '';
+                return '[' + (first.containerType || '?') + where + ']';
+            }
+        } catch (e) {
+            // ignore
+        }
+        return '';
+    }
+
+    function installLongTaskObserver() {
+        try {
+            if (typeof G.PerformanceObserver !== 'function') {
+                return;
+            }
+            var observer = new G.PerformanceObserver(function (list) {
+                try {
+                    var entries = list.getEntries();
+                    for (var i = 0; i < entries.length; i++) {
+                        var duration = entries[i].duration || 0;
+                        perf.longTasks += 1;
+                        perf.longTaskMs += duration;
+                        if (duration > perf.longTaskMaxMs) {
+                            perf.longTaskMaxMs = duration;
+                        }
+                        if (duration >= LONG_TASK_LOG_MS &&
+                            perf.longTasksLogged < LONG_TASK_LOG_MAX) {
+                            perf.longTasksLogged += 1;
+                            diag('debug', '长任务 ' + Math.round(duration) + 'ms ' +
+                                longTaskAttribution(entries[i]));
+                        }
+                    }
+                } catch (e) {
+                    // instrumentation must never break the page
+                }
+            });
+            observer.observe({entryTypes: ['longtask']});
+        } catch (e) {
+            // Not supported here: the counters simply stay at zero.
+        }
+    }
+
+    /** Periodic one-liner, emitted only when there was traffic to report. */
+    function reportPerf() {
+        var frames = perf.decodedFrames - perf.windowFrames;
+        var longTasks = perf.longTasks - perf.windowLongTasks;
+        if (frames === 0 && longTasks === 0) {
+            return;
+        }
+        var elapsed = Date.now() - perf.windowStartedAt;
+        var chars = perf.inboundChars - perf.windowChars;
+        var decodeMs = perf.decodeMs - perf.windowDecodeMs;
+        var longTaskMs = perf.longTaskMs - perf.windowLongTaskMs;
+        diag('debug', '页面开销 ' + Math.round(elapsed / 1000) + 's：收帧 ' + frames +
+            ' 个（' + Math.round(chars / 1024) + 'K 字符，解码合计 ' +
+            Math.round(decodeMs) + 'ms，单帧最长 ' + Math.round(perf.decodeMsMax) + 'ms）· ' +
+            '长任务 ' + longTasks + ' 个（合计 ' + Math.round(longTaskMs) +
+            'ms，最长 ' + Math.round(perf.longTaskMaxMs) + 'ms）');
+        perf.windowStartedAt = Date.now();
+        perf.windowFrames = perf.decodedFrames;
+        perf.windowChars = perf.inboundChars;
+        perf.windowDecodeMs = perf.decodeMs;
+        perf.windowLongTasks = perf.longTasks;
+        perf.windowLongTaskMs = perf.longTaskMs;
+    }
+
+    /**
+     * Navigation timing for the page itself, once per load.
+     *
+     * `onPageFinished` on the native side measures the document, but not what it
+     * was waiting for: this adds TTFB, DOMContentLoaded, load and the slowest
+     * resource, which is what distinguishes "the network is slow" from "the relay
+     * is slow" from "the page's own JS is slow".
+     */
+    function reportLoadTiming() {
+        try {
+            var nav = null;
+            var resources = [];
+            if (G.performance && typeof G.performance.getEntriesByType === 'function') {
+                var navs = G.performance.getEntriesByType('navigation');
+                nav = navs && navs[0] ? navs[0] : null;
+                resources = G.performance.getEntriesByType('resource') || [];
+            }
+            var parts = [];
+            if (nav) {
+                parts.push('ttfb=' + Math.round(nav.responseStart));
+                parts.push('DOMContentLoaded=' + Math.round(nav.domContentLoadedEventEnd));
+                parts.push('load=' + Math.round(nav.loadEventEnd));
+            }
+            var transferred = 0;
+            var slowest = null;
+            for (var i = 0; i < resources.length; i++) {
+                transferred += resources[i].transferSize || 0;
+                if (!slowest || resources[i].duration > slowest.duration) {
+                    slowest = resources[i];
+                }
+            }
+            parts.push('资源 ' + resources.length + ' 个 / ' +
+                Math.round(transferred / 1024) + 'KB');
+            if (slowest) {
+                parts.push('最慢 ' + safePath(slowest.name) + ' ' +
+                    Math.round(slowest.duration) + 'ms');
+            }
+            diag('info', '页面加载计时：' + parts.join(' · '));
+        } catch (e) {
+            // instrumentation must never break the page
         }
     }
 
@@ -293,18 +489,58 @@
         startScheduled = false;
     }
 
+    // -----------------------------------------------------------------------
+    // 3b. when to open our own bridges
+    //
+    // Not the moment pairing completes. The page is usually still loading its
+    // first conversation then, and one bridge costs four RPCs per workspace
+    // (hello, initialize, subscribe, listen) on the *same* relay socket: on
+    // device, seven workspaces took ~10 s of solid handshaking, all of it queued
+    // in front of whatever the user was opening. So the subscription waits for
+    // the page's own traffic to go quiet, with a hard cap so a busy page can
+    // never postpone notifications indefinitely.
+    // -----------------------------------------------------------------------
+
+    /** First opportunity to start (the previous fixed delay). */
+    var ACTIVE_START_DELAY_MS = 1500;
+    /** Our bridges only start once the socket has been quiet this long. */
+    var ACTIVE_START_QUIET_MS = 800;
+    /** Re-check interval while the page is still busy. */
+    var ACTIVE_START_RETRY_MS = 1000;
+    /** Upper bound on the deferral, however busy the page is. */
+    var ACTIVE_START_MAX_DEFER_MS = 12000;
+
     function maybeStartActive() {
         if (!relayPaired || startScheduled || !client) {
             return;
         }
         startScheduled = true;
-        setTimeout(function () {
-            startScheduled = false;
+        var deadline = Date.now() + ACTIVE_START_MAX_DEFER_MS;
+        var deferredLogs = 0;
+
+        var attempt = function () {
             if (!relayPaired || !client || !client.subscribeAll) {
+                startScheduled = false;
                 return;
             }
+            var quietFor = liveness.lastInboundAt ?
+                Date.now() - liveness.lastInboundAt : Number.MAX_VALUE;
+            if (Date.now() < deadline && quietFor < ACTIVE_START_QUIET_MS) {
+                if (deferredLogs < 3) {
+                    deferredLogs += 1;
+                    diag('debug', '页面仍在收帧（最后一次 ' + Math.round(quietFor) +
+                        'ms 前），推迟主动订阅');
+                }
+                setTimeout(attempt, ACTIVE_START_RETRY_MS);
+                return;
+            }
+            startScheduled = false;
+            diag('debug', 'active subscribe start（页面已空闲 ' +
+                (quietFor === Number.MAX_VALUE ? '∞' : Math.round(quietFor)) + 'ms）');
             client.start().catch(function () {});
-        }, 1500);
+        };
+
+        setTimeout(attempt, ACTIVE_START_DELAY_MS);
     }
 
     /** Sends a business payload on the socket the page has open. */
@@ -449,6 +685,7 @@
     function startHeartbeat() {
         setInterval(function () {
             reportLiveness();
+            reportPerf();
             if (!relayPaired || !deviceSid) {
                 return;
             }
@@ -686,6 +923,7 @@
         diag('error', 'WebSocket hook 失败: ' + e);
     }
     startHeartbeat();
+    installLongTaskObserver();
     post('ready', {href: location.href, subscribeAll: config().subscribeAll !== false});
     reportLiveness();
     // After the first layout pass, and again whenever the viewport changes.
@@ -693,4 +931,13 @@
     window.addEventListener('resize', function () {
         setTimeout(reportViewport, 300);
     });
+    // Navigation timing has to wait for the load event (and a moment after it,
+    // so the loadEventEnd of late resources is populated).
+    if (document.readyState === 'complete') {
+        setTimeout(reportLoadTiming, 1000);
+    } else {
+        window.addEventListener('load', function () {
+            setTimeout(reportLoadTiming, 1000);
+        });
+    }
 })();

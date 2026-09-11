@@ -64,8 +64,22 @@ object Diagnostics {
      * Strips anything that looks like a credential-bearing query string.
      * The remote URL carries `sid`/`hash`/`mid`; those must never be persisted
      * into logs or shown on screen.
+     *
+     * Two passes, because the sources differ: the shell's own messages name the
+     * page as `/remote/v4?...`, while anything the page logs (its console is
+     * forwarded here too) can contain an absolute URL to any of its endpoints.
+     * A query string on *any* http(s) URL is therefore dropped as well — the
+     * cost of losing a few diagnostic parameters is lower than the cost of a
+     * credential landing in a file the user is asked to share.
      */
     fun redact(message: String): String {
+        val absolute = URL_WITH_QUERY.replace(message) { match ->
+            match.value.substringBefore('?') + "?<redacted>"
+        }
+        return redactRemoteQuery(absolute)
+    }
+
+    private fun redactRemoteQuery(message: String): String {
         val remote = message.indexOf("/remote")
         if (remote < 0) return message
         val query = message.indexOf('?', remote)
@@ -80,4 +94,7 @@ object Diagnostics {
         }
         return message.substring(0, query) + "?<redacted>" + message.substring(end)
     }
+
+    /** An absolute http(s) URL up to the end of its query string. */
+    private val URL_WITH_QUERY = Regex("""https?://[^\s"'<>?]*\?[^\s"'<>]*""")
 }
