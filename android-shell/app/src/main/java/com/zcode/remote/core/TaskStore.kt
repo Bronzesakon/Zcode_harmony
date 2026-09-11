@@ -39,6 +39,17 @@ class TaskStore {
          * whole body of the card).
          */
         val title: String get() = NotifyState.formatTitle(status.label, task.displayTitle)
+
+        /**
+         * The task name as the *page* spells it, for the notification-tap locator.
+         *
+         * Kept separate from [title] on purpose, and it is the reason this property
+         * exists at all: the locator matches on text found in the page, and the page
+         * never renders our 状态 prefix. Handing it [title] made "tap the
+         * notification to jump to the task" fail silently — found on the device on
+         * 2026-09-12, not by any test.
+         */
+        val locateTitle: String get() = task.displayTitle
     }
 
     /** Everything that changed because of one update. */

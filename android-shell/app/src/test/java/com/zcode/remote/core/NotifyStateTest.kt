@@ -330,6 +330,31 @@ class NotifyStateTest {
     }
 
     @Test
+    fun `the decorated title is never what the locator searches the page for`() {
+        // Regression guard for a real one: the notification-tap locator matches
+        // its title against text in the page, and the page never renders our
+        // 状态 prefix. Handing it `title` broke "tap to jump to the task" on the
+        // device (2026-09-12) with no test failing.
+        val store = TaskStore()
+        val update = store.applyWorkspace(
+            key = "/repo/x", title = "仓库", path = "/repo/x", identity = "ws", source = "active",
+            tasks = listOf(task("a", "running", title = "重构登录页", preview = "在改 CSS")),
+        )
+        val running = update.running[0]
+        assertEquals("运行中 · 重构登录页", running.title)
+        assertEquals("重构登录页", running.locateTitle)
+        assertNotEquals(running.title, running.locateTitle)
+        // And the raw name must survive verbatim, newlines included, since the
+        // page's own text is what it will be compared against.
+        val multiline = store.applyWorkspace(
+            key = "/repo/y", title = "仓库", path = "/repo/y", identity = "ws", source = "active",
+            tasks = listOf(task("b", "running", title = "第一行\n第二行")),
+        ).running[0]
+        assertEquals("第一行\n第二行", multiline.locateTitle)
+        assertEquals("运行中 · 第一行 第二行", multiline.title)
+    }
+
+    @Test
     fun `the store unions running tasks across workspaces`() {
         val store = TaskStore()
         store.applyWorkspace("ws-1", "一", "/a", "ws-1", "active", listOf(task("a", "running")))

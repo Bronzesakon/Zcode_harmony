@@ -201,7 +201,13 @@ class Notifier(private val context: Context) {
             val intent = Intent(context, MainActivity::class.java).apply {
                 action = MainActivity.ACTION_LOCATE_TASK
                 putExtra(MainActivity.EXTRA_SESSION_ID, item.task.sessionId)
-                putExtra(MainActivity.EXTRA_TASK_TITLE, item.title)
+                // `locateTitle`, NOT `item.title`: the latter now carries the
+                // 状态 prefix for display, and the locator matches this string
+                // against text in the page — which never contains the prefix.
+                // Shipping the decorated title here silently broke "tap the
+                // notification to jump to the task" (caught on device
+                // 2026-09-12: `未能在页面上定位任务: 运行中 · …`).
+                putExtra(MainActivity.EXTRA_TASK_TITLE, item.locateTitle)
                 putExtra(MainActivity.EXTRA_WORKSPACE_KEY, item.workspaceKey)
             }
             val pending = PendingIntent.getActivity(
