@@ -246,6 +246,7 @@ function setupPage(options) {
         delete globalThis.__zcodeShellLocateTask;
         delete globalThis.__zcodeShellSetAppForeground;
         delete globalThis.__zcodeShellSetSubscribeAll;
+        delete globalThis.__zcodeShellHeartbeat;
     };
 
     return {document, window, posts, protocol, configValue, teardown};
@@ -597,6 +598,48 @@ test('liveness reporting is safe before any socket exists', () => {
         assert.strictEqual(last.socketState, -1);
         assert.strictEqual(last.lastInboundAgoMs, -1);
         assert.strictEqual(last.paired, false);
+    } finally {
+        page.teardown();
+    }
+});
+
+// The foreground service drives this while the app is backgrounded, because the
+// page's own setInterval is suspended there (measured on device: zero ticks in
+// 10+ minute background windows). Two drivers now exist, so the gap guard — not
+// the interval — is what keeps the heartbeat from being doubled.
+test('the native pump can drive a heartbeat, and the tick is rate limited', async () => {
+    const page = setupPage();
+    try {
+        const socket = new globalThis.WebSocket('wss://relay.example');
+        socket.dispatchEvent({type: 'open'});
+        socket.send(JSON.stringify({type: 'auth_init', role: 'terminal', device_sid: 'sid-1'}));
+        socket.receive({type: 'pair_status_ack', pair_status: 'matched'});
+        await wait(1700);
+
+        assert.strictEqual(
+            typeof globalThis.__zcodeShellHeartbeat, 'function',
+            'the native pump needs an entry point inside the page'
+        );
+
+        const before = socket.sent.length;
+        assert.strictEqual(globalThis.__zcodeShellHeartbeat(), true, 'the first pumped tick must be accepted');
+        const queries = socket.sent.slice(before)
+            .map((raw) => {
+                try {
+                    return JSON.parse(raw);
+                } catch (e) {
+                    return null;
+                }
+            })
+            .filter((frame) => frame && frame.payload && frame.payload.type === 'pair_status_query');
+        assert.strictEqual(queries.length, 1, 'a pumped tick must put exactly one pair_status_query on the wire');
+        assert.strictEqual(globalThis.__zcodeShellHeartbeat(), false, 'a tick inside the gap must be dropped');
+
+        globalThis.__zcodeShellReportLiveness();
+        await flush();
+        const last = findPost(page.posts, 'liveness').pop().data;
+        assert.strictEqual(last.heartbeatTicks, 1, 'the survival verdict reads this counter');
+        assert.strictEqual(last.nativeTicks, 1, 'pumped ticks must be distinguishable from timer ticks');
     } finally {
         page.teardown();
     }

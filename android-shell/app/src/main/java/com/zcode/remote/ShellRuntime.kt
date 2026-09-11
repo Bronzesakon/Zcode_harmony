@@ -69,6 +69,14 @@ object ShellRuntime {
         val pairAcks: Int,
         val socketsOpened: Int,
         val socketsClosed: Int,
+        /**
+         * Heartbeat ticks the page executed, and how many of them the native
+         * pump drove. This pair is what decides whether the pump worked: a
+         * background window that shows dispatches from here but no growth in
+         * [heartbeatTicks] means the renderer defers evaluateJavascript too.
+         */
+        val heartbeatTicks: Int,
+        val nativeTicks: Int,
         /** Uptime timestamp of the most recent inbound frame (0 = none yet). */
         val lastInboundAtElapsed: Long,
         val paired: Boolean,
@@ -81,6 +89,7 @@ object ShellRuntime {
     private var backgroundStartedAt = 0L
     private var backgroundFrameBase = 0
     private var backgroundAckBase = 0
+    private var backgroundTickBase = 0
 
     /** Set on return to foreground; the next liveness report resolves it. */
     @Volatile
@@ -103,6 +112,8 @@ object ShellRuntime {
             pairAcks = data.optInt("pairAcks"),
             socketsOpened = data.optInt("socketsOpened"),
             socketsClosed = data.optInt("socketsClosed"),
+            heartbeatTicks = data.optInt("heartbeatTicks"),
+            nativeTicks = data.optInt("nativeTicks"),
             lastInboundAtElapsed = if (ago >= 0) receivedAt - ago else 0,
             paired = data.optBoolean("paired"),
             socketState = data.optInt("socketState", -1),
@@ -114,14 +125,21 @@ object ShellRuntime {
             val current = liveness ?: return
             val frames = current.inboundFrames - backgroundFrameBase
             val acks = current.pairAcks - backgroundAckBase
+            val ticks = current.heartbeatTicks - backgroundTickBase
+            // The decisive question is NOT "did frames arrive" — they can arrive
+            // without a single timer running — but "did a heartbeat tick run at
+            // all". Measured on device: the WebView suspends the page's timer
+            // queue while the app is backgrounded, so before the native pump this
+            // number was always zero even on a link that was still delivering.
             val verdict = when {
-                acks > 0 -> "保活成立（链路有应答）"
-                frames > 0 -> "有数据但无配对确认，心跳可能被节流"
+                ticks > 0 -> "保活成立（后台心跳在跑）"
+                frames > 0 -> "心跳未跑（后台定时器仍被挂起），链接可能已断"
                 else -> "后台期间未收到任何帧，连接很可能已断"
             }
             val duration = formatDuration(backgroundEndedAt - backgroundStartedForVerdict)
             Diagnostics.info(
-                "后台存活检查：时长 $duration，期间收到 $frames 帧、" +
+                "后台存活检查：时长 $duration，期间心跳 $ticks 次" +
+                    "（原生泵 $pumpDispatchesForVerdict 次）、收到 $frames 帧、" +
                     "配对确认 $acks 次 → $verdict"
             )
         }
@@ -134,9 +152,15 @@ object ShellRuntime {
      * Records the background window and, on return, writes the milestone-4
      * verdict to the log. This is the line to read after leaving the app in the
      * background for 30 minutes.
+     *
+     * Also the switch for the heartbeat pump: the injected layer's own timer
+     * cannot run while the app is backgrounded, so the heartbeat is driven from
+     * here for exactly as long as the app is away.
      */
     fun onAppForegroundChanged(foreground: Boolean) {
+        appIsForeground = foreground
         if (foreground) {
+            stopHeartbeatPump()
             val startedAt = backgroundStartedAt
             val endedAt = SystemClock.elapsedRealtime()
             backgroundStartedAt = 0L
@@ -144,16 +168,81 @@ object ShellRuntime {
             if (endedAt - startedAt < VERDICT_MIN_BACKGROUND_MS) return
             backgroundStartedForVerdict = startedAt
             backgroundEndedAt = endedAt
+            pumpDispatchesForVerdict = pumpDispatches
             // Resolved by the first fresh liveness report, so the numbers are
             // measured after the renderer resumed rather than cached before it
             // froze.
             verdictPending = true
             requestLivenessReport()
         } else {
+            startHeartbeatPump()
             backgroundStartedAt = SystemClock.elapsedRealtime()
             val snapshot = liveness
             backgroundFrameBase = snapshot?.inboundFrames ?: 0
             backgroundAckBase = snapshot?.pairAcks ?: 0
+            backgroundTickBase = snapshot?.heartbeatTicks ?: 0
+        }
+    }
+
+    // ------------------------------------------------------------ heartbeat pump
+    //
+    // Measured on device (2026-09-11, WebView 153 / ColorOS 16): while the app
+    // is backgrounded the WebView suspends the page's timer queue outright — the
+    // injected layer's 10s heartbeat executed zero times across 10+ minute
+    // background windows. The desktop then stops seeing us, and both the page's
+    // ack watchdog and our own staleness branch declare the link dead the moment
+    // the renderer wakes up, which is the reconnect the user sees on return.
+    //
+    // An evaluateJavascript round trip is a message task, not a timer task, so
+    // driving the very same tick from here gets it running again. The interval
+    // is comfortably inside the page's own 30s ack timeout, and the injected
+    // side drops ticks that arrive closer than 5s apart, so the two drivers
+    // cannot double the traffic.
+
+    /** How often the pump drives one heartbeat tick. */
+    private const val PUMP_INTERVAL_MS = 15_000L
+
+    /** Every Nth dispatch is logged; the first one always is. */
+    private const val PUMP_LOG_EVERY = 10
+
+    @Volatile
+    private var appIsForeground = true
+
+    private var pumpDispatches = 0
+    private var pumpDispatchesForVerdict = 0
+
+    private val pumpRunnable = object : Runnable {
+        override fun run() {
+            if (!appIsForeground) {
+                if (jsEvaluator != null) {
+                    pumpDispatches += 1
+                    evaluateJs("window.__zcodeShellHeartbeat && window.__zcodeShellHeartbeat();")
+                    if (pumpDispatches == 1 || pumpDispatches % PUMP_LOG_EVERY == 0) {
+                        Diagnostics.log(
+                            "debug",
+                            "注入心跳泵 #$pumpDispatches（网页定时器在后台被挂起，改由原生驱动）",
+                        )
+                    }
+                }
+                mainHandler.postDelayed(this, PUMP_INTERVAL_MS)
+            }
+        }
+    }
+
+    private fun startHeartbeatPump() {
+        mainHandler.removeCallbacks(pumpRunnable)
+        pumpDispatches = 0
+        mainHandler.postDelayed(pumpRunnable, PUMP_INTERVAL_MS)
+        Diagnostics.log(
+            "debug",
+            "后台心跳泵已启动（每 ${PUMP_INTERVAL_MS / 1000}s 驱动一次注入层心跳）",
+        )
+    }
+
+    private fun stopHeartbeatPump() {
+        mainHandler.removeCallbacks(pumpRunnable)
+        if (pumpDispatches > 0) {
+            Diagnostics.log("debug", "后台心跳泵已停止，本次共发出 $pumpDispatches 次")
         }
     }
 
