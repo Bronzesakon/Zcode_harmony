@@ -79,6 +79,11 @@
     // also means "the handshake burst always waits out its cap" — and grow the
     // pending map without bound.
     var PAGE_RPC_PENDING_MAX = 200;
+    // A pending call older than this is reported once as "无回包"（桌面端从未
+    // 回答）——「迟迟不出内容」在日志里唯一的形状：完成/失败都有行，沉默没有。
+    // 上限 30s：桌面端 burst 高峰的单调用时延实测可到 10-20s（docs/05 审计），
+    // 阈值低于它会误报。报告后从 pending 摘除，不占用下一窗口。
+    var PAGE_RPC_SILENCE_MS = 30000;
 
     // How many times one workspace may fault and be reopened within a single
     // relay connection before we stop trying (see _handleDegraded).
@@ -994,6 +999,9 @@
      *   onPageRpcResult(r)   {name, ok, cost, message} — every completed page
      *                        promise call. The upload chain's completion/failure
      *                        evidence (inject.js logs upload-named calls).
+     *   onPageRpcSilence(r)  {name, ageMs} — a page call that never got ANY
+     *                        answer within PAGE_RPC_SILENCE_MS; the only log
+     *                        shape "the desktop never replied" can take.
      */
     function RemoteClient(options) {
         this._send = options.send;
@@ -1006,6 +1014,11 @@
         this.onStatus = null;
         this.onPageRpcCall = null;
         this.onPageRpcResult = null;
+        this.onPageRpcSilence = null;
+        // 页面日志汇（window.zcode.log）接通后，页面自己的 warn 已覆盖大多数
+        // 调用失败；镜像行降为冗余，由 inject.js 置 true 关掉（窗口汇总与
+        // 沉默线不受影响——它们没有重复来源）。
+        this.suppressPageRpcMirror = false;
 
         this._pending = {};
         // Two indexes on purpose: workspaces are addressed by key (for
@@ -1887,16 +1900,20 @@
             } catch (e) {
                 message = '';
             }
-            this._log('页面调用失败 ' + cost + 'ms：' + call.name +
-                (message ? ' · ' + String(message).substring(0, 160) : ''));
+            if (!this.suppressPageRpcMirror) {
+                this._log('页面调用失败 ' + cost + 'ms：' + call.name +
+                    (message ? ' · ' + String(message).substring(0, 160) : ''));
+            }
         } else if (cost >= this._pageRpcSlowMs) {
             this._pageRpc.slow += 1;
             this._pageRpc.windowSlow += 1;
             if (this._pageRpc.slowLogged < PAGE_RPC_SLOW_LOG_MAX) {
                 this._pageRpc.slowLogged += 1;
-                this._log('页面调用慢 ' + cost + 'ms：' + call.name +
-                    (this._pageRpc.slowLogged === PAGE_RPC_SLOW_LOG_MAX ?
-                        '（后续慢调用只计入窗口汇总）' : ''));
+                if (!this.suppressPageRpcMirror) {
+                    this._log('页面调用慢 ' + cost + 'ms：' + call.name +
+                        (this._pageRpc.slowLogged === PAGE_RPC_SLOW_LOG_MAX ?
+                            '（后续慢调用只计入窗口汇总）' : ''));
+                }
             }
         }
         if (typeof this.onPageRpcResult === 'function') {
@@ -1911,6 +1928,22 @@
     /** 每个心跳窗口一条有上限的汇总；这一窗口没有任何页面调用时保持安静。 */
     RemoteClient.prototype.reportPageRpcWindow = function () {
         var rpc = this._pageRpc;
+        // 沉默检测放在汇总早退之前：一个"只有沉默"的窗口 windowCalls 是 0，
+        // 但 pending 里的陈年调用正是要在这种窗口里被点名。报告后即摘除，
+        // 同一次沉默只说一遍。
+        var nowMs = Date.now();
+        for (var slot in rpc.pending) {
+            var p = rpc.pending[slot];
+            var age = nowMs - p.at;
+            if (age >= PAGE_RPC_SILENCE_MS) {
+                if (typeof this.onPageRpcSilence === 'function') {
+                    try {
+                        this.onPageRpcSilence({name: p.name, ageMs: age});
+                    } catch (e) {}
+                }
+                delete rpc.pending[slot];
+            }
+        }
         if (rpc.windowCalls === 0 && rpc.windowErrors === 0 && rpc.windowSlow === 0) {
             return;
         }

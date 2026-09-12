@@ -415,6 +415,32 @@ object ShellRuntime {
                     val data = root.optJSONObject("data") ?: return
                     Diagnostics.log(data.optString("level", "info"), data.optString("message", ""))
                 }
+                "pagelog" -> {
+                    // The page's own log sink (window.zcode.log). In the
+                    // production build this is the ONLY outlet the page's
+                    // lifecycle events have — console is short-circuited — so
+                    // before this sink existed the page's account of "I broke /
+                    // I'm retrying" was silently dropped (docs/05 audit).
+                    val data = root.optJSONObject("data") ?: return
+                    val args = data.optJSONArray("args")
+                    val parts = ArrayList<String>(args?.length() ?: 0)
+                    for (i in 0 until (args?.length() ?: 0)) {
+                        val part = args!!.optString(i)
+                        if (part.isNotEmpty()) parts.add(part)
+                    }
+                    Diagnostics.log(
+                        data.optString("level", "info"),
+                        "页面: " + parts.joinToString(" ").take(600),
+                    )
+                }
+                "pagevitals" -> {
+                    // DOM 体征快照（卡死看门狗布防/撤防/放弃时的现场）。
+                    val data = root.optJSONObject("data") ?: return
+                    Diagnostics.log(
+                        "debug",
+                        "页面体征(${data.optString("why")}): ${data.optJSONObject("vitals")}",
+                    )
+                }
                 "pagestate" -> {
                     // Which visual state the page is in, and which theme it
                     // resolved for itself. Names only — the colour table lives in

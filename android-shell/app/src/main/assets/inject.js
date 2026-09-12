@@ -15,10 +15,14 @@
  *   7. Stand in for the page's scrollbar: zero its space-taking rail and draw an
  *      overlay bar, so the page's content is centred and the position indicator
  *      survives (Android WebView will not render overlay scrollbars itself).
- *   8. Recover a task left on the fallback title (新建任务): confirm the
- *      fallback 2 s after the task was opened and, if it is still there at
- *      25 s, reload the page once — the user's own refresh, with guards so a
- *      draft or a brand-new task is never touched.
+ *   8. Stall watchdog for the conversation view: on entry beacons, page-log
+ *      failure events and a heartbeat patrol, a 3s decision ladder runs —
+ *      nudge first (close the shared relay socket so the page runs its own
+ *      reconnect/resubscribe ladder), reload only if still stuck, and give up
+ *      after 2 consecutive reloads until a recovery signal lands.
+ *   9. Sink the page's own logs: the production page reports every lifecycle
+ *      event (subscribe/store/recovery) solely to `window.zcode?.log`, which
+ *      nobody provided — here it becomes native log lines ("页面: …").
  *
  * Installed via WebViewCompat.addDocumentStartJavaScript, i.e. BEFORE any page
  * script runs. That timing is mandatory: the page opens its WebSocket during
@@ -75,6 +79,111 @@
     function diag(level, message) {
         post('diag', {level: level, message: message});
     }
+
+    // -----------------------------------------------------------------------
+    // 0. page log sink（window.zcode.log）
+    //
+    // 生产构建里，页面自己的日志出口只有一个：logger chunk 把 J.info/warn/error
+    // 与 J.lifecycle.* 全部（且仅）投给 `window.zcode?.log?.(level, args)`，
+    // console 在 PROD 被短路；而 WebView 里 window.zcode 原本不存在，所以页面
+    // 对「我断了 / 我在重试」的全部自述一直在静默丢弃（docs/05 审计，2026-09-12）。
+    // 这里供给一个最小 sink：把 (level, args) 原样转成 pagelog 消息交给原生日志。
+    // 快照审计证实全 bundle 对 window.zcode 只有这一处可选调用，定义 {log} 无
+    // 副作用；已存在时绝不覆盖。debug 级页面本来就不外发，无需过滤。
+    // -----------------------------------------------------------------------
+    var pagelogSeen = false;
+    var pagelogWindowCount = 0;
+    var PAGE_LOG_WINDOW_MAX = 60;
+
+    function describeLogArg(value) {
+        if (value === null || value === undefined) {
+            return String(value);
+        }
+        var type = typeof value;
+        if (type === 'string') {
+            return value.length > 400 ? value.substring(0, 400) + '…' : value;
+        }
+        if (type === 'number' || type === 'boolean') {
+            return String(value);
+        }
+        try {
+            var seen = [];
+            var text = JSON.stringify(value, function (key, val) {
+                if (val && typeof val === 'object') {
+                    if (seen.indexOf(val) >= 0) {
+                        return '[circular]';
+                    }
+                    seen.push(val);
+                    if (seen.length > 8) {
+                        return '[deep]';
+                    }
+                }
+                return val;
+            });
+            if (typeof text === 'string') {
+                return text.length > 400 ? text.substring(0, 400) + '…' : text;
+            }
+        } catch (e) {
+            // fall through to String()
+        }
+        return String(value);
+    }
+
+    /** 页面日志里的机器可读事件名（args 里带 {event: …} 的那一项）。 */
+    function pageLogEventName(args) {
+        if (!args || typeof args.length !== 'number') {
+            return null;
+        }
+        for (var i = 0; i < args.length; i += 1) {
+            var a = args[i];
+            if (a && typeof a === 'object' && typeof a.event === 'string') {
+                return a.event;
+            }
+        }
+        return null;
+    }
+
+    function installPageLogSink() {
+        try {
+            if (G.zcode && typeof G.zcode.log === 'function') {
+                return;
+            }
+            if (!G.zcode || typeof G.zcode !== 'object') {
+                G.zcode = {};
+            }
+            G.zcode.log = function (level, args) {
+                try {
+                    pagelogWindowCount += 1;
+                    if (pagelogWindowCount > PAGE_LOG_WINDOW_MAX) {
+                        return; // 洪峰保护：计数每个心跳窗口清零（heartbeatTick）
+                    }
+                    if (!pagelogSeen) {
+                        pagelogSeen = true;
+                        if (client) {
+                            client.suppressPageRpcMirror = true;
+                        }
+                        diag('info', '页面日志汇已接通（window.zcode.log）');
+                    }
+                    var list = [];
+                    if (args && typeof args.length === 'number') {
+                        for (var i = 0; i < args.length && i < 6; i += 1) {
+                            list.push(describeLogArg(args[i]));
+                        }
+                    }
+                    var event = pageLogEventName(args);
+                    if (event) {
+                        notePageLogEvent(event);
+                    }
+                    post('pagelog', {level: String(level || 'info'), args: list});
+                } catch (e) {
+                    // 日志汇绝不能反过来打断页面
+                }
+            };
+        } catch (e) {
+            diag('warn', '页面日志汇安装失败: ' + e);
+        }
+    }
+    installPageLogSink();
 
     if (!P) {
         diag('error', 'zcode-protocol.js 未加载，注入层无法工作');
@@ -162,6 +271,10 @@
     var sockets = [];
     var activeSocket = null;
     var deviceSid = null;
+    // KICK 实验素材（Tier2 可行性验证用）：页面建线用的 URL 与 auth_init 帧
+    // 原文。两者都是会话凭证级内容，只留内存、绝不进日志（safePath 只留路径）。
+    var lastRelayUrl = null;
+    var lastAuthInitText = null;
 
     function installWebSocketHook() {
         if (typeof NativeWebSocket !== 'function') {
@@ -275,6 +388,9 @@
     function trackSocket(socket, url) {
         if (socketKnown(socket)) {
             return;
+        }
+        if (url) {
+            lastRelayUrl = url;
         }
         if (knownSockets) {
             knownSockets.add(socket);
@@ -618,6 +734,11 @@
                 // the upload trace must never break the page's traffic
             }
         };
+        next.onPageRpcSilence = function (info) {
+            diag('warn', '页面调用无回包 ' + Math.round((info.ageMs || 0) / 1000) +
+                's：' + info.name + '（桌面端从未回答）');
+        };
+        next.suppressPageRpcMirror = pagelogSeen;
         next.onStatus = function (status) {
             post('status', status);
             if (!status.active && next.subscribeAll && startAttempts < 3) {
@@ -782,6 +903,7 @@
         if (frame.type === 'auth_init' && typeof frame.device_sid === 'string') {
             // Learned, never logged: it is a session credential.
             deviceSid = frame.device_sid;
+            lastAuthInitText = text;
             return;
         }
         if (frame.type === 'auth_ack' || frame.type === 'pair_status_ack') {
@@ -879,6 +1001,7 @@
     var staleTicks = 0;
     var appForeground = true;
     var backgroundStartedWallMs = 0;
+    var lastBackgroundSilenceLoggedAt = 0;
 
     /**
      * Liveness counters.
@@ -947,11 +1070,33 @@
             return false;
         }
         lastTickAt = nowMs;
+        pagelogWindowCount = 0;
         if (!appForeground) {
             liveness.backgroundTicks += 1;
             if (liveness.backgroundFirstTickDelayMs < 0 && backgroundStartedWallMs > 0) {
                 liveness.backgroundFirstTickDelayMs = nowMs - backgroundStartedWallMs;
             }
+            // Tier1 后台连续性取证：泵在跳但入站帧停了，说明 renderer 被冻结或
+            // 链路半死——这是"后台实况窗断掉/滞后"最可能的形状，留证据行。
+            if (liveness.lastInboundAt && nowMs - liveness.lastInboundAt > 60000 &&
+                nowMs - lastBackgroundSilenceLoggedAt > 60000) {
+                lastBackgroundSilenceLoggedAt = nowMs;
+                diag('warn', '后台链路静默 ' +
+                    Math.round((nowMs - liveness.lastInboundAt) / 1000) +
+                    's（泵仍在跳，入站帧停了）');
+            }
+        }
+        // 卡死看门狗的心跳巡检：覆盖没有进对话信标的卡死（如后台挂起回来、
+        // 恢复期页面自己没再发 subscribe）。也顺带在恢复时撤防。
+        try {
+            var vit = readVitals();
+            if (vitalsStalled(vit)) {
+                stallArm('心跳巡检: 正文未就绪');
+            } else if (vit && (stallState.armed || stallState.gaveUp)) {
+                stallCancel('心跳巡检: 界面已恢复');
+            }
+        } catch (e) {
+            // 巡检失败不影响心跳本身
         }
         reportLiveness();
         reportPerf();
@@ -1336,28 +1481,14 @@
         var headerBad = header !== '';
         var composerBad = !!(composer && elementDisabled(composer));
         if (!headerBad && !composerBad) {
-            diag('debug', '3s 检查：标题与输入框均就绪，不刷新');
+            // 全就绪本身是恢复信号：撤防 + 复位连续刷新计数。
+            diag('debug', '3s 检查：标题与输入框均就绪');
+            stallCancel('3s 检查：标题与输入框均就绪');
             return;
         }
-        var stamp = parseInt(storeGet(FALLBACK_STORE_AT), 10);
-        var last = Math.max(fallbackState.lastReloadAt, isNaN(stamp) ? 0 : stamp);
-        var wait = last + FALLBACK_RELOAD_GAP_MS - Date.now();
-        if (wait > 0) {
-            // 间隔内：顺延到间隔到期再查一次（保循环可终止），不是丢弃。
-            diag('debug', '3s 检查命中（' + (headerBad ? '标题回退' : '输入框未就绪') +
-                '），处于刷新间隔内，' + Math.round(wait / 1000) + 's 后复查');
-            fallbackTimer = setTimeout(fallbackCheck, wait);
-            return;
-        }
-        fallbackState.lastReloadAt = Date.now();
-        storeSet(FALLBACK_STORE_AT, String(fallbackState.lastReloadAt));
-        diag('warn', '进对话 3s 未就绪（' + (headerBad ? '标题回退' : '输入框未就绪') +
-            '），刷新页面');
-        try {
-            G.location.reload();
-        } catch (e) {
-            diag('warn', '自动刷新失败: ' + e);
-        }
+        // 坏态交给卡死看门狗分级处置（先轻推、后刷新，见 5c 节），
+        // 这里不再直接 reload。
+        stallArm('3s DOM 检查: ' + (headerBad ? '标题回退' : '输入框未就绪'));
     }
 
     /**
@@ -1380,26 +1511,11 @@
         }
         var trafficAt = clientNow.lastPageBridgeTrafficAt();
         if (trafficAt >= fallbackState.beaconAt) {
-            diag('debug', '10s 内容检查：页面桥有下发（内容已在路上），不刷新');
+            diag('debug', '10s 内容检查：页面桥有下发（内容已在路上）');
+            stallCancel('10s 内容检查：页面桥有下发（内容已在路上）');
             return;
         }
-        var stamp = parseInt(storeGet(FALLBACK_STORE_AT), 10);
-        var last = Math.max(fallbackState.lastReloadAt, isNaN(stamp) ? 0 : stamp);
-        var wait = last + FALLBACK_RELOAD_GAP_MS - Date.now();
-        if (wait > 0) {
-            diag('debug', '10s 内容检查命中（页面桥零下发），处于刷新间隔内，' +
-                Math.round(wait / 1000) + 's 后复查');
-            contentTimer = setTimeout(fallbackContentCheck, wait);
-            return;
-        }
-        fallbackState.lastReloadAt = Date.now();
-        storeSet(FALLBACK_STORE_AT, String(fallbackState.lastReloadAt));
-        diag('warn', '进对话 10s 内容零下发（标题与输入框正常但页面桥无任何入站帧），刷新页面');
-        try {
-            G.location.reload();
-        } catch (e) {
-            diag('warn', '自动刷新失败: ' + e);
-        }
+        stallArm('10s 内容检查: 页面桥零下发（标题与输入框正常但无任何入站帧）');
     }
 
     /** Upload-named page RPCs get explicit lines: that is the file-send chain. */
@@ -1442,8 +1558,359 @@
         },
         contentTimer: function () {
             return contentTimer;
+        },
+        arm: stallArm,
+        cancel: stallCancel,
+        vitals: readVitals,
+        fire: stallFire,
+        stall: function () {
+            return stallState;
         }
     };
+
+    // -----------------------------------------------------------------------
+    // 5c. 卡死看门狗（stall watchdog，2026-09-12 用户拍板的三级处置）
+    //
+    // 需求：卡死 3s 内必须有可见的恢复动作，动作从轻到重，刷新是最后一档。
+    //
+    //   phase 0（布防后 3s）→ 先看桌面端是否还在下发：在发就跳过干预（内容在
+    //     路上，掐 socket 只会更慢）；没在发就"轻推"——关闭共享 relay socket，
+    //     让页面走它自己的重连-重订阅梯子。可见性劫持（第 1 节）摘掉了页面的
+    //     pagehide/visibilitychange/freeze 监听，页面自己的 suspend→recover
+    //     快路在本壳里永远不可达，所以"借页面自身恢复"只剩 socket 这一条通路；
+    //     页面对 socket 重建有一整套设计好的恢复（重连→换代→重订阅），代价
+    //     约 2-5s，不丢 UI，快照审计（docs/05 @4700682/@2257650）证实。
+    //   phase 1（再 3s）→ 仍无内容才 reload。连续 2 次到顶放弃（sessionStorage
+    //     计数跨 reload 边界），恢复信号到达后自动复位；15s 刷新间隔保留。
+    //
+    // 撤防/复位信号：DOM 就绪（标题+输入框）、页面日志的订阅确认
+    // （v4.conversation.subscribe.acknowledged / store.connect.completed）、
+    // 心跳巡检恢复正常。错误横幅（chat-error-banner）出现即撤防——那是页面
+    // 在正常报错，刷新解决不了。
+    // -----------------------------------------------------------------------
+    var STALL_NUDGE_MS = 3000;
+    var STALL_RELOAD_MS = 3000;
+    var STALL_RELOAD_CAP = 2;
+    var STALL_STORE_RELOADS = 'zcodeShellStallReloads';
+    /** 布防的页面日志事件：仅梯子已耗尽的终态（retry_scheduled 是页面还在自救，不动）。 */
+    var PAGE_LOG_STALL_EVENTS = {
+        'v4.conversation.store.connect.failed': 1,
+        'v4.conversation.subscribe.failed': 1
+    };
+    var PAGE_LOG_RECOVER_EVENTS = {
+        'v4.conversation.store.connect.completed': 1,
+        'v4.conversation.subscribe.acknowledged': 1,
+        'v4.conversation.subscribe.activated': 1
+    };
+    var stallState = {
+        armed: false,
+        phase: 0,
+        timer: null,
+        since: 0,
+        deadline: 0,
+        armReason: '',
+        gaveUp: false,
+        lastReloadAt: 0,
+        // 连续刷新计数的内存权威；sessionStorage 是跨 reload 边界的镜像
+        // （storage 可能被拒，内存值仍保住单次加载内的上限语义）。
+        reloadCount: parseInt((function () {
+            try {
+                return G.sessionStorage ? G.sessionStorage.getItem(STALL_STORE_RELOADS) : null;
+            } catch (e) {
+                return null;
+            }
+        })(), 10) || 0
+    };
+
+    /**
+     * DOM 体征（场景三观察锚，快照 docs/05 第 4.6 节的标记全来自这里）。
+     * 只读属性，不碰布局；任何读取失败都归一成 null。
+     */
+    function readVitals() {
+        try {
+            var tl = document.querySelector('[data-v4-timeline-scroll]');
+            var composer = composerElement();
+            return {
+                chat: !!document.querySelector('[data-mobile-page="chat"]'),
+                timeline: !!tl,
+                rows: tl ? parseInt(tl.getAttribute('data-row-count') || '0', 10) || 0 : -1,
+                following: tl ? tl.getAttribute('data-following') : null,
+                loadingOlder: tl ? tl.getAttribute('data-loading-older') === 'true' : false,
+                loading: !!document.querySelector('[data-zcode-chat-loading-animate]'),
+                errorBanner: !!document.querySelector('[data-testid="chat-error-banner"]'),
+                liveTail: !!document.querySelector('[data-v4-running-live-tail]'),
+                composerDisabled: !!(composer && elementDisabled(composer)),
+                fallbackTitle: findHeaderText() !== ''
+            };
+        } catch (e) {
+            return null;
+        }
+    }
+
+    /** 卡态判定：聊天页在、无错误横幅、且（输入框灰着 或 标题回退）。 */
+    function vitalsStalled(v) {
+        if (!v || !v.chat || v.errorBanner) {
+            return false;
+        }
+        return v.composerDisabled || v.fallbackTitle;
+    }
+
+    function postPageVitals(why) {
+        try {
+            var v = readVitals();
+            if (v) {
+                post('pagevitals', {why: why, vitals: v});
+            }
+        } catch (e) {}
+    }
+
+    function stallArm(reason) {
+        if (stallState.gaveUp) {
+            return;
+        }
+        var v = readVitals();
+        if (v && v.errorBanner) {
+            return;
+        }
+        var nowMs = Date.now();
+        if (!stallState.armed) {
+            stallState.armed = true;
+            stallState.phase = 0;
+            stallState.since = nowMs;
+            stallState.deadline = nowMs + STALL_NUDGE_MS;
+        } else if (stallState.phase === 0) {
+            // 首判没到前允许顺延；phase 1 起页面自己的 10s 重试信标会不断
+            // 进来，绝不能让它们把刷新判定无限顺延。
+            stallState.deadline = nowMs + STALL_NUDGE_MS;
+        }
+        stallState.armReason = reason;
+        if (!stallState.timer) {
+            stallState.timer = setTimeout(stallFire,
+                Math.max(0, stallState.deadline - nowMs));
+        }
+        diag('info', '卡死看门狗布防（' + reason + '）phase=' + stallState.phase +
+            '，' + Math.round(Math.max(0, stallState.deadline - nowMs) / 1000) + 's 后判定');
+        postPageVitals('arm');
+    }
+
+    function stallFire() {
+        stallState.timer = null;
+        if (!stallState.armed) {
+            return;
+        }
+        var v = readVitals();
+        // 只在体征"可读且健康"时撤防；读不到（DOM 半拆/极端环境）不算恢复，
+        // 继续走梯子——布防理由本身已经是证据。
+        if (v && !vitalsStalled(v)) {
+            stallCancel('判定时已恢复');
+            return;
+        }
+        if (stallState.phase === 0) {
+            stallState.phase = 1;
+            var trafficAt = client && typeof client.lastPageBridgeTrafficAt === 'function' ?
+                client.lastPageBridgeTrafficAt() : 0;
+            if (trafficAt >= stallState.since) {
+                diag('info', '卡死看门狗：桌面端仍在下发（内容在路上），跳过轻推');
+            } else {
+                nudgeReconnect(stallState.armReason || '页面无进展');
+            }
+            stallState.deadline = Date.now() + STALL_RELOAD_MS;
+            stallState.timer = setTimeout(stallFire, STALL_RELOAD_MS);
+            return;
+        }
+        stallReloadIfAllowed();
+    }
+
+    /**
+     * 轻推：关掉共享 socket，恢复归页面。与心跳陈旧路径的 forceReconnect
+     * 共享 180s 限流时钟，两条路不会在同一段链路上反复开刀。
+     */
+    function nudgeReconnect(reason) {
+        var socket = activeSocket;
+        if (!socket || socket.readyState !== 1) {
+            diag('info', '卡死轻推：当前没有活动 socket，等页面自己重建');
+            return false;
+        }
+        lastForcedReconnectAt = Date.now();
+        diag('warn', '卡死轻推：关闭 relay socket 触发页面自愈（' + reason + '）');
+        try {
+            socket.close();
+        } catch (e) {
+            diag('warn', '卡死轻推关闭失败: ' + e);
+            return false;
+        }
+        return true;
+    }
+
+    function stallReloadIfAllowed() {
+        var stamp = parseInt(storeGet(FALLBACK_STORE_AT), 10);
+        var last = Math.max(stallState.lastReloadAt, isNaN(stamp) ? 0 : stamp);
+        var wait = last + FALLBACK_RELOAD_GAP_MS - Date.now();
+        if (wait > 0) {
+            diag('info', '卡死看门狗：处于刷新间隔内，' + Math.round(wait / 1000) + 's 后复查');
+            stallState.timer = setTimeout(stallFire, wait);
+            return;
+        }
+        var count = stallState.reloadCount;
+        if (count >= STALL_RELOAD_CAP) {
+            stallState.gaveUp = true;
+            stallState.armed = false;
+            diag('error', '卡死看门狗：连续刷新 ' + count + ' 次未恢复，停止自动干预' +
+                '（恢复信号到达后自动复位）');
+            postPageVitals('giveup');
+            return;
+        }
+        count += 1;
+        stallState.reloadCount = count;
+        storeSet(STALL_STORE_RELOADS, String(count));
+        stallState.lastReloadAt = Date.now();
+        storeSet(FALLBACK_STORE_AT, String(stallState.lastReloadAt));
+        diag('warn', '卡死看门狗：轻推后仍无内容，第 ' + count + '/' + STALL_RELOAD_CAP +
+            ' 次刷新页面');
+        try {
+            G.location.reload();
+        } catch (e) {
+            diag('warn', '自动刷新失败: ' + e);
+        }
+    }
+
+    function stallCancel(reason) {
+        var wasActive = stallState.armed || stallState.gaveUp;
+        if (stallState.timer) {
+            clearTimeout(stallState.timer);
+            stallState.timer = null;
+        }
+        stallState.armed = false;
+        stallState.phase = 0;
+        if (stallState.gaveUp) {
+            diag('info', '卡死看门狗解除放弃态: ' + reason);
+        }
+        stallState.gaveUp = false;
+        if (wasActive) {
+            stallState.reloadCount = 0;
+            storeSet(STALL_STORE_RELOADS, '0');
+            diag('info', '卡死看门狗撤防: ' + reason);
+            postPageVitals('cancel');
+        }
+    }
+
+    /** 页面日志事件 → 看门狗布防/撤防。只有当前界面真的卡着才布防。 */
+    function notePageLogEvent(name) {
+        if (PAGE_LOG_STALL_EVENTS[name]) {
+            if (vitalsStalled(readVitals())) {
+                stallArm('页面日志 ' + name);
+            } else {
+                diag('debug', '页面日志失败事件（当前界面无卡态，不布防）: ' + name);
+            }
+        } else if (PAGE_LOG_RECOVER_EVENTS[name]) {
+            stallCancel('页面日志 ' + name);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 5d. 诊断指令入口（adb 驱动的测试点）
+    //
+    //   adb shell am start -n com.zcode.remote/.MainActivity \
+    //       -a com.zcode.remote.action.DIAG --es diag_cmd kick_test|l1_test|vitals
+    //
+    //   vitals   读一次 DOM 体征并落日志；
+    //   l1_test  手动触发一次轻推（验证 socket 关闭→页面自愈链路）；
+    //   kick_test Tier2 可行性实验：用页面同款 URL+auth_init 开第二条
+    //            WebSocket，观察 relay 的 KICK/takeover 语义（第二条是被
+    //            接纳还是把旧连接踢掉）。全部结果走 diag/pagelog 落日志，
+    //            实验连接 30s 后自动关闭。
+    // -----------------------------------------------------------------------
+    function relayKickTest() {
+        if (!lastRelayUrl) {
+            diag('warn', 'KICK 实验：没有已知的 relay URL（本轮注入晚于建线？）');
+            return false;
+        }
+        diag('warn', 'KICK 实验：用同款凭证开第二条 WebSocket → ' + safePath(lastRelayUrl));
+        var ws;
+        try {
+            ws = new NativeWebSocket(lastRelayUrl);
+        } catch (e) {
+            diag('warn', 'KICK 实验：建线失败 ' + e);
+            return false;
+        }
+        var openedAt = Date.now();
+        var TAG = 'KICK实验';
+        ws.addEventListener('open', function () {
+            diag('warn', TAG + '：新连接 open，重放 auth_init');
+            try {
+                if (lastAuthInitText) {
+                    ws.send(lastAuthInitText);
+                } else {
+                    diag('warn', TAG + '：没有捕获到 auth_init，无法握手');
+                }
+            } catch (e) {
+                diag('warn', TAG + '：发送失败 ' + e);
+            }
+        });
+        ws.addEventListener('message', function (ev) {
+            var text = typeof ev.data === 'string' ? ev.data : '';
+            var summary = text ? text.substring(0, 60) : '(空)';
+            try {
+                var f = JSON.parse(text);
+                summary = f.type + (f.pair_status ? ':' + f.pair_status : '') +
+                    (f.error ? ':' + f.error : '');
+            } catch (e) {}
+            diag('warn', TAG + '：入站 ' + summary);
+        });
+        ws.addEventListener('close', function (ev) {
+            diag('warn', TAG + '：新连接关闭 code=' + ev.code + ' clean=' + ev.wasClean +
+                '（存活 ' + (Date.now() - openedAt) + 'ms）');
+        });
+        ws.addEventListener('error', function () {
+            diag('warn', TAG + '：新连接 error');
+        });
+        var old = activeSocket;
+        if (old && old.readyState === 1) {
+            var onOldClose = function (ev) {
+                diag('warn', TAG + '：旧 socket 被关闭 code=' + ev.code +
+                    ' clean=' + ev.wasClean + ' ← 旧连接被踢的证据');
+            };
+            try {
+                old.addEventListener('close', onOldClose);
+                setTimeout(function () {
+                    try {
+                        old.removeEventListener('close', onOldClose);
+                    } catch (e) {}
+                }, 30000);
+            } catch (e) {}
+        }
+        setTimeout(function () {
+            try {
+                if (ws.readyState === 1) {
+                    diag('warn', TAG + '：30s 到点，主动关闭实验连接');
+                    ws.close();
+                }
+            } catch (e) {}
+        }, 30000);
+        return true;
+    }
+
+    G.__zcodeShellDiag = function (cmd) {
+        try {
+            if (cmd === 'vitals') {
+                diag('info', '页面体征: ' + JSON.stringify(readVitals()));
+                return true;
+            }
+            if (cmd === 'l1_test') {
+                diag('warn', '诊断指令：手动触发卡死轻推');
+                return nudgeReconnect('l1_test 手动触发');
+            }
+            if (cmd === 'kick_test') {
+                return relayKickTest();
+            }
+            diag('warn', '未知诊断指令: ' + cmd);
+            return false;
+        } catch (e) {
+            diag('warn', '诊断指令执行失败: ' + e);
+            return false;
+        }
+    };
+
 
 /** Called by the native side when the app's foreground state changes. */
     G.__zcodeShellSetAppForeground = function (foreground) {
@@ -1763,7 +2230,12 @@
     // zero: nothing is created, measured or timed until something in the page
     // actually scrolls.
     // -----------------------------------------------------------------------
-    var SCROLLBAR_CSS = '::-webkit-scrollbar{width:0!important;height:0!important}';
+    // gutter 保险：页面把 [scrollbar-gutter:stable] 挂在主聊天滚动容器上（快照
+    // docs/05 @2259500）。当前 WebView 在条宽归零后会把预留槽一起收掉（2026-09-12
+    // 真机确认输入框已回正），这条规则是防页面改版/引擎升级把预留带回来的保险，
+    // 今天是 no-op。
+    var SCROLLBAR_CSS = '::-webkit-scrollbar{width:0!important;height:0!important}' +
+        '[data-v4-timeline-scroll]{scrollbar-gutter:auto!important}';
 
     function installScrollbarWidth() {
         try {

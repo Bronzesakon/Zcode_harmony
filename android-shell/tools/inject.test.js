@@ -1155,7 +1155,7 @@ test('快速刷新：热打开（真标题 + 输入框可用）不刷', () => {
     }
 });
 
-test('快速刷新：状态 A（头部回退「新建任务」）直刷', () => {
+test('快速刷新：状态 A（头部回退「新建任务」）→ 布防 + 轻推 + 复查刷', () => {
     const page = setupPage();
     const {reloads, restore} = stubReload();
     try {
@@ -1163,17 +1163,32 @@ test('快速刷新：状态 A（头部回退「新建任务」）直刷', () => 
         appendComposer(page, '向 ZCode 提问…', false);
         FB().note({name: 'zcode-agent.subscribeConversationV4', args: {sessionId: 'sess_a'}});
         FB().check();
-        assert.strictEqual(reloads.length, 1, 'state A reloads at once');
-        assert.ok(FB().state().lastReloadAt > 0, 'the gap stamp is taken');
+        assert.strictEqual(reloads.length, 0, 'arming alone never reloads');
+        assert.strictEqual(FB().stall().phase, 0, 'the ladder starts at phase 0');
         assert.ok(findPost(page.posts, 'diag', (d) =>
-            d.message.includes('进对话 3s 未就绪（标题回退）')).length === 1);
+            d.message.includes('卡死看门狗布防（3s DOM 检查: 标题回退）')).length === 1);
+
+        // 判定点 1：桌面端零下发 → 轻推（这里没有 socket，跳过）→ 进入刷新判定
+        FB().fire();
+        assert.strictEqual(reloads.length, 0, 'the nudge fires before any reload');
+        assert.strictEqual(FB().stall().phase, 1, 'the ladder advances to phase 1');
+
+        // 判定点 2：仍卡着 → 第 1/2 次刷新
+        FB().fire();
+        assert.strictEqual(reloads.length, 1, 'phase 1 reloads after the nudge');
+        assert.ok(findPost(page.posts, 'diag', (d) =>
+            d.message.includes('第 1/2 次刷新页面')).length === 1);
+        if (FB().stall().timer) {
+            clearTimeout(FB().stall().timer);
+            FB().stall().timer = null;
+        }
     } finally {
         restore();
         page.teardown();
     }
 });
 
-test('快速刷新：状态 B（真标题但输入框灰/禁用）直刷，占位符为空也识别', () => {
+test('快速刷新：状态 B（真标题但输入框灰/禁用）→ 同一梯子，占位符为空也识别', () => {
     const page = setupPage();
     const {reloads, restore} = stubReload();
     try {
@@ -1181,9 +1196,16 @@ test('快速刷新：状态 B（真标题但输入框灰/禁用）直刷，占�
         appendComposer(page, null, true);
         FB().note({name: 'zcode-agent.conversationRowsRangeV4', args: {sessionId: 'sess_b'}});
         FB().check();
-        assert.strictEqual(reloads.length, 1, 'a greyed composer reloads');
+        assert.strictEqual(reloads.length, 0, 'arming alone never reloads');
         assert.ok(findPost(page.posts, 'diag', (d) =>
-            d.message.includes('进对话 3s 未就绪（输入框未就绪）')).length === 1);
+            d.message.includes('卡死看门狗布防（3s DOM 检查: 输入框未就绪）')).length === 1);
+        FB().fire();
+        FB().fire();
+        assert.strictEqual(reloads.length, 1, 'a greyed composer reaches the reload rung');
+        if (FB().stall().timer) {
+            clearTimeout(FB().stall().timer);
+            FB().stall().timer = null;
+        }
     } finally {
         restore();
         page.teardown();
@@ -1206,7 +1228,7 @@ test('快速刷新：问候屏（无头 + 输入框可用）不刷', () => {
     }
 });
 
-test('快速刷新：15s 间隔内顺延复查，到期才再刷', () => {
+test('快速刷新：刷新间隔内不连刷；间隔到期再刷；连续 2 次到顶放弃；恢复信号复位', () => {
     const page = setupPage();
     const {reloads, restore} = stubReload();
     try {
@@ -1214,19 +1236,48 @@ test('快速刷新：15s 间隔内顺延复查，到期才再刷', () => {
         appendComposer(page, '向 ZCode 提问…', false);
         FB().note({name: 'zcode-agent.subscribeConversationV4', args: {sessionId: 'sess_1'}});
         FB().check();
-        assert.strictEqual(reloads.length, 1, 'first hit reloads');
+        FB().fire();
+        FB().fire();
+        assert.strictEqual(reloads.length, 1, 'first hit reloads at the reload rung');
 
-        // 刷新后的新页面里信标重新武装，仍旧卡着：间隔内 → 顺延而不是再刷
+        // 刷新后的新页面里信标重新武装，仍旧卡着：间隔内 → 不允许第二次刷新，
+        // 只顺延复查（phase 1 的信标重入不得把判定无限顺延到期之后）。
         FB().note({name: 'zcode-agent.conversationRowsRangeV4', args: {sessionId: 'sess_1'}});
         FB().check();
+        FB().fire();
         assert.strictEqual(reloads.length, 1, 'within the gap there must be no second reload');
-        assert.ok(FB().timer() !== null, 'a deferred re-check must be scheduled');
-        clearTimeout(FB().timer());
+        assert.ok(FB().stall().timer !== null, 'a deferred re-check must be scheduled');
+        clearTimeout(FB().stall().timer);
+        FB().stall().timer = null;
 
-        // 间隔到期（把间隔戳拨回 16s 前）：再查 → 再刷
-        FB().state().lastReloadAt = Date.now() - 16000;
-        FB().check();
+        // 间隔到期（把间隔戳拨回 16s 前）：再判 → 第 2/2 次刷新
+        FB().stall().lastReloadAt = Date.now() - 16000;
+        FB().fire();
         assert.strictEqual(reloads.length, 2, 'after the gap a stuck page reloads again');
+
+        // 第三次仍卡着：连续 2 次到顶 → 放弃，不再刷
+        if (FB().stall().timer) {
+            clearTimeout(FB().stall().timer);
+            FB().stall().timer = null;
+        }
+        FB().stall().lastReloadAt = Date.now() - 16000;
+        FB().fire();
+        assert.strictEqual(reloads.length, 2, 'the cap stops the reload loop');
+        assert.strictEqual(FB().stall().gaveUp, true, 'the ladder gives up at the cap');
+        assert.ok(findPost(page.posts, 'diag', (d) =>
+            d.message.includes('连续刷新 2 次未恢复')).length === 1);
+
+        // 布防在放弃态被忽略；恢复信号复位后可以重新开始
+        FB().check();
+        assert.strictEqual(FB().stall().armed, false, 'arming is a no-op while given up');
+        FB().cancel('测试恢复信号');
+        assert.strictEqual(FB().stall().gaveUp, false, 'recovery resets the give-up state');
+        FB().arm('测试再布防');
+        assert.strictEqual(FB().stall().armed, true, 'arming works again after recovery');
+        if (FB().stall().timer) {
+            clearTimeout(FB().stall().timer);
+            FB().stall().timer = null;
+        }
     } finally {
         restore();
         page.teardown();
@@ -1271,7 +1322,7 @@ test('hook 安全：晚注入经原型层收编页面已有 socket（零重连�
     }
 });
 
-test('快速刷新：DOM 全就绪但页面桥零下发 → 10s 内容检查刷新', () => {
+test('快速刷新：DOM 全就绪但页面桥零下发 → 10s 内容检查布防 → 梯子后刷新', () => {
     const page = setupPage();
     const {reloads, restore} = stubReload();
     try {
@@ -1283,17 +1334,25 @@ test('快速刷新：DOM 全就绪但页面桥零下发 → 10s 内容检查刷�
         FB().check();
         assert.strictEqual(reloads.length, 0, 'the 3s DOM check passes on a normal-looking page');
         FB().contentCheck();
-        assert.strictEqual(reloads.length, 1,
-            'zero page-bridge deliveries after the beacon must reload');
+        assert.strictEqual(reloads.length, 0,
+            'zero page-bridge deliveries arms the ladder instead of reloading');
         assert.ok(findPost(page.posts, 'diag', (d) =>
-            d.message.includes('进对话 10s 内容零下发')).length === 1);
+            d.message.includes('卡死看门狗布防（10s 内容检查: 页面桥零下发')).length === 1);
+        FB().fire();   // 轻推（关 socket）
+        FB().fire();   // 仍零内容 → 刷新
+        assert.strictEqual(reloads.length, 1,
+            'zero deliveries after the nudge must reload');
+        if (FB().stall().timer) {
+            clearTimeout(FB().stall().timer);
+            FB().stall().timer = null;
+        }
     } finally {
         restore();
         page.teardown();
     }
 });
 
-test('快速刷新：信标后页面桥有入站帧 → 10s 内容检查不刷', () => {
+test('快速刷新：信标后页面桥有入站帧 → 10s 内容检查撤防不刷', () => {
     const page = setupPage();
     const {reloads, restore} = stubReload();
     try {

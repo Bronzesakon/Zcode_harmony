@@ -665,6 +665,13 @@ class MainActivity : AppCompatActivity() {
      *   just pushes a screen on top (so the page still has to load underneath).
      */
     private fun handleIntent(intent: Intent?): Boolean {
+        if (intent?.action == ACTION_DIAG) {
+            // adb 驱动的诊断测试点（KICK 实验 / 手动轻推 / 体征快照）：
+            //   adb shell am start -n com.zcode.remote/.MainActivity \
+            //       -a com.zcode.remote.action.DIAG --es diag_cmd kick_test
+            runDiagCommand(intent.getStringExtra(EXTRA_DIAG_CMD).orEmpty())
+            return false
+        }
         if (intent?.action == ACTION_RELOAD) {
             reloadPage()
             return prefs.remoteUrl != null
@@ -731,6 +738,45 @@ class MainActivity : AppCompatActivity() {
             binding.webview.evaluateJavascript(script, null)
         } catch (e: Exception) {
             Diagnostics.log("warn", "执行定位脚本失败: ${e.message}")
+        }
+    }
+
+    // --------------------------------------------------------------- diag adb
+
+    private var pendingDiag: String? = null
+    private var diagAttempts = 0
+
+    /**
+     * adb 驱动的诊断测试点（注入层就绪后把指令转给 __zcodeShellDiag）。
+     * 冷启动时注入脚本要等页面 boot 完才就绪，所以沿用 tryLocate 的重试模式。
+     */
+    private fun runDiagCommand(cmd: String) {
+        if (cmd.isEmpty()) return
+        Diagnostics.log("info", "诊断指令: $cmd")
+        pendingDiag = cmd
+        diagAttempts = 0
+        tryDiag()
+    }
+
+    private fun tryDiag() {
+        val cmd = pendingDiag ?: return
+        if (!ShellRuntime.isInjectedReady()) {
+            if (diagAttempts >= MAX_LOCATE_ATTEMPTS) {
+                Diagnostics.log("warn", "放弃诊断指令（注入脚本未就绪）: $cmd")
+                pendingDiag = null
+                return
+            }
+            diagAttempts += 1
+            mainHandler.postDelayed({ tryDiag() }, LOCATE_RETRY_MS)
+            return
+        }
+        pendingDiag = null
+        val script = "window.__zcodeShellDiag && window.__zcodeShellDiag(" +
+            org.json.JSONObject.quote(cmd) + ");"
+        try {
+            binding.webview.evaluateJavascript(script, null)
+        } catch (e: Exception) {
+            Diagnostics.log("warn", "执行诊断脚本失败: ${e.message}")
         }
     }
 
@@ -874,6 +920,10 @@ class MainActivity : AppCompatActivity() {
 
         /** Launcher long-press shortcut: open the settings screen. */
         const val ACTION_OPEN_SETTINGS = "com.zcode.remote.action.OPEN_SETTINGS"
+
+        /** adb 驱动的诊断测试点：KICK 实验 / 手动轻推 / 体征快照（--es diag_cmd）。 */
+        const val ACTION_DIAG = "com.zcode.remote.action.DIAG"
+        const val EXTRA_DIAG_CMD = "diag_cmd"
         const val EXTRA_SESSION_ID = "session_id"
         const val EXTRA_TASK_TITLE = "task_title"
         const val EXTRA_WORKSPACE_KEY = "workspace_key"
