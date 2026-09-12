@@ -955,5 +955,25 @@ inject.js 现供给 sink，原生日志出 `页面: …` 行；
 **测试点（adb 驱动）**：`am start -a com.zcode.remote.action.DIAG --es diag_cmd kick_test|l1_test|vitals`——
 kick_test = Tier2 可行性实验（同凭证开第二条 WebSocket，观察 relay 的 KICK/takeover 语义，旧连接是否被踢），
 l1_test = 手动轻推，vitals = DOM 体征快照。JS 68 项测试全绿（快刷 6 项按看门狗语义重写）。
-**待真机**：kick_test 结果决定 Tier2（原生后台 relay 客户端）做不做；l1_test 验证轻推链路；
-后台长测验证实况窗不断不滞后（新增 `后台链路静默 Ns` 取证行）。
+**待真机**：kick_test / l1_test **均已实测通过**（见下）；后台长测验证实况窗不断不滞后
+（新增 `后台链路静默 Ns` 取证行）。
+
+**2026-09-12 深夜真机实测结果（pre.51，一加 PLC110 无线 adb）**：
+- **烟雾**：日志汇接通，`页面: …` 行把页面开对话的全过程自述了出来
+  （attach → store connect → subscribe → **ack 265ms** → snapshot 完成）——
+  此前这些信息完全不存在；DIAG 指令通路、vitals 体征读取全部工作。
+- **l1_test 轻推**：全链路通过——close 归因行直接指到 `nudgeReconnect`，
+  socket 关闭后 **0.7s 页面自己重开（#3）**，9s 内五个工作区全部重新订阅，
+  页面全程无感（无 reload、无 boot）；轻推后无页面订阅事件属正常（当时无会话在订）。
+- **kick_test（Tier2 前置实验）**：同款凭证的第二条 WebSocket **被 relay 接纳**
+  （`wss://zcode.z.ai/ws`，open 成功），但服务端回 **`auth_challenge`（质询-应答）**，
+  测试连接未应答故停在未配对态；**已配对的旧连接没有被踢**、页面零扰动。
+  ⇒ relay 的 KICK/takeover 发生在**配对完成**层面，不拒绝第二条连接本身。
+- **Tier2 可行性结论**：质询应答算法已从页面 bundle 提取
+  （`docs/05` 快照 @4696180）：`proof = base64url(HMAC-SHA256(key=passHash,
+  msg=nonce + '|' + 'terminal' + '|' + deviceSid))`，握手链
+  auth_init → auth_challenge → auth_response{proof} → pair。Kotlin 实现约百余行
+  （javax.crypto.Mac 即可），passHash/deviceSid 由注入层一次性转交（仅内存）。
+  **下一步**（待拍板）：原生 mini relay 客户端 + 「后台配对接管」实验——
+  原生完成配对时观察页面连接是否被踢/页面进 takeover 态，
+  验证后台接管的完整语义。
