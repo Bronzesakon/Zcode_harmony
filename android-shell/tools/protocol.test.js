@@ -490,7 +490,7 @@ test('active mode skips a workspace the page already streams', async () => {
 // the desktop for when a task is opened.
 // ---------------------------------------------------------------------------
 
-test('page coverage survives a relay reconnect (shared state)', async () => {
+test('page coverage must be re-proven on a new relay connection (zombie rule)', async () => {
     const pageScope = {workspacePath: '/repo/page', workspaceIdentity: 'ws-page'};
     const first = makeClient();
     const listenBody = encodeBody(
@@ -501,9 +501,11 @@ test('page coverage survives a relay reconnect (shared state)', async () => {
         first.client.acceptObservedPayload(payload, true);
     }
 
-    // A relay disconnect rebuilds the client, exactly like inject.js does. The
-    // learned coverage has to come along, or the page's own workspace is
-    // duplicated and the desktop answers rpc-transport-fault in a loop.
+    // A relay disconnect rebuilds the client. 2026-09-13 真机实证：socket 重建后
+    // 页面 runtime 不会重建（配对恢复但零业务帧、零自愈）——旧连接上的覆盖
+    // 证据是僵尸，跨连接沿用 = 该工作区通知/实况窗全盲。新连接上壳必须接管；
+    // 页面若真恢复了（reload 后重新开桥），观察到的 listen 会再次盖上本连接
+    // 的证据，_dropRedundantBridge 再把壳的桥让出去。
     const second = makeClient({sharedState: first.client.sharedState()});
     second.desktop.workspaces = [
         pageScope,
@@ -512,10 +514,20 @@ test('page coverage survives a relay reconnect (shared state)', async () => {
     await second.client.start();
 
     assert.deepStrictEqual(
-        second.desktop.subscriptions.map((s) => s.scope.workspaceIdentity),
-        ['ws-other'],
-        'the rebuilt client must not duplicate the workspace the page still owns'
+        second.desktop.subscriptions.map((s) => s.scope.workspaceIdentity).sort(),
+        ['ws-other', 'ws-page'],
+        'the rebuilt client must take over the workspace the page no longer streams'
     );
+
+    // 页面在同一连接上恢复流之后，壳的重复桥要让位（回到既有语义）。
+    // 注意只让出 ws-page：ws-other 页面从未覆盖，壳的桥必须留下。
+    for (const payload of fragment(listenBody, 'page-bridge-2', 1)) {
+        second.client.acceptObservedPayload(payload, true);
+    }
+    assert.strictEqual(Object.keys(second.client._bridges).length, 1,
+        'only the re-proven workspace is handed back');
+    assert.ok(!second.client._bridges['ws-page'],
+        'the page bridge replaces ours for the workspace it re-proved');
 });
 
 test('a bridge is dropped once the page proves it streams that workspace', async () => {
@@ -744,10 +756,16 @@ test('page-held evidence survives a relay rebuild (attached, not read)', async (
     const second = makeClient({sharedState: shared});
     second.desktop.workspaces = [{workspacePath: '/repo/page', workspaceIdentity: 'ws-page'}];
     await second.client.start();
+    // 2026-09-13 语义更新：覆盖证据按连接代次（_pageCoveredKeys，per-client），
+    // 共享的 pageOwned 不再让新连接无限让位——socket 重建后页面 runtime 不重建
+    // （僵尸订阅），壳必须接管。本断言保留的回归点是：共享 map 必须被"附着"
+    // 引用而非读取复制（attached, not read），_pageOwned 的知识要跨客户端可见。
+    assert.strictEqual(second.client._pageOwned['ws-page'], true,
+        'the shared page-owned map is attached, not copied');
     assert.strictEqual(
         second.desktop.subscriptions.length,
-        0,
-        'the rebuilt client must still know the page owns it'
+        1,
+        'without same-connection page evidence the shell takes the workspace over'
     );
 });
 

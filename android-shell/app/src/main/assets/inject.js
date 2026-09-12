@@ -717,8 +717,12 @@
             sharedState: pageCoverage
         });
         next.gen = ++clientGenSeq;
+        next.bornAt = Date.now();
         next.onSessions = function (update) {
             post('sessions', update);
+            try {
+                noteRunningActivity(update);
+            } catch (e) {}
         };
         next.onPageRpcCall = function (call) {
             try {
@@ -758,6 +762,27 @@
             client = createClient();
         }
         return client;
+    }
+
+    /**
+     * 每个工作区"最近一次看到 running 任务有活动"的时间（sessions-index 推送）。
+     * 僵尸订阅检测的判据之一：任务在跑（桌面端在产出）而页面桥零帧。
+     */
+    var runningActivityByKey = {};
+
+    function noteRunningActivity(update) {
+        if (!update || !update.key || !update.sessions) {
+            return;
+        }
+        for (var i = 0; i < update.sessions.length; i += 1) {
+            var task = update.sessions[i];
+            if (task && task.phase === 'running') {
+                var at = task.lastActivityAt || Date.now();
+                if (at > (runningActivityByKey[update.key] || 0)) {
+                    runningActivityByKey[update.key] = at;
+                }
+            }
+        }
     }
 
     function resetClient() {
@@ -1087,11 +1112,16 @@
             }
         }
         // 卡死看门狗的心跳巡检：覆盖没有进对话信标的卡死（如后台挂起回来、
-        // 恢复期页面自己没再发 subscribe）。也顺带在恢复时撤防。
+        // 恢复期页面自己没再发 subscribe）。僵尸订阅检测也在这里：
+        // 任务在跑（sessions-index 活动）而页面桥零业务帧 ≥45s、DOM 却健康——
+        // 2026-09-13 真机实证的形态（socket 重建后页面 runtime 不重建、零自愈）。
         try {
             var vit = readVitals();
             if (vitalsStalled(vit)) {
                 stallArm('心跳巡检: 正文未就绪');
+            } else if (vit && vit.chat && zombieSuspected(nowMs)) {
+                stallArm('心跳巡检: 僵尸订阅（任务在跑但页面桥 ' + zombieSilenceS +
+                    's 零帧）', true);
             } else if (vit && (stallState.armed || stallState.gaveUp)) {
                 stallCancel('心跳巡检: 界面已恢复');
             }
@@ -1611,6 +1641,7 @@
         armReason: '',
         gaveUp: false,
         lastReloadAt: 0,
+        skipNudge: false,
         // 连续刷新计数的内存权威；sessionStorage 是跨 reload 边界的镜像
         // （storage 可能被拒，内存值仍保住单次加载内的上限语义）。
         reloadCount: parseInt((function () {
@@ -1664,7 +1695,40 @@
         } catch (e) {}
     }
 
-    function stallArm(reason) {
+    var ZOMBIE_FRAME_SILENCE_MS = 45000;
+    var ZOMBIE_ACTIVITY_FRESH_MS = 60000;
+    var zombieSilenceS = 0;
+
+    /**
+     * 僵尸订阅指纹（2026-09-13 真机实证）：桌面端对本会话的任务仍在产出
+     * （sessions-index 里 running 任务的 lastActivityAt 在 60s 内推进），
+     * 而页面桥 ≥45s 没有收到任何业务帧，且 DOM 完全健康——三方都以为
+     * 别人在办。socket 重建后页面 runtime 不重建是根因。
+     */
+    function zombieSuspected(nowMs) {
+        var clientNow = client;
+        if (!clientNow || typeof clientNow.lastPageBridgeTrafficAt !== 'function' ||
+            typeof clientNow.pageBridgeSessionIds !== 'function') {
+            return false;
+        }
+        var lastTraffic = Math.max(clientNow.lastPageBridgeTrafficAt() || 0,
+            clientNow.bornAt || 0);
+        var silence = nowMs - lastTraffic;
+        if (silence < ZOMBIE_FRAME_SILENCE_MS) {
+            return false;
+        }
+        var ids = clientNow.pageBridgeSessionIds();
+        for (var key in ids) {
+            var at = runningActivityByKey[key] || 0;
+            if (at && nowMs - at < ZOMBIE_ACTIVITY_FRESH_MS) {
+                zombieSilenceS = Math.round(silence / 1000);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    function stallArm(reason, skipNudge) {
         if (stallState.gaveUp) {
             return;
         }
@@ -1678,10 +1742,14 @@
             stallState.phase = 0;
             stallState.since = nowMs;
             stallState.deadline = nowMs + STALL_NUDGE_MS;
+            stallState.skipNudge = skipNudge === true;
         } else if (stallState.phase === 0) {
             // 首判没到前允许顺延；phase 1 起页面自己的 10s 重试信标会不断
             // 进来，绝不能让它们把刷新判定无限顺延。
             stallState.deadline = nowMs + STALL_NUDGE_MS;
+            if (skipNudge === true) {
+                stallState.skipNudge = true;
+            }
         }
         stallState.armReason = reason;
         if (!stallState.timer) {
@@ -1707,12 +1775,18 @@
         }
         if (stallState.phase === 0) {
             stallState.phase = 1;
-            var trafficAt = client && typeof client.lastPageBridgeTrafficAt === 'function' ?
-                client.lastPageBridgeTrafficAt() : 0;
-            if (trafficAt >= stallState.since) {
-                diag('info', '卡死看门狗：桌面端仍在下发（内容在路上），跳过轻推');
+            if (stallState.skipNudge) {
+                // 僵尸订阅形态：轻推（关 socket）只会让页面重连配对，runtime
+                // 照旧不重建（2026-09-13 实测），直接进刷新判定。
+                diag('info', '卡死看门狗：僵尸订阅形态，跳过轻推直达刷新判定');
             } else {
-                nudgeReconnect(stallState.armReason || '页面无进展');
+                var trafficAt = client && typeof client.lastPageBridgeTrafficAt === 'function' ?
+                    client.lastPageBridgeTrafficAt() : 0;
+                if (trafficAt >= stallState.since) {
+                    diag('info', '卡死看门狗：桌面端仍在下发（内容在路上），跳过轻推');
+                } else {
+                    nudgeReconnect(stallState.armReason || '页面无进展');
+                }
             }
             stallState.deadline = Date.now() + STALL_RELOAD_MS;
             stallState.timer = setTimeout(stallFire, STALL_RELOAD_MS);
@@ -1782,6 +1856,7 @@
         }
         stallState.armed = false;
         stallState.phase = 0;
+        stallState.skipNudge = false;
         if (stallState.gaveUp) {
             diag('info', '卡死看门狗解除放弃态: ' + reason);
         }

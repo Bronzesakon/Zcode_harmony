@@ -1070,6 +1070,11 @@
         // conversation bridge does not send that listen, so keying "do not
         // duplicate this" on `_passive` alone missed it.
         this._pageBridges = (this._shared && this._shared.pageBridges) || {};
+        // 本连接内观察到页面桥证据（bridge-ready / 会话索引监听）的工作区。
+        // 故意 per-client 不共享：socket 重建 = 新连接，页面必须在新的连接上
+        // 重新自证覆盖，壳才能继续让位；僵尸态（页面 runtime 不随重建恢复）
+        // 下没有新证据，壳就会接管该工作区的通知覆盖（2026-09-13 真机结论）。
+        this._pageCoveredKeys = {};
         // Workspaces we have given up on because the page holds them and the
         // desktop refused our duplicate. Only ever set on that evidence, so a
         // transient fault can never silently cost us notification coverage.
@@ -1180,12 +1185,18 @@
      * guess would silently cost notification coverage. The decision is made in
      * `_handleDegraded`, where this evidence is combined with the desktop
      * actually refusing our bridge.
+     *
+     * 2026-09-13 真机证据（l1_test 僵尸复现）：页面 runtime 在 socket 重建后
+     * 不会重建——配对恢复、runtime 全灭、零自愈。所以"页面已覆盖"的证据必须
+     * 按连接代次：本连接内观察到页面桥证据才允许让位，跨重建的旧证据作废
+     * （pageCoverage 共享态里的 _pageBridges/_pageOwned 只代表历史）。
      */
     RemoteClient.prototype._notePageBridge = function (key) {
         if (!key || this._pageBridges[key]) {
             return;
         }
         this._pageBridges[key] = true;
+        this._pageCoveredKeys[key] = true;
         this._log('页面自己持有 bridge：' + key);
     };
 
@@ -1736,8 +1747,19 @@
                     // duplicate it. Opening a second bridge for a workspace the
                     // page owns is what the desktop answers with
                     // rpc-transport-fault, over and over.
-                    skipped += 1;
-                    continue;
+                    //
+                    // 但让位必须以"本连接上页面还有覆盖证据"为前提
+                    // （_pageCoveredKeys，per-client）：socket 重建后页面 runtime
+                    // 不会重建（2026-09-13 真机实证），旧共享态里的覆盖记录是
+                    // 僵尸——继续让位 = 该工作区通知/实况窗全盲。没有本连接
+                    // 证据就由壳接管；页面日后真恢复了，_dropRedundantBridge
+                    // 会把我们的桥再让出去。
+                    if (!self._activeKeys[key] && !self._pageCoveredKeys[key]) {
+                        self._log('页面覆盖证据不在本连接（' + key + '），由壳接管');
+                    } else {
+                        skipped += 1;
+                        continue;
+                    }
                 }
                 targets.push(workspace);
             }
@@ -2068,6 +2090,8 @@
         }
         this._outboundListenIds[payload.bridgeSessionId + '#' + header[1]] = key;
         this._bridgeWorkspace[payload.bridgeSessionId] = key;
+        // 页面在本连接上流这个工作区的直接证据（见 _pageCoveredKeys）。
+        this._pageCoveredKeys[key] = true;
         if (!this._passive[key]) {
             this._passive[key] = {
                 key: key,
