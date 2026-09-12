@@ -1890,6 +1890,62 @@
         return true;
     }
 
+    // -----------------------------------------------------------------------
+    // 5e. degrade 实验（B 路线测试点：不 reload 逼页面全量恢复）
+    //
+    // 僵尸订阅态（配对健康、runtime 全灭、页面零自愈）下，页面唯一不丢 UI 的
+    // 恢复通路是它自己的 bridge-degraded 处理器：匹配当前桥 id → markDegraded
+    // → T() → recoverConnection + 重开工作区/任务 → runtime 在新 socket 上重建。
+    // 页面桥对象跨 socket 重建存活（getBridgeSessionId 返回旧 id），而壳从被动
+    // 观察里记录了同一个 id（pageBridgeSessionIds）——所以可以合成一帧
+    // {zcode_type:'bridge-degraded'} 用 MessageEvent 派发到共享 socket 上，
+    // 页面自己的 message 监听会把它当服务端帧处理。帧格式与 zcode-protocol.js
+    // 解析的完全同源。成功判据：页面日志出现订阅级联（unsubscribe→subscribe→ack）。
+    // -----------------------------------------------------------------------
+    function relayDegradeTest() {
+        var clientNow = client;
+        if (!clientNow || typeof clientNow.pageBridgeSessionIds !== 'function') {
+            diag('warn', 'degrade实验：协议客户端不在');
+            return false;
+        }
+        var ids = clientNow.pageBridgeSessionIds();
+        var keys = Object.keys(ids);
+        if (keys.length === 0) {
+            diag('warn', 'degrade实验：没有记录到任何页面桥 id（页面还没开过桥？）');
+            return false;
+        }
+        var socket = activeSocket;
+        if (!socket || socket.readyState !== 1) {
+            diag('warn', 'degrade实验：没有活动 socket');
+            return false;
+        }
+        diag('warn', 'degrade实验：向 ' + keys.length + ' 个页面桥注入 bridge-degraded（同帧派发）');
+        var dispatched = 0;
+        for (var i = 0; i < keys.length; i += 1) {
+            var key = keys[i];
+            var envelope = JSON.stringify({
+                type: 'data',
+                payload: {
+                    zcode_type: 'bridge-degraded',
+                    bridgeSessionId: ids[key],
+                    reason: 'shell-degrade-test'
+                },
+                client_ts: Date.now()
+            });
+            try {
+                var ev = new G.MessageEvent('message', {data: envelope});
+                socket.dispatchEvent(ev);
+                dispatched += 1;
+                diag('warn', 'degrade实验：已派发 [' + key + '] bridgeSessionId=' + ids[key]);
+            } catch (e) {
+                diag('warn', 'degrade实验：派发失败 [' + key + ']: ' + e);
+            }
+        }
+        diag('warn', 'degrade实验：派发完成 ' + dispatched + '/' + keys.length +
+            '，成功判据=页面日志出现订阅级联（unsubscribe→subscribe→ack）');
+        return dispatched > 0;
+    }
+
     G.__zcodeShellDiag = function (cmd) {
         try {
             if (cmd === 'vitals') {
@@ -1902,6 +1958,9 @@
             }
             if (cmd === 'kick_test') {
                 return relayKickTest();
+            }
+            if (cmd === 'degrade_test') {
+                return relayDegradeTest();
             }
             diag('warn', '未知诊断指令: ' + cmd);
             return false;

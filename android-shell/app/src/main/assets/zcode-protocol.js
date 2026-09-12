@@ -1189,6 +1189,27 @@
         this._log('页面自己持有 bridge：' + key);
     };
 
+    /**
+     * 页面桥的反查表：workspaceKey → 该页面桥的 bridgeSessionId。
+     *
+     * 用途：伪造 bridge-degraded 喂回页面（degrade_test / 未来的僵尸订阅自愈）
+     * 时要携带页面桥自己的 id——页面侧的匹配是
+     * `e.bridgeSessionId === currentBridge.getBridgeSessionId()`，带我们的 id
+     * 永远不命中。僵尸态下页面桥对象还活着但不再重建，这里记录的正是它
+     * 最后一次被观察到的 id，与页面对象内存中的值一致。
+     * 排除我们自己的桥（_bridgesById / _requestedBridgeIds）。
+     */
+    RemoteClient.prototype.pageBridgeSessionIds = function () {
+        var out = {};
+        for (var id in this._bridgeWorkspace) {
+            if (this._bridgesById[id] || this._requestedBridgeIds[id]) {
+                continue;
+            }
+            out[this._bridgeWorkspace[id]] = id;
+        }
+        return out;
+    };
+
     RemoteClient.prototype._emitStatus = function (reason) {
         if (!this.onStatus) {
             return;

@@ -617,6 +617,28 @@ test('a page-held workspace is dropped, not reopened, when the desktop refuses o
     assert.ok(!logs.some((m) => m.indexOf('reopening') === 0), 'no reopen loop');
 });
 
+test('pageBridgeSessionIds exposes the page bridge id per workspace and skips our own', async () => {
+    const {client, desktop} = makeClient({log: () => {}});
+    desktop.workspaces = [{workspacePath: '/repo/ours'}, {workspacePath: '/repo/theirs'}];
+    await client.start();
+    assert.ok(client._bridges['/repo/ours'], 'our own bridge exists');
+
+    // The page opens its own bridge for a workspace: a ready frame for an id we
+    // never requested. This id is what a forged bridge-degraded frame must carry
+    // (the page matches it against its own bridge object).
+    client.acceptObservedPayload({
+        zcode_type: 'workspace-bridge-ready',
+        bridgeSessionId: 'page-bridge-9',
+        bridge: {bridgeSessionId: 'page-bridge-9', workspaceKey: '/repo/theirs'}
+    }, false);
+
+    const ids = client.pageBridgeSessionIds();
+    assert.strictEqual(ids['/repo/theirs'], 'page-bridge-9',
+        'the page bridge id is exposed for the degrade path');
+    assert.strictEqual(ids['/repo/ours'], undefined,
+        'our own bridges must never be mistaken for the page bridge');
+});
+
 test('the first fault on a workspace is not reopened (the shipped default)', async () => {
     const logs = [];
     // No maxReopensPerBridge override: the default is 0, i.e. one strike per
