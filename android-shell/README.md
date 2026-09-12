@@ -277,6 +277,14 @@ subscribeSessionsIndex / listen）→ 这些 RPC 全部排在**同一条 socket*
 会话有关？`readSession` 对非 active 会话尚有 `Session is not active` 的显式拒绝，这里却是沉默——
 客户端无从重试决策。壳侧待办：无（三种客户端同证）。
 
+**后续（同日下午）：桌面端重启后第一阶段消失，案情报更精确了一层。** 重启后上传管线全程打通
+（新对话与本对话都能发文件），但 **文本附件到不了 agent 手里**：桌面端只注入空占位标记
+（`[Attached text/plain: attachment-N]`，两个独立会话的 agent 同证），**而暂存层内容完整**——
+`~/.zcode/cli/artifacts/<sessId>/prompt-attachment-upload-*.txt` 里 106KB base64 data URI，
+解码即日志全文（本会话已实测解码 776 行）。图片附件注入正常。⇒ 桌面端 bug 精确锁定：
+**「文本附件 → agent 上下文注入」这一跳丢内容**（staging ✓ → injection ✗）。
+agent 侧绕过：直接读 artifacts 目录解码（已写入项目记忆与本节）。
+
 **D3 完成卡片踩在规范边上（本轮新增，取舍已记录）**
 
 `ColorOS_docs/06-…/01-创建实时更新通知（Views 实现指南）.md` 里除硬性要求外还有一句
