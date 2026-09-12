@@ -1270,3 +1270,73 @@ test('hook 安全：晚注入经原型层收编页面已有 socket（零重连�
         page.teardown();
     }
 });
+
+test('快速刷新：DOM 全就绪但页面桥零下发 → 10s 内容检查刷新', () => {
+    const page = setupPage();
+    const {reloads, restore} = stubReload();
+    try {
+        appendHeader(page, '真实任务名');
+        appendComposer(page, '继续输入以排队后续修改', false);
+        const socket = new globalThis.WebSocket('wss://relay.example');
+        socket.receive({type: 'pair_status_ack', pair_status: 'matched'});
+        FB().note({name: 'zcode-agent.subscribeConversationV4', args: {sessionId: 'sess_c'}});
+        FB().check();
+        assert.strictEqual(reloads.length, 0, 'the 3s DOM check passes on a normal-looking page');
+        FB().contentCheck();
+        assert.strictEqual(reloads.length, 1,
+            'zero page-bridge deliveries after the beacon must reload');
+        assert.ok(findPost(page.posts, 'diag', (d) =>
+            d.message.includes('进对话 10s 内容零下发')).length === 1);
+    } finally {
+        restore();
+        page.teardown();
+    }
+});
+
+test('快速刷新：信标后页面桥有入站帧 → 10s 内容检查不刷', () => {
+    const page = setupPage();
+    const {reloads, restore} = stubReload();
+    try {
+        appendHeader(page, '真实任务名');
+        appendComposer(page, '继续输入以排队后续修改', false);
+        const socket = new globalThis.WebSocket('wss://relay.example');
+        socket.receive({type: 'pair_status_ack', pair_status: 'matched'});
+        FB().note({name: 'zcode-agent.subscribeConversationV4', args: {sessionId: 'sess_d'}});
+        // 信标之后桌面端回了数据（页面桥入站 rpc-frame）——内容在路上。
+        const ok = encodeBody([page.protocol.RES_PROMISE_SUCCESS, 77], {rows: []});
+        for (const payload of fragment(ok, 'page-bridge-13', 1)) {
+            socket.receive({type: 'data', payload});
+        }
+        FB().check();
+        FB().contentCheck();
+        assert.strictEqual(reloads.length, 0, 'traffic after the beacon means content is flowing');
+        assert.ok(findPost(page.posts, 'diag', (d) =>
+            d.message.includes('10s 内容检查：页面桥有下发')).length === 1);
+    } finally {
+        restore();
+        page.teardown();
+    }
+});
+
+test('快速刷新：链路重建（client 换代/消亡）时 10s 内容检查让行', () => {
+    const page = setupPage();
+    const {reloads, restore} = stubReload();
+    try {
+        appendHeader(page, '真实任务名');
+        appendComposer(page, '继续输入以排队后续修改', false);
+        const socket = new globalThis.WebSocket('wss://relay.example');
+        socket.receive({type: 'pair_status_ack', pair_status: 'matched'});
+        FB().note({name: 'zcode-agent.subscribeConversationV4', args: {sessionId: 'sess_e'}});
+        // 链路重建：pair 状态翻负 → resetClient → client 为 null（新客户端尚未出生）。
+        socket.receive({type: 'pair_status_ack', pair_status: 'unmatched'});
+        FB().contentCheck();
+        assert.strictEqual(reloads.length, 0,
+            'a rebuilt link must not be reloaded mid-recovery');
+        assert.ok(findPost(page.posts, 'diag', (d) =>
+            d.message.includes('10s 内容检查：期间链路重建')).length === 1);
+    } finally {
+        restore();
+        page.teardown();
+    }
+});
+

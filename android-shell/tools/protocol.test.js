@@ -816,3 +816,36 @@ test('onPageRpcResult hands the page call outcome to the shell', () => {
     assert.ok(results[0].cost >= 0);
     assert.deepStrictEqual([results[1].ok, results[1].message], [false, 'disk full']);
 });
+
+test('lastPageBridgeTrafficAt：页面桥入站 rpc-frame 盖章，我方桥与出站不盖', () => {
+    const {client} = makeClient();
+    assert.strictEqual(client.lastPageBridgeTrafficAt(), 0, 'nothing seen yet');
+
+    // 我方桥（已登记在 _bridgesById）的入站帧：在盖章点之前就 return。
+    client._bridgesById['shell-bridge-own'] = {workspaceKey: 'ws-own'};
+    const ownBody = encodeBody([P.RES_PROMISE_SUCCESS, 41], {ok: true});
+    for (const payload of fragment(ownBody, 'shell-bridge-own', 1)) {
+        client.acceptObservedPayload(payload, false);
+    }
+    assert.strictEqual(client.lastPageBridgeTrafficAt(), 0, 'our own bridges must not stamp');
+
+    // 页面桥的入站 rpc-frame：盖章。
+    const okBody = encodeBody([P.RES_PROMISE_SUCCESS, 42], {rows: []});
+    for (const payload of fragment(okBody, 'page-bridge-5', 1)) {
+        client.acceptObservedPayload(payload, false);
+    }
+    assert.ok(client.lastPageBridgeTrafficAt() > 0, 'page-bridge inbound frames stamp the clock');
+
+    // 页面桥的出站帧（页面→桌面）不盖章：这是请求不是下发。
+    const reqBody = encodeBody([P.REQ_PROMISE, 43, 'zcode-agent', 'conversationRowsRangeV4'],
+        {sessionId: 'sess_x'});
+    const stamped = client.lastPageBridgeTrafficAt();
+    for (const payload of fragment(reqBody, 'page-bridge-5', 1)) {
+        client.acceptObservedPayload(payload, true);
+    }
+    assert.strictEqual(client.lastPageBridgeTrafficAt(), stamped,
+        'outbound page frames are not desktop deliveries');
+});
+
+// --- append to inject.test.js ---------------------------------------------
+

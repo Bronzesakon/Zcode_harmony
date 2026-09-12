@@ -1093,6 +1093,7 @@
         // The threshold is injectable so the Node tests do not have to sleep.
         this._pageRpcSlowMs = typeof options.pageRpcSlowMs === 'number' ?
             options.pageRpcSlowMs : PAGE_RPC_SLOW_MS;
+        this._pageBridgeTrafficAt = 0;
         this._pageRpc = {
             pending: {},
             calls: 0,
@@ -1125,9 +1126,13 @@
         };
     };
 
+    /** Page bridges' most recent inbound rpc-frame time (0 = none seen this client). */
+    RemoteClient.prototype.lastPageBridgeTrafficAt = function () {
+        return this._pageBridgeTrafficAt || 0;
+    };
+
     /** How many page RPCs are awaiting a reply right now (0 when idle). */
-    RemoteClient.prototype.inFlightPageRpcs = function () {
-        var count = 0;
+    RemoteClient.prototype.inFlightPageRpcs = function () {        var count = 0;
         for (var slot in this._pageRpc.pending) {
             count += 1;
         }
@@ -2025,6 +2030,10 @@
         if (this._bridgesById[payload.bridgeSessionId]) {
             return;
         }
+        // 页面桥的入站流量戳（任何 rpc-frame 都算）：「对话内容是否真的在下发」
+        // 的协议层信号——DOM 层看不出内容缺失（标题/输入框都正常），流量看得出。
+        // inject.js 的 10s 内容检查用（见 §5b）。
+        this._pageBridgeTrafficAt = Date.now();
         var bytes = this._tryAssemble(payload, false);
         if (!bytes) {
             return;

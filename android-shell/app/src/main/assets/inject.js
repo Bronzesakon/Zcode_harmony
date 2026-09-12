@@ -600,6 +600,7 @@
             subscribeAll: cfg.subscribeAll !== false,
             sharedState: pageCoverage
         });
+        next.gen = ++clientGenSeq;
         next.onSessions = function (update) {
             post('sessions', update);
         };
@@ -1190,9 +1191,15 @@
     var FALLBACK_CHECK_MS = 3000;
     var FALLBACK_RELOAD_GAP_MS = 15000;
     var FALLBACK_STORE_AT = 'zcodeShellFastRefreshAt';
+    // 第二级检查：DOM 判不出「标题正确 + 输入框可用 + 内容不来」（2026-09-12 真机
+    // 日志证实该形态存在且输入框并不灰），改用协议层信号——信标后页面桥若在
+    // CONTENT 窗口内零入站帧，说明桌面端什么都没下发，刷新换一条连接。
+    var FALLBACK_CONTENT_CHECK_MS = 10000;
 
     var fallbackTimer = null;
-    var fallbackState = {lastReloadAt: 0};
+    var contentTimer = null;
+    var fallbackState = {lastReloadAt: 0, beaconAt: 0, beaconGen: 0};
+    var clientGenSeq = 0;
 
     function fallbackElementVisible(el) {
         try {
@@ -1296,12 +1303,18 @@
         }
     }
 
-    /** 进对话信标：重置 3s 一次性检查（快速切换会话时，以最后一次为准）。 */
+    /** 进对话信标：重置 3s DOM 检查与 10s 内容检查（快速切换时以最后一次为准）。 */
     function scheduleFallbackCheck() {
         if (fallbackTimer) {
             clearTimeout(fallbackTimer);
         }
         fallbackTimer = setTimeout(fallbackCheck, FALLBACK_CHECK_MS);
+        if (contentTimer) {
+            clearTimeout(contentTimer);
+        }
+        fallbackState.beaconAt = Date.now();
+        fallbackState.beaconGen = client ? client.gen : 0;
+        contentTimer = setTimeout(fallbackContentCheck, FALLBACK_CONTENT_CHECK_MS);
     }
 
     function fallbackCheck() {
@@ -1347,6 +1360,48 @@
         }
     }
 
+    /**
+     * 第二级检查（+10s）：DOM 全就绪但桌面端零下发。信标之后页面桥但凡收到过
+     * 任何 rpc-frame（会话内容、rows 结果、事件都算），就认为内容在路上；一帧
+     * 都没有才判卡死。链路重建（client 换代）的窗口跳过本轮——恢复期不插刀。
+     */
+    function fallbackContentCheck() {
+        if (contentTimer) {
+            clearTimeout(contentTimer);
+        }
+        contentTimer = null;
+        var clientNow = client;
+        if (!clientNow || clientNow.gen !== fallbackState.beaconGen) {
+            diag('debug', '10s 内容检查：期间链路重建，本轮不判');
+            return;
+        }
+        if (typeof clientNow.lastPageBridgeTrafficAt !== 'function') {
+            return;
+        }
+        var trafficAt = clientNow.lastPageBridgeTrafficAt();
+        if (trafficAt >= fallbackState.beaconAt) {
+            diag('debug', '10s 内容检查：页面桥有下发（内容已在路上），不刷新');
+            return;
+        }
+        var stamp = parseInt(storeGet(FALLBACK_STORE_AT), 10);
+        var last = Math.max(fallbackState.lastReloadAt, isNaN(stamp) ? 0 : stamp);
+        var wait = last + FALLBACK_RELOAD_GAP_MS - Date.now();
+        if (wait > 0) {
+            diag('debug', '10s 内容检查命中（页面桥零下发），处于刷新间隔内，' +
+                Math.round(wait / 1000) + 's 后复查');
+            contentTimer = setTimeout(fallbackContentCheck, wait);
+            return;
+        }
+        fallbackState.lastReloadAt = Date.now();
+        storeSet(FALLBACK_STORE_AT, String(fallbackState.lastReloadAt));
+        diag('warn', '进对话 10s 内容零下发（标题与输入框正常但页面桥无任何入站帧），刷新页面');
+        try {
+            G.location.reload();
+        } catch (e) {
+            diag('warn', '自动刷新失败: ' + e);
+        }
+    }
+
     /** Upload-named page RPCs get explicit lines: that is the file-send chain. */
     var UPLOAD_RPC_RE = /upload|attachment|artifact/i;
 
@@ -1378,11 +1433,15 @@
     G.__zcodeShellFallback = {
         note: notePageRpcCall,
         check: fallbackCheck,
+        contentCheck: fallbackContentCheck,
         state: function () {
             return fallbackState;
         },
         timer: function () {
             return fallbackTimer;
+        },
+        contentTimer: function () {
+            return contentTimer;
         }
     };
 
