@@ -1180,31 +1180,141 @@ test('标题回退：DOM 判据只认「已打开任务的回退态」', () => {
     try {
         const facts = FB().facts;
         appendFallbackDom(page, {titleText: '新建任务', placeholder: '向 ZCode 提问…'});
-        assert.deepStrictEqual(facts(), {domFallback: true, composerValue: ''});
+        assert.deepStrictEqual(facts(),
+            {domFallback: true, composerValue: '', headerMatch: 'leaf', placeholder: true});
 
         page.document.body.children.length = 0;
         appendFallbackDom(page,
             {titleText: '新建任务', placeholder: '向 ZCode 提问…', value: '草稿'});
-        assert.deepStrictEqual(facts(), {domFallback: true, composerValue: '草稿'},
+        assert.deepStrictEqual(facts(),
+            {domFallback: true, composerValue: '草稿', headerMatch: 'leaf', placeholder: true},
             'a draft must be readable so the reload can wait for it');
 
         page.document.body.children.length = 0;
         appendFallbackDom(page,
             {titleText: '真实任务名', placeholder: '继续输入以排队后续修改'});
-        assert.deepStrictEqual(facts(), {domFallback: false, composerValue: ''},
+        assert.deepStrictEqual(facts(),
+            {domFallback: false, composerValue: '', headerMatch: '', placeholder: false},
             'the healed pair is not a fallback');
 
         page.document.body.children.length = 0;
         appendFallbackDom(page,
             {titleText: '上午好呀，有什么想让我帮忙的吗', placeholder: '向 ZCode 提问…'});
-        assert.deepStrictEqual(facts(), {domFallback: false, composerValue: ''},
+        assert.deepStrictEqual(facts(),
+            {domFallback: false, composerValue: '', headerMatch: '', placeholder: false},
             'the genuine new-task greeting screen must never count as fallback');
 
         page.document.body.children.length = 0;
         appendFallbackDom(page,
             {titleText: '新建任务', placeholder: '向 ZCode 提问，使用 @ 添加上下文'});
-        assert.deepStrictEqual(facts(), {domFallback: true, composerValue: ''},
+        assert.deepStrictEqual(facts(),
+            {domFallback: true, composerValue: '', headerMatch: 'leaf', placeholder: true},
             'the wide-layout long placeholder is the same new-task mode');
+
+        // 标题被包进容器（两个 span 拼成全文）：leaf 不命中时 deep 兜底
+        page.document.body.children.length = 0;
+        const wrap = new FakeElement('div');
+        const part1 = new FakeElement('span');
+        part1.textContent = '新建';
+        const part2 = new FakeElement('span');
+        part2.textContent = '任务';
+        wrap.appendChild(part1);
+        wrap.appendChild(part2);
+        page.document.body.appendChild(wrap);
+        appendFallbackDom(page, {titleText: '占位不相关', placeholder: '向 ZCode 提问…'});
+        assert.strictEqual(facts().headerMatch, 'deep',
+            'a title wrapped in child elements still matches via the deep pass');
+        assert.strictEqual(facts().domFallback, true);
+    } finally {
+        page.teardown();
+    }
+});
+
+test('标题回退：每个 episode 首查打一行事实，且只打一行', () => {
+    const page = setupPage();
+    try {
+        const fb = FB();
+        fb.note({name: 'zcode-agent.subscribeConversationV4', args: {sessionId: 'sess_x'}});
+        fb.learn([{sessionId: 'sess_x', title: '真标题', phase: 'running'}]);
+        appendFallbackDom(page, {titleText: '新建任务', placeholder: '向 ZCode 提问…'});
+        fb.tick();
+        const first = findPost(page.posts, 'diag', (d) => d.message.includes('标题回退首查'));
+        assert.strictEqual(first.length, 1, 'exactly one first-check line');
+        assert.ok(first[0].data.message.includes('头部=leaf'), 'header match is on the line');
+        assert.ok(first[0].data.message.includes('会话=sess_x'), 'session is on the line');
+        assert.ok(first[0].data.message.includes('壳侧标题=有'), 'learned title is on the line');
+        fb.tick();
+        assert.strictEqual(
+            findPost(page.posts, 'diag', (d) => d.message.includes('标题回退首查')).length, 1,
+            'the first-check line must not repeat within one episode');
+    } finally {
+        page.teardown();
+    }
+});
+
+test('上传链路：上传相关的页面 RPC 调用打显式行', () => {
+    const page = setupPage();
+    try {
+        const fb = FB();
+        fb.note({name: 'zcode-file.uploadArtifact', args: null});
+        assert.strictEqual(fb.episode().timer, null,
+            'an upload call is not a task-entry beacon');
+        assert.ok(findPost(page.posts, 'diag', (d) =>
+            d.message.includes('页面上传调用开始：zcode-file.uploadArtifact')).length === 1);
+        fb.note({name: 'zcode-agent.subscribeConversationV4', args: {sessionId: 'sess_u'}});
+        assert.ok(findPost(page.posts, 'diag', (d) =>
+            d.message.includes('页面上传调用')).length === 1,
+            'a non-upload call must not add upload lines');
+        fb.stop();
+    } finally {
+        page.teardown();
+    }
+});
+
+test('上传链路：上传相关的页面 RPC 结果打完成/失败行', () => {
+    const page = setupPage();
+    try {
+        const socket = new globalThis.WebSocket('wss://relay.example');
+        const bridge = 'page-bridge-21';
+        const call = encodeBody(
+            [page.protocol.REQ_PROMISE, 5, 'zcode-file', 'uploadArtifact'], {a: 1});
+        for (const payload of fragment(call, bridge, 1)) {
+            socket.send(JSON.stringify({type: 'data', payload}));
+        }
+        const ok = encodeBody([page.protocol.RES_PROMISE_SUCCESS, 5], {done: true});
+        for (const payload of fragment(ok, bridge, 2)) {
+            socket.receive({type: 'data', payload});
+        }
+        const call2 = encodeBody(
+            [page.protocol.REQ_PROMISE, 6, 'zcode-file', 'uploadArtifact'], {a: 1});
+        for (const payload of fragment(call2, bridge, 3)) {
+            socket.send(JSON.stringify({type: 'data', payload}));
+        }
+        const err = encodeBody([page.protocol.RES_PROMISE_ERROR, 6], {message: 'disk full'});
+        for (const payload of fragment(err, bridge, 4)) {
+            socket.receive({type: 'data', payload});
+        }
+        assert.ok(findPost(page.posts, 'diag', (d) =>
+            d.message.includes('页面上传调用完成') &&
+            d.message.includes('uploadArtifact')).length === 1, 'success line');
+        assert.ok(findPost(page.posts, 'diag', (d) =>
+            d.message.includes('页面上传调用失败') &&
+            d.message.includes('disk full')).length === 1, 'failure line carries the message');
+    } finally {
+        page.teardown();
+    }
+});
+
+test('页面开销行携带出站帧计数（上传块的信号）', () => {
+    const page = setupPage();
+    try {
+        const socket = new globalThis.WebSocket('wss://relay.example');
+        const body = 'x'.repeat(2048);
+        socket.send(JSON.stringify({type: 'data', payload: {zcode_type: 'unknown', body}}));
+        globalThis.__zcodeShellHeartbeat();
+        assert.ok(findPost(page.posts, 'diag', (d) =>
+            d.message.includes('页面开销') && d.message.includes('发帧 1 个')).length === 1,
+            'the perf line must count the page\'s outbound frames');
     } finally {
         page.teardown();
     }

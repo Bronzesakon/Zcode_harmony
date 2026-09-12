@@ -13,6 +13,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.provider.OpenableColumns
 import android.view.View
 import android.webkit.ConsoleMessage
 import android.webkit.ValueCallback
@@ -369,6 +370,9 @@ class MainActivity : AppCompatActivity() {
                 }
                 // A second request while one is still pending would strand the
                 // first callback and freeze that input.
+                if (pendingFileCallback != null) {
+                    Diagnostics.log("warn", "上传请求：上一个选择仍未返回，先取消它")
+                }
                 pendingFileCallback?.onReceiveValue(null)
                 pendingFileCallback = filePathCallback
                 showUploadSourceDialog(fileChooserParams)
@@ -728,6 +732,7 @@ class MainActivity : AppCompatActivity() {
         val pickMode = if (multiple) "多选" else "单选"
         val mimeTypes = UploadMime.normalisePlatform(params.acceptTypes?.toList())
         val request = PickVisualMediaRequest(visualMediaTypeFor(mimeTypes))
+        Diagnostics.info("上传请求：网页打开选择器（$pickMode）accept=${mimeTypes.joinToString()}")
 
         UploadSourceDialog(
             context = this,
@@ -784,9 +789,47 @@ class MainActivity : AppCompatActivity() {
         val callback = pendingFileCallback ?: return
         pendingFileCallback = null
         Diagnostics.info(
-            if (uris.isEmpty()) "文件选择已取消" else "已选择 ${uris.size} 个文件，交回网页"
+            if (uris.isEmpty()) "文件选择已取消"
+            else "已选择 ${uris.size} 个文件，交回网页：${describePickedFiles(uris)}"
         )
         callback.onReceiveValue(if (uris.isEmpty()) null else uris.toTypedArray())
+    }
+
+    /**
+     * 一行、有界的选择结果：每个文件 名称（mime，大小），最多列 5 个。这是
+     * 「安卓端 pick 到网页内发送」链条的安卓侧终点——文件是否按预期到达网页，
+     * 类型/大小对不对，看这一行就够。
+     */
+    private fun describePickedFiles(uris: List<Uri>): String {
+        val parts = uris.take(5).map { uri ->
+            try {
+                var name = ""
+                var size = -1L
+                contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                    val nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    val sizeIdx = cursor.getColumnIndex(OpenableColumns.SIZE)
+                    if (cursor.moveToFirst()) {
+                        if (nameIdx >= 0) name = cursor.getString(nameIdx) ?: ""
+                        if (sizeIdx >= 0 && !cursor.isNull(sizeIdx)) size = cursor.getLong(sizeIdx)
+                    }
+                }
+                if (name.length > 40) {
+                    name = name.take(40) + "…"
+                }
+                "$name（${contentResolver.getType(uri) ?: "?"}, ${humanSize(size)}）"
+            } catch (e: Exception) {
+                "（读取失败：${e.message}）"
+            }
+        }
+        val more = if (uris.size > 5) " …共 ${uris.size} 个" else ""
+        return parts.joinToString() + more
+    }
+
+    private fun humanSize(bytes: Long): String = when {
+        bytes < 0 -> "大小未知"
+        bytes < 1024 -> "${bytes}B"
+        bytes < 1024 * 1024 -> "%.1fKB".format(bytes / 1024.0)
+        else -> "%.1fMB".format(bytes / 1024.0 / 1024.0)
     }
 
     private fun toast(message: String) {

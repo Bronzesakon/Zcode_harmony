@@ -341,7 +341,7 @@
      * hidden-page timers" and "the page is still beating and something else arms the
      * watchdog" need different fixes and look identical from the outside.
      */
-    var linkWindow = {acks: 0, probes: 0, pageBeats: 0};
+    var linkWindow = {acks: 0, probes: 0, pageBeats: 0, outFrames: 0, outChars: 0};
 
     function now() {
         try {
@@ -435,10 +435,15 @@
         var acks = linkWindow.acks;
         var probes = linkWindow.probes;
         var pageBeats = linkWindow.pageBeats;
+        var outFrames = linkWindow.outFrames;
+        var outChars = linkWindow.outChars;
         linkWindow.acks = 0;
         linkWindow.probes = 0;
         linkWindow.pageBeats = 0;
-        if (frames === 0 && longTasks === 0 && acks === 0 && probes === 0 && pageBeats === 0) {
+        linkWindow.outFrames = 0;
+        linkWindow.outChars = 0;
+        if (frames === 0 && longTasks === 0 && acks === 0 && probes === 0 && pageBeats === 0 &&
+            outFrames === 0) {
             return;
         }
         var elapsed = Date.now() - perf.windowStartedAt;
@@ -451,6 +456,7 @@
             Math.round(decodeMs) + 'ms，单帧最长 ' + Math.round(perf.decodeMsMax) + 'ms）· ' +
             '长任务 ' + longTasks + ' 个（合计 ' + Math.round(longTaskMs) +
             'ms，最长 ' + Math.round(perf.longTaskMaxMs) + 'ms）· ' +
+            '发帧 ' + outFrames + ' 个（' + Math.round(outChars / 1024) + 'K 字符）· ' +
             '链路 ack ' + acks + ' · 探针 ' + probes + ' · paired ' + relayPaired +
             ' socket ' + (socket ? socket.readyState : -1) +
             ' · 页面心跳 ' + pageBeats);
@@ -555,6 +561,13 @@
                 notePageRpcCall(call);
             } catch (e) {
                 // the fallback watcher must never break the page's traffic
+            }
+        };
+        next.onPageRpcResult = function (result) {
+            try {
+                notePageRpcResult(result);
+            } catch (e) {
+                // the upload trace must never break the page's traffic
             }
         };
         next.onStatus = function (status) {
@@ -755,6 +768,11 @@
             return;
         }
         if (outbound) {
+            // The page's outbound volume: the upload path ships file chunks as
+            // relay frames, so a multi-hundred-KB burst here IS the "the page
+            // is sending my file" signature (reported in 页面开销).
+            linkWindow.outFrames += 1;
+            linkWindow.outChars += text.length;
             try {
                 ensureClient().acceptObservedPayload(frame.payload, true);
             } catch (e) {
@@ -1131,7 +1149,13 @@
     var FALLBACK_STORE_SESSION = 'zcodeShellAutoReloadSession';
     var FALLBACK_TITLES_MAX = 1500;
 
-    var fallbackEpisode = {session: '', entryAt: 0, confirmed: false, timer: null};
+    var fallbackEpisode = {
+        session: '',
+        entryAt: 0,
+        confirmed: false,
+        checked: false,
+        timer: null
+    };
     var fallbackTitles = {};
     var fallbackReloaded = {};
 
@@ -1189,22 +1213,31 @@
         }
     }
 
-    /** First visible leaf whose exact text is `text`, or null. */
-    function findVisibleLeaf(text) {
+    function findHeaderText() {
+        // Whether the fallback title text is visible at all, and how literally
+        // it was found: 'leaf' = a childless element carries exactly that text
+        // (the normal case), 'deep' = only a container with children matches
+        // (the header wraps the title in spans/icons — still a match), '' = no
+        // visible occurrence. The distinction is logged on the first check so
+        // a real-device miss can be told apart from "the page simply healed".
         var nodes = document.querySelectorAll('body *');
+        var deep = false;
         for (var i = 0; i < nodes.length; i++) {
             var el = nodes[i];
-            if (el.childElementCount !== 0) {
+            if ((el.textContent || '').trim() !== FALLBACK_TITLE_TEXT) {
                 continue;
             }
-            if ((el.textContent || '').trim() !== text) {
+            if (el.childElementCount === 0) {
+                if (fallbackElementVisible(el)) {
+                    return 'leaf';
+                }
                 continue;
             }
-            if (fallbackElementVisible(el)) {
-                return el;
+            if (!deep && fallbackElementVisible(el)) {
+                deep = true;
             }
         }
-        return null;
+        return deep ? 'deep' : '';
     }
 
     /** The composer as {inNewTaskMode, value}, identified by placeholder. */
@@ -1231,11 +1264,22 @@
     }
 
     function fallbackFacts() {
-        if (!findVisibleLeaf(FALLBACK_TITLE_TEXT)) {
-            return {domFallback: false, composerValue: ''};
+        var header = findHeaderText();
+        if (!header) {
+            return {
+                domFallback: false,
+                composerValue: '',
+                headerMatch: '',
+                placeholder: false
+            };
         }
         var composer = composerState();
-        return {domFallback: composer.inNewTaskMode, composerValue: composer.value};
+        return {
+            domFallback: composer.inNewTaskMode,
+            composerValue: composer.value,
+            headerMatch: header,
+            placeholder: composer.inNewTaskMode
+        };
     }
 
     function storeGet(key) {
@@ -1264,6 +1308,7 @@
         fallbackEpisode.session = '';
         fallbackEpisode.entryAt = 0;
         fallbackEpisode.confirmed = false;
+        fallbackEpisode.checked = false;
     }
 
     function sessionFromArgs(args) {
@@ -1285,6 +1330,7 @@
                 fallbackEpisode.session = session;
                 fallbackEpisode.entryAt = Date.now();
                 fallbackEpisode.confirmed = false;
+                fallbackEpisode.checked = false;
                 diag('debug', '标题回退观察重置（切到 ' + session + '）');
             }
             return;
@@ -1292,12 +1338,22 @@
         fallbackEpisode.session = session;
         fallbackEpisode.entryAt = Date.now();
         fallbackEpisode.confirmed = false;
+        fallbackEpisode.checked = false;
         fallbackEpisode.timer = setInterval(fallbackTick, FALLBACK_POLL_MS);
         diag('debug', '标题回退观察开始（进任务' + (session ? '：' + session : '') + '）');
     }
 
+    /** Upload-named page RPCs get explicit lines: that is the file-send chain. */
+    var UPLOAD_RPC_RE = /upload|attachment|artifact/i;
+
     function notePageRpcCall(call) {
-        if (!call || call.name !== FALLBACK_ENTRY_METHOD) {
+        if (!call) {
+            return;
+        }
+        if (UPLOAD_RPC_RE.test(call.name)) {
+            diag('info', '页面上传调用开始：' + call.name);
+        }
+        if (call.name !== FALLBACK_ENTRY_METHOD) {
             return;
         }
         var session = sessionFromArgs(call.args);
@@ -1305,6 +1361,18 @@
             return;
         }
         startFallbackEpisode(session);
+    }
+
+    function notePageRpcResult(result) {
+        if (!result || !UPLOAD_RPC_RE.test(result.name)) {
+            return;
+        }
+        if (result.ok) {
+            diag('info', '页面上传调用完成 ' + Math.round(result.cost || 0) + 'ms：' + result.name);
+        } else {
+            diag('warn', '页面上传调用失败 ' + Math.round(result.cost || 0) + 'ms：' + result.name +
+                (result.message ? ' · ' + String(result.message).substring(0, 120) : ''));
+        }
     }
 
     function learnSessionTitles(sessions) {
@@ -1343,6 +1411,21 @@
         facts.foreground = appForeground;
         if (facts.domFallback) {
             fallbackEpisode.confirmed = true;
+        }
+        if (!fallbackEpisode.checked) {
+            // The one line that makes this feature diagnosable from a pasted
+            // log: whether the DOM criteria hit on a real device at all. Every
+            // task entry passes through here exactly once.
+            fallbackEpisode.checked = true;
+            var learned = fallbackEpisode.session ?
+                String(fallbackTitles[fallbackEpisode.session] || '') : '';
+            diag('info', '标题回退首查 +' + Math.round(facts.age / 1000) + 's：头部=' +
+                (facts.headerMatch || '未找到') +
+                ' 占位符=' + (facts.placeholder ? '新任务' : '否') +
+                ' 草稿=' + (facts.composerValue ? facts.composerValue.length + '字' : '无') +
+                ' 前台=' + (appForeground ? '是' : '否') +
+                (fallbackEpisode.session ? ' 会话=' + fallbackEpisode.session : '') +
+                ' 壳侧标题=' + (learned && learned !== FALLBACK_TITLE_TEXT ? '有' : '无'));
         }
         var decision = evaluateFallbackEpisode(fallbackEpisode, facts, {
             titles: fallbackTitles,

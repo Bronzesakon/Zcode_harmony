@@ -788,3 +788,31 @@ test('onPageRpcCall hands the page\'s outbound call name and args to the shell',
     assert.strictEqual(calls[0].args && calls[0].args.sessionId, 'sess_beacon',
         'the sessionId rides along for the fallback watcher');
 });
+
+test('onPageRpcResult hands the page call outcome to the shell', () => {
+    const results = [];
+    const {client} = makeClient({});
+    client.onPageRpcResult = (r) => results.push(r);
+    const bridge = 'page-bridge-10';
+    const call = encodeBody([P.REQ_PROMISE, 8, 'zcode-file', 'uploadArtifact'], {a: 1});
+    for (const payload of fragment(call, bridge, 1)) {
+        client.acceptObservedPayload(payload, true);
+    }
+    const ok = encodeBody([P.RES_PROMISE_SUCCESS, 8], {done: true});
+    for (const payload of fragment(ok, bridge, 2)) {
+        client.acceptObservedPayload(payload, false);
+    }
+    const call2 = encodeBody([P.REQ_PROMISE, 9, 'zcode-file', 'uploadArtifact'], {a: 1});
+    for (const payload of fragment(call2, bridge, 3)) {
+        client.acceptObservedPayload(payload, true);
+    }
+    const err = encodeBody([P.RES_PROMISE_ERROR, 9], {message: 'disk full'});
+    for (const payload of fragment(err, bridge, 4)) {
+        client.acceptObservedPayload(payload, false);
+    }
+    assert.strictEqual(results.length, 2);
+    assert.deepStrictEqual([results[0].ok, results[0].name],
+        [true, 'zcode-file.uploadArtifact']);
+    assert.ok(results[0].cost >= 0);
+    assert.deepStrictEqual([results[1].ok, results[1].message], [false, 'disk full']);
+});

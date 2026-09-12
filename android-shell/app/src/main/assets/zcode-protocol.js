@@ -991,6 +991,9 @@
      *                        observed outbound. subscribeConversationV4 is the
      *                        "the user just opened a task" beacon (inject.js
      *                        §5b); args carry its sessionId.
+     *   onPageRpcResult(r)   {name, ok, cost, message} — every completed page
+     *                        promise call. The upload chain's completion/failure
+     *                        evidence (inject.js logs upload-named calls).
      */
     function RemoteClient(options) {
         this._send = options.send;
@@ -1002,6 +1005,7 @@
         this.onSessions = null;
         this.onStatus = null;
         this.onPageRpcCall = null;
+        this.onPageRpcResult = null;
 
         this._pending = {};
         // Two indexes on purpose: workspaces are addressed by key (for
@@ -1867,10 +1871,11 @@
         }
         delete this._pageRpc.pending[slot];
         var cost = Date.now() - call.at;
-        if (type !== RES_PROMISE_SUCCESS) {
+        var ok = type === RES_PROMISE_SUCCESS;
+        var message = '';
+        if (!ok) {
             this._pageRpc.errors += 1;
             this._pageRpc.windowErrors += 1;
-            var message = '';
             try {
                 message = data && typeof data === 'object' && data.message ?
                     String(data.message) : (typeof data === 'string' ? data : JSON.stringify(data));
@@ -1879,9 +1884,7 @@
             }
             this._log('页面调用失败 ' + cost + 'ms：' + call.name +
                 (message ? ' · ' + String(message).substring(0, 160) : ''));
-            return;
-        }
-        if (cost >= this._pageRpcSlowMs) {
+        } else if (cost >= this._pageRpcSlowMs) {
             this._pageRpc.slow += 1;
             this._pageRpc.windowSlow += 1;
             if (this._pageRpc.slowLogged < PAGE_RPC_SLOW_LOG_MAX) {
@@ -1889,6 +1892,13 @@
                 this._log('页面调用慢 ' + cost + 'ms：' + call.name +
                     (this._pageRpc.slowLogged === PAGE_RPC_SLOW_LOG_MAX ?
                         '（后续慢调用只计入窗口汇总）' : ''));
+            }
+        }
+        if (typeof this.onPageRpcResult === 'function') {
+            try {
+                this.onPageRpcResult({name: call.name, ok: ok, cost: cost, message: message});
+            } catch (e) {
+                // a hook must never break the page's traffic
             }
         }
     };
