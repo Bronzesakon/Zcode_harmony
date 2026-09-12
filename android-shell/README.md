@@ -955,25 +955,29 @@ inject.js 现供给 sink，原生日志出 `页面: …` 行；
 **测试点（adb 驱动）**：`am start -a com.zcode.remote.action.DIAG --es diag_cmd kick_test|l1_test|vitals`——
 kick_test = Tier2 可行性实验（同凭证开第二条 WebSocket，观察 relay 的 KICK/takeover 语义，旧连接是否被踢），
 l1_test = 手动轻推，vitals = DOM 体征快照。JS 68 项测试全绿（快刷 6 项按看门狗语义重写）。
-**待真机**：kick_test / l1_test **均已实测通过**（见下）；后台长测验证实况窗不断不滞后
-（新增 `后台链路静默 Ns` 取证行）。
+**2026-09-12 深夜真机实测（pre.51）**：日志汇接通（`页面: …` 行把页面开对话全过程自述出来，
+此前完全盲区）；l1_test 轻推全链路通过（0.7s 页面自愈重连）；kick_test 证实 relay 不拒绝
+第二条连接、KICK/takeover 发生在配对完成层面；Tier2 质询算法已提取
+（`proof = base64url(HMAC-SHA256(passHash, nonce|'terminal'|deviceSid))`，docs/05 @4696180），
+原生 mini relay 客户端可行性确认，未开工。
 
-**2026-09-12 深夜真机实测结果（pre.51，一加 PLC110 无线 adb）**：
-- **烟雾**：日志汇接通，`页面: …` 行把页面开对话的全过程自述了出来
-  （attach → store connect → subscribe → **ack 265ms** → snapshot 完成）——
-  此前这些信息完全不存在；DIAG 指令通路、vitals 体征读取全部工作。
-- **l1_test 轻推**：全链路通过——close 归因行直接指到 `nudgeReconnect`，
-  socket 关闭后 **0.7s 页面自己重开（#3）**，9s 内五个工作区全部重新订阅，
-  页面全程无感（无 reload、无 boot）；轻推后无页面订阅事件属正常（当时无会话在订）。
-- **kick_test（Tier2 前置实验）**：同款凭证的第二条 WebSocket **被 relay 接纳**
-  （`wss://zcode.z.ai/ws`，open 成功），但服务端回 **`auth_challenge`（质询-应答）**，
-  测试连接未应答故停在未配对态；**已配对的旧连接没有被踢**、页面零扰动。
-  ⇒ relay 的 KICK/takeover 发生在**配对完成**层面，不拒绝第二条连接本身。
-- **Tier2 可行性结论**：质询应答算法已从页面 bundle 提取
-  （`docs/05` 快照 @4696180）：`proof = base64url(HMAC-SHA256(key=passHash,
-  msg=nonce + '|' + 'terminal' + '|' + deviceSid))`，握手链
-  auth_init → auth_challenge → auth_response{proof} → pair。Kotlin 实现约百余行
-  （javax.crypto.Mac 即可），passHash/deviceSid 由注入层一次性转交（仅内存）。
-  **下一步**（待拍板）：原生 mini relay 客户端 + 「后台配对接管」实验——
-  原生完成配对时观察页面连接是否被踢/页面进 takeover 态，
-  验证后台接管的完整语义。
+**2026-09-13 凌晨追加（僵尸订阅战役，pre.51→pre.53）**：
+用户真机遭遇「手机画面冻结 45 分钟」并要求定因——日志定案为**僵尸订阅**：socket 重建后页面
+配对恢复但 runtime（工作区桥+会话订阅）不重建、零自愈（页面自己的看门狗只守传输心跳，
+"配对健康但零业务帧"无人值守），传输层存活完全掩护了内容层死亡。三层对照实验（PC 生成/
+传输 ack/页面 rows 冻结）+ l1_test 主动复现证实。
+- **B 路线（伪造 bridge-degraded 逼页面恢复）实测否决**：degrade_test 两发（首页态/会话态）
+  页面零反应——本地型工作区的桥包装对象没有 `getBridgeSessionId`，匹配永不成立。
+  测试点保留（`diag_cmd degrade_test`），pageBridgeSessionIds() 反查保留（协议测试覆盖）。
+- **A 路线已落地并验证**：
+  ① 协议层覆盖证据改为**按连接代次**（`_pageCoveredKeys`，per-client）：新连接上页面必须
+  重新自证（bridge-ready/会话索引监听），否则壳接管该工作区通知覆盖；页面恢复后
+  `_dropRedundantBridge` 自动让位。旧"覆盖跨重建共享"测试按新语义重写。
+  ② inject 僵尸订阅检测：任务 running 活动 60s 内 + 页面桥零业务帧 45s + DOM 健康
+  → 看门狗布防并**跳过轻推**（轻推已被证明不重建 runtime）直达刷新；恢复判据用帧流
+  不用 DOM（僵尸 DOM 本来就健康，vitals 判会自撤——首轮真机踩中已修）。
+  ③ 端到端实测：l1_test 复现 → 壳接管尝试与页面恢复竞争 → 页面自身错误恢复链被
+  激活（重新开桥+重订阅）→ 壳让位 → 全链路收敛健康。僵尸刷新档作为页面不恢复时的兜底。
+- **遗留**：后台长测（实况窗不断不滞后，`后台链路静默 Ns` 行取证）；
+  并发会话在 inject.js 的半成品补丁（lastPairStatus 未声明变量）存于
+  `/tmp/concurrent-pair-status.patch`，待其完成后再合入。
