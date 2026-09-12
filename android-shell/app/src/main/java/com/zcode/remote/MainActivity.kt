@@ -540,7 +540,6 @@ class MainActivity : AppCompatActivity() {
      * several reports per second.
      */
     private fun onPageStateReported(stateToken: String?, themeToken: String?) {
-        pageStateSeenSinceLoad = true
         runOnUiThread {
             val state = PageBarColor.stateOf(stateToken)
             val theme = PageBarColor.themeOf(themeToken)
