@@ -1766,12 +1766,21 @@
         if (!stallState.armed) {
             return;
         }
-        var v = readVitals();
-        // 只在体征"可读且健康"时撤防；读不到（DOM 半拆/极端环境）不算恢复，
-        // 继续走梯子——布防理由本身已经是证据。
-        if (v && !vitalsStalled(v)) {
-            stallCancel('判定时已恢复');
-            return;
+        if (stallState.skipNudge) {
+            // 僵尸布防的"恢复"判据是帧流，不是 DOM——僵尸的 DOM 本来就健康，
+            // 用 vitalsStalled 判会在 3s 判定点把自己撤掉（首轮真机实测踩中）。
+            if (!zombieSuspected(Date.now())) {
+                stallCancel('判定时帧流已恢复');
+                return;
+            }
+        } else {
+            var v = readVitals();
+            // 只在体征"可读且健康"时撤防；读不到（DOM 半拆/极端环境）不算恢复，
+            // 继续走梯子——布防理由本身已经是证据。
+            if (v && !vitalsStalled(v)) {
+                stallCancel('判定时已恢复');
+                return;
+            }
         }
         if (stallState.phase === 0) {
             stallState.phase = 1;
