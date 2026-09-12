@@ -771,3 +771,20 @@ test('the burst yields while a page request is in flight, but not past its budge
     await waiting;
     assert.ok(Date.now() - started < 3000, 'resumed as soon as the page was idle');
 });
+
+test('onPageRpcCall hands the page\'s outbound call name and args to the shell', () => {
+    const calls = [];
+    const {client} = makeClient({});
+    client.onPageRpcCall = (call) => calls.push(call);
+    const body = encodeBody(
+        [P.REQ_PROMISE, 7, 'zcode-agent', 'subscribeConversationV4'],
+        {sessionId: 'sess_beacon'}
+    );
+    for (const payload of fragment(body, 'page-bridge-9', 1)) {
+        client.acceptObservedPayload(payload, true);
+    }
+    assert.strictEqual(calls.length, 1, 'one promise call, one event');
+    assert.strictEqual(calls[0].name, 'zcode-agent.subscribeConversationV4');
+    assert.strictEqual(calls[0].args && calls[0].args.sessionId, 'sess_beacon',
+        'the sessionId rides along for the fallback watcher');
+});

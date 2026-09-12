@@ -987,6 +987,10 @@
      *   onSessions(update)   {key, title, workspacePath, workspaceIdentity,
      *                         source, sessions:[...]}
      *   onStatus(status)     {active, passive, workspaces, bridges, reason}
+     *   onPageRpcCall(call)  {name, args} — every promise call the page sends,
+     *                        observed outbound. subscribeConversationV4 is the
+     *                        "the user just opened a task" beacon (inject.js
+     *                        §5b); args carry its sessionId.
      */
     function RemoteClient(options) {
         this._send = options.send;
@@ -997,6 +1001,7 @@
 
         this.onSessions = null;
         this.onStatus = null;
+        this.onPageRpcCall = null;
 
         this._pending = {};
         // Two indexes on purpose: workspaces are addressed by key (for
@@ -1816,7 +1821,7 @@
      * 壳自己的 bridge 永远回答不了「点进任务为什么半天不出内容」，因为那个
      * 会话请求属于页面。这是唯一能看到它的地方。
      */
-    RemoteClient.prototype._tracePageCall = function (bridgeSessionId, header) {
+    RemoteClient.prototype._tracePageCall = function (bridgeSessionId, header, args) {
         var id = header[1];
         if (typeof id !== 'number') {
             return;
@@ -1841,6 +1846,13 @@
         this._pageRpc.windowCalls += 1;
         var methods = this._pageRpc.windowMethods;
         methods[name] = (methods[name] || 0) + 1;
+        if (typeof this.onPageRpcCall === 'function') {
+            try {
+                this.onPageRpcCall({name: name, args: args || null});
+            } catch (e) {
+                // a hook must never break the page's traffic
+            }
+        }
     };
 
     RemoteClient.prototype._tracePageResult = function (bridgeSessionId, type, header, data) {
@@ -1967,7 +1979,7 @@
                     clientKind: args[0].clientKind
                 };
             }
-            this._tracePageCall(payload.bridgeSessionId, header);
+            this._tracePageCall(payload.bridgeSessionId, header, args);
             return;
         }
         if (header[0] === REQ_PROMISE_CANCEL) {

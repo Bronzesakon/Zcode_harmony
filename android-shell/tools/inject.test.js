@@ -402,6 +402,7 @@ function setupPage(options) {
         delete globalThis.__zcodeShellHeartbeat;
         delete globalThis.__zcodeShellReportPageState;
         delete globalThis.__zcodeShellPageStateHooked;
+        delete globalThis.__zcodeShellFallback;
     };
 
     return {document, window, posts, protocol, configValue, dom, mediaQueries, teardown};
@@ -1092,6 +1093,228 @@ test('a document-start arrival before <html> exists retries instead of giving up
         await flush();
         assert.deepStrictEqual(pageStates(page.posts), ['main-header/dark'],
             'the reporter must install itself once the tree exists');
+    } finally {
+        page.teardown();
+    }
+});
+
+// ---------------------------------------------------------------------------
+// 标题回退自动恢复（§5b）
+//
+// 冷会话首次打开会把页面头部留在「新建任务」回退态：页面自己静默吞掉失败，
+// 通常 9–22 秒自愈，卡住时用户的办法是再刷一次。这里钉住用户定的时钟口径：
+// t0 = 进任务（页面发出 subscribeConversationV4，通知/流体云定位同路），
+// +2s 判定回退态在场，+25s 仍在 → 刷新一次；守卫逐条验证。
+// ---------------------------------------------------------------------------
+
+const FB = () => globalThis.__zcodeShellFallback;
+
+function appendFallbackDom(page, options) {
+    const title = new FakeElement('div');
+    title.textContent = options.titleText;
+    page.document.body.appendChild(title);
+    const composer = new FakeElement('textarea');
+    composer.setAttribute('placeholder', options.placeholder);
+    if (options.value !== undefined) {
+        composer.value = options.value;
+    }
+    page.document.body.appendChild(composer);
+}
+
+test('标题回退：判定表的每一条规则', () => {
+    const page = setupPage();
+    try {
+        const evaluate = FB().evaluate;
+        const env = {
+            titles: {sess_a: '真实任务名'},
+            tried: {},
+            lastReloadSession: null,
+            detectMs: 2000,
+            reloadAtMs: 25000
+        };
+        const ep = {session: 'sess_a', entryAt: 0, confirmed: false};
+        const facts = (over) => Object.assign(
+            {now: 0, age: 26000, domFallback: true, composerValue: '', foreground: true},
+            over);
+
+        assert.deepStrictEqual(evaluate(ep, facts(), env),
+            {action: 'reload', reason: 'stuck'});
+        // 回退不在场：确认过=已自愈；没确认过=本就正常
+        assert.deepStrictEqual(
+            evaluate({session: 'sess_a', entryAt: 0, confirmed: true},
+                facts({domFallback: false}), env),
+            {action: 'disarm', reason: 'healed'});
+        assert.deepStrictEqual(
+            evaluate({session: 'sess_a', entryAt: 0, confirmed: false},
+                facts({domFallback: false}), env),
+            {action: 'disarm', reason: 'no-fallback'});
+        assert.deepStrictEqual(evaluate(ep, facts({age: 1000, domFallback: false}), env),
+            {action: 'wait', reason: 'entry-transition'});
+        assert.deepStrictEqual(evaluate(ep, facts({foreground: false}), env),
+            {action: 'wait', reason: 'background'});
+        assert.deepStrictEqual(evaluate(ep, facts({composerValue: '草稿'}), env),
+            {action: 'wait', reason: 'composer-draft'});
+        assert.deepStrictEqual(
+            evaluate({session: 'sess_new', entryAt: 0, confirmed: true}, facts(),
+                Object.assign({}, env, {titles: {}})),
+            {action: 'disarm', reason: 'session-unknown'});
+        assert.deepStrictEqual(
+            evaluate({session: 'sess_new', entryAt: 0, confirmed: true}, facts(),
+                Object.assign({}, env, {titles: {sess_new: '新建任务'}})),
+            {action: 'disarm', reason: 'session-unknown'});
+        assert.deepStrictEqual(
+            evaluate(ep, facts(), Object.assign({}, env, {tried: {sess_a: true}})),
+            {action: 'disarm', reason: 'already-reloaded'});
+        assert.deepStrictEqual(
+            evaluate(ep, facts(), Object.assign({}, env, {lastReloadSession: 'sess_a'})),
+            {action: 'disarm', reason: 'already-reloaded'});
+        assert.deepStrictEqual(evaluate(ep, facts({age: 24000}), env),
+            {action: 'wait', reason: 'window'});
+    } finally {
+        page.teardown();
+    }
+});
+
+test('标题回退：DOM 判据只认「已打开任务的回退态」', () => {
+    const page = setupPage();
+    try {
+        const facts = FB().facts;
+        appendFallbackDom(page, {titleText: '新建任务', placeholder: '向 ZCode 提问…'});
+        assert.deepStrictEqual(facts(), {domFallback: true, composerValue: ''});
+
+        page.document.body.children.length = 0;
+        appendFallbackDom(page,
+            {titleText: '新建任务', placeholder: '向 ZCode 提问…', value: '草稿'});
+        assert.deepStrictEqual(facts(), {domFallback: true, composerValue: '草稿'},
+            'a draft must be readable so the reload can wait for it');
+
+        page.document.body.children.length = 0;
+        appendFallbackDom(page,
+            {titleText: '真实任务名', placeholder: '继续输入以排队后续修改'});
+        assert.deepStrictEqual(facts(), {domFallback: false, composerValue: ''},
+            'the healed pair is not a fallback');
+
+        page.document.body.children.length = 0;
+        appendFallbackDom(page,
+            {titleText: '上午好呀，有什么想让我帮忙的吗', placeholder: '向 ZCode 提问…'});
+        assert.deepStrictEqual(facts(), {domFallback: false, composerValue: ''},
+            'the genuine new-task greeting screen must never count as fallback');
+
+        page.document.body.children.length = 0;
+        appendFallbackDom(page,
+            {titleText: '新建任务', placeholder: '向 ZCode 提问，使用 @ 添加上下文'});
+        assert.deepStrictEqual(facts(), {domFallback: true, composerValue: ''},
+            'the wide-layout long placeholder is the same new-task mode');
+    } finally {
+        page.teardown();
+    }
+});
+
+test('标题回退：进任务信标起表，同会话不重置时钟、换会话才重置', () => {
+    const page = setupPage();
+    try {
+        const fb = FB();
+        fb.note({name: 'zcode-agent.subscribeConversationV4', args: {sessionId: 'sess_a'}});
+        assert.strictEqual(fb.episode().session, 'sess_a');
+        assert.ok(fb.episode().timer, 'the beacon must arm the watcher');
+        const entryAt = fb.episode().entryAt;
+        fb.note({name: 'zcode-agent.subscribeConversationV4', args: {sessionId: 'sess_a'}});
+        assert.strictEqual(fb.episode().entryAt, entryAt,
+            'a same-session resubscribe is one entry, not a new clock');
+        fb.note({name: 'zcode-agent.subscribeConversationV4', args: {sessionId: 'sess_b'}});
+        assert.strictEqual(fb.episode().session, 'sess_b');
+        assert.ok(fb.episode().entryAt >= entryAt, 'a new task restarts the clock');
+
+        fb.stop();
+        assert.strictEqual(fb.episode().timer, null);
+        fb.note({name: 'zcode-agent.openConversationV4', args: {sessionId: 'sess_c'}});
+        assert.strictEqual(fb.episode().timer, null,
+            'only the conversation-subscribe beacon arms an episode');
+    } finally {
+        page.teardown();
+    }
+});
+
+test('标题回退：页面真实发出的 subscribeConversationV4 触发起表', () => {
+    const page = setupPage();
+    try {
+        const socket = new globalThis.WebSocket('wss://relay.example');
+        const body = encodeBody(
+            [page.protocol.REQ_PROMISE, 9, 'zcode-agent', 'subscribeConversationV4'],
+            {workspacePath: '/repo', sessionId: 'sess_wire'}
+        );
+        for (const payload of fragment(body, 'page-bridge-11', 1)) {
+            socket.send(JSON.stringify({type: 'data', payload}));
+        }
+        assert.strictEqual(FB().episode().session, 'sess_wire',
+            'the observed beacon must arm the watcher with its sessionId');
+        assert.ok(FB().episode().timer);
+    } finally {
+        page.teardown();
+    }
+});
+
+test('标题回退：窗口到期自动刷新一次，同一会话绝不刷第二次', () => {
+    const page = setupPage();
+    const reloads = [];
+    const previousLocation = globalThis.location;
+    globalThis.location = {
+        href: 'https://zcode.z.ai/remote/v4',
+        reload: () => reloads.push(1)
+    };
+    try {
+        const fb = FB();
+        fb.note({name: 'zcode-agent.subscribeConversationV4', args: {sessionId: 'sess_fb1'}});
+        fb.learn([{sessionId: 'sess_fb1', title: '真实任务名', phase: 'running'}]);
+        appendFallbackDom(page, {titleText: '新建任务', placeholder: '向 ZCode 提问…'});
+        fb.episode().entryAt -= 26000;
+        fb.tick();
+        assert.strictEqual(reloads.length, 1, 'matured window + fallback on screen → reload');
+        assert.strictEqual(fb.episode().timer, null, 'the episode closes behind the reload');
+
+        fb.note({name: 'zcode-agent.subscribeConversationV4', args: {sessionId: 'sess_fb1'}});
+        assert.ok(fb.episode().timer, 'the restored task re-arms after the reload');
+        fb.tick();
+        assert.strictEqual(reloads.length, 1, 'one reload per session, ever');
+        assert.strictEqual(fb.episode().timer, null);
+
+        // 换一个会话不再拦（没有全局冷却——用户的口径）
+        fb.note({name: 'zcode-agent.subscribeConversationV4', args: {sessionId: 'sess_fb2'}});
+        fb.learn([{sessionId: 'sess_fb2', title: '另一个任务', phase: 'running'}]);
+        fb.episode().entryAt -= 26000;
+        fb.tick();
+        assert.strictEqual(reloads.length, 2, 'a different stuck task may reload at once');
+    } finally {
+        globalThis.location = previousLocation;
+        page.teardown();
+    }
+});
+
+test('标题回退：判定门内不误伤热打开，确认后消失视为自愈', () => {
+    const page = setupPage();
+    try {
+        const fb = FB();
+        // 热打开：+2s 头部已是真标题 → 判定门一过就收手
+        fb.note({name: 'zcode-agent.subscribeConversationV4', args: {sessionId: 'sess_hot'}});
+        fb.learn([{sessionId: 'sess_hot', title: '热任务名', phase: 'running'}]);
+        appendFallbackDom(page,
+            {titleText: '热任务名', placeholder: '继续输入以排队后续修改'});
+        fb.episode().entryAt -= 3000;
+        fb.tick();
+        assert.strictEqual(fb.episode().timer, null, 'a hot open never gets a reload');
+
+        // 冷打开：回退在场被确认，随后自愈 → 观察结束而不是刷新
+        fb.note({name: 'zcode-agent.subscribeConversationV4', args: {sessionId: 'sess_cold'}});
+        fb.learn([{sessionId: 'sess_cold', title: '冷任务名', phase: 'running'}]);
+        appendFallbackDom(page, {titleText: '新建任务', placeholder: '向 ZCode 提问…'});
+        fb.tick();
+        assert.ok(fb.episode().confirmed, 'the fallback pair confirms the episode');
+        page.document.body.children.length = 0;
+        appendFallbackDom(page,
+            {titleText: '冷任务名', placeholder: '继续输入以排队后续修改'});
+        fb.episode().entryAt -= 5000;
+        fb.tick();
+        assert.strictEqual(fb.episode().timer, null, 'healed → stand down, no reload');
     } finally {
         page.teardown();
     }

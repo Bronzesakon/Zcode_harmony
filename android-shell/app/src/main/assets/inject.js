@@ -15,6 +15,10 @@
  *   7. Stand in for the page's scrollbar: zero its space-taking rail and draw an
  *      overlay bar, so the page's content is centred and the position indicator
  *      survives (Android WebView will not render overlay scrollbars itself).
+ *   8. Recover a task left on the fallback title (新建任务): confirm the
+ *      fallback 2 s after the task was opened and, if it is still there at
+ *      25 s, reload the page once — the user's own refresh, with guards so a
+ *      draft or a brand-new task is never touched.
  *
  * Installed via WebViewCompat.addDocumentStartJavaScript, i.e. BEFORE any page
  * script runs. That timing is mandatory: the page opens its WebSocket during
@@ -539,7 +543,19 @@
             sharedState: pageCoverage
         });
         next.onSessions = function (update) {
+            try {
+                learnSessionTitles(update && update.sessions);
+            } catch (e) {
+                // bookkeeping must never break notification delivery
+            }
             post('sessions', update);
+        };
+        next.onPageRpcCall = function (call) {
+            try {
+                notePageRpcCall(call);
+            } catch (e) {
+                // the fallback watcher must never break the page's traffic
+            }
         };
         next.onStatus = function (status) {
             post('status', status);
@@ -1068,6 +1084,307 @@
             }
         }, 300);
         return true;
+    };
+
+    // -----------------------------------------------------------------------
+    // 5b. stuck title fallback -> one automatic reload
+    //
+    // Opening a conversation the desktop has not loaded yet strands the page's
+    // header on the fallback title 新建任务: the open tears the page's own
+    // subscription down, so its store is empty, and the readSession fallback
+    // fails with "Session is not active" — a failure the page swallows
+    // (.catch(() => null)) and never retries on its own. It normally heals in
+    // 9–22 s when the store refills (标题迟加载-调研报告, 2026-09-12); when it
+    // does not, the user's own remedies are opening the task again or
+    // refreshing the page.
+    //
+    // So this layer does what the user would do, on the clocks the user chose:
+    //   t0       — the page opens a task (it sends subscribeConversationV4;
+    //              a notification/流体云 tap enters through the same call).
+    //   t0 + 2 s — detection: the DOM shows the fallback pair, a visible
+    //              header title exactly 新建任务 (only ever rendered for an
+    //              OPEN task whose title could not be resolved — the genuine
+    //              new-task screen is the greeting layout and has no such row)
+    //              plus a composer in new-task mode (placeholder 向 ZCode
+    //              提问…). Not there -> the task loaded fine, stand down.
+    //   t0 + 25 s — refresh window matures: still the fallback pair -> reload
+    //              once. After a reload the page re-opens its last task on its
+    //              own (observed in the field log).
+    //
+    // Guards, because this reloads someone else's page: composer empty (never
+    // wipe a draft), foreground only, the shell's own sessions-index knows a
+    // real title for the session (never a brand-new task the desktop has not
+    // named yet), and one reload per session — remembered in sessionStorage, so
+    // the reload itself cannot loop into another one. There is deliberately NO
+    // global cooldown (user's call): a second, different stuck task may reload
+    // right away. A re-subscribe of the SAME conversation within an episode is
+    // that entry's own teardown/rebuild, so it does not restart the clock — a
+    // stuck retry loop must still mature to the window.
+    // -----------------------------------------------------------------------
+    var FALLBACK_TITLE_TEXT = '新建任务';
+    var FALLBACK_PLACEHOLDER_PREFIX = '向 ZCode 提问';
+    var FALLBACK_ENTRY_METHOD = 'zcode-agent.subscribeConversationV4';
+    var FALLBACK_SESSION_RE = /sess_[A-Za-z0-9_-]+/;
+    var FALLBACK_DETECT_MS = 2000;
+    var FALLBACK_RELOAD_AT_MS = 25000;
+    var FALLBACK_POLL_MS = 2000;
+    var FALLBACK_STORE_SESSION = 'zcodeShellAutoReloadSession';
+    var FALLBACK_TITLES_MAX = 1500;
+
+    var fallbackEpisode = {session: '', entryAt: 0, confirmed: false, timer: null};
+    var fallbackTitles = {};
+    var fallbackReloaded = {};
+
+    /**
+     * The whole decision, side-effect free. `ep` is the running episode
+     * {session, entryAt, confirmed}; `facts` what this tick observed
+     * {now, age, domFallback, composerValue, foreground}; `env` the knobs and
+     * memories {titles, tried, lastReloadSession, detectMs, reloadAtMs}.
+     * Returns {action, reason}, action one of 'wait' | 'disarm' | 'reload'.
+     */
+    function evaluateFallbackEpisode(ep, facts, env) {
+        if (!facts.domFallback) {
+            // Inside the detect gate this is just the entry transition
+            // rendering; after it, a screen without the fallback pair needs no
+            // recovery — and an episode that WAS confirmed and now is not has
+            // healed (or the user navigated away).
+            if (facts.age < env.detectMs) {
+                return {action: 'wait', reason: 'entry-transition'};
+            }
+            return {action: 'disarm', reason: ep.confirmed ? 'healed' : 'no-fallback'};
+        }
+        if (facts.foreground === false) {
+            return {action: 'wait', reason: 'background'};
+        }
+        if (String(facts.composerValue || '') !== '') {
+            return {action: 'wait', reason: 'composer-draft'};
+        }
+        var title = ep.session ? String(env.titles[ep.session] || '') : '';
+        if (!title || title === FALLBACK_TITLE_TEXT) {
+            // A session we cannot vouch for could be a brand-new task the
+            // desktop simply has not named yet — which looks exactly like the
+            // fallback. Stand down rather than ever reload one of those.
+            return {action: 'disarm', reason: 'session-unknown'};
+        }
+        if (env.tried[ep.session] || env.lastReloadSession === ep.session) {
+            return {action: 'disarm', reason: 'already-reloaded'};
+        }
+        if (facts.age < env.reloadAtMs) {
+            return {action: 'wait', reason: 'window'};
+        }
+        return {action: 'reload', reason: 'stuck'};
+    }
+
+    function fallbackElementVisible(el) {
+        try {
+            if (typeof el.getBoundingClientRect !== 'function') {
+                // No geometry in this environment (tests, old engines):
+                // assume visible — the other guards still apply.
+                return true;
+            }
+            var rect = el.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0;
+        } catch (e) {
+            return true;
+        }
+    }
+
+    /** First visible leaf whose exact text is `text`, or null. */
+    function findVisibleLeaf(text) {
+        var nodes = document.querySelectorAll('body *');
+        for (var i = 0; i < nodes.length; i++) {
+            var el = nodes[i];
+            if (el.childElementCount !== 0) {
+                continue;
+            }
+            if ((el.textContent || '').trim() !== text) {
+                continue;
+            }
+            if (fallbackElementVisible(el)) {
+                return el;
+            }
+        }
+        return null;
+    }
+
+    /** The composer as {inNewTaskMode, value}, identified by placeholder. */
+    function composerState() {
+        var nodes = document.querySelectorAll('body *');
+        for (var i = 0; i < nodes.length; i++) {
+            var el = nodes[i];
+            var tag = el.tagName;
+            if (tag !== 'TEXTAREA' && tag !== 'INPUT') {
+                continue;
+            }
+            var placeholder = el.getAttribute ? el.getAttribute('placeholder') : null;
+            if (typeof placeholder !== 'string' ||
+                placeholder.indexOf(FALLBACK_PLACEHOLDER_PREFIX) !== 0) {
+                continue;
+            }
+            var value = el.value;
+            return {
+                inNewTaskMode: true,
+                value: value === undefined || value === null ? '' : String(value)
+            };
+        }
+        return {inNewTaskMode: false, value: ''};
+    }
+
+    function fallbackFacts() {
+        if (!findVisibleLeaf(FALLBACK_TITLE_TEXT)) {
+            return {domFallback: false, composerValue: ''};
+        }
+        var composer = composerState();
+        return {domFallback: composer.inNewTaskMode, composerValue: composer.value};
+    }
+
+    function storeGet(key) {
+        try {
+            return G.sessionStorage ? G.sessionStorage.getItem(key) : null;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function storeSet(key, value) {
+        try {
+            if (G.sessionStorage) {
+                G.sessionStorage.setItem(key, value);
+            }
+        } catch (e) {
+            // Storage can be denied; the in-memory guard still bounds one load.
+        }
+    }
+
+    function stopFallbackWatch() {
+        if (fallbackEpisode.timer) {
+            clearInterval(fallbackEpisode.timer);
+            fallbackEpisode.timer = null;
+        }
+        fallbackEpisode.session = '';
+        fallbackEpisode.entryAt = 0;
+        fallbackEpisode.confirmed = false;
+    }
+
+    function sessionFromArgs(args) {
+        if (!args || typeof args !== 'object') {
+            return '';
+        }
+        var id = args.sessionId;
+        return typeof id === 'string' ? id : '';
+    }
+
+    /**
+     * A task was entered — the page sent subscribeConversationV4. A different
+     * conversation restarts the clocks (the user navigated); the SAME one does
+     * not (its own teardown/rebuild must not push the window away).
+     */
+    function startFallbackEpisode(session) {
+        if (fallbackEpisode.timer) {
+            if (session && session !== fallbackEpisode.session) {
+                fallbackEpisode.session = session;
+                fallbackEpisode.entryAt = Date.now();
+                fallbackEpisode.confirmed = false;
+                diag('debug', '标题回退观察重置（切到 ' + session + '）');
+            }
+            return;
+        }
+        fallbackEpisode.session = session;
+        fallbackEpisode.entryAt = Date.now();
+        fallbackEpisode.confirmed = false;
+        fallbackEpisode.timer = setInterval(fallbackTick, FALLBACK_POLL_MS);
+        diag('debug', '标题回退观察开始（进任务' + (session ? '：' + session : '') + '）');
+    }
+
+    function notePageRpcCall(call) {
+        if (!call || call.name !== FALLBACK_ENTRY_METHOD) {
+            return;
+        }
+        var session = sessionFromArgs(call.args);
+        if (!session) {
+            return;
+        }
+        startFallbackEpisode(session);
+    }
+
+    function learnSessionTitles(sessions) {
+        if (!sessions || typeof sessions.length !== 'number') {
+            return;
+        }
+        var size = 0;
+        var key;
+        for (key in fallbackTitles) {
+            size += 1;
+        }
+        if (size > FALLBACK_TITLES_MAX) {
+            fallbackTitles = {};
+        }
+        for (var i = 0; i < sessions.length; i++) {
+            var session = sessions[i];
+            if (session && session.sessionId && session.title) {
+                fallbackTitles[session.sessionId] = String(session.title);
+            }
+        }
+    }
+
+    function fallbackTick() {
+        if (!fallbackEpisode.timer) {
+            return;
+        }
+        var facts;
+        try {
+            facts = fallbackFacts();
+        } catch (e) {
+            // DOM half-torn-down on this tick; let the next one decide.
+            return;
+        }
+        facts.now = Date.now();
+        facts.age = facts.now - fallbackEpisode.entryAt;
+        facts.foreground = appForeground;
+        if (facts.domFallback) {
+            fallbackEpisode.confirmed = true;
+        }
+        var decision = evaluateFallbackEpisode(fallbackEpisode, facts, {
+            titles: fallbackTitles,
+            tried: fallbackReloaded,
+            lastReloadSession: storeGet(FALLBACK_STORE_SESSION),
+            detectMs: FALLBACK_DETECT_MS,
+            reloadAtMs: FALLBACK_RELOAD_AT_MS
+        });
+        if (decision.action === 'wait') {
+            return;
+        }
+        var session = fallbackEpisode.session;
+        var age = facts.age;
+        stopFallbackWatch();
+        if (decision.action === 'disarm') {
+            diag('debug', '标题回退观察结束（' + decision.reason + '）');
+            return;
+        }
+        fallbackReloaded[session] = true;
+        storeSet(FALLBACK_STORE_SESSION, session);
+        diag('warn', '标题回退持续 ' + Math.round(age / 1000) + 's（' + session +
+            '），自动刷新页面恢复');
+        try {
+            G.location.reload();
+        } catch (e) {
+            diag('warn', '自动刷新失败: ' + e);
+        }
+    }
+
+    /** Test and console debugging surface for the fallback watcher. */
+    G.__zcodeShellFallback = {
+        evaluate: evaluateFallbackEpisode,
+        facts: fallbackFacts,
+        note: notePageRpcCall,
+        episode: function () {
+            return fallbackEpisode;
+        },
+        tick: fallbackTick,
+        learn: learnSessionTitles,
+        stop: function () {
+            stopFallbackWatch();
+        }
     };
 
     /** Called by the native side when the app's foreground state changes. */
