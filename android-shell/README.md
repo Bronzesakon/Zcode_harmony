@@ -318,9 +318,11 @@ git 历史两版滚动条：`fd05a69` 零宽 v1 → `43c6998` 全撤销 → `189
 2. **onPageStarted 补注**：document-start 因任何未知形态失效时，这里是最早可得时机。
 3. **onPageFinished 兜底**：再兜一道。
 
-脚本自带 `__zcodeShellInstalled` 幂等守卫：健康文档里第 2/3 道近零成本跳过；只有 document-start
-真的缺席时才装上（会漏首帧、通知恢复延迟 45–60s，inject.js 会打取证行
-**「注入未在 document-start 生效，由加载期补注」**——那行出现即抓到根因现场）。
+脚本自带 `__zcodeShellInstalled` 幂等守卫：健康文档里第 2/3 道近零成本跳过。document-start 真缺席
+时由补注装上，**也不漏线**：hook 挂在 `WebSocket.prototype` 上、对补注前已存在的页面连接同样生效，
+它下一次 send/close 会把活实例送进来，当场「原型层收编」（补挂监听 + 设为 activeSocket）——零重连，
+观测与壳桥接即刻恢复；只有收编**之前**窗口里的入站帧缺失（最长约一个心跳周期）。取证行
+**「注入未在 document-start 生效，由加载期补注」**与「已从原型层收编现有 socket」出现即抓到根因现场。
 `reloadPage`（错误面板重试/ACTION_RELOAD）现在也会先装注入再刷新。
 
 判据速查：日志出现「注入未在 document-start 生效」= 抓到失效现场（连同上下文发出去定根因）；

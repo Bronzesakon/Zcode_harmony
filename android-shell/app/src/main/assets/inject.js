@@ -45,7 +45,8 @@
     // 若不是，说明这一次加载 document-start 没有生效（原生侧的 onPageStarted/
     // onPageFinished 补注接住了它）——根因线索直接进日志。
     if (typeof document !== 'undefined' && document.readyState !== 'loading') {
-        var lateNote = '注入未在 document-start 生效，由加载期补注（可能漏首帧，通知恢复会延迟）';
+        var lateNote = '注入未在 document-start 生效，由加载期补注；页面现有连接将从原型层收编' +
+            '（收编前的入站帧缺失，最长约一个心跳周期）';
         try {
             if (G.ZCodeShell && typeof G.ZCodeShell.postMessage === 'function') {
                 G.ZCodeShell.postMessage(JSON.stringify(
@@ -192,6 +193,9 @@
         var proto = NativeWebSocket.prototype;
         var originalSend = proto.send;
         var wrappedSend = function (data) {
+            try {
+                adoptSocket(this);
+            } catch (e) {}
             if (!injecting && typeof data === 'string') {
                 try {
                     observeText(data, true);
@@ -218,6 +222,9 @@
         var originalClose = proto.close;
         var wrappedClose = function () {
             try {
+                adoptSocket(this);
+            } catch (e) {}
+            try {
                 var lines = String((new Error()).stack || '').split('\n');
                 var frames = [];
                 for (var i = 1; i < lines.length && frames.length < 3; i += 1) {
@@ -239,7 +246,39 @@
         proto.close = wrappedClose;
     }
 
+    var knownSockets = typeof WeakSet === 'function' ? new WeakSet() : null;
+
+    function socketKnown(socket) {
+        if (knownSockets) {
+            return knownSockets.has(socket);
+        }
+        return sockets.indexOf(socket) >= 0;
+    }
+
+    /**
+     * 晚注入恢复（零重连）：hook 挂在 WebSocket.prototype 上，对补注前就已
+     * 创建的页面 socket 同样生效——它下一次任何 send/close 都会把活实例作为
+     * `this` 送进来。当场收编（补挂 message 监听、设为 activeSocket），壳的
+     * 入站观测与自建桥接即刻恢复，页面全程无感、无需重建连接。
+     */
+    function adoptSocket(socket) {
+        if (!socket || socketKnown(socket)) {
+            return;
+        }
+        trackSocket(socket);
+        if (!activeSocket) {
+            activeSocket = socket;
+        }
+        diag('warn', '注入晚于页面建线，已从原型层收编现有 socket（零重连）');
+    }
+
     function trackSocket(socket, url) {
+        if (socketKnown(socket)) {
+            return;
+        }
+        if (knownSockets) {
+            knownSockets.add(socket);
+        }
         sockets.push(socket);
         if (sockets.length > 8) {
             sockets.shift();

@@ -1250,3 +1250,23 @@ test('快速刷新：页面真实发出的信标会武装 3s 检查', () => {
         page.teardown();
     }
 });
+
+test('hook 安全：晚注入经原型层收编页面已有 socket（零重连）', () => {
+    const page = setupPage();
+    try {
+        // 绕过构造包装直建实例 = 模拟「hook 装上之前页面已建好的连接」
+        const orphan = new FakeWebSocket('wss://relay.example');
+        // 它的下一次 send 走原型补丁 → 当场收编
+        orphan.send(JSON.stringify({type: 'data', payload: {zcode_type: 'x'}}));
+        assert.ok(findPost(page.posts, 'diag', (d) =>
+            d.message.includes('已从原型层收编现有 socket')).length === 1,
+            'adoption must be logged');
+        // 收编后：入站帧恢复观测（配对 ack 让 relayPaired 翻真）
+        orphan.receive({type: 'pair_status_ack', pair_status: 'matched'});
+        globalThis.__zcodeShellHeartbeat();
+        assert.ok(findPost(page.posts, 'liveness', (d) => d.paired === true).length === 1,
+            'the adopted socket must deliver inbound frames to the shell');
+    } finally {
+        page.teardown();
+    }
+});
