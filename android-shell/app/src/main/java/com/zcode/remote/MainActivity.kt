@@ -80,15 +80,17 @@ class MainActivity : AppCompatActivity() {
     private var pageTheme: PageTheme? = null
 
     /** Script used when the WebView lacks document-start support (fallback). */
-    private var fallbackScript: String? = null
+    /**
+     * 注入脚本缓存。每次主帧加载有三道时机（见 installInjection / injectStable），
+     * 都用同一份脚本；只在首次成功读取时缓存，读失败不缓存（下次加载重试）。
+     */
+    private var injectionScript: String? = null
 
     /** Set when a notification tap asked us to locate a task. */
     private var pendingLocate: Pair<String, String>? = null
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private var locateAttempts = 0
-    /** The host the injected script was installed for, if any. */
-    private var injectedHost: String? = null
 
     /**
      * Console lines captured from the page for this load. The page is a chatty
@@ -99,15 +101,6 @@ class MainActivity : AppCompatActivity() {
 
     /** Uptime at onPageStarted, for the "how long did the page take" line. */
     private var pageStartedAt = 0L
-
-    /**
-     * 注入层看门狗（2026-09-12 外场发现注入偶发整体失效：零宽滚动条回归 + 状态栏
-     * 退回 boot 底色，页面自身却照常可用）。健康加载里 document-start 一定会在
-     * 一两秒内上报一次页面状态；整个加载后 10s 仍零上报即判注入缺失，自动重载一次
-     * （每进程只补一次，防止注入持续失败时变成重载循环）。
-     */
-    private var pageStateSeenSinceLoad = false
-    private var injectionWatchdogUsed = false
 
     /**
      * onPageFinished callbacks seen for the current document. WebView fires it
@@ -265,7 +258,6 @@ class MainActivity : AppCompatActivity() {
                 super.onPageStarted(view, url, favicon)
                 consoleLines = 0
                 finishCallbacks = 0
-                pageStateSeenSinceLoad = false
                 pageStartedAt = SystemClock.elapsedRealtime()
                 Diagnostics.info("网页开始加载")
                 // A fresh document boots with the page background at the top (the
@@ -273,12 +265,9 @@ class MainActivity : AppCompatActivity() {
                 // reports otherwise. Without this a reload keeps the *previous*
                 // document's header colour under the status bar.
                 onPageStateReported(PageBarState.BOOT.token, null)
-                fallbackScript?.let { script ->
-                    // No document-start support: inject as early as we can. The
-                    // page may already have opened its socket, which is exactly
-                    // why document-start is preferred.
-                    view.evaluateJavascript(script, null)
-                }
+                // 稳定注入第二道：document-start 因任何形态失效时，这里以最早
+                // 可得的时机补注。幂等守卫让已注入的文档近乎零成本地跳过。
+                injectStable(view)
             }
 
             override fun onPageFinished(view: WebView, url: String) {
@@ -307,20 +296,10 @@ class MainActivity : AppCompatActivity() {
                         " · 控制台已捕获 $consoleLines 行",
                 )
                 hideError()
+                // 稳定注入第三道：加载完成再兜一次（幂等）。
+                injectStable(view)
                 maybeRequestNotificationPermission()
                 tryLocate()
-                if (finishCallbacks == 1 && !injectionWatchdogUsed) {
-                    mainHandler.postDelayed({
-                        if (!pageStateSeenSinceLoad && !injectionWatchdogUsed && !isFinishing) {
-                            injectionWatchdogUsed = true
-                            Diagnostics.log(
-                                "warn",
-                                "页面加载 10s 未收到注入层状态上报，疑似注入缺失，自动重载一次",
-                            )
-                            reloadPage()
-                        }
-                    }, INJECTION_WATCHDOG_MS)
-                }
             }
 
             override fun onReceivedError(
@@ -404,29 +383,48 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Installs the injected scripts for [url]. Called before loadUrl so the hook
-     * is in place before the page opens its WebSocket — the single most
-     * important timing constraint in this design (§5.1).
+     * 稳定注入：任何一次主帧加载都有三道互相独立的时机，缺哪道都兜得住——
+     *   1. document-start（addDocumentStartJavaScript）：主道，抢在页面任何
+     *      脚本之前，能拿到首帧 WebSocket。注册挂在 WebView 实例上、跨 loadUrl
+     *      持续生效，因此每次加载前都无条件重装一次（同脚本幂等）。
+     *   2. onPageStarted：页面开始加载即补注。document-start 因任何未知的
+     *      上层/引擎形态没有生效时，这里是最早的可得时机。
+     *   3. onPageFinished：加载完成再兜一道。
+     * 脚本自带 __zcodeShellInstalled 幂等守卫：已注入的文档里重复执行近零成本。
+     * 后两道只在 document-start 失效时才真正装上（会漏首帧、通知恢复延迟，
+     * inject.js 会打「注入未在 document-start 生效」的取证行）——远好于整层缺席。
      */
-    private fun installInjection(url: String) {
-        val webView = binding.webview
+    private fun ensureInjectionScript(): String? {
+        injectionScript?.let { return it }
         val script = (readAsset("zcode-protocol.js") ?: "") + "\n" + (readAsset("inject.js") ?: "")
-        if (script.isBlank()) {
+        if (script.isNotBlank()) {
+            injectionScript = script
+        }
+        return script.ifBlank { null }
+    }
+
+    private fun installInjection(url: String) {
+        val script = ensureInjectionScript()
+        if (script == null) {
             Diagnostics.log("error", "注入脚本缺失，通知功能将不可用")
             return
         }
+        val webView = binding.webview
         if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
-            fallbackScript = null
             val rules = setOf(RemoteUrl.originRule(url), "https://*.$ALLOWED_ROOT")
             WebViewCompat.addDocumentStartJavaScript(webView, script, rules)
             Diagnostics.info("已安装 document-start 注入 (${rules.joinToString()})")
         } else {
-            fallbackScript = script
             Diagnostics.log(
                 "warn",
-                "系统 WebView 不支持 document-start 注入，回退到 onPageStarted（可能漏掉首帧）",
+                "系统 WebView 不支持 document-start 注入，依赖加载期补注（可能漏首帧）",
             )
         }
+    }
+
+    private fun injectStable(view: WebView) {
+        val script = ensureInjectionScript() ?: return
+        view.evaluateJavascript(script, null)
     }
 
     private fun readAsset(name: String): String? = try {
@@ -444,15 +442,9 @@ class MainActivity : AppCompatActivity() {
         binding.webview.visibility = View.VISIBLE
         binding.setupPanel.visibility = View.GONE
         hideError()
-        val host = try {
-            Uri.parse(url).host
-        } catch (e: Exception) {
-            null
-        }
-        if (injectedHost != host) {
-            installInjection(url)
-            injectedHost = host
-        }
+        // 稳定注入：每次加载前都无条件重装 document-start 注册（同脚本幂等，
+        // 注册挂在 WebView 实例上——这里不再做 host 去重，防任何路径漏装）。
+        installInjection(url)
         ShellRuntime.ensureServiceRunning(this)
         binding.webview.loadUrl(url)
     }
@@ -460,6 +452,7 @@ class MainActivity : AppCompatActivity() {
     private fun reloadPage() {
         val url = prefs.remoteUrl ?: return showSetup()
         hideError()
+        installInjection(url)
         binding.webview.loadUrl(url)
     }
 
@@ -894,9 +887,6 @@ class MainActivity : AppCompatActivity() {
         /** Console capture budget for one page load (see onConsoleMessage). */
         private const val MAX_CONSOLE_LINES = 200
         private const val MAX_CONSOLE_CHARS = 400
-
-        /** 注入层看门狗：首次加载完成后等待状态上报的宽限（见 pageStateSeenSinceLoad）。 */
-        private const val INJECTION_WATCHDOG_MS = 10_000L
 
         /** Mirrors the HarmonyOS build's PhotoViewPicker maxSelectNumber. */
         private const val MAX_UPLOAD_ITEMS = 5

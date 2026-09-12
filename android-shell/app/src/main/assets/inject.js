@@ -41,6 +41,19 @@
     }
     G.__zcodeShellInstalled = true;
 
+    // 注入时机的取证行：document-start 跑进来时 document 必然还是 'loading'。
+    // 若不是，说明这一次加载 document-start 没有生效（原生侧的 onPageStarted/
+    // onPageFinished 补注接住了它）——根因线索直接进日志。
+    if (typeof document !== 'undefined' && document.readyState !== 'loading') {
+        var lateNote = '注入未在 document-start 生效，由加载期补注（可能漏首帧，通知恢复会延迟）';
+        try {
+            if (G.ZCodeShell && typeof G.ZCodeShell.postMessage === 'function') {
+                G.ZCodeShell.postMessage(JSON.stringify(
+                    {event: 'diag', data: {level: 'warn', message: lateNote}}));
+            }
+        } catch (e) {}
+    }
+
     var P = G.ZcodeProtocol;
     var bridge = G.ZCodeShell || null;
 
@@ -902,7 +915,6 @@
         }
         reportLiveness();
         reportPerf();
-        ensureScrollbarStyle();
         if (client && client.reportPageRpcWindow) {
             try {
                 // What the page itself asked the desktop for, and how long the
@@ -1655,8 +1667,6 @@
     // -----------------------------------------------------------------------
     var SCROLLBAR_CSS = '::-webkit-scrollbar{width:0!important;height:0!important}';
 
-    var scrollbarStyleEl = null;
-
     function installScrollbarWidth() {
         try {
             var parent = document.head || document.documentElement;
@@ -1669,28 +1679,8 @@
             style.setAttribute('data-zcode-shell', 'scrollbar-width');
             style.textContent = SCROLLBAR_CSS;
             parent.appendChild(style);
-            scrollbarStyleEl = style;
         } catch (e) {
             diag('warn', '滚动条宽度置零失败: ' + e);
-        }
-    }
-
-    /**
-     * 自愈检查（每次心跳跑一次，一个 querySelector 的成本）。外场实测过注入层
-     * 偶发整体失效的形态：零宽样式不在了 → 原生滚动条回归 + 页面状态不再上报
-     * → 状态栏取色退回 boot 底色。这里只兜样式这一层：节点被页面运行期移除
-     * （或从未装上）就重装并留痕，10 秒内恢复悬浮自绘方案。
-     */
-    function ensureScrollbarStyle() {
-        try {
-            if (scrollbarStyleEl && typeof scrollbarStyleEl.isConnected === 'boolean' &&
-                scrollbarStyleEl.isConnected) {
-                return;
-            }
-            installScrollbarWidth();
-            diag('warn', '检测到滚动条置零样式丢失，已重新安装（自愈）');
-        } catch (e) {
-            // 自愈检查自身绝不打扰页面
         }
     }
 
@@ -1722,10 +1712,6 @@
     }
 
     function barElement() {
-        if (barEl && typeof barEl.isConnected === 'boolean' && !barEl.isConnected) {
-            // 页面运行期把挂载点换掉了：旧节点已成孤儿，重建并重新挂载。
-            barEl = null;
-        }
         if (barEl) {
             return barEl;
         }

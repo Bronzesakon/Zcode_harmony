@@ -1250,24 +1250,3 @@ test('快速刷新：页面真实发出的信标会武装 3s 检查', () => {
         page.teardown();
     }
 });
-
-test('自愈：滚动条置零样式被移除后，心跳内重装并留痕', () => {
-    const page = setupPage({
-        pageState: true,
-        media: {'(max-width: 767px)': true},
-    });
-    try {
-        const html = page.document.documentElement;
-        const styles = () => html.children.filter(
-            (c) => c.getAttribute('data-zcode-shell') === 'scrollbar-width');
-        assert.strictEqual(styles().length, 1, 'boot installs the zero-width style');
-        styles()[0].isConnected = false;   // 模拟页面运行期把节点移除
-        globalThis.__zcodeShellHeartbeat();
-        assert.strictEqual(styles().length, 2, 'the heartbeat must reinstall it');
-        assert.ok(findPost(page.posts, 'diag', (d) =>
-            d.message.includes('样式丢失')).length === 1,
-            'the self-heal must leave a warn line for forensics');
-    } finally {
-        page.teardown();
-    }
-});
