@@ -460,6 +460,7 @@ object ShellRuntime {
                 )
             )
         }
+        logPhaseHistogram(key, tasks)
         val update = store.applyWorkspace(
             key = key,
             title = data.optString("title"),
@@ -469,6 +470,33 @@ object ShellRuntime {
             tasks = tasks,
         )
         applyUpdate(update)
+    }
+
+    /** Last phase histogram logged per workspace, so the line is written on change only. */
+    private val lastPhaseHistogram = HashMap<String, String>()
+
+    /**
+     * What each workspace actually reports, phase by phase.
+     *
+     * This exists because of a real question the phone raised on 2026-09-12: the
+     * remote page showed a task as 运行中 while the shell had no running-task
+     * notification for it. Whether that is a phase we do not classify as running,
+     * a task the sessions-index carries outside its `sessions` array, or a frame
+     * we never see at all, is not answerable from the outside — `RUNNING_PHASES`
+     * is a guess about someone else's protocol, and this line is what turns it
+     * into something checkable. Deduped per workspace so it stays a change log.
+     */
+    private fun logPhaseHistogram(key: String, tasks: List<TaskSnapshot>) {
+        val counts = LinkedHashMap<String, Int>()
+        for (task in tasks) {
+            val phase = task.phase.ifEmpty { "(空)" }
+            counts[phase] = (counts[phase] ?: 0) + 1
+        }
+        val line = tasks.size.toString() + " 个任务 · " +
+            counts.entries.joinToString(" / ") { "${it.key}×${it.value}" }
+        if (lastPhaseHistogram[key] == line) return
+        lastPhaseHistogram[key] = line
+        Diagnostics.log("debug", "工作区相位 $key：$line")
     }
 
     private fun onStatus(data: JSONObject?) {
