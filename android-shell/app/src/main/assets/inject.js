@@ -549,11 +549,6 @@
             sharedState: pageCoverage
         });
         next.onSessions = function (update) {
-            try {
-                learnSessionTitles(update && update.sessions);
-            } catch (e) {
-                // bookkeeping must never break notification delivery
-            }
             post('sessions', update);
         };
         next.onPageRpcCall = function (call) {
@@ -907,6 +902,7 @@
         }
         reportLiveness();
         reportPerf();
+        ensureScrollbarStyle();
         if (client && client.reportPageRpcWindow) {
             try {
                 // What the page itself asked the desktop for, and how long the
@@ -1105,105 +1101,47 @@
     };
 
     // -----------------------------------------------------------------------
-    // 5b. stuck title fallback -> one automatic reload
+    // 5b. 3s dual-state fast refresh
     //
-    // Opening a conversation the desktop has not loaded yet strands the page's
-    // header on the fallback title 新建任务: the open tears the page's own
-    // subscription down, so its store is empty, and the readSession fallback
-    // fails with "Session is not active" — a failure the page swallows
-    // (.catch(() => null)) and never retries on its own. It normally heals in
-    // 9–22 s when the store refills (标题迟加载-调研报告, 2026-09-12); when it
-    // does not, the user's own remedies are opening the task again or
-    // refreshing the page.
+    // Entering a conversation on a cold session can strand the page in one of
+    // two states. State A: the header stays on the fallback title 新建任务 —
+    // the page never resolved the task. State B: the title resolves but the
+    // conversation content never arrives, and the composer sits there greyed
+    // out — the page's own signal that content has not loaded. The page
+    // swallows its failures silently and usually heals in 9–22 s; the user
+    // chose the blunt version instead: check ONCE, 3 s after the entry beacon,
+    // and reload the page if either state is on screen. After a reload the
+    // page re-opens its last task on its own (observed in the field log).
     //
-    // So this layer does what the user would do, on the clocks the user chose:
-    //   t0       — the page opens a task (it sends subscribeConversationV4;
-    //              a notification/流体云 tap enters through the same call).
-    //   t0 + 2 s — detection: the DOM shows the fallback pair, a visible
-    //              header title exactly 新建任务 (only ever rendered for an
-    //              OPEN task whose title could not be resolved — the genuine
-    //              new-task screen is the greeting layout and has no such row)
-    //              plus a composer in new-task mode (placeholder 向 ZCode
-    //              提问…). Not there -> the task loaded fine, stand down.
-    //   t0 + 25 s — refresh window matures: still the fallback pair -> reload
-    //              once. After a reload the page re-opens its last task on its
-    //              own (observed in the field log).
-    //
-    // Guards, because this reloads someone else's page: composer empty (never
-    // wipe a draft), foreground only, the shell's own sessions-index knows a
-    // real title for the session (never a brand-new task the desktop has not
-    // named yet), and one reload per session — remembered in sessionStorage, so
-    // the reload itself cannot loop into another one. There is deliberately NO
-    // global cooldown (user's call): a second, different stuck task may reload
-    // right away. A re-subscribe of the SAME conversation within an episode is
-    // that entry's own teardown/rebuild, so it does not restart the clock — a
-    // stuck retry loop must still mature to the window.
+    // Everything the earlier design guarded is gone on purpose (user's call):
+    // no draft guard, no foreground check, no title cross-check, no
+    // per-session limit. ONE piece remains because without it the loop cannot
+    // terminate: a 15 s minimum gap between reloads. A fresh page gets checked
+    // at +3 s — always before content had a chance — so an unguarded check
+    // would reload forever and the page would never finish loading. With the
+    // gap, a stuck page retries every ~15 s and a loaded page stops for good.
+    // The gap is also bridged across the reload itself via sessionStorage.
     // -----------------------------------------------------------------------
     var FALLBACK_TITLE_TEXT = '新建任务';
     var FALLBACK_PLACEHOLDER_PREFIX = '向 ZCode 提问';
+    var FALLBACK_PLACEHOLDER_KNOWN = {
+        '继续输入以排队后续修改': 1,
+        '提出后续修改要求': 1,
+        '初始化任务中': 1
+    };
     // 两种进对话的页面行为都观测到过：任务列表点进去发 subscribeConversationV4
     // （D1-b，10:04）；会话视图打开/恢复则只发 conversationRowsRangeV4（13:08 实录，
-    // 全程无 subscribe——按单一信标武装会整窗漏掉）。两个都当进任务信标。
+    // 全程无 subscribe——按单一信标武装会整窗漏掉）。两个都当进对话信标。
     var FALLBACK_ENTRY_METHODS = {
         'zcode-agent.subscribeConversationV4': 1,
         'zcode-agent.conversationRowsRangeV4': 1
     };
-    var FALLBACK_SESSION_RE = /sess_[A-Za-z0-9_-]+/;
-    var FALLBACK_DETECT_MS = 2000;
-    var FALLBACK_RELOAD_AT_MS = 25000;
-    var FALLBACK_POLL_MS = 2000;
-    var FALLBACK_STORE_SESSION = 'zcodeShellAutoReloadSession';
-    var FALLBACK_TITLES_MAX = 1500;
+    var FALLBACK_CHECK_MS = 3000;
+    var FALLBACK_RELOAD_GAP_MS = 15000;
+    var FALLBACK_STORE_AT = 'zcodeShellFastRefreshAt';
 
-    var fallbackEpisode = {
-        session: '',
-        entryAt: 0,
-        confirmed: false,
-        checked: false,
-        timer: null
-    };
-    var fallbackTitles = {};
-    var fallbackReloaded = {};
-
-    /**
-     * The whole decision, side-effect free. `ep` is the running episode
-     * {session, entryAt, confirmed}; `facts` what this tick observed
-     * {now, age, domFallback, composerValue, foreground}; `env` the knobs and
-     * memories {titles, tried, lastReloadSession, detectMs, reloadAtMs}.
-     * Returns {action, reason}, action one of 'wait' | 'disarm' | 'reload'.
-     */
-    function evaluateFallbackEpisode(ep, facts, env) {
-        if (!facts.domFallback) {
-            // Inside the detect gate this is just the entry transition
-            // rendering; after it, a screen without the fallback pair needs no
-            // recovery — and an episode that WAS confirmed and now is not has
-            // healed (or the user navigated away).
-            if (facts.age < env.detectMs) {
-                return {action: 'wait', reason: 'entry-transition'};
-            }
-            return {action: 'disarm', reason: ep.confirmed ? 'healed' : 'no-fallback'};
-        }
-        if (facts.foreground === false) {
-            return {action: 'wait', reason: 'background'};
-        }
-        if (String(facts.composerValue || '') !== '') {
-            return {action: 'wait', reason: 'composer-draft'};
-        }
-        var title = ep.session ? String(env.titles[ep.session] || '') : '';
-        if (!title || title === FALLBACK_TITLE_TEXT) {
-            // A session we cannot vouch for could be a brand-new task the
-            // desktop simply has not named yet — which looks exactly like the
-            // fallback. Stand down rather than ever reload one of those.
-            return {action: 'disarm', reason: 'session-unknown'};
-        }
-        if (env.tried[ep.session] || env.lastReloadSession === ep.session) {
-            return {action: 'disarm', reason: 'already-reloaded'};
-        }
-        if (facts.age < env.reloadAtMs) {
-            return {action: 'wait', reason: 'window'};
-        }
-        return {action: 'reload', reason: 'stuck'};
-    }
+    var fallbackTimer = null;
+    var fallbackState = {lastReloadAt: 0};
 
     function fallbackElementVisible(el) {
         try {
@@ -1224,8 +1162,7 @@
         // it was found: 'leaf' = a childless element carries exactly that text
         // (the normal case), 'deep' = only a container with children matches
         // (the header wraps the title in spans/icons — still a match), '' = no
-        // visible occurrence. The distinction is logged on the first check so
-        // a real-device miss can be told apart from "the page simply healed".
+        // visible occurrence.
         var nodes = document.querySelectorAll('body *');
         var deep = false;
         for (var i = 0; i < nodes.length; i++) {
@@ -1246,9 +1183,31 @@
         return deep ? 'deep' : '';
     }
 
-    /** The composer as {inNewTaskMode, value}, identified by placeholder. */
-    function composerState() {
+    function elementDisabled(el) {
+        try {
+            if (el.disabled === true) {
+                return true;
+            }
+            if (el.getAttribute && el.getAttribute('disabled') !== null) {
+                return true;
+            }
+            if (el.getAttribute && el.getAttribute('aria-disabled') === 'true') {
+                return true;
+            }
+        } catch (e) {
+            // fall through to false
+        }
+        return false;
+    }
+
+    /**
+     * The chat composer: identified by one of its known placeholders, falling
+     * back to any disabled textarea (the grey state may carry no placeholder
+     * at all). Returns null when nothing looks like the composer.
+     */
+    function composerElement() {
         var nodes = document.querySelectorAll('body *');
+        var disabledOne = null;
         for (var i = 0; i < nodes.length; i++) {
             var el = nodes[i];
             var tag = el.tagName;
@@ -1256,36 +1215,16 @@
                 continue;
             }
             var placeholder = el.getAttribute ? el.getAttribute('placeholder') : null;
-            if (typeof placeholder !== 'string' ||
-                placeholder.indexOf(FALLBACK_PLACEHOLDER_PREFIX) !== 0) {
-                continue;
+            if (typeof placeholder === 'string' &&
+                (placeholder.indexOf(FALLBACK_PLACEHOLDER_PREFIX) === 0 ||
+                    FALLBACK_PLACEHOLDER_KNOWN[placeholder] === 1)) {
+                return el;
             }
-            var value = el.value;
-            return {
-                inNewTaskMode: true,
-                value: value === undefined || value === null ? '' : String(value)
-            };
+            if (disabledOne === null && elementDisabled(el)) {
+                disabledOne = el;
+            }
         }
-        return {inNewTaskMode: false, value: ''};
-    }
-
-    function fallbackFacts() {
-        var header = findHeaderText();
-        if (!header) {
-            return {
-                domFallback: false,
-                composerValue: '',
-                headerMatch: '',
-                placeholder: false
-            };
-        }
-        var composer = composerState();
-        return {
-            domFallback: composer.inNewTaskMode,
-            composerValue: composer.value,
-            headerMatch: header,
-            placeholder: composer.inNewTaskMode
-        };
+        return disabledOne;
     }
 
     function storeGet(key) {
@@ -1302,51 +1241,59 @@
                 G.sessionStorage.setItem(key, value);
             }
         } catch (e) {
-            // Storage can be denied; the in-memory guard still bounds one load.
+            // Storage can be denied; the in-memory stamp still bounds one load.
         }
     }
 
-    function stopFallbackWatch() {
-        if (fallbackEpisode.timer) {
-            clearInterval(fallbackEpisode.timer);
-            fallbackEpisode.timer = null;
+    /** 进对话信标：重置 3s 一次性检查（快速切换会话时，以最后一次为准）。 */
+    function scheduleFallbackCheck() {
+        if (fallbackTimer) {
+            clearTimeout(fallbackTimer);
         }
-        fallbackEpisode.session = '';
-        fallbackEpisode.entryAt = 0;
-        fallbackEpisode.confirmed = false;
-        fallbackEpisode.checked = false;
+        fallbackTimer = setTimeout(fallbackCheck, FALLBACK_CHECK_MS);
     }
 
-    function sessionFromArgs(args) {
-        if (!args || typeof args !== 'object') {
-            return '';
+    function fallbackCheck() {
+        if (fallbackTimer) {
+            // 自然到期之外的手动触发（测试/控制台）也要清掉挂起的定时器，
+            // 否则同一检查会跑两次。
+            clearTimeout(fallbackTimer);
         }
-        var id = args.sessionId;
-        return typeof id === 'string' ? id : '';
-    }
-
-    /**
-     * A task was entered — the page sent subscribeConversationV4. A different
-     * conversation restarts the clocks (the user navigated); the SAME one does
-     * not (its own teardown/rebuild must not push the window away).
-     */
-    function startFallbackEpisode(session) {
-        if (fallbackEpisode.timer) {
-            if (session && session !== fallbackEpisode.session) {
-                fallbackEpisode.session = session;
-                fallbackEpisode.entryAt = Date.now();
-                fallbackEpisode.confirmed = false;
-                fallbackEpisode.checked = false;
-                diag('debug', '标题回退观察重置（切到 ' + session + '）');
-            }
+        fallbackTimer = null;
+        var header = '';
+        var composer = null;
+        try {
+            header = findHeaderText();
+            composer = composerElement();
+        } catch (e) {
+            // DOM 半拆的这一拍不判定；下一个信标会重新武装。
             return;
         }
-        fallbackEpisode.session = session;
-        fallbackEpisode.entryAt = Date.now();
-        fallbackEpisode.confirmed = false;
-        fallbackEpisode.checked = false;
-        fallbackEpisode.timer = setInterval(fallbackTick, FALLBACK_POLL_MS);
-        diag('debug', '标题回退观察开始（进任务' + (session ? '：' + session : '') + '）');
+        var headerBad = header !== '';
+        var composerBad = !!(composer && elementDisabled(composer));
+        if (!headerBad && !composerBad) {
+            diag('debug', '3s 检查：标题与输入框均就绪，不刷新');
+            return;
+        }
+        var stamp = parseInt(storeGet(FALLBACK_STORE_AT), 10);
+        var last = Math.max(fallbackState.lastReloadAt, isNaN(stamp) ? 0 : stamp);
+        var wait = last + FALLBACK_RELOAD_GAP_MS - Date.now();
+        if (wait > 0) {
+            // 间隔内：顺延到间隔到期再查一次（保循环可终止），不是丢弃。
+            diag('debug', '3s 检查命中（' + (headerBad ? '标题回退' : '输入框未就绪') +
+                '），处于刷新间隔内，' + Math.round(wait / 1000) + 's 后复查');
+            fallbackTimer = setTimeout(fallbackCheck, wait);
+            return;
+        }
+        fallbackState.lastReloadAt = Date.now();
+        storeSet(FALLBACK_STORE_AT, String(fallbackState.lastReloadAt));
+        diag('warn', '进对话 3s 未就绪（' + (headerBad ? '标题回退' : '输入框未就绪') +
+            '），刷新页面');
+        try {
+            G.location.reload();
+        } catch (e) {
+            diag('warn', '自动刷新失败: ' + e);
+        }
     }
 
     /** Upload-named page RPCs get explicit lines: that is the file-send chain. */
@@ -1359,14 +1306,9 @@
         if (UPLOAD_RPC_RE.test(call.name)) {
             diag('info', '页面上传调用开始：' + call.name);
         }
-        if (!FALLBACK_ENTRY_METHODS[call.name]) {
-            return;
+        if (FALLBACK_ENTRY_METHODS[call.name]) {
+            scheduleFallbackCheck();
         }
-        var session = sessionFromArgs(call.args);
-        if (!session) {
-            return;
-        }
-        startFallbackEpisode(session);
     }
 
     function notePageRpcResult(result) {
@@ -1381,102 +1323,19 @@
         }
     }
 
-    function learnSessionTitles(sessions) {
-        if (!sessions || typeof sessions.length !== 'number') {
-            return;
-        }
-        var size = 0;
-        var key;
-        for (key in fallbackTitles) {
-            size += 1;
-        }
-        if (size > FALLBACK_TITLES_MAX) {
-            fallbackTitles = {};
-        }
-        for (var i = 0; i < sessions.length; i++) {
-            var session = sessions[i];
-            if (session && session.sessionId && session.title) {
-                fallbackTitles[session.sessionId] = String(session.title);
-            }
-        }
-    }
-
-    function fallbackTick() {
-        if (!fallbackEpisode.timer) {
-            return;
-        }
-        var facts;
-        try {
-            facts = fallbackFacts();
-        } catch (e) {
-            // DOM half-torn-down on this tick; let the next one decide.
-            return;
-        }
-        facts.now = Date.now();
-        facts.age = facts.now - fallbackEpisode.entryAt;
-        facts.foreground = appForeground;
-        if (facts.domFallback) {
-            fallbackEpisode.confirmed = true;
-        }
-        if (!fallbackEpisode.checked) {
-            // The one line that makes this feature diagnosable from a pasted
-            // log: whether the DOM criteria hit on a real device at all. Every
-            // task entry passes through here exactly once.
-            fallbackEpisode.checked = true;
-            var learned = fallbackEpisode.session ?
-                String(fallbackTitles[fallbackEpisode.session] || '') : '';
-            diag('info', '标题回退首查 +' + Math.round(facts.age / 1000) + 's：头部=' +
-                (facts.headerMatch || '未找到') +
-                ' 占位符=' + (facts.placeholder ? '新任务' : '否') +
-                ' 草稿=' + (facts.composerValue ? facts.composerValue.length + '字' : '无') +
-                ' 前台=' + (appForeground ? '是' : '否') +
-                (fallbackEpisode.session ? ' 会话=' + fallbackEpisode.session : '') +
-                ' 壳侧标题=' + (learned && learned !== FALLBACK_TITLE_TEXT ? '有' : '无'));
-        }
-        var decision = evaluateFallbackEpisode(fallbackEpisode, facts, {
-            titles: fallbackTitles,
-            tried: fallbackReloaded,
-            lastReloadSession: storeGet(FALLBACK_STORE_SESSION),
-            detectMs: FALLBACK_DETECT_MS,
-            reloadAtMs: FALLBACK_RELOAD_AT_MS
-        });
-        if (decision.action === 'wait') {
-            return;
-        }
-        var session = fallbackEpisode.session;
-        var age = facts.age;
-        stopFallbackWatch();
-        if (decision.action === 'disarm') {
-            diag('debug', '标题回退观察结束（' + decision.reason + '）');
-            return;
-        }
-        fallbackReloaded[session] = true;
-        storeSet(FALLBACK_STORE_SESSION, session);
-        diag('warn', '标题回退持续 ' + Math.round(age / 1000) + 's（' + session +
-            '），自动刷新页面恢复');
-        try {
-            G.location.reload();
-        } catch (e) {
-            diag('warn', '自动刷新失败: ' + e);
-        }
-    }
-
-    /** Test and console debugging surface for the fallback watcher. */
+    /** Test and console debugging surface for the fast refresh. */
     G.__zcodeShellFallback = {
-        evaluate: evaluateFallbackEpisode,
-        facts: fallbackFacts,
         note: notePageRpcCall,
-        episode: function () {
-            return fallbackEpisode;
+        check: fallbackCheck,
+        state: function () {
+            return fallbackState;
         },
-        tick: fallbackTick,
-        learn: learnSessionTitles,
-        stop: function () {
-            stopFallbackWatch();
+        timer: function () {
+            return fallbackTimer;
         }
     };
 
-    /** Called by the native side when the app's foreground state changes. */
+/** Called by the native side when the app's foreground state changes. */
     G.__zcodeShellSetAppForeground = function (foreground) {
         diag('info', 'app foreground = ' + (foreground ? 'true' : 'false'));
         appForeground = foreground;
@@ -1796,6 +1655,8 @@
     // -----------------------------------------------------------------------
     var SCROLLBAR_CSS = '::-webkit-scrollbar{width:0!important;height:0!important}';
 
+    var scrollbarStyleEl = null;
+
     function installScrollbarWidth() {
         try {
             var parent = document.head || document.documentElement;
@@ -1808,8 +1669,28 @@
             style.setAttribute('data-zcode-shell', 'scrollbar-width');
             style.textContent = SCROLLBAR_CSS;
             parent.appendChild(style);
+            scrollbarStyleEl = style;
         } catch (e) {
             diag('warn', '滚动条宽度置零失败: ' + e);
+        }
+    }
+
+    /**
+     * 自愈检查（每次心跳跑一次，一个 querySelector 的成本）。外场实测过注入层
+     * 偶发整体失效的形态：零宽样式不在了 → 原生滚动条回归 + 页面状态不再上报
+     * → 状态栏取色退回 boot 底色。这里只兜样式这一层：节点被页面运行期移除
+     * （或从未装上）就重装并留痕，10 秒内恢复悬浮自绘方案。
+     */
+    function ensureScrollbarStyle() {
+        try {
+            if (scrollbarStyleEl && typeof scrollbarStyleEl.isConnected === 'boolean' &&
+                scrollbarStyleEl.isConnected) {
+                return;
+            }
+            installScrollbarWidth();
+            diag('warn', '检测到滚动条置零样式丢失，已重新安装（自愈）');
+        } catch (e) {
+            // 自愈检查自身绝不打扰页面
         }
     }
 
@@ -1841,6 +1722,10 @@
     }
 
     function barElement() {
+        if (barEl && typeof barEl.isConnected === 'boolean' && !barEl.isConnected) {
+            // 页面运行期把挂载点换掉了：旧节点已成孤儿，重建并重新挂载。
+            barEl = null;
+        }
         if (barEl) {
             return barEl;
         }

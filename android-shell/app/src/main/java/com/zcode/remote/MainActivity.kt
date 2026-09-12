@@ -101,6 +101,15 @@ class MainActivity : AppCompatActivity() {
     private var pageStartedAt = 0L
 
     /**
+     * 注入层看门狗（2026-09-12 外场发现注入偶发整体失效：零宽滚动条回归 + 状态栏
+     * 退回 boot 底色，页面自身却照常可用）。健康加载里 document-start 一定会在
+     * 一两秒内上报一次页面状态；整个加载后 10s 仍零上报即判注入缺失，自动重载一次
+     * （每进程只补一次，防止注入持续失败时变成重载循环）。
+     */
+    private var pageStateSeenSinceLoad = false
+    private var injectionWatchdogUsed = false
+
+    /**
      * onPageFinished callbacks seen for the current document. WebView fires it
      * more than once (SPA history changes, late subframes), and only the first
      * one can be compared against the load start — see onPageFinished.
@@ -256,6 +265,7 @@ class MainActivity : AppCompatActivity() {
                 super.onPageStarted(view, url, favicon)
                 consoleLines = 0
                 finishCallbacks = 0
+                pageStateSeenSinceLoad = false
                 pageStartedAt = SystemClock.elapsedRealtime()
                 Diagnostics.info("网页开始加载")
                 // A fresh document boots with the page background at the top (the
@@ -299,6 +309,18 @@ class MainActivity : AppCompatActivity() {
                 hideError()
                 maybeRequestNotificationPermission()
                 tryLocate()
+                if (finishCallbacks == 1 && !injectionWatchdogUsed) {
+                    mainHandler.postDelayed({
+                        if (!pageStateSeenSinceLoad && !injectionWatchdogUsed && !isFinishing) {
+                            injectionWatchdogUsed = true
+                            Diagnostics.log(
+                                "warn",
+                                "页面加载 10s 未收到注入层状态上报，疑似注入缺失，自动重载一次",
+                            )
+                            reloadPage()
+                        }
+                    }, INJECTION_WATCHDOG_MS)
+                }
             }
 
             override fun onReceivedError(
@@ -525,6 +547,7 @@ class MainActivity : AppCompatActivity() {
      * several reports per second.
      */
     private fun onPageStateReported(stateToken: String?, themeToken: String?) {
+        pageStateSeenSinceLoad = true
         runOnUiThread {
             val state = PageBarColor.stateOf(stateToken)
             val theme = PageBarColor.themeOf(themeToken)
@@ -871,6 +894,9 @@ class MainActivity : AppCompatActivity() {
         /** Console capture budget for one page load (see onConsoleMessage). */
         private const val MAX_CONSOLE_LINES = 200
         private const val MAX_CONSOLE_CHARS = 400
+
+        /** 注入层看门狗：首次加载完成后等待状态上报的宽限（见 pageStateSeenSinceLoad）。 */
+        private const val INJECTION_WATCHDOG_MS = 10_000L
 
         /** Mirrors the HarmonyOS build's PhotoViewPicker maxSelectNumber. */
         private const val MAX_UPLOAD_ITEMS = 5
