@@ -58,6 +58,7 @@
 | P4 | 上传链路（相册 / SAF / 取消不卡住）与通知细节（分组、点击定位、完成提示音） | 未验证；**全程日志已备好**（`538f67d` 后：选择器请求→方式→文件详情→页面发送，见「网页文件上传」末节），等一次真机上传即可同时验收 | 见「网页文件上传」与「实现要点」 |
 | P5 | 标题回退「新建任务」（用户 2026-09-12 两次报） | **壳侧自动恢复已实现（`538f67d`，待真机验收）**：进任务 2s 判定回退态、25s 仍在则自动刷新一次（同 session 仅一次、无全局冷却）。页面自身 9–22 秒自愈的机制不变（忙时约 2 分钟；再打开一次 <2 秒即正确）；桌面端拒答 `readSession` 的根因仍在那边 | 见「已知问题 D·1 / D1-b」与 [`标题迟加载-调研报告`](标题迟加载-调研报告-2026-09-12.md) |
 | P6 | 长后台后点进任务长时间不出内容（用户 2026-09-12 报） | **已定位并落地壳侧收敛**：回前台页面自恢复期间，壳为页面已持有的工作区重开 bridge → `rpc-transport-fault` → 每次重开 4 条 RPC 压在页面的 socket 上，持续约 2.5 分钟。`MAX_REOPENS_PER_BRIDGE` 2 → 0 | 见「已知问题 D·2」 |
+| P7 | 附件上传/长文本在三个客户端全部失败（`attachmentBeginV4` 30s 无应答） | **已定性为桌面端选择性静默丢弃**（13:09 实录：7 次/40s 零应答，同窗口 relay 调度器活着——fault/ack/增量都正常，相邻窗口其它 RPC 正常应答）；与客户端实现无关（安卓/鸿蒙/zemote 同证）。需要桌面端回答触发条件 | 见「已知问题 E」 |
 | — | `MODE_SAVE`（网页请求保存文件） | **未实现**，返回 false 并记 warn | — |
 
 ### 已知问题 A：ColorOS「悬浮显示」弹窗
@@ -212,7 +213,9 @@ this.heartbeatAckWatchdogTimer = void 0,
 否则可能劫持用户的新建任务输入。**未实现，等用户决定。**
 
 **已实现（2026-09-12 下午，`538f67d`，用户拍板后的时钟口径）**：注入层自动替用户"再刷一次"。
-t0 = 页面发出 `subscribeConversationV4`（通知/流体云定位进任务走同一条路，自动覆盖）；
+t0 = 页面进对话的信标——`subscribeConversationV4` **或** `conversationRowsRangeV4`（实测页面有两种
+进对话行为：任务列表点进去发前者；会话视图打开/恢复只发后者——单一信标会整窗漏掉，13:08 实录修正）；
+通知/流体云定位进任务走同一条路，自动覆盖。
 t0+2s 判定 DOM 回退对——可见头部标题恰为「新建任务」+ 输入框新任务占位符（`向 ZCode 提问…` 前缀，
 宽窄布局两个变体都认）。真新建任务界面是问候布局（`chat.empty.greeting.*`），**没有这条头**，
 判据结构上不会误伤（用户两张截图确认，本报告 §九）。t0+25s 仍在且守卫全过 → `location.reload()` 一次。
@@ -247,6 +250,32 @@ subscribeSessionsIndex / listen）→ 这些 RPC 全部排在**同一条 socket*
 却每次都要在页面正忙的那条 socket 上插 4 条 RPC。改成「一条连接一次机会」后，同一窗口的干扰从 3 轮降到 1 轮；
 重试交给下一条 relay 连接（**实测前台页面约 45–60 秒就会自建一条新连接**，所以最坏等一分钟），
 跨连接的 `FAULT_COOLDOWN_CONNECTIONS=3` 冷却仍在，长期被拒的工作区 10 分钟后彻底让路。
+
+### 已知问题 E：附件上传在所有客户端无应答——`zcode-agent.attachmentBeginV4`（2026-09-12，桌面端）
+
+现象与证据（`zcode-shell.log` 13:09 窗口，v1.0.0-pre.52，上传全程日志齐备）：
+
+- 手机端向会话上传 `zcode-remote-log.txt`（34.9KB text/plain）：`上传请求` → `上传方式` →
+  `已选择 1 个文件，交回网页：…` 全部正常落盘，`页面上传调用开始：zcode-agent.attachmentBeginV4` 发出。
+- 页面 **40 秒内重试 7 次**（约 8 秒一次），**全部无应答**——RPC 窗口只有计数（`attachmentBeginV4 1/2`），
+  无慢无失败（只要应答过必留痕）；`发帧 1 个`/窗口 = 每次都真发出去了。最终页面
+  `prompt-attachment-transfer.cancel` 放弃。
+- **同一窗口桌面端 relay 调度器是活的**：pair ack 正常、sessions-index 增量正常，13:09:22 还主动
+  回给我们 default 工作区的重复 bridge 一个 `rpc-transport-fault`（桌面端在处理帧、在拒绝）。
+- 相邻窗口其它 RPC 正常应答：`readSession` 1010ms 成功、`conversationRowsRangeV4`/`attachmentReadV4`
+  1–1.8s 成功。
+- **三种独立实现同样失败**：安卓 WebView（本壳）、鸿蒙壳、zemote（Dart，
+  `TimeoutException after 0:00:30.000000`）——与客户端无关。
+- 粘贴长文本同族：页面把长文本转临时附件，走 `createTempTextAttachment` **平台方法 RPC**（发桌面端
+  代建，代码注释 "Temporary text attachments require a desktop host"）；安卓上快速被结构化拒绝——
+  toast `读取附件失败：[object Object]`（拒绝值是普通对象非 Error；页面 console warn
+  「创建粘贴文本临时附件失败」带完整对象，导出日志 `[web:` 行可查）。
+- 「桌面忙」不构成解释：用户在桌面空闲窗口实测仍失败。
+
+**定性：桌面端对 `attachmentBeginV4`（可能含 `createTempTextAttachment` 一族）选择性静默丢弃。**
+需要桌面端回答：这个调用在什么条件下被丢弃？是否与会话的 agent 状态（active/空闲/已完成）或目标
+会话有关？`readSession` 对非 active 会话尚有 `Session is not active` 的显式拒绝，这里却是沉默——
+客户端无从重试决策。壳侧待办：无（三种客户端同证）。
 
 **D3 完成卡片踩在规范边上（本轮新增，取舍已记录）**
 

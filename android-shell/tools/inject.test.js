@@ -1339,7 +1339,12 @@ test('标题回退：进任务信标起表，同会话不重置时钟、换会�
         assert.strictEqual(fb.episode().timer, null);
         fb.note({name: 'zcode-agent.openConversationV4', args: {sessionId: 'sess_c'}});
         assert.strictEqual(fb.episode().timer, null,
-            'only the conversation-subscribe beacon arms an episode');
+            'only the conversation-entry beacons arm an episode');
+        // 第二种进对话行为（会话视图打开只发 rows-range，13:08 实录）也要起表
+        fb.note({name: 'zcode-agent.conversationRowsRangeV4',
+            args: {sessionId: 'sess_d'}});
+        assert.strictEqual(fb.episode().session, 'sess_d',
+            'the rows-range entry path must arm the watcher too');
     } finally {
         page.teardown();
     }

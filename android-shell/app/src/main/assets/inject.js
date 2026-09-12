@@ -1141,7 +1141,13 @@
     // -----------------------------------------------------------------------
     var FALLBACK_TITLE_TEXT = '新建任务';
     var FALLBACK_PLACEHOLDER_PREFIX = '向 ZCode 提问';
-    var FALLBACK_ENTRY_METHOD = 'zcode-agent.subscribeConversationV4';
+    // 两种进对话的页面行为都观测到过：任务列表点进去发 subscribeConversationV4
+    // （D1-b，10:04）；会话视图打开/恢复则只发 conversationRowsRangeV4（13:08 实录，
+    // 全程无 subscribe——按单一信标武装会整窗漏掉）。两个都当进任务信标。
+    var FALLBACK_ENTRY_METHODS = {
+        'zcode-agent.subscribeConversationV4': 1,
+        'zcode-agent.conversationRowsRangeV4': 1
+    };
     var FALLBACK_SESSION_RE = /sess_[A-Za-z0-9_-]+/;
     var FALLBACK_DETECT_MS = 2000;
     var FALLBACK_RELOAD_AT_MS = 25000;
@@ -1353,7 +1359,7 @@
         if (UPLOAD_RPC_RE.test(call.name)) {
             diag('info', '页面上传调用开始：' + call.name);
         }
-        if (call.name !== FALLBACK_ENTRY_METHOD) {
+        if (!FALLBACK_ENTRY_METHODS[call.name]) {
             return;
         }
         var session = sessionFromArgs(call.args);
