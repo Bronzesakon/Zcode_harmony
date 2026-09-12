@@ -345,8 +345,10 @@ class NotifyStateTest {
         assertEquals("重构登录页", running.locateTitle)
         assertNotEquals(running.title, running.locateTitle)
         // And the raw name must survive verbatim, newlines included, since the
-        // page's own text is what it will be compared against.
-        val multiline = store.applyWorkspace(
+        // page's own text is what it will be compared against. Fresh store: the
+        // running list is unioned across every workspace, so reusing this one
+        // would hand back the previous workspace's task at index 0.
+        val multiline = TaskStore().applyWorkspace(
             key = "/repo/y", title = "仓库", path = "/repo/y", identity = "ws", source = "active",
             tasks = listOf(task("b", "running", title = "第一行\n第二行")),
         ).running[0]
