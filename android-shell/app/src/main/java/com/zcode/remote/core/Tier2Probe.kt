@@ -24,7 +24,7 @@ internal fun relayProof(passHash: String, nonce: String, role: String, deviceSid
     return java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(digest)
 }
 
-/** Tier2 探针的连接凭证。只驻内存；任何日志路径都不得打印这些字段。 */
+/** Tier2 的连接凭证。只驻内存；任何日志路径都不得打印这些字段。 */
 data class RelayCreds(
     val wsUrl: String,
     val deviceSid: String,
@@ -33,19 +33,23 @@ data class RelayCreds(
 )
 
 /**
- * Tier2 probe — 原生直连 relay 的最小客户端，完全不经过 WebView/renderer。
+ * Tier2 — 原生直连 relay 客户端，完全不经过 WebView/renderer。
  *
- * 目的（2026-09-13 拍板）：验证「第二条完成配对的连接」对页面已配对连接的
- * KICK/takeover 语义——kick_test 已证实未配对的第二条不会踢人，配对后的
- * 行为是后台接管（Tier2）能否成立的决定性未知量。
+ * 两种模式（2026-09-13 拍板的后台独占形态）：
+ *   * 实验模式（durationMs>0，诊断指令 tier2_test）：配对跑一轮自动关闭，
+ *     用于 KICK/takeover 语义观测——已定案：配对层面单控制端互斥。
+ *   * 接管模式（durationMs<=0）：后台 Tier1 判死时由 ShellRuntime 启动；
+ *     配对成功后启动 BridgeManager 覆盖（M3b/c：workspace-list → 每工作区
+ *     4-RPC 握手 + sessions-index 订阅），任务事件经 [sessionsSink] 直接进
+ *     原生 TaskStore/通知链路。断线自动重连（退避 10s），直到 [stop]（回前台
+ *     交还）。接管会踢掉页面连接（KICK 互斥），因此前台绝不进入本模式。
  *
  * 握手链与页面逐字对齐（docs/05 @4699005/@4702045）：
  *   connect → auth_init{role:'terminal', device_sid, meta, client_ts}
  *   ← auth_challenge{nonce}
  *   → auth_response{device_sid, proof, client_ts}
- *   ← auth_ack{pair_status} → paired；此后每 10s pair_status_query 保活。
+ *   ← auth_ack{pair_status} → paired
  *
- * 生命周期由诊断指令驱动（tier2_test / tier2_stop）：durationMs 到点主动关闭。
  * 日志只打阶段与 pair_status——凭证、URL、sid/hash/mid 一律不落日志。
  */
 object Tier2Probe {
@@ -61,11 +65,22 @@ object Tier2Probe {
     @Volatile
     private var creds: RelayCreds? = null
 
+    /** 接管模式的任务事件出口（ShellRuntime 注入，喂 TaskStore/通知）。 */
+    @Volatile
+    var sessionsSink: ((JSONObject) -> Unit)? = null
+
     private var heartbeatCount = 0
     private var ackCount = 0
     private var startedAtMs = 0L
+    private var persistent = false
+    private var stopping = false
+    private var reconnectAttempt = 0
     private var durationTimer: java.util.Timer? = null
     private var heartbeatTimer: java.util.Timer? = null
+    private var reconnectTimer: java.util.Timer? = null
+
+    @Volatile
+    private var bridgeManager: BridgeManager? = null
 
     private val client by lazy {
         OkHttpClient.Builder()
@@ -80,8 +95,8 @@ object Tier2Probe {
     fun isRunning(): Boolean = phase != Phase.IDLE && phase != Phase.CLOSED
 
     /**
-     * @param durationMs 探针存活时长；<=0 表示持久（后台接管模式），
-     *   直到 [stop] 被调用（回前台交还）。
+     * @param durationMs 探针存活时长；<=0 表示接管模式（持久，直到 [stop]，
+     *   且配对成功后启动桥覆盖 + 断线自动重连）。
      */
     fun start(newCreds: RelayCreds, durationMs: Long = 60_000L) {
         if (isRunning()) {
@@ -89,22 +104,17 @@ object Tier2Probe {
             return
         }
         creds = newCreds
+        persistent = durationMs <= 0
+        stopping = false
+        reconnectAttempt = 0
         heartbeatCount = 0
         ackCount = 0
         startedAtMs = System.currentTimeMillis()
-        phase = Phase.CONNECTING
-        Diagnostics.log("info", "Tier2: 启动原生直连探针（duration=${durationMs / 1000}s，凭证仅内存）")
-
-        val url = buildString {
-            append(newCreds.wsUrl)
-            if (!newCreds.deviceMid.isNullOrBlank()) {
-                append(if (newCreds.wsUrl.contains('?')) "&" else "?")
-                append("mid=").append(java.net.URLEncoder.encode(newCreds.deviceMid, "UTF-8"))
-            }
-        }
-        val request = Request.Builder().url(url).build()
-
-        // duration 到点主动关闭；<=0 = 持久模式（后台接管），由 stop() 交还。
+        Diagnostics.log(
+            "info",
+            "Tier2: 启动原生直连探针（${if (persistent) "接管模式" else "duration=${durationMs / 1000}s"}，凭证仅内存）",
+        )
+        connectNow()
         if (durationMs > 0) {
             durationTimer = java.util.Timer(true).apply {
                 schedule(
@@ -124,15 +134,32 @@ object Tier2Probe {
                 10_000L,
             )
         }
+    }
 
+    private fun connectNow() {
+        val c = creds ?: return
+        phase = Phase.CONNECTING
+        val url = buildString {
+            append(c.wsUrl)
+            if (!c.deviceMid.isNullOrBlank()) {
+                append(if (c.wsUrl.contains('?')) "&" else "?")
+                append("mid=").append(java.net.URLEncoder.encode(c.deviceMid, "UTF-8"))
+            }
+        }
+        val request = Request.Builder().url(url).build()
         socket = client.newWebSocket(request, listener)
     }
 
     fun stop(reason: String) {
+        stopping = true
         durationTimer?.cancel()
         durationTimer = null
         heartbeatTimer?.cancel()
         heartbeatTimer = null
+        reconnectTimer?.cancel()
+        reconnectTimer = null
+        bridgeManager?.disposeEverything(reason)
+        bridgeManager = null
         val s = socket
         socket = null
         val lasted = (System.currentTimeMillis() - startedAtMs) / 1000
@@ -141,18 +168,68 @@ object Tier2Probe {
             "Tier2: 关闭（$reason）phase=$phase 存活=${lasted}s 心跳=$heartbeatCount ack=$ackCount",
         )
         try {
-            s?.close(1000, "tier2 probe done")
+            s?.close(1000, "tier2 done")
         } catch (e: Exception) {
             Diagnostics.log("warn", "Tier2: close 异常 ${e.message}")
         }
         phase = Phase.CLOSED
     }
 
+    private fun startCoverageIfPersistent() {
+        if (!persistent) return
+        val c = creds ?: return
+        val manager = BridgeManager(
+            sendPayloadOut = { payload -> sendBusinessPayload(payload, quiet = false) },
+            onSessionsUpdate = { update ->
+                try {
+                    sessionsSink?.invoke(update)
+                } catch (e: Exception) {
+                    Diagnostics.log("warn", "Tier2: sessions 回调失败 ${e.message}")
+                }
+            },
+            onLogLine = { line -> Diagnostics.log("debug", line) },
+        )
+        bridgeManager = manager
+        Thread {
+            try {
+                val workspaces = manager.listWorkspacesBlocking()
+                if (workspaces.isEmpty()) {
+                    Diagnostics.log("warn", "Tier2: 接管模式拿到空工作区列表")
+                    return@Thread
+                }
+                manager.beginCoverage(workspaces)
+            } catch (e: Exception) {
+                Diagnostics.log("warn", "Tier2: 覆盖启动失败 ${e.message}")
+            }
+        }.start()
+    }
+
+    private fun scheduleReconnect() {
+        if (!persistent || stopping) return
+        reconnectAttempt += 1
+        val delayMs = 10_000L
+        if (reconnectAttempt % 6 == 1) {
+            Diagnostics.log("warn", "Tier2: 断线，${delayMs / 1000}s 后重连（第 $reconnectAttempt 次）")
+        }
+        reconnectTimer = java.util.Timer(true).apply {
+            schedule(
+                object : java.util.TimerTask() {
+                    override fun run() {
+                        if (stopping || !persistent) return
+                        bridgeManager?.disposeEverything("重连重建")
+                        bridgeManager = null
+                        connectNow()
+                    }
+                },
+                delayMs,
+            )
+        }
+    }
+
     private val listener = object : WebSocketListener() {
         override fun onOpen(webSocket: WebSocket, response: okhttp3.Response) {
             phase = Phase.AUTHENTICATING
             val c = creds ?: return
-            // auth_init 与页面同构（meta 也保持一致，服务端可能按它区分终端形态）。
             val init = JSONObject().apply {
                 put("type", "auth_init")
                 put("role", "terminal")
@@ -192,15 +269,24 @@ object Tier2Probe {
                     ackCount += 1
                     if (phase != Phase.PAIRED && status == "matched") {
                         phase = Phase.PAIRED
-                        // 关键观测点：本端配对成功后，页面那条连接是否还活着——
-                        // 页面侧的 socket close 会以「relay socket closed」出现在同一份日志里。
-                        Diagnostics.log(
-                            "warn",
-                            "Tier2: ★配对成功（matched）——现在观察页面连接是否被踢（KICK/takeover 语义定案点）",
-                        )
-                    } else if (status != "matched") {
-                        Diagnostics.log("info", "Tier2: pair_status=$status")
+                        if (persistent) {
+                            Diagnostics.log(
+                                "warn",
+                                "Tier2: ★接管配对成功（matched）——页面连接已被顶掉，开始桥覆盖",
+                            )
+                            startCoverageIfPersistent()
+                        } else {
+                            Diagnostics.log(
+                                "warn",
+                                "Tier2: ★配对成功（matched）——现在观察页面连接是否被踢（KICK/takeover 语义定案点）",
+                            )
+                        }
                     }
+                }
+                "data" -> {
+                    // 业务帧路由（M3b）：rpc-frame / 桥开启应答 / 工作区列表应答。
+                    val payload = frame.optJSONObject("payload") ?: return
+                    bridgeManager?.acceptRelayPayload(payload)
                 }
                 "error" -> {
                     Diagnostics.log(
@@ -213,20 +299,38 @@ object Tier2Probe {
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: okhttp3.Response?) {
-            if (phase == Phase.CLOSED) return
+            if (stopping || phase == Phase.CLOSED) return
             phase = Phase.CLOSED
             Diagnostics.log("warn", "Tier2: 连接失败 ${t.javaClass.simpleName}: ${t.message?.take(120)}")
+            scheduleReconnect()
         }
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-            if (phase == Phase.CLOSED) return
+            if (stopping || phase == Phase.CLOSED) return
             phase = Phase.CLOSED
             Diagnostics.log("warn", "Tier2: 对端关闭 code=$code reason=${reason.take(60)}")
+            scheduleReconnect()
         }
 
         override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
             // relay 终端协议是 JSON 文本帧；二进制帧出现即记录不处理。
             Diagnostics.log("debug", "Tier2: 收到二进制帧 ${bytes.size}B（忽略）")
+        }
+    }
+
+    private fun sendBusinessPayload(payload: JSONObject, quiet: Boolean) {
+        val s = socket ?: run {
+            if (!quiet) Diagnostics.log("warn", "Tier2: 无 socket，业务帧丢弃 ${payload.optString("zcode_type")}")
+            return
+        }
+        val envelope = JSONObject()
+            .put("type", "data")
+            .put("payload", payload)
+            .put("client_ts", System.currentTimeMillis())
+        try {
+            s.send(envelope.toString())
+        } catch (e: Exception) {
+            Diagnostics.log("warn", "Tier2: 业务帧发送失败 ${e.message}")
         }
     }
 

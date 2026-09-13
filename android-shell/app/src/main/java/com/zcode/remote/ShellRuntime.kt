@@ -516,6 +516,9 @@ object ShellRuntime {
                         passHash = passHash,
                         deviceMid = data.optString("deviceMid").ifBlank { null },
                     )
+                    // Tier2 接管期间的任务事件直接进原生 TaskStore/通知链路
+                    // （M3c）：与注入层 post('sessions') 的更新形状同构。
+                    Tier2Probe.sessionsSink = { update -> acceptNativeSessions(update) }
                     Diagnostics.log("info", "Tier2: relay 凭证已接收（仅内存）")
                 }
                 "pagestate" -> {
@@ -539,6 +542,11 @@ object ShellRuntime {
         } catch (e: Exception) {
             Diagnostics.log("warn", "无法解析注入脚本消息: ${e.message}")
         }
+    }
+
+    /** Tier2 原生任务事件入口（M3c）：更新形状与注入层 post('sessions') 同构。 */
+    fun acceptNativeSessions(update: JSONObject) {
+        onSessions(update)
     }
 
     private fun onSessions(data: JSONObject?) {
