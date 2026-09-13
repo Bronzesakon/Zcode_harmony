@@ -399,6 +399,16 @@ object ShellRuntime {
         }
     }
 
+    /**
+     * 诊断指令 tier1_silence_test：把 liveness 时间戳强制拨旧，验证"渲染器静默
+     * → 原生判死 → Tier2 接管"这条路径（真机无法自然制造渲染器冻结）。
+     */
+    fun forceTier1SilenceCheckForTest() {
+        lastLivenessAt = SystemClock.elapsedRealtime() - (TIER2_TAKEOVER_SILENCE_MS + 5_000L)
+        Diagnostics.log("warn", "Tier1 静默测试：强制判死并立即巡检")
+        checkTier1Silence()
+    }
+
     fun startTier1Watchdog() {
         mainHandler.removeCallbacks(tier1Watchdog)
         mainHandler.postDelayed(tier1Watchdog, 5_000L)
