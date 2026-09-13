@@ -342,7 +342,7 @@ class RelayBridgeTest {
         }
 
         private val seqs = java.util.concurrent.ConcurrentHashMap<String, Long>()
-        private fun nextSeq(bridgeId: String): Long = seqs.merge(bridgeId, 1L, Long::plus)
+        private fun nextSeq(bridgeId: String): Long = seqs.merge(bridgeId, 1L, Long::plus) ?: 1L
 
         fun mgrStart() {
             thread.start()
