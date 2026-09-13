@@ -146,7 +146,8 @@ object ShellRuntime {
             paired = data.optBoolean("paired"),
             socketState = data.optInt("socketState", -1),
         )
-        maybeTakeOverInBackground(ago)
+        // 这里**不再**用注入层自述的链路静默（lastInboundAgoMs）触发接管：
+        // 桌面端安静不等于渲染器死了（见 checkTier1Silence 的说明）。
         // A background window just closed and this is the first fresh reading:
         // this is the milestone-4 verdict.
         if (verdictPending && backgroundStartedAt == 0L) {
@@ -216,6 +217,9 @@ object ShellRuntime {
             backgroundFrameBase = snapshot?.inboundFrames ?: 0
             backgroundAckBase = snapshot?.pairAcks ?: 0
             backgroundTickBase = snapshot?.backgroundTicks ?: 0
+            // 退后台这一刻就问一次"渲染器还活着吗"：活着 → Tier1 继续供数，
+            // 不踢页面；答不上来 → 4s 后立刻接管，不等 25s 判死窗（见函数注释）。
+            probeRendererOnBackground()
         }
     }
 
@@ -334,6 +338,13 @@ object ShellRuntime {
     private const val TIER2_TAKEOVER_SILENCE_MS = 25_000L
 
     /**
+     * 退后台探针的应答窗：退后台那一刻问一次 liveness，4s 内没有回音即认定
+     * 渲染器已经起不来（熄屏被挂起/被冻结）→ 立刻接管。取 4s 是因为正常往返
+     * 只要几十毫秒，而"熄屏后渲染器整段挂起"是毫秒级就注定的形态。
+     */
+    private const val RENDERER_PROBE_MS = 4_000L
+
+    /**
      * 最后一次收到注入层 liveness 报告的墙钟时刻。
      *
      * 关键：接管判据不能只看 JS 上报的 lastInboundAgoMs——渲染器被冻结时
@@ -364,7 +375,17 @@ object ShellRuntime {
 
     /**
      * 原生侧巡检 Tier1 静默（常驻看门狗，不依赖注入层上报）。
-     * 判据：用户已离开 + 静默超过阈值 + 最后已知配对为 matched（桌面在线）。
+     *
+     * 判据只有一条：**原生多久没收到注入层的 liveness**。
+     * 那才是"渲染器瞎了"的证据——liveness 由原生泵每 10s 用 evaluateJavascript
+     * 驱动（见 [pumpRunnable]），渲染器被冻结/杀死时它整段停摆。
+     *
+     * 2026-09-13 真机教训：这里原先取 min(注入层报告静默, 链路入站静默)，于是
+     * "桌面端 25s 没下发任何帧"也会判死并接管。那是**误判**：桌面端安静不等于
+     * 我们瞎了（接管同样拿不到帧），而接管的代价是把页面顶掉（relay 单控制端
+     * 互斥，KICK 语义已定案）。16:05 那次误判把页面踢成 KICKED 终态，页面不会
+     * 自愈，流体云从此断供——链路安静归页面自己的心跳看门狗管，接管只认
+     * "渲染器不答话"。
      */
     private fun checkTier1Silence() {
         if (lastLivenessAt <= 0L) {
@@ -373,21 +394,10 @@ object ShellRuntime {
         if (!userIsAway()) {
             return
         }
-        val now = SystemClock.elapsedRealtime()
-        val silenceByReport = now - lastLivenessAt
-        var silenceByLink = Long.MAX_VALUE
-        val snapshot = liveness
-        if (snapshot != null && snapshot.lastInboundAtElapsed > 0) {
-            silenceByLink = now - snapshot.lastInboundAtElapsed
-        }
-        var silence = silenceByReport
-        if (silenceByLink < silence) {
-            silence = silenceByLink
-        }
-        maybeTakeOverInBackground(silence)
+        maybeTakeOverInBackground(SystemClock.elapsedRealtime() - lastLivenessAt)
     }
 
-    /** Tier1 静默看门狗：每 15s 一跳，前台/后台/熄屏都在岗。 */
+    /** Tier1 静默看门狗：每 5s 一跳，前台/后台/熄屏都在岗。 */
     private val tier1Watchdog = object : Runnable {
         override fun run() {
             try {
@@ -415,29 +425,59 @@ object ShellRuntime {
     }
 
     /**
-     * Tier2 后台接管触发（2026-09-13 拍板的形态）：应用在后台且 Tier1 的入站
-     * 流静默超过阈值（renderer 冻结/链路死亡，实况窗会断）→ 原生直连 relay
-     * 接管配对。KICK 语义已定案为配对互斥：接管会踢掉页面连接，所以前台绝不
-     * 做这件事；回前台由 [onAppForegroundChanged] 交还。M3（原生任务事件解码）
-     * 落地前，接管只保连接与配对，不产出通知数据。
+     * 退后台的立即探针（用户 2026-09-13 的"切后台就直接接管"落点）。
+     *
+     * 退后台第 0 秒先要一次 liveness：
+     *   * 渲染器还活着 → 几百毫秒内就回一个，Tier1 继续供数（流体云照常更新），
+     *     **不踢页面**——踢了反而要在回前台重载一次；
+     *   * 渲染器已经答不上来（熄屏被系统挂起、进程被冻结）→ 4s 内一个都没有，
+     *     这时立刻接管，不等 25s 判死窗。真机实测：熄屏后日志与流体云双双定格
+     *     正是这个形态。
      */
-    private fun maybeTakeOverInBackground(inboundAgoMs: Long) {
+    private fun probeRendererOnBackground() {
+        rendererProbeToken += 1
+        val token = rendererProbeToken
+        requestLivenessReport()
+        mainHandler.postDelayed({
+            if (token != rendererProbeToken) return@postDelayed
+            if (appIsForeground) return@postDelayed
+            val since = SystemClock.elapsedRealtime() - lastLivenessAt
+            if (since < RENDERER_PROBE_MS) return@postDelayed
+            takeOverNow("退后台 ${since / 1000}s 注入层零应答（渲染器已冻结）")
+        }, RENDERER_PROBE_MS)
+    }
+
+    @Volatile
+    private var rendererProbeToken = 0
+
+    /**
+     * Tier2 后台接管触发：应用在后台且**注入层已经不答话**（渲染器冻结/被杀，
+     * 实况窗必然要断）→ 原生直连 relay 接管配对与任务事件。
+     *
+     * KICK 语义已定案为配对互斥：接管会踢掉页面连接，所以前台绝不做这件事；
+     * 回前台由 [onAppForegroundChanged] 交还，页面侧再由 KICKED 自愈重载恢复。
+     */
+    private fun maybeTakeOverInBackground(livenessAgoMs: Long) {
+        if (livenessAgoMs in 0 until TIER2_TAKEOVER_SILENCE_MS) return
+        takeOverNow("用户已离开且注入层静默 ${livenessAgoMs / 1000}s（渲染器已冻结）")
+    }
+
+    /** 执行接管（前置条件已满足，只做最后两道门）。 */
+    private fun takeOverNow(reason: String) {
         if (!userIsAway()) return
-        if (inboundAgoMs in 0 until TIER2_TAKEOVER_SILENCE_MS) return
         if (Tier2Probe.isRunning()) return
         // 桌面活着才接管：最后一次 pair ack 非 matched（桌面休眠/离线）时，
         // 静默是"没有可监控的东西"而非"我们瞎了"——接管只会占坑挡页面恢复。
         val snapshot = liveness
         if (snapshot == null || !snapshot.paired) {
-            Diagnostics.log("debug", "Tier2: 静默但桌面非在线（pair_status 非 matched），不接管")
+            Diagnostics.log("debug", "Tier2: $reason，但桌面非在线（pair_status 非 matched），不接管")
             return
         }
         val c = relayCreds ?: return
         Tier2Probe.start(c, durationMs = 0L)
         Diagnostics.log(
             "warn",
-            "Tier2: 用户已离开且 Tier1 判死（静默 ${inboundAgoMs / 1000}s），原生接管配对与任务事件" +
-                "（回前台/亮屏自动交还）",
+            "Tier2: $reason——原生接管配对与任务事件（回前台/亮屏自动交还）",
         )
     }
 

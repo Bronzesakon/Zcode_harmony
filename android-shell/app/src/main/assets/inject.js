@@ -971,6 +971,10 @@
             liveness.pairAcks += 1;
             linkWindow.acks += 1;
             if (relayPaired) {
+                // 配对成功＝链路真的回来了，KICKED 自愈的连续计数到此清零。
+                if (kickedHealCount() > 0) {
+                    storeSet(KICKED_HEAL_STORE, '0');
+                }
                 ensureClient();
                 maybeStartActive();
             } else {
@@ -986,6 +990,16 @@
                 // "its timer is throttled away while hidden" (no beats) from "it is
                 // still beating and something else is arming the watchdog".
                 linkWindow.pageBeats += 1;
+            }
+            return;
+        }
+        if (frame.type === 'error') {
+            // relay 级错误。KICKED ＝ 本端被顶掉：壳在后台的原生接管（预期），
+            // 或另一台控制端接入（不是我们的战场）。页面自己的传输层会因此
+            // 进入终态（"已被其他设备接管"页，只能手动点"重新连接"），所以
+            // 这里记一笔，回前台时由壳重载页面把链路重新拿回来。
+            if (String(frame.code) === 'KICKED') {
+                noteRelayKicked();
             }
             return;
         }
@@ -1051,6 +1065,9 @@
     var RESUME_DEAD_LINK_MS = 60000;
     /** Ticks closer together than this are dropped so the timer and the pump cannot double up. */
     var MIN_TICK_GAP_MS = 5000;
+    /** Cap on automatic reloads after a KICKED, counted across the reload itself. */
+    var KICKED_HEAL_CAP = 2;
+    var KICKED_HEAL_STORE = 'zcodeShellKickedHeals';
     var lastPairAckAt = 0;
     var lastForcedReconnectAt = 0;
     var lastTickAt = 0;
@@ -1058,6 +1075,60 @@
     var appForeground = true;
     var backgroundStartedWallMs = 0;
     var lastBackgroundSilenceLoggedAt = 0;
+
+    /**
+     * relay 把本端顶掉（KICKED）。
+     *
+     * 两种来源：① 壳在后台的原生接管——这是**预期**行为（relay 是单控制端互斥
+     * 的，原生要接管就必须把页面顶下去）；② 另一台控制端接入——不是我们的战场。
+     * 共同点是页面自己的传输层会因此进终态（"已被其他设备接管"，只有手动点
+     * "重新连接"才回得来），所以壳必须负责把它救回来：
+     *
+     *   * 后台被顶 → 什么都不做（那时页面不该在跑），只在回前台时重载一次，
+     *     让页面用同一条链路重新握手（原生槽位那时已交还）。
+     *   * 前台被顶 → 不自动干预（可能与另一台控制端在抢）。
+     *
+     * 重载夹在 1.5 s 之后：原生交还需要先关掉它自己的 socket，立刻重载会再被
+     * 顶一次。跨 reload 用 sessionStorage 记次数，配对成功即清零，所以最坏也
+     * 只是重载两次而不是死循环。
+     */
+    var kickedAwayAt = 0;
+
+    function kickedHealCount() {
+        return parseInt(storeGet(KICKED_HEAL_STORE), 10) || 0;
+    }
+
+    function noteRelayKicked() {
+        if (appForeground) {
+            diag('warn', '页面连接被顶掉（relay 返回 KICKED，前台）：不自动干预');
+            return;
+        }
+        kickedAwayAt = Date.now();
+        diag('warn', '页面连接被顶掉（relay 返回 KICKED，应用在后台）：' +
+            '回前台将自动重载页面恢复');
+    }
+
+    function healKickedOnForeground() {
+        if (!kickedAwayAt) {
+            return;
+        }
+        kickedAwayAt = 0;
+        var count = kickedHealCount();
+        if (count >= KICKED_HEAL_CAP) {
+            diag('error', 'KICKED 自愈：已连续重载 ' + count + ' 次仍未配对，停止自动重载');
+            return;
+        }
+        storeSet(KICKED_HEAL_STORE, String(count + 1));
+        diag('warn', 'KICKED 自愈：1.5s 后重载页面（第 ' + (count + 1) + '/' +
+            KICKED_HEAL_CAP + ' 次），让页面重新配对');
+        setTimeout(function () {
+            try {
+                G.location.reload();
+            } catch (e) {
+                diag('warn', 'KICKED 自愈重载失败: ' + e);
+            }
+        }, 1500);
+    }
 
     /**
      * Liveness counters.
@@ -1359,26 +1430,27 @@
     };
 
     // -----------------------------------------------------------------------
-    // 5b. 3s dual-state fast refresh
+    // 5b. 进对话铁判准：5 s 内对话详情没就绪 → 直接刷新
     //
-    // Entering a conversation on a cold session can strand the page in one of
-    // two states. State A: the header stays on the fallback title 新建任务 —
-    // the page never resolved the task. State B: the title resolves but the
-    // conversation content never arrives, and the composer sits there greyed
-    // out — the page's own signal that content has not loaded. The page
-    // swallows its failures silently and usually heals in 9–22 s; the user
-    // chose the blunt version instead: check ONCE, 3 s after the entry beacon,
-    // and reload the page if either state is on screen. After a reload the
-    // page re-opens its last task on its own (observed in the field log).
+    // 用户 2026-09-13 拍板的口径（"5 s 内加载不出对话详情就是铁判准，直接触发页面
+    // 刷新"）。判据不看 DOM 长什么样，只看**页面自己有没有把对话内容拿到**：
     //
-    // Everything the earlier design guarded is gone on purpose (user's call):
-    // no draft guard, no foreground check, no title cross-check, no
-    // per-session limit. ONE piece remains because without it the loop cannot
-    // terminate: a 15 s minimum gap between reloads. A fresh page gets checked
-    // at +3 s — always before content had a chance — so an unguarded check
-    // would reload forever and the page would never finish loading. With the
-    // gap, a stuck page retries every ~15 s and a loaded page stops for good.
-    // The gap is also bridged across the reload itself via sessionStorage.
+    //   就绪（信标窗内任一成立即算，此后本轮不再干预）——
+    //     1. 页面日志 v4.conversation.store.connect.completed（页面的
+    //        conversation store 连上、快照已应用；空会话同样会走到这里，
+    //        所以"新建任务"不会被误刷）；
+    //     2. 页面日志 v4.conversation.subscribe.acknowledged / .activated；
+    //     3. DOM 时间线已有行（rows > 0）；
+    //     4. 页面桥在信标之后收到过任何入站帧（桌面端确实回话了）。
+    //   未就绪 → 到点直接 reload。**跳过"轻推"这一档**：轻推关的是共享 socket，
+    //   而"桌面端不回话"的形态里换一条连接才有用（旧 3 s DOM 判定把轻推串在刷新
+    //   前面，实测要 ~9 s 才刷，且标题回退态还要被轻推绕一圈）。
+    //
+    // 终止性只留两件（其余守卫按用户要求全部删掉：不看草稿、不看前台、不做标题
+    // 交叉验证）：15 s 最小刷新间隔（跨 reload 由 sessionStorage 记），以及连续
+    // 刷新上限（到顶放弃，任何就绪信号到达即复位）。没有间隔，刚 reload 的新页
+    // 会在 +5 s 被判"没内容"从而无限刷新；有了它，卡住的页面每 ~15 s 重来一次，
+    // 加载成功的页面一次都不刷。
     // -----------------------------------------------------------------------
     var FALLBACK_TITLE_TEXT = '新建任务';
     var FALLBACK_PLACEHOLDER_PREFIX = '向 ZCode 提问';
@@ -1394,17 +1466,13 @@
         'zcode-agent.subscribeConversationV4': 1,
         'zcode-agent.conversationRowsRangeV4': 1
     };
-    var FALLBACK_CHECK_MS = 3000;
+    /** 铁判准窗：信标后 5 s（用户拍板值，不要再调大）。 */
+    var FALLBACK_CHECK_MS = 5000;
     var FALLBACK_RELOAD_GAP_MS = 15000;
     var FALLBACK_STORE_AT = 'zcodeShellFastRefreshAt';
-    // 第二级检查：DOM 判不出「标题正确 + 输入框可用 + 内容不来」（2026-09-12 真机
-    // 日志证实该形态存在且输入框并不灰），改用协议层信号——信标后页面桥若在
-    // CONTENT 窗口内零入站帧，说明桌面端什么都没下发，刷新换一条连接。
-    var FALLBACK_CONTENT_CHECK_MS = 10000;
 
     var fallbackTimer = null;
-    var contentTimer = null;
-    var fallbackState = {lastReloadAt: 0, beaconAt: 0, beaconGen: 0};
+    var fallbackState = {lastReloadAt: 0, beaconAt: 0, beaconGen: 0, readyAt: 0, readyBy: ''};
     var clientGenSeq = 0;
 
     function fallbackElementVisible(el) {
@@ -1509,20 +1577,69 @@
         }
     }
 
-    /** 进对话信标：重置 3s DOM 检查与 10s 内容检查（快速切换时以最后一次为准）。 */
+    /**
+     * 进对话信标：重置 5 s 铁判准窗（快速切换时以最后一次信标为准）。
+     * 页面卡住时它每 ~10 s 重发一次同样的请求，信标因此会连续重来——那正是
+     * 我们希望它重来的形态：每次都重新给 5 s，就绪信号一到就停。
+     */
     function scheduleFallbackCheck() {
         if (fallbackTimer) {
             clearTimeout(fallbackTimer);
         }
         fallbackTimer = setTimeout(fallbackCheck, FALLBACK_CHECK_MS);
-        if (contentTimer) {
-            clearTimeout(contentTimer);
-        }
         fallbackState.beaconAt = Date.now();
         fallbackState.beaconGen = client ? client.gen : 0;
-        contentTimer = setTimeout(fallbackContentCheck, FALLBACK_CONTENT_CHECK_MS);
+        fallbackState.readyAt = 0;
+        fallbackState.readyBy = '';
     }
 
+    /**
+     * 页面自述的"对话内容已就绪"：store 连上（快照已应用）或订阅确认。
+     * 这是铁判准的第一手信号——比任何 DOM 形态都靠前，且空会话同样会走到
+     * store.connect.completed，所以判"就绪"不会误伤新建任务。
+     */
+    function noteConversationReady(reason) {
+        if (!fallbackState.beaconAt) {
+            return;
+        }
+        if (Date.now() - fallbackState.beaconAt > FALLBACK_CHECK_MS * 4) {
+            // 早已过了窗口（这轮已经判过/刷过），不再回填。
+            return;
+        }
+        if (!fallbackState.readyAt) {
+            fallbackState.readyAt = Date.now();
+            fallbackState.readyBy = reason;
+        }
+    }
+
+    /** 本轮信标窗内的就绪证据；空数组＝对话详情没到。 */
+    function conversationReadyReasons() {
+        var state = fallbackState;
+        var reasons = [];
+        if (state.readyAt && state.readyAt >= state.beaconAt) {
+            reasons.push(state.readyBy || '页面自述已就绪');
+        }
+        try {
+            var v = readVitals();
+            if (v && v.rows > 0) {
+                reasons.push('时间线 ' + v.rows + ' 行');
+            }
+        } catch (e) {
+            // 体征读不到不算证据，也不算反证
+        }
+        var clientNow = client;
+        if (clientNow && typeof clientNow.lastPageBridgeTrafficAt === 'function' &&
+            clientNow.lastPageBridgeTrafficAt() >= state.beaconAt) {
+            reasons.push('页面桥有入站帧');
+        }
+        return reasons;
+    }
+
+    /**
+     * 铁判准判定点（信标 +5 s）。就绪 → 本轮收工；未就绪 → 直接刷新页面。
+     * 链路在此期间换代（页面已经在自己重连）就跳过本轮：那种形态下页面正在
+     * 恢复，插一刀只会更慢；换代后的新信标会重新给 5 s。
+     */
     function fallbackCheck() {
         if (fallbackTimer) {
             // 自然到期之外的手动触发（测试/控制台）也要清掉挂起的定时器，
@@ -1530,53 +1647,75 @@
             clearTimeout(fallbackTimer);
         }
         fallbackTimer = null;
-        var header = '';
-        var composer = null;
+        var state = fallbackState;
+        if (!state.beaconAt) {
+            return;
+        }
+        var clientNow = client;
+        if (state.beaconGen && (!clientNow || clientNow.gen !== state.beaconGen)) {
+            diag('debug', '进对话 5s 判定：期间链路换代（' +
+                (clientNow ? '第 ' + state.beaconGen + '→' + clientNow.gen + ' 代' : '客户端已销毁') +
+                '），本轮不判（页面正按自己的梯子重连）');
+            return;
+        }
+        var reasons = conversationReadyReasons();
+        if (reasons.length) {
+            diag('debug', '进对话 ' +
+                Math.round((Date.now() - state.beaconAt) / 1000) + 's 已就绪（' +
+                reasons.join('、') + '）');
+            stallCancel('进对话 5s 判定：对话详情已就绪');
+            return;
+        }
+        var el = '';
         try {
-            header = findHeaderText();
-            composer = composerElement();
+            var header = findHeaderText();
+            el = header ? '标题回退' : '';
+            var composer = composerElement();
+            if (composer && elementDisabled(composer)) {
+                el = el ? el + '+输入框未就绪' : '输入框未就绪';
+            }
         } catch (e) {
-            // DOM 半拆的这一拍不判定；下一个信标会重新武装。
-            return;
+            el = 'DOM 不可读';
         }
-        var headerBad = header !== '';
-        var composerBad = !!(composer && elementDisabled(composer));
-        if (!headerBad && !composerBad) {
-            // 全就绪本身是恢复信号：撤防 + 复位连续刷新计数。
-            diag('debug', '3s 检查：标题与输入框均就绪');
-            stallCancel('3s 检查：标题与输入框均就绪');
-            return;
-        }
-        // 坏态交给卡死看门狗分级处置（先轻推、后刷新，见 5c 节），
-        // 这里不再直接 reload。
-        stallArm('3s DOM 检查: ' + (headerBad ? '标题回退' : '输入框未就绪'));
+        diag('warn', '进对话 5s 未出对话详情' + (el ? '（' + el + '）' : '') +
+            '：直接刷新页面');
+        reloadForMissingConversation('进对话 5s 未出对话详情');
     }
 
     /**
-     * 第二级检查（+10s）：DOM 全就绪但桌面端零下发。信标之后页面桥但凡收到过
-     * 任何 rpc-frame（会话内容、rows 结果、事件都算），就认为内容在路上；一帧
-     * 都没有才判卡死。链路重建（client 换代）的窗口跳过本轮——恢复期不插刀。
+     * 铁判准的刷新动作。与卡死看门狗共享同一套终止性状态（15 s 间隔 + 连续
+     * 上限 + 就绪即复位），但**不经过轻推**：见 5b 节头部的决策说明。
      */
-    function fallbackContentCheck() {
-        if (contentTimer) {
-            clearTimeout(contentTimer);
-        }
-        contentTimer = null;
-        var clientNow = client;
-        if (!clientNow || clientNow.gen !== fallbackState.beaconGen) {
-            diag('debug', '10s 内容检查：期间链路重建，本轮不判');
+    function reloadForMissingConversation(reason) {
+        var stamp = parseInt(storeGet(FALLBACK_STORE_AT), 10);
+        var last = Math.max(stallState.lastReloadAt, isNaN(stamp) ? 0 : stamp);
+        var wait = last + FALLBACK_RELOAD_GAP_MS - Date.now();
+        if (wait > 0) {
+            diag('info', reason + '：处于刷新间隔内，' + Math.round(wait / 1000) + 's 后再判');
+            if (fallbackTimer) {
+                clearTimeout(fallbackTimer);
+            }
+            fallbackTimer = setTimeout(fallbackCheck, wait);
             return;
         }
-        if (typeof clientNow.lastPageBridgeTrafficAt !== 'function') {
+        if (stallState.reloadCount >= STALL_RELOAD_CAP) {
+            stallState.gaveUp = true;
+            diag('error', reason + '：连续刷新 ' + stallState.reloadCount +
+                ' 次未恢复，停止自动刷新（任何就绪信号到达后自动复位）');
+            postPageVitals('giveup');
             return;
         }
-        var trafficAt = clientNow.lastPageBridgeTrafficAt();
-        if (trafficAt >= fallbackState.beaconAt) {
-            diag('debug', '10s 内容检查：页面桥有下发（内容已在路上）');
-            stallCancel('10s 内容检查：页面桥有下发（内容已在路上）');
-            return;
+        stallState.reloadCount += 1;
+        storeSet(STALL_STORE_RELOADS, String(stallState.reloadCount));
+        stallState.lastReloadAt = Date.now();
+        storeSet(FALLBACK_STORE_AT, String(stallState.lastReloadAt));
+        diag('warn', reason + '：第 ' + stallState.reloadCount + '/' + STALL_RELOAD_CAP +
+            ' 次刷新页面');
+        try {
+            G.location.reload();
+        } catch (e) {
+            diag('warn', '自动刷新失败: ' + e);
         }
-        stallArm('10s 内容检查: 页面桥零下发（标题与输入框正常但无任何入站帧）');
     }
 
     /** Upload-named page RPCs get explicit lines: that is the file-send chain. */
@@ -1610,15 +1749,13 @@
     G.__zcodeShellFallback = {
         note: notePageRpcCall,
         check: fallbackCheck,
-        contentCheck: fallbackContentCheck,
+        ready: noteConversationReady,
+        readyReasons: conversationReadyReasons,
         state: function () {
             return fallbackState;
         },
         timer: function () {
             return fallbackTimer;
-        },
-        contentTimer: function () {
-            return contentTimer;
         },
         arm: stallArm,
         cancel: stallCancel,
@@ -1913,7 +2050,7 @@
         }
     }
 
-    /** 页面日志事件 → 看门狗布防/撤防。只有当前界面真的卡着才布防。 */
+    /** 页面日志事件 → 看门狗布防/撤防 + 进对话铁判准的就绪信号。 */
     function notePageLogEvent(name) {
         if (PAGE_LOG_STALL_EVENTS[name]) {
             if (vitalsStalled(readVitals())) {
@@ -1922,6 +2059,7 @@
                 diag('debug', '页面日志失败事件（当前界面无卡态，不布防）: ' + name);
             }
         } else if (PAGE_LOG_RECOVER_EVENTS[name]) {
+            noteConversationReady(name);
             stallCancel('页面日志 ' + name);
         }
     }
@@ -2107,6 +2245,10 @@
             liveness.backgroundFirstTickDelayMs = -1;
             return;
         }
+        // 被 relay 顶掉的终态页面不会自愈（只有手动"重新连接"才回得来），
+        // 所以回前台第一件事就是把它重载回来。放在所有链路判断之前——被顶掉时
+        // relayPaired 已经是 false，走不到下面的分支。
+        healKickedOnForeground();
         if (!relayPaired || !deviceSid) {
             diag('info', '回前台时链路未就绪，交由页面自行重连');
             reportPageState();

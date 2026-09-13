@@ -1137,25 +1137,79 @@ function stubReload() {
     return {reloads, restore: () => { globalThis.location = previous; }};
 }
 
-test('快速刷新：热打开（真标题 + 输入框可用）不刷', () => {
+function stubSessionStorage() {
+    const store = new Map();
+    const previous = globalThis.sessionStorage;
+    globalThis.sessionStorage = {
+        getItem: (k) => (store.has(k) ? store.get(k) : null),
+        setItem: (k, v) => store.set(k, String(v)),
+        removeItem: (k) => store.delete(k)
+    };
+    return {store, restore: () => { globalThis.sessionStorage = previous; }};
+}
+
+test('进对话铁判准：信标后页面桥有入站帧 → 判就绪不刷', () => {
     const page = setupPage();
     const {reloads, restore} = stubReload();
     try {
         appendHeader(page, '真实任务名');
         appendComposer(page, '继续输入以排队后续修改', false);
+        const socket = new globalThis.WebSocket('wss://relay.example');
+        socket.receive({type: 'pair_status_ack', pair_status: 'matched'});
         FB().note({name: 'zcode-agent.subscribeConversationV4', args: {sessionId: 'sess_hot'}});
-        assert.ok(FB().timer() !== null, 'the beacon arms the 3s check');
+        assert.ok(FB().timer() !== null, 'the beacon arms the 5s deadline');
+        // 信标之后桌面端回了数据（页面桥入站 rpc-frame）——内容在路上。
+        const ok = encodeBody([page.protocol.RES_PROMISE_SUCCESS, 77], {rows: []});
+        for (const payload of fragment(ok, 'page-bridge-13', 1)) {
+            socket.receive({type: 'data', payload});
+        }
         FB().check();
-        assert.strictEqual(reloads.length, 0, 'a healthy open never reloads');
+        assert.strictEqual(reloads.length, 0, 'content already flowing must never reload');
         assert.ok(findPost(page.posts, 'diag', (d) =>
-            d.message.includes('3s 检查：标题与输入框均就绪')).length === 1);
+            d.message.includes('已就绪（页面桥有入站帧）')).length === 1);
     } finally {
         restore();
         page.teardown();
     }
 });
 
-test('快速刷新：状态 A（头部回退「新建任务」）→ 布防 + 轻推 + 复查刷', () => {
+test('进对话铁判准：页面自述 store 已连上 → 不刷（新任务也不会被误刷）', () => {
+    const page = setupPage();
+    const {reloads, restore} = stubReload();
+    try {
+        appendHeader(page, '上午好呀，有什么想让我帮忙的吗');
+        appendComposer(page, '向 ZCode 提问…', false);
+        FB().note({name: 'zcode-agent.subscribeConversationV4', args: {sessionId: 'sess_new'}});
+        // 空会话没有行，但页面自己的 store 一样会连上——这就是"就绪"的权威信号。
+        FB().ready('v4.conversation.store.connect.completed');
+        FB().check();
+        assert.strictEqual(reloads.length, 0,
+            'a brand-new empty task reaches store.connect.completed and must not be reloaded');
+        assert.ok(findPost(page.posts, 'diag', (d) =>
+            d.message.includes('已就绪（v4.conversation.store.connect.completed）')).length === 1);
+    } finally {
+        restore();
+        page.teardown();
+    }
+});
+
+test('进对话铁判准：页面日志的订阅确认也算就绪', () => {
+    const page = setupPage();
+    const {reloads, restore} = stubReload();
+    try {
+        appendHeader(page, '新建任务');
+        appendComposer(page, '向 ZCode 提问…', false);
+        FB().note({name: 'zcode-agent.conversationRowsRangeV4', args: {sessionId: 'sess_p'}});
+        FB().ready('v4.conversation.subscribe.acknowledged');
+        FB().check();
+        assert.strictEqual(reloads.length, 0, 'an acknowledged subscription is readiness');
+    } finally {
+        restore();
+        page.teardown();
+    }
+});
+
+test('进对话铁判准：5s 到点零就绪 → 直接刷新（不经过轻推）', () => {
     const page = setupPage();
     const {reloads, restore} = stubReload();
     try {
@@ -1163,32 +1217,20 @@ test('快速刷新：状态 A（头部回退「新建任务」）→ 布防 + �
         appendComposer(page, '向 ZCode 提问…', false);
         FB().note({name: 'zcode-agent.subscribeConversationV4', args: {sessionId: 'sess_a'}});
         FB().check();
-        assert.strictEqual(reloads.length, 0, 'arming alone never reloads');
-        assert.strictEqual(FB().stall().phase, 0, 'the ladder starts at phase 0');
+        assert.strictEqual(reloads.length, 1, 'the hard deadline reloads directly');
         assert.ok(findPost(page.posts, 'diag', (d) =>
-            d.message.includes('卡死看门狗布防（3s DOM 检查: 标题回退）')).length === 1);
-
-        // 判定点 1：桌面端零下发 → 轻推（这里没有 socket，跳过）→ 进入刷新判定
-        FB().fire();
-        assert.strictEqual(reloads.length, 0, 'the nudge fires before any reload');
-        assert.strictEqual(FB().stall().phase, 1, 'the ladder advances to phase 1');
-
-        // 判定点 2：仍卡着 → 第 1/2 次刷新
-        FB().fire();
-        assert.strictEqual(reloads.length, 1, 'phase 1 reloads after the nudge');
+            d.message.includes('进对话 5s 未出对话详情（标题回退）')).length === 1);
         assert.ok(findPost(page.posts, 'diag', (d) =>
             d.message.includes('第 1/2 次刷新页面')).length === 1);
-        if (FB().stall().timer) {
-            clearTimeout(FB().stall().timer);
-            FB().stall().timer = null;
-        }
+        assert.strictEqual(FB().stall().armed, false,
+            'the stall ladder (nudge first) is not on this path any more');
     } finally {
         restore();
         page.teardown();
     }
 });
 
-test('快速刷新：状态 B（真标题但输入框灰/禁用）→ 同一梯子，占位符为空也识别', () => {
+test('进对话铁判准：状态 B（真标题 + 输入框禁用）同样直接刷', () => {
     const page = setupPage();
     const {reloads, restore} = stubReload();
     try {
@@ -1196,39 +1238,16 @@ test('快速刷新：状态 B（真标题但输入框灰/禁用）→ 同一梯�
         appendComposer(page, null, true);
         FB().note({name: 'zcode-agent.conversationRowsRangeV4', args: {sessionId: 'sess_b'}});
         FB().check();
-        assert.strictEqual(reloads.length, 0, 'arming alone never reloads');
+        assert.strictEqual(reloads.length, 1, 'a greyed composer with no content still reloads');
         assert.ok(findPost(page.posts, 'diag', (d) =>
-            d.message.includes('卡死看门狗布防（3s DOM 检查: 输入框未就绪）')).length === 1);
-        FB().fire();
-        FB().fire();
-        assert.strictEqual(reloads.length, 1, 'a greyed composer reaches the reload rung');
-        if (FB().stall().timer) {
-            clearTimeout(FB().stall().timer);
-            FB().stall().timer = null;
-        }
+            d.message.includes('（输入框未就绪）')).length === 1);
     } finally {
         restore();
         page.teardown();
     }
 });
 
-test('快速刷新：问候屏（无头 + 输入框可用）不刷', () => {
-    const page = setupPage();
-    const {reloads, restore} = stubReload();
-    try {
-        appendHeader(page, '上午好呀，有什么想让我帮忙的吗');
-        appendComposer(page, '向 ZCode 提问…', false);
-        FB().note({name: 'zcode-agent.subscribeConversationV4', args: {sessionId: 'sess_new'}});
-        FB().check();
-        assert.strictEqual(reloads.length, 0,
-            'the genuine new-task greeting screen must not be reloaded');
-    } finally {
-        restore();
-        page.teardown();
-    }
-});
-
-test('快速刷新：刷新间隔内不连刷；间隔到期再刷；连续 2 次到顶放弃；恢复信号复位', () => {
+test('进对话铁判准：15s 间隔内不连刷；到期再刷；2 次到顶放弃；就绪即复位', () => {
     const page = setupPage();
     const {reloads, restore} = stubReload();
     try {
@@ -1236,55 +1255,62 @@ test('快速刷新：刷新间隔内不连刷；间隔到期再刷；连续 2 �
         appendComposer(page, '向 ZCode 提问…', false);
         FB().note({name: 'zcode-agent.subscribeConversationV4', args: {sessionId: 'sess_1'}});
         FB().check();
-        FB().fire();
-        FB().fire();
-        assert.strictEqual(reloads.length, 1, 'first hit reloads at the reload rung');
+        assert.strictEqual(reloads.length, 1, 'the first deadline reloads');
 
-        // 刷新后的新页面里信标重新武装，仍旧卡着：间隔内 → 不允许第二次刷新，
-        // 只顺延复查（phase 1 的信标重入不得把判定无限顺延到期之后）。
+        // 刷新后的新页面里信标重来，仍旧卡着：间隔内 → 不刷，只顺延复查
         FB().note({name: 'zcode-agent.conversationRowsRangeV4', args: {sessionId: 'sess_1'}});
         FB().check();
-        FB().fire();
         assert.strictEqual(reloads.length, 1, 'within the gap there must be no second reload');
-        assert.ok(FB().stall().timer !== null, 'a deferred re-check must be scheduled');
-        clearTimeout(FB().stall().timer);
-        FB().stall().timer = null;
+        assert.ok(FB().timer() !== null, 'a deferred re-check must be scheduled');
+        clearTimeout(FB().timer());
 
-        // 间隔到期（把间隔戳拨回 16s 前）：再判 → 第 2/2 次刷新
+        // 间隔到期：再判 → 第 2/2 次刷新
         FB().stall().lastReloadAt = Date.now() - 16000;
-        FB().fire();
+        FB().check();
         assert.strictEqual(reloads.length, 2, 'after the gap a stuck page reloads again');
 
-        // 第三次仍卡着：连续 2 次到顶 → 放弃，不再刷
-        if (FB().stall().timer) {
-            clearTimeout(FB().stall().timer);
-            FB().stall().timer = null;
-        }
+        // 第三次仍卡着：到顶 → 放弃
         FB().stall().lastReloadAt = Date.now() - 16000;
-        FB().fire();
+        FB().check();
         assert.strictEqual(reloads.length, 2, 'the cap stops the reload loop');
-        assert.strictEqual(FB().stall().gaveUp, true, 'the ladder gives up at the cap');
+        assert.strictEqual(FB().stall().gaveUp, true, 'the deadline gives up at the cap');
         assert.ok(findPost(page.posts, 'diag', (d) =>
             d.message.includes('连续刷新 2 次未恢复')).length === 1);
 
-        // 布防在放弃态被忽略；恢复信号复位后可以重新开始
+        // 就绪信号到达 → 复位，可以重新开始
+        FB().note({name: 'zcode-agent.subscribeConversationV4', args: {sessionId: 'sess_1'}});
+        FB().ready('v4.conversation.store.connect.completed');
         FB().check();
-        assert.strictEqual(FB().stall().armed, false, 'arming is a no-op while given up');
-        FB().cancel('测试恢复信号');
-        assert.strictEqual(FB().stall().gaveUp, false, 'recovery resets the give-up state');
-        FB().arm('测试再布防');
-        assert.strictEqual(FB().stall().armed, true, 'arming works again after recovery');
-        if (FB().stall().timer) {
-            clearTimeout(FB().stall().timer);
-            FB().stall().timer = null;
-        }
+        assert.strictEqual(FB().stall().gaveUp, false, 'readiness resets the give-up state');
     } finally {
         restore();
         page.teardown();
     }
 });
 
-test('快速刷新：页面真实发出的信标会武装 3s 检查', () => {
+test('进对话铁判准：链路换代那一拍不判（页面正按自己的梯子重连）', () => {
+    const page = setupPage();
+    const {reloads, restore} = stubReload();
+    try {
+        appendHeader(page, '真实任务名');
+        appendComposer(page, '继续输入以排队后续修改', false);
+        const socket = new globalThis.WebSocket('wss://relay.example');
+        socket.receive({type: 'pair_status_ack', pair_status: 'matched'});
+        FB().note({name: 'zcode-agent.subscribeConversationV4', args: {sessionId: 'sess_e'}});
+        // 链路重建：pair 状态翻负 → resetClient → client 为 null（新客户端尚未出生）
+        socket.receive({type: 'pair_status_ack', pair_status: 'unmatched'});
+        FB().check();
+        assert.strictEqual(reloads.length, 0,
+            'a rebuilt link must not be reloaded mid-recovery');
+        assert.ok(findPost(page.posts, 'diag', (d) =>
+            d.message.includes('期间链路换代')).length === 1);
+    } finally {
+        restore();
+        page.teardown();
+    }
+});
+
+test('进对话铁判准：页面真实发出的信标会武装 5s 判定', () => {
     const page = setupPage();
     try {
         const socket = new globalThis.WebSocket('wss://relay.example');
@@ -1296,8 +1322,93 @@ test('快速刷新：页面真实发出的信标会武装 3s 检查', () => {
             socket.send(JSON.stringify({type: 'data', payload}));
         }
         assert.ok(FB().timer() !== null,
-            'the observed rows-range beacon must arm the 3s check');
+            'the observed rows-range beacon must arm the 5s deadline');
+        // 武装出来的判定器必须清掉：否则 5s 后它会落到后续测试的 location 上刷新
+        // （整跑时表现为"别的用例多出一次 reload"）。
+        clearTimeout(FB().timer());
     } finally {
+        page.teardown();
+    }
+});
+
+test('KICKED 自愈：后台被顶掉 → 回前台 1.5s 后自己重载回来', async () => {
+    const page = setupPage();
+    const {reloads, restore} = stubReload();
+    const storage = stubSessionStorage();
+    try {
+        const socket = new globalThis.WebSocket('wss://relay.example');
+        globalThis.__zcodeShellSetAppForeground(false);
+        socket.receive({type: 'error', code: 'KICKED', message: 'session-conflict'});
+        assert.ok(findPost(page.posts, 'diag', (d) =>
+            d.message.includes('应用在后台')).length === 1,
+            'a background kick must be recorded');
+        globalThis.__zcodeShellSetAppForeground(true);
+        assert.strictEqual(reloads.length, 0,
+            'the reload is deferred so the native side can release the slot first');
+        await wait(1700);
+        assert.strictEqual(reloads.length, 1,
+            'the kicked page must reload itself back onto a live link');
+    } finally {
+        storage.restore();
+        restore();
+        page.teardown();
+    }
+});
+
+test('KICKED：前台被顶掉不自动重载（可能与另一台控制端在抢）', async () => {
+    const page = setupPage();
+    const {reloads, restore} = stubReload();
+    const storage = stubSessionStorage();
+    try {
+        const socket = new globalThis.WebSocket('wss://relay.example');
+        socket.receive({type: 'error', code: 'KICKED', message: 'session-conflict'});
+        globalThis.__zcodeShellSetAppForeground(false);
+        globalThis.__zcodeShellSetAppForeground(true);
+        await wait(1700);
+        assert.strictEqual(reloads.length, 0, 'a foreground kick is not ours to fix');
+        assert.ok(findPost(page.posts, 'diag', (d) =>
+            d.message.includes('前台）：不自动干预')).length === 1);
+    } finally {
+        storage.restore();
+        restore();
+        page.teardown();
+    }
+});
+
+test('KICKED 自愈：跨 reload 连续两次后停止（避免死循环）', async () => {
+    const page = setupPage();
+    const {reloads, restore} = stubReload();
+    const storage = stubSessionStorage();
+    try {
+        storage.store.set('zcodeShellKickedHeals', '2');
+        const socket = new globalThis.WebSocket('wss://relay.example');
+        globalThis.__zcodeShellSetAppForeground(false);
+        socket.receive({type: 'error', code: 'KICKED', message: 'session-conflict'});
+        globalThis.__zcodeShellSetAppForeground(true);
+        await wait(1700);
+        assert.strictEqual(reloads.length, 0, 'the heal cap stops the reload loop; diag=' +
+            JSON.stringify(findPost(page.posts, 'diag').map((p) => p.data.message)));
+        assert.ok(findPost(page.posts, 'diag', (d) =>
+            d.message.includes('停止自动重载')).length === 1,
+            'diag: ' + JSON.stringify(findPost(page.posts, 'diag').map((p) => p.data.message)));
+    } finally {
+        storage.restore();
+        restore();
+        page.teardown();
+    }
+});
+
+test('KICKED 自愈：配对成功即清零计数', () => {
+    const page = setupPage();
+    const storage = stubSessionStorage();
+    try {
+        storage.store.set('zcodeShellKickedHeals', '1');
+        const socket = new globalThis.WebSocket('wss://relay.example');
+        socket.receive({type: 'pair_status_ack', pair_status: 'matched'});
+        assert.strictEqual(storage.store.get('zcodeShellKickedHeals'), '0',
+            'a matched pair resets the heal counter');
+    } finally {
+        storage.restore();
         page.teardown();
     }
 });
@@ -1322,80 +1433,4 @@ test('hook 安全：晚注入经原型层收编页面已有 socket（零重连�
     }
 });
 
-test('快速刷新：DOM 全就绪但页面桥零下发 → 10s 内容检查布防 → 梯子后刷新', () => {
-    const page = setupPage();
-    const {reloads, restore} = stubReload();
-    try {
-        appendHeader(page, '真实任务名');
-        appendComposer(page, '继续输入以排队后续修改', false);
-        const socket = new globalThis.WebSocket('wss://relay.example');
-        socket.receive({type: 'pair_status_ack', pair_status: 'matched'});
-        FB().note({name: 'zcode-agent.subscribeConversationV4', args: {sessionId: 'sess_c'}});
-        FB().check();
-        assert.strictEqual(reloads.length, 0, 'the 3s DOM check passes on a normal-looking page');
-        FB().contentCheck();
-        assert.strictEqual(reloads.length, 0,
-            'zero page-bridge deliveries arms the ladder instead of reloading');
-        assert.ok(findPost(page.posts, 'diag', (d) =>
-            d.message.includes('卡死看门狗布防（10s 内容检查: 页面桥零下发')).length === 1);
-        FB().fire();   // 轻推（关 socket）
-        FB().fire();   // 仍零内容 → 刷新
-        assert.strictEqual(reloads.length, 1,
-            'zero deliveries after the nudge must reload');
-        if (FB().stall().timer) {
-            clearTimeout(FB().stall().timer);
-            FB().stall().timer = null;
-        }
-    } finally {
-        restore();
-        page.teardown();
-    }
-});
-
-test('快速刷新：信标后页面桥有入站帧 → 10s 内容检查撤防不刷', () => {
-    const page = setupPage();
-    const {reloads, restore} = stubReload();
-    try {
-        appendHeader(page, '真实任务名');
-        appendComposer(page, '继续输入以排队后续修改', false);
-        const socket = new globalThis.WebSocket('wss://relay.example');
-        socket.receive({type: 'pair_status_ack', pair_status: 'matched'});
-        FB().note({name: 'zcode-agent.subscribeConversationV4', args: {sessionId: 'sess_d'}});
-        // 信标之后桌面端回了数据（页面桥入站 rpc-frame）——内容在路上。
-        const ok = encodeBody([page.protocol.RES_PROMISE_SUCCESS, 77], {rows: []});
-        for (const payload of fragment(ok, 'page-bridge-13', 1)) {
-            socket.receive({type: 'data', payload});
-        }
-        FB().check();
-        FB().contentCheck();
-        assert.strictEqual(reloads.length, 0, 'traffic after the beacon means content is flowing');
-        assert.ok(findPost(page.posts, 'diag', (d) =>
-            d.message.includes('10s 内容检查：页面桥有下发')).length === 1);
-    } finally {
-        restore();
-        page.teardown();
-    }
-});
-
-test('快速刷新：链路重建（client 换代/消亡）时 10s 内容检查让行', () => {
-    const page = setupPage();
-    const {reloads, restore} = stubReload();
-    try {
-        appendHeader(page, '真实任务名');
-        appendComposer(page, '继续输入以排队后续修改', false);
-        const socket = new globalThis.WebSocket('wss://relay.example');
-        socket.receive({type: 'pair_status_ack', pair_status: 'matched'});
-        FB().note({name: 'zcode-agent.subscribeConversationV4', args: {sessionId: 'sess_e'}});
-        // 链路重建：pair 状态翻负 → resetClient → client 为 null（新客户端尚未出生）。
-        socket.receive({type: 'pair_status_ack', pair_status: 'unmatched'});
-        FB().contentCheck();
-        assert.strictEqual(reloads.length, 0,
-            'a rebuilt link must not be reloaded mid-recovery');
-        assert.ok(findPost(page.posts, 'diag', (d) =>
-            d.message.includes('10s 内容检查：期间链路重建')).length === 1);
-    } finally {
-        restore();
-        page.teardown();
-    }
-});
 
