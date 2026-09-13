@@ -155,4 +155,6 @@ dependencies {
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
     testImplementation("junit:junit:4.13.2")
+    // JVM 单测用真实现替代 android.jar 的 org.json stub（RelayWire 的 JSON tag 解码）。
+    testImplementation("org.json:json:20240303")
 }
