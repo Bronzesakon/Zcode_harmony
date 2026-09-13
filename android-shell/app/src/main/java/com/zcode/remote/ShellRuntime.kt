@@ -366,8 +366,22 @@ object ShellRuntime {
         Tier2Probe.stop("手动停止")
     }
 
-    /** 诊断指令 tier2_takeover：接管语义（桥覆盖 + 会话事件）跑固定时长后自动交还。 */
-    fun startTier2TakeoverForTest(autoStopMs: Long = 90_000L) {
+    /**
+     * 诊断指令 tier2_takeover：接管语义（桥覆盖 + 会话事件）跑固定时长后自动交还。
+     * 诊断命令会伴随页面重载，凭证由页面重新移交——等它到达再启动（最多 5 次）。
+     */
+    fun startTier2TakeoverForTest(autoStopMs: Long = 90_000L, attempt: Int = 1) {
+        if (relayCreds == null) {
+            Diagnostics.log("info", "Tier2: 等待凭证重发（第 $attempt 次，页面重载中）")
+            if (attempt > 5) {
+                Diagnostics.log("warn", "Tier2: 凭证始终未到，放弃启动接管验证")
+                return
+            }
+            mainHandler.postDelayed({
+                startTier2TakeoverForTest(autoStopMs, attempt + 1)
+            }, 2_000L)
+            return
+        }
         Tier2Probe.startTakeoverForTest(autoStopMs)
     }
 
