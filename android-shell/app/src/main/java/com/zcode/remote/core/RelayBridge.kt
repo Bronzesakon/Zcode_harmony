@@ -282,6 +282,7 @@ class BridgeSession(
     private val convSubscriptions = ConcurrentHashMap<String, String>()
     private val convTails = ConcurrentHashMap<String, RelayWire.ConversationTail>()
     private val convLastText = ConcurrentHashMap<String, String>()
+    private val convAttempting = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
 
     @Volatile
     private var convSink: ((String, String, String) -> Unit)? = null
@@ -295,7 +296,9 @@ class BridgeSession(
      * 后续的对话 RPC。订阅本身还会立刻推一份 snapshot（整窗行），所以第一条
      * 进展不用等。
      *
-     * 幂等：同一 sessionId 重复调用只更新回调。网络调用在后台线程。
+     * 幂等且**可反复调用**：已订阅→立即返回；有在飞的尝试→跳过（避免每 12 s
+     * 的轮询把订阅请求叠起来）；失败后下一轮自然重试（真机踩过：调用方若把
+     * "试过一次"记成终态，第一个轮询拍（桥还没开）就会把该会话永久拉黑）。
      */
     fun subscribeConversationProgress(
         sessionId: String,
@@ -304,6 +307,7 @@ class BridgeSession(
         if (closed) return
         convSink = { _, id, text -> onProgress(id, text) }
         if (convSubscriptions.containsKey(sessionId)) return
+        if (!convAttempting.add(sessionId)) return
         installConversationListener()
         Thread {
             try {
@@ -325,6 +329,8 @@ class BridgeSession(
                 onLogLine("subscribed conversation for $sessionId (${ack.optString("mode")})")
             } catch (e: Exception) {
                 onLogLine("conversation subscribe failed for $sessionId: ${e.message}")
+            } finally {
+                convAttempting.remove(sessionId)
             }
         }.start()
     }

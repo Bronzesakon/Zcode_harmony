@@ -255,10 +255,10 @@ object ShellRuntime {
                         for ((key, sessionId) in refs) {
                             // ① 订阅（主通道）：桌面端要先把会话挂到本客户端上才认
                             //    后续对话 RPC，订阅本身也会立刻推一份 snapshot。
-                            if (convSubscribeTried.add(sessionId)) {
-                                Tier2Probe.subscribeProgress(key, sessionId) { _, id, text ->
-                                    pushLivePreview(key, id, text)
-                                }
+                            //    每轮都调：桥可能还没开（第一拍总是这样），订阅成功后
+                            //    是幂等空操作，失败就在下一轮自然重试。
+                            Tier2Probe.subscribeProgress(key, sessionId) { _, id, text ->
+                                pushLivePreview(key, id, text)
                             }
                             // ② 拉取（补充）：推送稀疏时靠它把尾窗刷新回来。
                             val text = Tier2Probe.fetchProgress(key, sessionId) ?: continue
@@ -275,9 +275,6 @@ object ShellRuntime {
 
     @Volatile
     private var liveFetchInFlight = false
-
-    /** 本次接管里已经尝试过订阅的会话（避免每 12s 重复发订阅）。 */
-    private val convSubscribeTried = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
 
     private fun pushLivePreview(key: String, sessionId: String, text: String) {
         mainHandler.post {
@@ -302,7 +299,6 @@ object ShellRuntime {
     private fun stopLiveProgressPolling() {
         livePolling = false
         mainHandler.removeCallbacks(liveProgressPoller)
-        convSubscribeTried.clear()
         store.clearLivePreviews()
     }
 
