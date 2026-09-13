@@ -133,6 +133,7 @@ object ShellRuntime {
 
     private fun onLiveness(data: JSONObject) {
         val receivedAt = SystemClock.elapsedRealtime()
+        lastLivenessAt = receivedAt
         val ago = data.optLong("lastInboundAgoMs", -1)
         liveness = Liveness(
             inboundFrames = data.optInt("inboundFrames"),
@@ -209,6 +210,7 @@ object ShellRuntime {
             requestLivenessReport()
         } else {
             startHeartbeatPump()
+            lastLivenessAt = SystemClock.elapsedRealtime()
             backgroundStartedAt = SystemClock.elapsedRealtime()
             val snapshot = liveness
             backgroundFrameBase = snapshot?.inboundFrames ?: 0
@@ -276,6 +278,8 @@ object ShellRuntime {
                         Diagnostics.log("debug", "后台心跳泵 #$pumpDispatches 次发令")
                     }
                 }
+                // 原生巡检：渲染器冻结时注入层的 liveness 会整段停摆，这里仍能判死并接管。
+                checkTier1Silence()
                 mainHandler.postDelayed(this, PUMP_INTERVAL_MS)
             }
         }
@@ -326,6 +330,69 @@ object ShellRuntime {
     private const val TIER2_TAKEOVER_SILENCE_MS = 60_000L
 
     /**
+     * 最后一次收到注入层 liveness 报告的墙钟时刻。
+     *
+     * 关键：接管判据不能只看 JS 上报的 lastInboundAgoMs——渲染器被冻结时
+     * 连报告本身都停了（2026-09-13 真机：进程 FGS 存活、渲染器静默 30 分钟，
+     * 注入层零上报，接管因此永远不会触发）。这里用"原生多久没收到任何
+     * liveness"作为主判据，JS 的自述只作补充。
+     */
+    @Volatile
+    private var lastLivenessAt = 0L
+
+    /**
+     * 用户是否已经离开（接管的前置条件）：应用在后台，**或屏幕已熄灭**。
+     *
+     * 屏幕熄灭这一条是 2026-09-13 真机补上的：应用名义上还在前台时原生泵不
+     * 启动，而熄屏会让渲染器定时器整体挂起——注入层连"我停了"都报不出来，
+     * 流体云随之定格（日志停在熄屏那一刻）。后台与熄屏必须同等对待。
+     */
+    private fun userIsAway(): Boolean {
+        if (!appIsForeground) return true
+        return try {
+            val power = appContext.getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+            !power.isInteractive
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    /**
+     * 原生侧巡检 Tier1 静默（常驻看门狗，不依赖注入层上报）。
+     * 判据：用户已离开 + 静默超过阈值 + 最后已知配对为 matched（桌面在线）。
+     */
+    private fun checkTier1Silence() {
+        if (lastLivenessAt <= 0L || !userIsAway()) return
+        val silenceNow = SystemClock.elapsedRealtime() - lastLivenessAt
+        val reported = liveness?.let {
+            if (it.lastInboundAtElapsed > 0) {
+                SystemClock.elapsedRealtime() - it.lastInboundAtElapsed
+            } else {
+                Long.MAX_VALUE
+            }
+        } ?: Long.MAX_VALUE
+        val silence = minOf(silenceNow, reported)
+        maybeTakeOverInBackground(silence.coerceAtMost(Long.MAX_VALUE))
+    }
+
+    /** Tier1 静默看门狗：每 15s 一跳，前台/后台/熄屏都在岗。 */
+    private val tier1Watchdog = object : Runnable {
+        override fun run() {
+            try {
+                checkTier1Silence()
+            } catch (e: Exception) {
+                Diagnostics.log("warn", "Tier1 看门狗异常: ${e.message}")
+            }
+            mainHandler.postDelayed(this, 15_000L)
+        }
+    }
+
+    fun startTier1Watchdog() {
+        mainHandler.removeCallbacks(tier1Watchdog)
+        mainHandler.postDelayed(tier1Watchdog, 15_000L)
+    }
+
+    /**
      * Tier2 后台接管触发（2026-09-13 拍板的形态）：应用在后台且 Tier1 的入站
      * 流静默超过阈值（renderer 冻结/链路死亡，实况窗会断）→ 原生直连 relay
      * 接管配对。KICK 语义已定案为配对互斥：接管会踢掉页面连接，所以前台绝不
@@ -333,7 +400,7 @@ object ShellRuntime {
      * 落地前，接管只保连接与配对，不产出通知数据。
      */
     private fun maybeTakeOverInBackground(inboundAgoMs: Long) {
-        if (appIsForeground) return
+        if (!userIsAway()) return
         if (inboundAgoMs in 0 until TIER2_TAKEOVER_SILENCE_MS) return
         if (Tier2Probe.isRunning()) return
         // 桌面活着才接管：最后一次 pair ack 非 matched（桌面休眠/离线）时，
@@ -347,8 +414,8 @@ object ShellRuntime {
         Tier2Probe.start(c, durationMs = 0L)
         Diagnostics.log(
             "warn",
-            "Tier2: 后台 Tier1 判死（入站静默 ${inboundAgoMs / 1000}s），原生接管配对" +
-                "（M3 前仅保活，不产通知数据；回前台自动交还）",
+            "Tier2: 用户已离开且 Tier1 判死（静默 ${inboundAgoMs / 1000}s），原生接管配对与任务事件" +
+                "（回前台/亮屏自动交还）",
         )
     }
 
@@ -468,6 +535,7 @@ object ShellRuntime {
         prefs = Prefs(appContext)
         notifier = Notifier(appContext)
         notifier.ensureChannels()
+        startTier1Watchdog()
     }
 
     fun prefs(): Prefs = prefs
