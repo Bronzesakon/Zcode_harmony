@@ -955,63 +955,74 @@ inject.js 现供给 sink，原生日志出 `页面: …` 行；
 **测试点（adb 驱动）**：`am start -a com.zcode.remote.action.DIAG --es diag_cmd kick_test|l1_test|vitals`——
 kick_test = Tier2 可行性实验（同凭证开第二条 WebSocket，观察 relay 的 KICK/takeover 语义，旧连接是否被踢），
 l1_test = 手动轻推，vitals = DOM 体征快照。JS 68 项测试全绿（快刷 6 项按看门狗语义重写）。
-**2026-09-12 深夜真机实测（pre.51）**：日志汇接通（`页面: …` 行把页面开对话全过程自述出来，
-此前完全盲区）；l1_test 轻推全链路通过（0.7s 页面自愈重连）；kick_test 证实 relay 不拒绝
-第二条连接、KICK/takeover 发生在配对完成层面；Tier2 质询算法已提取
-（`proof = base64url(HMAC-SHA256(passHash, nonce|'terminal'|deviceSid))`，docs/05 @4696180），
-原生 mini relay 客户端可行性确认，未开工。
+### 本轮（第十一轮）目标：Tier2 原生直连——渲染器死了监控也不能断
 
-**2026-09-13 凌晨追加（僵尸订阅战役，pre.51→pre.53）**：
-用户真机遭遇「手机画面冻结 45 分钟」并要求定因——日志定案为**僵尸订阅**：socket 重建后页面
-配对恢复但 runtime（工作区桥+会话订阅）不重建、零自愈（页面自己的看门狗只守传输心跳，
-"配对健康但零业务帧"无人值守），传输层存活完全掩护了内容层死亡。三层对照实验（PC 生成/
-传输 ack/页面 rows 冻结）+ l1_test 主动复现证实。
-- **B 路线（伪造 bridge-degraded 逼页面恢复）实测否决**：degrade_test 两发（首页态/会话态）
-  页面零反应——本地型工作区的桥包装对象没有 `getBridgeSessionId`，匹配永不成立。
-  测试点保留（`diag_cmd degrade_test`），pageBridgeSessionIds() 反查保留（协议测试覆盖）。
-- **A 路线已落地并验证**：
-  ① 协议层覆盖证据改为**按连接代次**（`_pageCoveredKeys`，per-client）：新连接上页面必须
-  重新自证（bridge-ready/会话索引监听），否则壳接管该工作区通知覆盖；页面恢复后
-  `_dropRedundantBridge` 自动让位。旧"覆盖跨重建共享"测试按新语义重写。
-  ② inject 僵尸订阅检测：任务 running 活动 60s 内 + 页面桥零业务帧 45s + DOM 健康
-  → 看门狗布防并**跳过轻推**（轻推已被证明不重建 runtime）直达刷新；恢复判据用帧流
-  不用 DOM（僵尸 DOM 本来就健康，vitals 判会自撤——首轮真机踩中已修）。
-  ③ 端到端实测：l1_test 复现 → 壳接管尝试与页面恢复竞争 → 页面自身错误恢复链被
-  激活（重新开桥+重订阅）→ 壳让位 → 全链路收敛健康。僵尸刷新档作为页面不恢复时的兜底。
-**2026-09-13 上午追加（Tier2 开工，pre.53→pre.55）**：
-- **lastPairStatus 半成品暂缓**：并发会话在 inject.js 加的 pair_status 归因（变量未声明会炸）
-  目前无人消费（僵尸检测用的是帧静默+任务活动，不是 pair_status），补丁存
-  `/tmp/concurrent-pair-status.patch`，等那边补完声明并接上消费者再合入。
-- **Tier2 原生直连探针落地**（`core/Tier2Probe.kt` + OkHttp）：WSS 直连 → auth_init →
-  auth_challenge → auth_response（HMAC proof）→ **配对成功**——握手链与页面逐字对齐，
-  测试向量离线生成（`Tier2ProofTest`）。凭证由注入层一次性移交（relaycreds，仅内存）。
-  诊断指令：`tier2_test`（60s 自动关）/ `tier2_stop`。
-- **★KICK 语义定案（真机 USB）**：原生配对成功（matched）的**同一秒**，页面连接被服务端
-  断开（1006）；Tier2 持有配对期间页面自动重连**被拒**，必须整页 reload 才能回来。
-  ⇒ **配对层面单控制端互斥，并行不可行**。Tier2 常驻形态由此定案：**后台独占模式**——
-  页面前台绝不配对；退后台且 Tier1 判死（`后台链路静默`）才配对接管；回前台先断 Tier2
-  再走现有「回前台重载」流程，与既有行为天然契合。
-- **下一步（待拍板）**：Tier2 常驻化——Tier1 判死信号接 Tier2 启动、前台交还时序、
-  以及原生侧任务事件解码（ sessions-index/工作区桥 4-RPC 协议的 Kotlin 移植，
-  zcode-protocol.js 为参照）。
-- **Tier2 M2 已落地并真机验证（pre.56，`bd72358`+`40d3e77`）**：
-  ① 接管触发：后台 + 入站静默 >60s + 最后 pair ack 为 matched（桌面在线门——
-  桌面休眠期接管无意义还会挡页面恢复）→ 原生自动接管（duration=0 持久模式）；
-  ② 前台交还：`onAppForegroundChanged(true)` 先停 Tier2 再走既有恢复链路；
-  ③ 真机验证：负路径 90s 后台（泵/ack 正常）零接管 ✓；交还时序
-  （探针配对→退后台→回前台→「前台交还完成」）✓。
-  正路径（renderer 真被冻结）无法人工安全复现，交给野外事件——
-  `后台链路静默 Ns` 行就是它的触发遥测。
-  pair_status 判读结论：对「无帧 vs AI 无产出」无区分力（那是任务活动判据的事，
-  已实现），其残余价值（桌面在线门）已用现有 `relayPaired` 一行吸收；
-  lastPairStatus 半成品补丁继续暂缓于 `/tmp/concurrent-pair-status.patch`。
-- **M3a 已落地（`22ff5ba`→`4aa54a9`，CI 全绿）**：relay 桥线上协议的 Kotlin 移植
-  （`core/RelayWire.kt`）——值编解码（7 tag）、LEB128 varint（32 位语义）、CRC32-IEEE、
-  rpc-frame 出站分片+入站重组（乱序/校验/冲突重置/ack）、ChannelClient body 组装解析。
-  golden vectors 由 zcode-protocol.js 离线生成、Kotlin 字节级对齐、CI 单测守护。
-  过程中的三个坑已修：结构检查器同文件重名启发式（读写方法改名规避）、
-  JVM/Android org.json 序列化行为不一致（JSON tag 编码改自带 writer，JS stringify 语义）、
-  METHOD_* 不在 JS 导出面（golden 向量曾把方法名编成 null——向量错、移植对）。
-- **M3（未开工，下一轮主体）**：M3b——ChannelClient 状态机（promise 配对/事件监听）
-  + 桥开启流程（workspace-list/bridge-open 信封）接 Tier2Probe；M3c——sessions-index
-  snapshot/delta 解码 → 任务事件 → 通知/实况窗数据。
+**为什么**：Tier1（共享页面 socket + 注入层）在渲染器被冻结/杀死时整层失效；更糟的是
+**判死信号也来自那一层**，所以连"该接管了"都感知不到（2026-09-13 真机现场：熄屏后日志与
+流体云双双定格、进程 FGS 存活、电池策略并未被重置）。Tier2 = 原生自己连 relay、自己开桥、
+自己解码任务事件，全程不经 WebView。
+
+**已完成（pre.53→pre.60，全部 CI 绿）**
+
+| 里程碑 | 内容 | 关键提交 |
+|---|---|---|
+| M1 探针 | WSS + HMAC 质询应答配对（算法与页面逐字对齐，golden 向量入单测）；**KICK 语义定案：配对层面单控制端互斥，并行不可行** | `f093b8c` 之前 |
+| M2 生命周期 | 接管触发（Tier1 判死 + 桌面在线门）+ 前台交还 | `bd72358` `40d3e77` |
+| M3a 线协议 | `core/RelayWire.kt`：值编解码 / varint / CRC32 / rpc-frame 分片重组 / ChannelClient body（golden 对照） | `22ff5ba`→`4aa54a9` |
+| M3b 桥引擎 | `core/RelayBridge.kt`：Initialize 门控、promise 配对、四步握手、resync、Initialize-先于-ready 竞态缓冲 | `09a2d89` `6a1dcbe` |
+| M3c 事件解码 | `core/SessionsIndexState.kt`：快照 / deltas / 缺口重同步 → 与注入层 `post('sessions')` 同构的更新 → `ShellRuntime.acceptNativeSessions` → 通知与流体云 | 同上 |
+| 静默看门狗 | 常驻原生看门狗（5s 一跳）+ 25s 判死窗 + `userIsAway`（后台**或熄屏**）+ 桌面在线门 | `7ceeadd` `1701e2c` |
+
+**未竟（按此顺序做）**
+
+1. **真机端到端验证 M3b/c —— 唯一未验项**。装最新 pre 包后：
+   ```bash
+   ADB="C:/Program Files/UotanToolbox/Bin/platform-tools/adb.exe"; S="3B6F5RE8GCL3LYY7"
+   MSYS_NO_PATHCONV=1 "$ADB" -s "$S" shell "am start -f 0x20000000 -n com.zcode.remote/.MainActivity      -a com.zcode.remote.action.DIAG --es diag_cmd tier1_silence_test"
+   ```
+   期望日志依次（拉回本地读，设备端 grep 中文会碎）：
+   `Tier1 静默测试：强制判死并立即巡检` → `Tier2: 用户已离开且 Tier1 判死（静默 Ns），原生接管配对与任务事件`
+   → `Tier2: ★接管配对成功（matched）` → `workspace list: N` → `bridge ready for <key>` ×N
+   → `[<key>] subscribed sessions-index for <key>` → **`工作区相位 <key>：…`（原生解码的铁证）**。
+   同时流体云应继续更新：`dumpsys notification --noredact | grep -A3 'id=202385'` 看 text 变化。
+   验完回前台，期望 `Tier2: 前台交还完成` + 页面恢复（必要时 `ACTION_RELOAD` 兜底）。
+   **两条同时成立才算通过**：原生 `工作区相位` 在涨 **且** 页面侧 `页面: …` 已停（页面确实被顶掉）。
+2. 通过后做接管的生产化收尾评审：接管期间通知/流体云文案是否标注"原生接管中"；
+   `userAway` 是否需要额外反例（投屏/车机等"亮屏但没人看"的场景）。
+3. **后台长测（一直没做）**：熄屏过夜，看 `后台链路静默 Ns` 是否出现、流体云是否跟手、
+   Tier2 是否按预期接管与交还。
+4. 并发会话留的 `lastPairStatus` 半成品（注入层赋值但变量未声明，直接编译会炸）：
+   补丁在 `/tmp/concurrent-pair-status.patch`，等那边补完声明并接上消费者再合入。
+
+**当前状态（2026-09-13 傍晚）**
+- `pre` HEAD = `1f1d55c`，CI 全绿（js / build+单测 / prerelease）。
+- 真机（USB `3B6F5RE8GCL3LYY7`、无线 `192.168.0.185:33633`）机上还是 `1701e2c` 包，
+  **`1f1d55c` 未装机**——做第 1 项前先装机。
+- 诊断指令全集（统一 `am start -f 0x20000000 -n com.zcode.remote/.MainActivity -a com.zcode.remote.action.DIAG --es diag_cmd <cmd>`）：
+  `vitals`｜`l1_test`（轻推 socket）｜`kick_test`（第二条 WS 观察 KICK）｜`degrade_test`（已否决的 B 路线）｜
+  `tier2_test`（配对+覆盖 60s）｜`tier2_stop`｜`tier2_takeover`（接管 90s 自动交还）｜
+  `tier1_silence_test`（强制判死，走静默接管路径）。
+
+### 工作环境（新会话必读）
+
+- **本机没有 JDK / Android SDK：编译与单测只能靠 CI。** 任何 Kotlin/资源改动 =
+  `git push origin pre` → CI（js 静态检查 + `:app:testReleaseUnitTest` + APK）→
+  滚动预发布 `android-pre`（固定直链 `…/releases/download/android-pre/zcode-remote.apk`，
+  下载覆盖安装即最新）。**本地无法编译，类型/语法错误只能等 CI 回报。**
+- **本地能跑的检查**：`node --test`（69 项，JS 协议与注入）、
+  `python tools/check_kotlin_structure.py`（括号配平 / 包名 / 同文件重名——**不同嵌套类里的同名
+  fun 也会被点名**，`override fun` 豁免）、`python tools/check_resources.py`；
+  读 CI 用 `python tools/watch_ci.py`（含 `e:` 注解行）。
+- **网络**：本机到 github.com 间歇性 TLS 失败（`git push`、API 都要重试循环）；
+  `api.github.com` 匿名限流 60/h ——优先用 `watch_ci.py`。
+- **设备侧**：`MSYS_NO_PATHCONV=1` + 显式 `-s <serial>`；日志在
+  `/sdcard/Android/data/com.zcode.remote/files/logs/zcode-shell.log`，用 `exec-out cat` 拉回本地读
+  （设备端 grep 中文会碎）；进程死因看 `dumpsys activity exit-info com.zcode.remote`；
+  流体云内容看 `dumpsys notification --noredact`（`id=202385`）。
+- **K2 编译坑（本轮踩过）**：CI 的 Kotlin 编译器不接受把 `try{}catch{}` 直接当 `return` 操作数
+  （报 "Unexpected token" / "Return type mismatch: expected Boolean, actual Any"），
+  改成朴素 `if` + `return` 即过。
+- **org.json 坑**：JVM（maven 包）与 Android 的序列化行为不一致（转义差异），
+  故 `RelayWire` 的 JSON tag 编码用自写 writer（JS `JSON.stringify` 语义），不依赖 org.json。
+- **工作区纪律**：只 stage `android-shell` 自己的改动（`git add android-shell` 子树）；
+  并发会话会动 `inject.js`（见未竟第 4 条），提交前先看 `git diff` 里有没有别人的半成品。
