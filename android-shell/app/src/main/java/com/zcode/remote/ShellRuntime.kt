@@ -336,6 +336,13 @@ object ShellRuntime {
         if (appIsForeground) return
         if (inboundAgoMs in 0 until TIER2_TAKEOVER_SILENCE_MS) return
         if (Tier2Probe.isRunning()) return
+        // 桌面活着才接管：最后一次 pair ack 非 matched（桌面休眠/离线）时，
+        // 静默是"没有可监控的东西"而非"我们瞎了"——接管只会占坑挡页面恢复。
+        val snapshot = liveness
+        if (snapshot == null || !snapshot.paired) {
+            Diagnostics.log("debug", "Tier2: 静默但桌面非在线（pair_status 非 matched），不接管")
+            return
+        }
         val c = relayCreds ?: return
         Tier2Probe.start(c, durationMs = 0L)
         Diagnostics.log(
