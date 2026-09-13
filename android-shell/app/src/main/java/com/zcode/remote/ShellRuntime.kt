@@ -238,8 +238,9 @@ object ShellRuntime {
     // 前台时段不做：那时连接在页面手里（单控制端互斥），订不了也拉不了。
     private const val LIVE_PROGRESS_POLL_MS = 12_000L
 
-    /** 每这么多拍重挂一次（12s × 8 ≈ 96s）。 */
-    private const val LIVE_REANCHOR_EVERY_POLLS = 8
+    /** 每这么多拍重挂一次（12s × 4 ≈ 48s）。真机实测桌面端推完首屏快照后就不再推，
+     *  所以刷新率完全由这个周期决定；48s 是"跟手"与"少打扰桌面端"的折中。 */
+    private const val LIVE_REANCHOR_EVERY_POLLS = 4
 
     @Volatile
     private var livePolling = false
@@ -266,13 +267,10 @@ object ShellRuntime {
                         Tier2Probe.reanchorProgress()
                     }
                     for ((key, sessionId) in refs) {
-                        // 订阅（主通道）：桌面端要先把会话挂到本客户端上才认后续
-                        // 对话 RPC，订阅本身也会立刻推一份 snapshot。每轮都调：
-                        // 桥可能还没开（第一拍总是这样），订阅成功后是幂等空操作，
-                        // 失败就在下一轮自然重试。
-                        Tier2Probe.subscribeProgress(key, sessionId) { _, id, text ->
-                            pushLivePreview(key, id, text)
-                        }
+                        // 订阅（主通道）：桥一出生就订好了（见 runHandshake——顺序
+                        // 必须是"先对话后索引"），这里只是兜住"接管期间新起任务"的
+                        // 情况；已订阅时是幂等空操作，失败下一轮自然重试。
+                        Tier2Probe.subscribeProgress(key, sessionId)
                     }
                 }
             }
@@ -296,6 +294,10 @@ object ShellRuntime {
     private fun startLiveProgressPolling() {
         if (livePolling) return
         livePolling = true
+        Tier2Probe.progressSink = { key, sessionId, text -> pushLivePreview(key, sessionId, text) }
+        Tier2Probe.runningSessionsProvider = { key ->
+            store.runningTaskRefs().filter { it.first == key }.map { it.second }
+        }
         mainHandler.post(liveProgressPoller)
     }
 
