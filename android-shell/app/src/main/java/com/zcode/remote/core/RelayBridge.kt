@@ -246,6 +246,169 @@ class BridgeSession(
         }.start()
     }
 
+    // ---------------------------------------------- M4：对话详情订阅（跟手主通道）
+
+    private var convListenerId = -1L
+    private val convAssembler = RelayWire.LogicalFrameAssembler()
+    private val convSubscriptions = ConcurrentHashMap<String, String>()
+    private val convTails = ConcurrentHashMap<String, RelayWire.ConversationTail>()
+    private val convLastText = ConcurrentHashMap<String, String>()
+    private val convAttempting = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    /** 收到的对话帧计数（诊断用：区分"桌面端不推"与"我们丢帧"）。 */
+    @Volatile
+    private var convFrames = 0
+
+    @Volatile
+    private var convSink: ((String, String, String) -> Unit)? = null
+
+    /**
+     * 订阅某会话的对话详情，并把"最新进展"文本回调出去。
+     *
+     * 幂等且**可反复调用**：已订阅→立即返回；有在飞的尝试→跳过（避免每 12 s
+     * 的轮询把订阅请求叠起来）；失败后下一轮自然重试（真机踩过：调用方若把
+     * "试过一次"记成终态，第一个轮询拍（桥还没开）就会把该会话永久拉黑）。
+     */
+    fun subscribeConversationProgress(
+        sessionId: String,
+        onProgress: (sessionId: String, text: String) -> Unit,
+    ) {
+        if (closed) return
+        convSink = { _, id, text -> onProgress(id, text) }
+        if (convSubscriptions.containsKey(sessionId)) return
+        if (!convAttempting.add(sessionId)) return
+        installConversationListener()
+        Thread {
+            try {
+                val args = JSONObject(scope.toString()).put("sessionId", sessionId)
+                val result = channels.callBlocking(
+                    RelayWire.CHANNEL_CONVERSATION,
+                    RelayWire.METHOD_SUBSCRIBE_CONV,
+                    listOf<Any?>(args),
+                    30_000,
+                ) as? JSONObject
+                val ack = result?.optJSONObject("ack")
+                val subId = ack?.optString("subscriptionId").orEmpty()
+                if (ack == null || subId.isEmpty()) {
+                    onLogLine("conversation subscribe: no ack.subscriptionId for $sessionId")
+                    return@Thread
+                }
+                convSubscriptions[sessionId] = subId
+                convTails.putIfAbsent(sessionId, RelayWire.ConversationTail())
+                onLogLine(
+                    "subscribed conversation for $sessionId (${ack.optString("mode")}, " +
+                        "帧已收 ${convFrames} 个)",
+                )
+            } catch (e: Exception) {
+                onLogLine("conversation subscribe failed for $sessionId: ${e.message}")
+            } finally {
+                convAttempting.remove(sessionId)
+            }
+        }.start()
+    }
+
+    /**
+     * 周期性重挂：退订后重订阅，逼桌面端再推一份 snapshot。
+     *
+     * **这是真机逼出来的**：pre.87 实测订阅建立那一刻拿到一份 snapshot
+     * （"正在执行 Bash"），此后 73 分钟桌面端**一个帧都没再推**——流体云的
+     * `when` 冻在原地。所以"最新进展"不能只赌 push：每隔一段时间重挂一次，
+     * 最坏也只慢一个重挂周期，而不会回到几十分钟级的滞后。
+     */
+    fun reanchorConversations() {
+        if (closed) return
+        for (session in convSubscriptions.keys.toList()) {
+            val subId = convSubscriptions.remove(session) ?: continue
+            val sink = convSink
+            Thread {
+                try {
+                    val args = JSONObject(scope.toString()).put("subscriptionId", subId)
+                    channels.callBlocking(
+                        RelayWire.CHANNEL_CONVERSATION,
+                        RelayWire.METHOD_UNSUBSCRIBE_CONV,
+                        listOf<Any?>(args),
+                        8_000,
+                    )
+                } catch (e: Exception) {
+                    // 尽力而为：退订失败也不影响重订阅（会带新的 subscriptionId）
+                }
+                onLogLine("reanchor conversation for $session (距上次共收 ${convFrames} 个帧)")
+                subscribeConversationProgress(session) { id, text ->
+                    sink?.invoke(workspaceKey, id, text)
+                }
+            }.start()
+        }
+    }
+
+    /** 必须先注册监听再订阅：ACK 之前到达的帧按 topic 缓冲在桌面端，不怕早发。 */
+    private fun installConversationListener() {
+        if (convListenerId >= 0) return
+        convListenerId = channels.listenEvent(
+            RelayWire.CHANNEL_CONVERSATION,
+            RelayWire.EVENT_CONVERSATION_FRAME,
+            JSONObject(scope.toString()),
+        ) { data -> onConversationWire(data) }
+    }
+
+    private fun onConversationWire(data: Any?) {
+        val frame = convAssembler.acceptEnvelope(data as? JSONObject) ?: return
+        val topic = frame.optString("topic")
+        if (!topic.startsWith("conversation/")) return
+        convFrames += 1
+        val subId = frame.optString("subscriptionId")
+        var sessionId: String? = null
+        for ((session, sub) in convSubscriptions) {
+            if (sub == subId) {
+                sessionId = session
+                break
+            }
+        }
+        val id = sessionId ?: return
+        val tail = convTails.getOrPut(id) { RelayWire.ConversationTail() }
+        val payload = frame.optJSONObject("payload") ?: return
+        when (payload.optString("kind")) {
+            "snapshot" -> tail.applySnapshot(payload.optJSONObject("snapshot"))
+            "deltas" -> tail.applyDeltas(payload.optJSONArray("deltas"))
+            else -> return
+        }
+        val text = tail.latestProgressText() ?: return
+        if (convLastText[id] == text) return
+        convLastText[id] = text
+        convSink?.invoke(workspaceKey, id, text)
+    }
+
+    private fun unsubscribeConversations() {
+        for ((session, subId) in convSubscriptions) {
+            try {
+                val args = JSONObject(scope.toString()).put("subscriptionId", subId)
+                channels.callBlocking(
+                    RelayWire.CHANNEL_CONVERSATION,
+                    RelayWire.METHOD_UNSUBSCRIBE_CONV,
+                    listOf<Any?>(args),
+                    10_000,
+                )
+                onLogLine("unsubscribed conversation for $session")
+            } catch (e: Exception) {
+                // 尽力而为
+            }
+        }
+        convSubscriptions.clear()
+        convTails.clear()
+        convLastText.clear()
+        if (convListenerId >= 0) {
+            try {
+                channels.removeListener(
+                    RelayWire.CHANNEL_CONVERSATION,
+                    RelayWire.EVENT_CONVERSATION_FRAME,
+                    convListenerId,
+                )
+            } catch (e: Exception) {
+                // 关闭路径不再抛
+            }
+            convListenerId = -1L
+        }
+    }
+
     /** 摘监听 + 退订（尽力而为）。 */
     fun closeBridge() {
         if (closed) return
