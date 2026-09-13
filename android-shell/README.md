@@ -978,6 +978,19 @@ l1_test = 手动轻推，vitals = DOM 体征快照。JS 68 项测试全绿（快
   不用 DOM（僵尸 DOM 本来就健康，vitals 判会自撤——首轮真机踩中已修）。
   ③ 端到端实测：l1_test 复现 → 壳接管尝试与页面恢复竞争 → 页面自身错误恢复链被
   激活（重新开桥+重订阅）→ 壳让位 → 全链路收敛健康。僵尸刷新档作为页面不恢复时的兜底。
-- **遗留**：后台长测（实况窗不断不滞后，`后台链路静默 Ns` 行取证）；
-  并发会话在 inject.js 的半成品补丁（lastPairStatus 未声明变量）存于
-  `/tmp/concurrent-pair-status.patch`，待其完成后再合入。
+**2026-09-13 上午追加（Tier2 开工，pre.53→pre.55）**：
+- **lastPairStatus 半成品暂缓**：并发会话在 inject.js 加的 pair_status 归因（变量未声明会炸）
+  目前无人消费（僵尸检测用的是帧静默+任务活动，不是 pair_status），补丁存
+  `/tmp/concurrent-pair-status.patch`，等那边补完声明并接上消费者再合入。
+- **Tier2 原生直连探针落地**（`core/Tier2Probe.kt` + OkHttp）：WSS 直连 → auth_init →
+  auth_challenge → auth_response（HMAC proof）→ **配对成功**——握手链与页面逐字对齐，
+  测试向量离线生成（`Tier2ProofTest`）。凭证由注入层一次性移交（relaycreds，仅内存）。
+  诊断指令：`tier2_test`（60s 自动关）/ `tier2_stop`。
+- **★KICK 语义定案（真机 USB）**：原生配对成功（matched）的**同一秒**，页面连接被服务端
+  断开（1006）；Tier2 持有配对期间页面自动重连**被拒**，必须整页 reload 才能回来。
+  ⇒ **配对层面单控制端互斥，并行不可行**。Tier2 常驻形态由此定案：**后台独占模式**——
+  页面前台绝不配对；退后台且 Tier1 判死（`后台链路静默`）才配对接管；回前台先断 Tier2
+  再走现有「回前台重载」流程，与既有行为天然契合。
+- **下一步（待拍板）**：Tier2 常驻化——Tier1 判死信号接 Tier2 启动、前台交还时序、
+  以及原生侧任务事件解码（ sessions-index/工作区桥 4-RPC 协议的 Kotlin 移植，
+  zcode-protocol.js 为参照）。
