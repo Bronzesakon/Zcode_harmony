@@ -76,9 +76,16 @@ object Tier2Probe {
 
     val currentPhase: Phase get() = phase
 
-    fun start(newCreds: RelayCreds, durationMs: Long = 60_000) {
-        if (phase != Phase.IDLE && phase != Phase.CLOSED) {
-            Diagnostics.log("warn", "Tier2: 已在运行（phase=$phase），先 tier2_stop 再重试")
+    /** 探针是否持有（或正在建立）连接——接管触发与前台交还都看它。 */
+    fun isRunning(): Boolean = phase != Phase.IDLE && phase != Phase.CLOSED
+
+    /**
+     * @param durationMs 探针存活时长；<=0 表示持久（后台接管模式），
+     *   直到 [stop] 被调用（回前台交还）。
+     */
+    fun start(newCreds: RelayCreds, durationMs: Long = 60_000L) {
+        if (isRunning()) {
+            Diagnostics.log("warn", "Tier2: 已在运行（phase=$phase），忽略重复启动")
             return
         }
         creds = newCreds
@@ -97,14 +104,16 @@ object Tier2Probe {
         }
         val request = Request.Builder().url(url).build()
 
-        // 到点主动关闭：实验探针不常驻，常驻形态等语义定案后再设计。
-        durationTimer = java.util.Timer(true).apply {
-            schedule(
-                object : java.util.TimerTask() {
-                    override fun run() = stop("duration 到点")
-                },
-                durationMs,
-            )
+        // duration 到点主动关闭；<=0 = 持久模式（后台接管），由 stop() 交还。
+        if (durationMs > 0) {
+            durationTimer = java.util.Timer(true).apply {
+                schedule(
+                    object : java.util.TimerTask() {
+                        override fun run() = stop("duration 到点")
+                    },
+                    durationMs,
+                )
+            }
         }
         heartbeatTimer = java.util.Timer(true).apply {
             scheduleAtFixedRate(

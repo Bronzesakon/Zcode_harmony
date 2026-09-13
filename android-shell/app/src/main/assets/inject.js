@@ -1742,6 +1742,10 @@
             typeof clientNow.pageBridgeSessionIds !== 'function') {
             return false;
         }
+        // 桌面活着才布防：pair ack 不是 matched（桌面掉线/休眠）时刷新页面无意义。
+        if (!relayPaired) {
+            return false;
+        }
         var lastTraffic = Math.max(clientNow.lastPageBridgeTrafficAt() || 0,
             clientNow.bornAt || 0);
         var silence = nowMs - lastTraffic;

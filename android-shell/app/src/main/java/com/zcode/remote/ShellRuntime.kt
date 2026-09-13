@@ -145,6 +145,7 @@ object ShellRuntime {
             paired = data.optBoolean("paired"),
             socketState = data.optInt("socketState", -1),
         )
+        maybeTakeOverInBackground(ago)
         // A background window just closed and this is the first fresh reading:
         // this is the milestone-4 verdict.
         if (verdictPending && backgroundStartedAt == 0L) {
@@ -186,6 +187,12 @@ object ShellRuntime {
     fun onAppForegroundChanged(foreground: Boolean) {
         appIsForeground = foreground
         if (foreground) {
+            // Tier2 交还：后台接管持有的配对必须先释放，页面自己的重连才可能
+            // 成功；重连后 runtime 已死，由卡死看门狗的僵尸档走刷新恢复。
+            if (Tier2Probe.isRunning()) {
+                Tier2Probe.stop("回前台交还")
+                Diagnostics.log("warn", "Tier2: 前台交还完成，页面将由重连+僵尸看门狗恢复")
+            }
             stopHeartbeatPump()
             val startedAt = backgroundStartedAt
             val endedAt = SystemClock.elapsedRealtime()
@@ -314,6 +321,29 @@ object ShellRuntime {
     /** Tier2 原生直连 relay 的凭证（注入层移交，仅内存，不落日志）。 */
     @Volatile
     private var relayCreds: RelayCreds? = null
+
+    /** Tier1 后台静默超过该时长即视为判死，Tier2 原生接管配对。 */
+    private const val TIER2_TAKEOVER_SILENCE_MS = 60_000L
+
+    /**
+     * Tier2 后台接管触发（2026-09-13 拍板的形态）：应用在后台且 Tier1 的入站
+     * 流静默超过阈值（renderer 冻结/链路死亡，实况窗会断）→ 原生直连 relay
+     * 接管配对。KICK 语义已定案为配对互斥：接管会踢掉页面连接，所以前台绝不
+     * 做这件事；回前台由 [onAppForegroundChanged] 交还。M3（原生任务事件解码）
+     * 落地前，接管只保连接与配对，不产出通知数据。
+     */
+    private fun maybeTakeOverInBackground(inboundAgoMs: Long) {
+        if (appIsForeground) return
+        if (inboundAgoMs in 0 until TIER2_TAKEOVER_SILENCE_MS) return
+        if (Tier2Probe.isRunning()) return
+        val c = relayCreds ?: return
+        Tier2Probe.start(c, durationMs = 0L)
+        Diagnostics.log(
+            "warn",
+            "Tier2: 后台 Tier1 判死（入站静默 ${inboundAgoMs / 1000}s），原生接管配对" +
+                "（M3 前仅保活，不产通知数据；回前台自动交还）",
+        )
+    }
 
     /** 诊断指令 tier2_test：原生直连探针跑一轮（默认 60s 自动关闭）。 */
     fun startTier2Probe(durationMs: Long = 60_000L) {
