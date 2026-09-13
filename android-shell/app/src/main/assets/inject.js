@@ -1472,7 +1472,14 @@
     var FALLBACK_STORE_AT = 'zcodeShellFastRefreshAt';
 
     var fallbackTimer = null;
-    var fallbackState = {lastReloadAt: 0, beaconAt: 0, beaconGen: 0, readyAt: 0, readyBy: ''};
+    var fallbackState = {
+        lastReloadAt: 0,
+        beaconAt: 0,
+        beaconGen: 0,
+        readyAt: 0,
+        readyBy: '',
+        chatView: false
+    };
     var clientGenSeq = 0;
 
     function fallbackElementVisible(el) {
@@ -2451,6 +2458,41 @@
         }
         pageStateScheduled = true;
         setTimeout(pushPageState, 0);
+        noteChatViewEntered();
+    }
+
+    /**
+     * 进对话的**第二个**信标：DOM 视图。
+     *
+     * 页面进入对话视图时会挂上 `[data-mobile-page="chat"]`（`readVitals` 一直用
+     * 它判"当前在不在对话里"）。为什么铁判准也要认它：第一个信标是页面自己发的
+     * `subscribeConversationV4`/`conversationRowsRangeV4`，可当页面传输层已经坏掉
+     * 时，用户点进任务**连这个请求都不会发出去**——只认 RPC 信标就会整窗漏掉，
+     * 那正是"还是做不到"的形态。视图一旦出现就武装 5 s，与 RPC 信标等价。
+     */
+    function noteChatViewEntered() {
+        var has = false;
+        try {
+            has = !!document.querySelector('[data-mobile-page="chat"]');
+        } catch (e) {
+            return;
+        }
+        if (has === fallbackState.chatView) {
+            return;
+        }
+        fallbackState.chatView = has;
+        if (!has) {
+            return;
+        }
+        var age = fallbackState.beaconAt ? Date.now() - fallbackState.beaconAt : -1;
+        if (age >= 0 && age < FALLBACK_CHECK_MS) {
+            // 已经有一个在跑的窗口（页面自己发的 RPC 信标）→ 不重置：重置会把
+            // 它刚记下的就绪证据抹掉，空会话（没有行、也没有新入站帧）就会被
+            // 误判成"没内容"而白刷一次。
+            return;
+        }
+        diag('debug', '进入对话视图（DOM 信标）→ 武装 5s 铁判准');
+        scheduleFallbackCheck();
     }
 
     function watchMedia(query) {
