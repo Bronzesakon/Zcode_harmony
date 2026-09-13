@@ -994,3 +994,17 @@ l1_test = 手动轻推，vitals = DOM 体征快照。JS 68 项测试全绿（快
 - **下一步（待拍板）**：Tier2 常驻化——Tier1 判死信号接 Tier2 启动、前台交还时序、
   以及原生侧任务事件解码（ sessions-index/工作区桥 4-RPC 协议的 Kotlin 移植，
   zcode-protocol.js 为参照）。
+- **Tier2 M2 已落地并真机验证（pre.56，`bd72358`+`40d3e77`）**：
+  ① 接管触发：后台 + 入站静默 >60s + 最后 pair ack 为 matched（桌面在线门——
+  桌面休眠期接管无意义还会挡页面恢复）→ 原生自动接管（duration=0 持久模式）；
+  ② 前台交还：`onAppForegroundChanged(true)` 先停 Tier2 再走既有恢复链路；
+  ③ 真机验证：负路径 90s 后台（泵/ack 正常）零接管 ✓；交还时序
+  （探针配对→退后台→回前台→「前台交还完成」）✓。
+  正路径（renderer 真被冻结）无法人工安全复现，交给野外事件——
+  `后台链路静默 Ns` 行就是它的触发遥测。
+  pair_status 判读结论：对「无帧 vs AI 无产出」无区分力（那是任务活动判据的事，
+  已实现），其残余价值（桌面在线门）已用现有 `relayPaired` 一行吸收；
+  lastPairStatus 半成品补丁继续暂缓于 `/tmp/concurrent-pair-status.patch`。
+- **M3（未开工，下一轮主体）**：原生任务事件解码——工作区桥 4-RPC +
+  rpc-frame 编解码（varint/crc32/分片/ChannelClient body）的 Kotlin 移植，
+  参照 zcode-protocol.js 与其 Node 测试；落地后后台接管才有通知/实况窗数据。
