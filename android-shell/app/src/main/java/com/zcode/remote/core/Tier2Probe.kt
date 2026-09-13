@@ -200,9 +200,9 @@ object Tier2Probe {
         phase = Phase.CLOSED
     }
 
-    private fun startCoverageIfPersistent() {
-        if (!persistent) return
-        val c = creds ?: return
+    private fun startCoverage() {
+        if (bridgeManager != null) return
+        creds ?: return
         val manager = BridgeManager(
             sendPayloadOut = { payload -> sendBusinessPayload(payload, quiet = false) },
             onSessionsUpdate = { update ->
@@ -299,13 +299,13 @@ object Tier2Probe {
                                 "warn",
                                 "Tier2: ★接管配对成功（matched）——页面连接已被顶掉，开始桥覆盖",
                             )
-                            startCoverageIfPersistent()
                         } else {
                             Diagnostics.log(
                                 "warn",
-                                "Tier2: ★配对成功（matched）——现在观察页面连接是否被踢（KICK/takeover 语义定案点）",
+                                "Tier2: ★配对成功（matched）——实验模式，同时开桥覆盖（验证 M3b/c 解码）",
                             )
                         }
+                        startCoverage()
                     }
                 }
                 "data" -> {
