@@ -166,30 +166,76 @@ object RelayWire {
                 require(value in 0..0x7FFFFFFF) { "value: int out of range $value" }
                 writer.writeByte(6).writeVarint(value)
             }
-            // 其余（布尔/浮点/对象）按页面参照走 JSON tag。
-            else -> {
-                val json = jsonOf(value).toString().toByteArray(Charsets.UTF_8)
-                writer.writeByte(5).writeVarint(json.size.toLong()).writeBytes(json)
-            }
+            // 其余（布尔/浮点/对象）按页面参照走 JSON tag。JSON 文本由本文件
+            // 的 writer 生成（JS JSON.stringify 语义：不转义 '/'），不依赖
+            // org.json——Android 与 JVM 的 org.json 序列化行为不一致，
+            // golden vectors 必须两端逐字相同。
+            else -> writeJsonTag(writer, writeJsonValue(value))
         }
     }
 
-    private fun jsonOf(value: Any?): Any = when (value) {
-        null -> JSONObject.NULL
-        is JSONObject -> value
-        is Map<*, *> -> {
-            val o = JSONObject()
-            for ((k, v) in value) o.put(k.toString(), jsonOf(v))
-            o
+    private fun writeJsonTag(writer: ByteWriter, jsonText: String) {
+        val json = jsonText.toByteArray(Charsets.UTF_8)
+        writer.writeByte(5).writeVarint(json.size.toLong()).writeBytes(json)
+    }
+
+    private fun writeJsonValue(value: Any?): String {
+        val sb = StringBuilder()
+        writeJsonInto(sb, value)
+        return sb.toString()
+    }
+
+    private fun writeJsonInto(sb: StringBuilder, value: Any?) {
+        when (value) {
+            null -> sb.append("null")
+            is String -> writeJsonString(sb, value)
+            is Boolean -> sb.append(if (value) "true" else "false")
+            is Int, is Long -> sb.append(value.toString())
+            is Map<*, *> -> {
+                sb.append('{')
+                var first = true
+                for ((k, v) in value) {
+                    if (!first) sb.append(',')
+                    first = false
+                    writeJsonString(sb, k.toString())
+                    sb.append(':')
+                    writeJsonInto(sb, v)
+                }
+                sb.append('}')
+            }
+            is List<*> -> {
+                sb.append('[')
+                var first = true
+                for (item in value) {
+                    if (!first) sb.append(',')
+                    first = false
+                    writeJsonInto(sb, item)
+                }
+                sb.append(']')
+            }
+            is JSONObject -> sb.append(value.toString())
+            else -> writeJsonString(sb, value.toString())
         }
-        is Boolean -> value
-        is Double, is Float -> value
-        is List<*> -> {
-            val arr = org.json.JSONArray()
-            for (item in value) arr.put(jsonOf(item))
-            arr
+    }
+
+    /** JSON 字符串转义，与 JS JSON.stringify 一致（不转义 '/'）。 */
+    private fun writeJsonString(sb: StringBuilder, s: String) {
+        sb.append('"')
+        for (c in s) {
+            when (c) {
+                '"' -> sb.append("\\\"")
+                '\\' -> sb.append("\\\\")
+                '\n' -> sb.append("\\n")
+                '\r' -> sb.append("\\r")
+                '\t' -> sb.append("\\t")
+                '\b' -> sb.append("\\b")
+                '\u000C' -> sb.append("\\f")
+                else -> {
+                    if (c < ' ') sb.append("\\u%04x".format(c.code)) else sb.append(c)
+                }
+            }
         }
-        else -> value
+        sb.append('"')
     }
 
     /** JSON 值的长度预计算与顺序无关；页面端 JSON.parse 不在乎键序。 */

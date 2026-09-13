@@ -32,8 +32,9 @@ class RelayWireTest {
 
     @Test
     fun `subscribe request with scope object matches`() {
-        // scope 是单键 JSON 对象——键序无关紧要，两个实现字节一致。
-        val scope = JSONObject().put("workspacePath", "/repo/x")
+        // scope 是单键 JSON 对象——编码走自带 writer（JS stringify 语义，
+        // 不依赖 org.json 的序列化行为），与 JS 参照字节一致。
+        val scope = linkedMapOf<String, Any?>("workspacePath" to "/repo/x")
         val body = RelayWire.encodeBody(
             listOf(RelayWire.REQ_PROMISE, 2, RelayWire.CHANNEL_CONVERSATION, RelayWire.METHOD_SUBSCRIBE_SI),
             listOf(scope),
@@ -48,7 +49,7 @@ class RelayWireTest {
     fun `promise success reply with nested ack matches`() {
         val body = RelayWire.encodeBody(
             listOf(RelayWire.RES_PROMISE_SUCCESS, 5),
-            JSONObject().put("ack", JSONObject().put("subscriptionId", "sub-1")),
+            linkedMapOf<String, Any?>("ack" to linkedMapOf<String, Any?>("subscriptionId" to "sub-1")),
         )
         assertEquals(
             "040206c901060505227b2261636b223a7b22737562736372697074696f6e4964223a227375622d31227d7d",
@@ -60,7 +61,7 @@ class RelayWireTest {
     fun `listen body matches`() {
         val body = RelayWire.encodeBody(
             listOf(RelayWire.REQ_EVENT_LISTEN, 9, RelayWire.CHANNEL_CONVERSATION, RelayWire.EVENT_SESSIONS_INDEX),
-            listOf(JSONObject().put("workspaceIdentity", "ws-a")),
+            listOf(linkedMapOf<String, Any?>("workspaceIdentity" to "ws-a")),
         )
         assertEquals(
             "040406660609010b7a636f64652d6167656e74011b6f6e44796e616d696353657373696f6e73496e6465784672616d650401051c7b22776f726b73706163654964656e74697479223a2277732d61227d",
