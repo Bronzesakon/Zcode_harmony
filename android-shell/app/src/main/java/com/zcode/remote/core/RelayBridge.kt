@@ -246,6 +246,31 @@ class BridgeSession(
         }.start()
     }
 
+    /**
+     * 拉一次对话详情尾窗并取"当前进展"文本（M4：流体云跟手的取数口）。
+     *
+     * 会阻塞（最长 [timeoutMs]），调用方必须放到后台线程。
+     *
+     * 为什么用请求-应答而不是订阅帧：真机实测（2026-09-13，页面侧 `页面开销`
+     * 逐 10s 统计）显示桌面端对远端的**推送是稀疏的**——快照到达之后整段只有
+     * 心跳帧、入站字符数为 0，任务正在流式输出时也一样。会话索引里的 preview
+     * 又只在轮次边界变（它就是"最后一条消息的开头"）。所以"跟手"只能靠主动拉：
+     * 每次拉回一份新的尾窗，取最后一行即可，不需要 delta/缺口状态机。
+     */
+    fun fetchProgressText(sessionId: String, limit: Int = 20, timeoutMs: Long = 20_000): String? {
+        if (closed) return null
+        val args = JSONObject()
+            .put("sessionId", sessionId)
+            .put("limit", limit.coerceIn(1, RelayWire.ROWS_RANGE_MAX_LIMIT))
+        val result = channels.callBlocking(
+            RelayWire.CHANNEL_CONVERSATION,
+            RelayWire.METHOD_ROWS_RANGE,
+            listOf<Any?>(args),
+            timeoutMs,
+        ) as? JSONObject ?: return null
+        return RelayWire.progressTextFromRows(result.optJSONArray("rows"))
+    }
+
     /** 摘监听 + 退订（尽力而为）。 */
     fun closeBridge() {
         if (closed) return
@@ -340,6 +365,15 @@ class BridgeManager(
             }
             onLogLine("tier2 active coverage: $opened workspace(s)")
         }.start()
+    }
+
+    /**
+     * 拉某工作区的对话详情（M4）。桥不存在/已关/调用失败都返回 null——
+     * 调用方保留现有文案，绝不用空串覆盖。
+     */
+    fun fetchProgress(key: String, sessionId: String, limit: Int = 20): String? {
+        val bridge = bridges[key] ?: return null
+        return bridge.fetchProgressText(sessionId, limit)
     }
 
     /** relay `data` payload 分发：桥帧 / 桥开启应答 / 工作区列表应答。 */

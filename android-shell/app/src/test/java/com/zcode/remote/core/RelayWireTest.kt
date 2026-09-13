@@ -183,6 +183,73 @@ class RelayWireTest {
         assertArrayEquals(byteArrayOf(4, 5, 6, 7, 8), delivered!!.message)
     }
 
+    // ------------------------------------------- 对话详情尾窗 → 进展文本（M4）
+
+    private fun rows(vararg items: JSONObject) = org.json.JSONArray().apply {
+        for (item in items) put(item)
+    }
+
+    @Test
+    fun `progress text takes the newest assistant text`() {
+        val text = RelayWire.progressTextFromRows(
+            rows(
+                JSONObject().put("kind", "userInput").put("text", "帮我看看"),
+                JSONObject().put("kind", "assistantText").put("text", "先读代码").put("state", "complete"),
+                JSONObject().put("kind", "assistantText").put("text", "正在改").put("state", "streaming"),
+            ),
+        )
+        assertEquals("正在改", text)
+    }
+
+    @Test
+    fun `progress text skips finished tool calls and reasoning`() {
+        // 最新是已结束的工具调用、再下面是思考过程：都不算"进展"，继续往前找正文。
+        val text = RelayWire.progressTextFromRows(
+            rows(
+                JSONObject().put("kind", "assistantText").put("text", "正文在这里"),
+                JSONObject().put("kind", "reasoning").put("text", "嗯……"),
+                JSONObject().put("kind", "toolCall").put("toolName", "Bash").put("status", "success"),
+            ),
+        )
+        assertEquals("正文在这里", text)
+    }
+
+    @Test
+    fun `progress text names a running tool`() {
+        val text = RelayWire.progressTextFromRows(
+            rows(
+                JSONObject().put("kind", "assistantText").put("text", "开始验证"),
+                JSONObject().put("kind", "toolCall").put("toolName", "Bash").put("status", "running"),
+            ),
+        )
+        assertEquals("正在执行 Bash", text)
+    }
+
+    @Test
+    fun `progress text falls back to a running subagent summary`() {
+        val text = RelayWire.progressTextFromRows(
+            rows(
+                JSONObject().put("kind", "subagent").put("status", "running")
+                    .put("subagentType", "explore").put("summaryText", "正在挖协议"),
+            ),
+        )
+        assertEquals("正在挖协议", text)
+    }
+
+    @Test
+    fun `progress text is null when nothing is displayable`() {
+        assertNull(RelayWire.progressTextFromRows(null))
+        assertNull(RelayWire.progressTextFromRows(org.json.JSONArray()))
+        assertNull(
+            RelayWire.progressTextFromRows(
+                rows(
+                    JSONObject().put("kind", "turnHeader").put("state", "running"),
+                    JSONObject().put("kind", "userInput").put("text", "只说了这句"),
+                ),
+            ),
+        )
+    }
+
     private fun hexToBytes(hex: String): ByteArray =
         ByteArray(hex.length / 2) { ((Character.digit(hex[it * 2], 16) shl 4) + Character.digit(hex[it * 2 + 1], 16)).toByte() }
 }

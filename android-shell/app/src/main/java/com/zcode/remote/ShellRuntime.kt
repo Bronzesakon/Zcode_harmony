@@ -193,8 +193,9 @@ object ShellRuntime {
             // 成功；重连后 runtime 已死，由卡死看门狗的僵尸档走刷新恢复。
             if (Tier2Probe.isRunning()) {
                 Tier2Probe.stop("回前台交还")
-                Diagnostics.log("warn", "Tier2: 前台交还完成，页面将由重连+僵尸看门狗恢复")
+                Diagnostics.log("warn", "Tier2: 前台交还完成，页面将由重连+KICKED 自愈恢复")
             }
+            stopLiveProgressPolling()
             stopHeartbeatPump()
             val startedAt = backgroundStartedAt
             val endedAt = SystemClock.elapsedRealtime()
@@ -217,10 +218,76 @@ object ShellRuntime {
             backgroundFrameBase = snapshot?.inboundFrames ?: 0
             backgroundAckBase = snapshot?.pairAcks ?: 0
             backgroundTickBase = snapshot?.backgroundTicks ?: 0
-            // 退后台这一刻就问一次"渲染器还活着吗"：活着 → Tier1 继续供数，
-            // 不踢页面；答不上来 → 4s 后立刻接管，不等 25s 判死窗（见函数注释）。
-            probeRendererOnBackground()
+            // 退后台宽限期后原生接管（页面的 socket 让位，壳自己拉对话详情）。
+            scheduleBackgroundTakeover()
         }
+    }
+
+    // ------------------------------------------------- M4 活进展（流体云跟手）
+    //
+    // 桌面端对远端的推送是稀疏的（真机逐 10s 统计：页面拿到快照后整段只有心跳
+    // 帧、入站字符数为 0），会话索引的 preview 又只在轮次边界变。所以在**壳自己
+    // 持有连接**的后台时段，由原生按节拍主动拉每个在跑任务的对话详情尾窗
+    // （conversationRowsRangeV4），把最新一行（流式正文 / 正在跑的工具）喂给
+    // 通知与流体云。前台时段不做：那时连接在页面手里（单控制端互斥），拉不了。
+    private const val LIVE_PROGRESS_POLL_MS = 12_000L
+
+    @Volatile
+    private var livePolling = false
+
+    private val liveProgressThread = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+        Thread(r, "zcode-live-progress").apply { isDaemon = true }
+    }
+
+    private val liveProgressPoller = object : Runnable {
+        override fun run() {
+            if (appIsForeground || !Tier2Probe.isRunning()) {
+                livePolling = false
+                return
+            }
+            val refs = store.runningTaskRefs()
+            // 上一轮还没拉完就跳过这一拍：桌面端忙的时候一次拉取可能顶到超时，
+            // 排队的请求只会越积越多。
+            if (refs.isNotEmpty() && !liveFetchInFlight) {
+                liveFetchInFlight = true
+                liveProgressThread.execute {
+                    try {
+                        for ((key, sessionId) in refs) {
+                            val text = Tier2Probe.fetchProgress(key, sessionId) ?: continue
+                            mainHandler.post {
+                                val update = store.applyLivePreview(sessionId, text)
+                                if (update.running.isNotEmpty()) {
+                                    Diagnostics.log(
+                                        "debug",
+                                        "活进展 $key：${text.replace('\n', ' ').take(60)}",
+                                    )
+                                    applyUpdate(update)
+                                }
+                            }
+                        }
+                    } finally {
+                        liveFetchInFlight = false
+                    }
+                }
+            }
+            mainHandler.postDelayed(this, LIVE_PROGRESS_POLL_MS)
+        }
+    }
+
+    @Volatile
+    private var liveFetchInFlight = false
+
+    private fun startLiveProgressPolling() {
+        if (livePolling) return
+        livePolling = true
+        mainHandler.post(liveProgressPoller)
+    }
+
+    /** 交还前台：停止拉取，并把活进展清掉（此后以页面供的会话索引为准）。 */
+    private fun stopLiveProgressPolling() {
+        livePolling = false
+        mainHandler.removeCallbacks(liveProgressPoller)
+        store.clearLivePreviews()
     }
 
     // ------------------------------------------------------------ heartbeat pump
@@ -339,10 +406,16 @@ object ShellRuntime {
 
     /**
      * 退后台探针的应答窗：退后台那一刻问一次 liveness，4s 内没有回音即认定
-     * 渲染器已经起不来（熄屏被挂起/被冻结）→ 立刻接管。取 4s 是因为正常往返
-     * 只要几十毫秒，而"熄屏后渲染器整段挂起"是毫秒级就注定的形态。
+     * 渲染器已经起不来（熄屏被挂起/被冻结）——接管理由行会这么写。接管本身
+     * 与它无关（后台总要接管），这个读数只用来把理由写准。
      */
     private const val RENDERER_PROBE_MS = 4_000L
+
+    /**
+     * 退后台到接管的宽限：瞥一眼别的应用就切回来不该付"页面被踢+回前台重载"
+     * 的代价。5s 相对流体云的跟手需求可以忽略。
+     */
+    private const val BACKGROUND_TAKEOVER_DELAY_MS = 5_000L
 
     /**
      * 最后一次收到注入层 liveness 报告的墙钟时刻。
@@ -425,16 +498,20 @@ object ShellRuntime {
     }
 
     /**
-     * 退后台的立即探针（用户 2026-09-13 的"切后台就直接接管"落点）。
+     * 退后台后的接管（用户 2026-09-13 的口径："切后台就直接原生接管连接并继续
+     * 获取对话详情推送到流体云"）。
      *
-     * 退后台第 0 秒先要一次 liveness：
-     *   * 渲染器还活着 → 几百毫秒内就回一个，Tier1 继续供数（流体云照常更新），
-     *     **不踢页面**——踢了反而要在回前台重载一次；
-     *   * 渲染器已经答不上来（熄屏被系统挂起、进程被冻结）→ 4s 内一个都没有，
-     *     这时立刻接管，不等 25s 判死窗。真机实测：熄屏后日志与流体云双双定格
-     *     正是这个形态。
+     * 为什么后台一定要接管：桌面端对远端的**推送是稀疏的**——真机逐 10s 统计
+     * 证实，页面拿到快照之后整段只有心跳帧、入站字符数为 0，任务在流式输出时
+     * 也一样；会话索引的 preview 又只在轮次边界变。所以后台想让流体云跟手，
+     * 只能由**壳自己持有连接并主动拉**，而那要求页面的 socket 让位（relay 单
+     * 控制端互斥，KICK 语义已定案）。
+     *
+     * 时点：退后台后 [BACKGROUND_TAKEOVER_DELAY_MS] 再动手——用户瞥一眼别的
+     * 应用就切回来的场景不该被踢（页面被踢的代价是回前台要重载一次）。
+     * 理由行会写清是"渲染器已冻结"还是"后台接管（推流稀疏）"。
      */
-    private fun probeRendererOnBackground() {
+    private fun scheduleBackgroundTakeover() {
         rendererProbeToken += 1
         val token = rendererProbeToken
         requestLivenessReport()
@@ -442,9 +519,13 @@ object ShellRuntime {
             if (token != rendererProbeToken) return@postDelayed
             if (appIsForeground) return@postDelayed
             val since = SystemClock.elapsedRealtime() - lastLivenessAt
-            if (since < RENDERER_PROBE_MS) return@postDelayed
-            takeOverNow("退后台 ${since / 1000}s 注入层零应答（渲染器已冻结）")
-        }, RENDERER_PROBE_MS)
+            val why = if (since >= RENDERER_PROBE_MS) {
+                "渲染器已冻结（注入层 ${since / 1000}s 零应答）"
+            } else {
+                "后台接管（页面推流稀疏，改由原生主动拉对话详情）"
+            }
+            takeOverNow(why)
+        }, BACKGROUND_TAKEOVER_DELAY_MS)
     }
 
     @Volatile
@@ -479,6 +560,7 @@ object ShellRuntime {
             "warn",
             "Tier2: $reason——原生接管配对与任务事件（回前台/亮屏自动交还）",
         )
+        startLiveProgressPolling()
     }
 
     /** 诊断指令 tier2_test：原生直连探针跑一轮（默认 60s 自动关闭）。 */

@@ -64,6 +64,20 @@ class TaskStore {
     private val workspaces = LinkedHashMap<String, Workspace>()
     private var previousRunningIds: Set<Int> = emptySet()
 
+    /**
+     * M4：原生实拉的"对话详情"文本，按 sessionId 覆盖会话索引里的 preview。
+     *
+     * 为什么需要它：会话索引的 preview 语义是"最后一条消息的开头"，只在**轮次
+     * 边界**才变，长轮次里它天然滞后几十分钟（2026-09-13 真机：流体云停在上一轮
+     * 的开头，而任务正在做一大堆事）。而桌面端对远端的推送又是稀疏的（页面侧
+     * 逐 10s 统计证实：拿到快照后整段只有心跳帧）。所以跟手只能靠原生主动拉
+     * 尾窗，把最新一行（流式正文 / 正在跑的工具）喂到这里。
+     *
+     * 生命周期：接管期间由 [applyLivePreview] 写入，回前台交还时由
+     * [clearLivePreviews] 清空（那时页面重新供数，以会话索引为准）。
+     */
+    private val livePreviews = HashMap<String, String>()
+
     /** Workspaces currently subscribed, for the diagnostics screen. */
     fun workspaces(): List<Workspace> = workspaces.values.toList()
 
@@ -71,6 +85,27 @@ class TaskStore {
 
     val hasRunningTasks: Boolean
         get() = workspaces.values.any { it.running.isNotEmpty() }
+
+    /** 正在跑的任务（工作区键、会话 id）——原生拉取对话详情的清单。 */
+    fun runningTaskRefs(): List<Pair<String, String>> =
+        workspaces.values.flatMap { ws -> ws.running.map { ws.key to it.sessionId } }
+
+    /**
+     * 覆盖某任务的"活进展"文案并重建通知。文本没变时返回空 Update（不打扰系统）。
+     */
+    fun applyLivePreview(sessionId: String, text: String): Update {
+        val trimmed = text.trim()
+        if (trimmed.isEmpty() || livePreviews[sessionId] == trimmed) {
+            return Update(emptyList(), emptyList(), emptyList(), emptyList())
+        }
+        livePreviews[sessionId] = trimmed
+        return buildUpdate(NotifyUpdate(running = emptyList(), completed = emptyList(), attention = emptyList()))
+    }
+
+    /** 交还前台：活进展不再是数据源，交给页面自己的会话索引。 */
+    fun clearLivePreviews() {
+        livePreviews.clear()
+    }
 
     /**
      * Folds a fresh sessions-index snapshot of one workspace in and reports the
@@ -130,7 +165,10 @@ class TaskStore {
                         workspaceTitle = workspace.title,
                         task = task,
                         status = notifyState.statusOf(task),
-                        body = NotifyState.formatBody(task.preview, workspace.title),
+                        body = NotifyState.formatBody(
+                            livePreviews[task.sessionId] ?: task.preview,
+                            workspace.title,
+                        ),
                     )
                 )
             }

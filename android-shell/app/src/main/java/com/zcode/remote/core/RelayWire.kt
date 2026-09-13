@@ -1,5 +1,6 @@
 package com.zcode.remote.core
 
+import org.json.JSONArray
 import org.json.JSONObject
 
 /**
@@ -36,6 +37,18 @@ object RelayWire {
     const val METHOD_SUBSCRIBE_SI = "subscribeSessionsIndexV4"
     const val METHOD_UNSUBSCRIBE_SI = "unsubscribeSessionsIndexV4"
     const val METHOD_RESYNC_SI = "resyncSessionsIndexV4"
+
+    /**
+     * 对话详情尾窗（M4，流体云跟手的取数口）。
+     *
+     * 请求 `{sessionId, limit}` → 应答 `{rows, atSeq, atLogEpoch, hasMore}`（行结构
+     * 与页面 `onDynamicConversationFrame` 里的行完全同构，见 docs/05 快照
+     * src-DHgFesxz.js 的行联合）。它是**请求-应答**，每次都是一份新的尾窗快照，
+     * 所以原生侧不需要 delta/缺口状态机：取最后一次应答里的最后一行即可，
+     * 这正是不照搬整台 conversation store 的原因。
+     */
+    const val METHOD_ROWS_RANGE = "conversationRowsRangeV4"
+    const val ROWS_RANGE_MAX_LIMIT = 200
 
     const val MAX_MESSAGE_BYTES = 16 * 1024 * 1024
     const val MAX_FRAGMENT_BYTES = 512 * 1024
@@ -421,5 +434,52 @@ object RelayWire {
         val args = if (reader.remaining > 0) decodeValue(reader) else null
         @Suppress("UNCHECKED_CAST")
         return ParsedBody(header as List<Any?>, args)
+    }
+
+    // ------------------------------------------------------- 对话详情 → 进展文本
+
+    /**
+     * 从 `conversationRowsRangeV4` 的 rows 里取出"当前进展"那一行文字。
+     *
+     * 行是按 `kind` 判别的联合（快照 docs/05 `src-DHgFesxz.js` @100327–@105291）：
+     * `assistantText{text,state}` / `reasoning{text,state}` / `toolCall{toolName,status,…}` /
+     * `subagent{summaryText,status,subagentType}` / `turnHeader{state}` / `userInput{text}` /
+     * `hookInvocation` / `timelineMarker`。
+     *
+     * 取法：**从最新一行往前找第一行能给出"进展"的**——
+     *   * `assistantText` → `text`（流式期间由 `row.delta path=text` 持续加长，
+     *     所以拉到的就是此刻正在写的正文）；
+     *   * `toolCall` 且状态在跑（inputStreaming/pendingApproval/running）→
+     *     「正在执行 <toolName>」；已结束的工具调用跳过，继续往前找正文；
+     *   * `subagent` 且在跑 → `summaryText`，空则「子任务 <type> 运行中」；
+     *   * `reasoning`（思考）跳过——它不是用户要看的"进展"；
+     *   * `userInput`/`turnHeader`/其它 跳过。
+     *
+     * 全都给不出人话时返回 null：调用方要保留原有 preview，**不要**拿空串覆盖。
+     */
+    fun progressTextFromRows(rows: JSONArray?): String? {
+        if (rows == null || rows.length() == 0) return null
+        for (i in rows.length() - 1 downTo 0) {
+            val row = rows.optJSONObject(i) ?: continue
+            val text = progressTextFromRow(row)
+            if (!text.isNullOrBlank()) return text
+        }
+        return null
+    }
+
+    private fun progressTextFromRow(row: JSONObject): String? = when (row.optString("kind")) {
+        "assistantText" -> row.optString("text")
+        "toolCall" -> when (row.optString("status")) {
+            "inputStreaming", "pendingApproval", "running" ->
+                "正在执行 " + row.optString("toolName").ifBlank { "工具" }
+            else -> null
+        }
+        "subagent" -> when (row.optString("status")) {
+            "running" -> row.optString("summaryText").ifBlank {
+                "子任务 " + row.optString("subagentType").ifBlank { "运行中" }
+            }
+            else -> null
+        }
+        else -> null
     }
 }

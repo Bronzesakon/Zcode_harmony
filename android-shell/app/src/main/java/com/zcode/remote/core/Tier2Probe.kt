@@ -95,6 +95,20 @@ object Tier2Probe {
     fun isRunning(): Boolean = phase != Phase.IDLE && phase != Phase.CLOSED
 
     /**
+     * M4：拉一次某任务的对话详情（阻塞，调用方负责放到后台线程）。
+     * 未接管 / 该工作区没有桥 / 调用失败一律返回 null——调用方保留现有文案。
+     */
+    fun fetchProgress(workspaceKey: String, sessionId: String): String? {
+        val manager = bridgeManager ?: return null
+        return try {
+            manager.fetchProgress(workspaceKey, sessionId)
+        } catch (e: Exception) {
+            Diagnostics.log("debug", "Tier2: 拉取对话详情失败（$workspaceKey）: ${e.message}")
+            null
+        }
+    }
+
+    /**
      * @param durationMs 探针存活时长；<=0 表示接管模式（持久，直到 [stop]，
      *   且配对成功后启动桥覆盖 + 断线自动重连）。
      */
