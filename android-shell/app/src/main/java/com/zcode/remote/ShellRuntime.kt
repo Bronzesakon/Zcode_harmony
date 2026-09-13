@@ -227,13 +227,25 @@ object ShellRuntime {
     //
     // 桌面端对远端的推送是稀疏的（真机逐 10s 统计：页面拿到快照后整段只有心跳
     // 帧、入站字符数为 0），会话索引的 preview 又只在轮次边界变。所以在**壳自己
-    // 持有连接**的后台时段，由原生按节拍主动拉每个在跑任务的对话详情尾窗
-    // （conversationRowsRangeV4），把最新一行（流式正文 / 正在跑的工具）喂给
-    // 通知与流体云。前台时段不做：那时连接在页面手里（单控制端互斥），拉不了。
+    // 持有连接**的后台时段，由原生订阅每个在跑任务的对话详情（已验证的取快照
+    // 路径），把最新一行（流式正文 / 正在跑的工具）喂给通知与流体云；每隔
+    // [LIVE_REANCHOR_EVERY_POLLS] 拍重挂一次订阅，逼桌面端再推一份快照——最坏
+    // 也只慢一个重挂周期，不会回到"停在上一轮开头"那种几十分钟级的滞后。
+    //
+    // 不用 conversationRowsRangeV4 拉取：真机实测它**即便在订阅建立之后**仍然
+    // 每次 20s 超时（桌面端根本不回这个包），是条死路。
+    //
+    // 前台时段不做：那时连接在页面手里（单控制端互斥），订不了也拉不了。
     private const val LIVE_PROGRESS_POLL_MS = 12_000L
+
+    /** 每这么多拍重挂一次（12s × 8 ≈ 96s）。 */
+    private const val LIVE_REANCHOR_EVERY_POLLS = 8
 
     @Volatile
     private var livePolling = false
+
+    @Volatile
+    private var livePolls = 0
 
     private val liveProgressThread = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
         Thread(r, "zcode-live-progress").apply { isDaemon = true }
@@ -246,35 +258,27 @@ object ShellRuntime {
                 return
             }
             val refs = store.runningTaskRefs()
-            // 上一轮还没拉完就跳过这一拍：桌面端忙的时候一次拉取可能顶到超时，
-            // 排队的请求只会越积越多。
-            if (refs.isNotEmpty() && !liveFetchInFlight) {
-                liveFetchInFlight = true
+            livePolls += 1
+            if (refs.isNotEmpty()) {
+                val reanchor = livePolls % LIVE_REANCHOR_EVERY_POLLS == 0
                 liveProgressThread.execute {
-                    try {
-                        for ((key, sessionId) in refs) {
-                            // ① 订阅（主通道）：桌面端要先把会话挂到本客户端上才认
-                            //    后续对话 RPC，订阅本身也会立刻推一份 snapshot。
-                            //    每轮都调：桥可能还没开（第一拍总是这样），订阅成功后
-                            //    是幂等空操作，失败就在下一轮自然重试。
-                            Tier2Probe.subscribeProgress(key, sessionId) { _, id, text ->
-                                pushLivePreview(key, id, text)
-                            }
-                            // ② 拉取（补充）：推送稀疏时靠它把尾窗刷新回来。
-                            val text = Tier2Probe.fetchProgress(key, sessionId) ?: continue
-                            pushLivePreview(key, sessionId, text)
+                    if (reanchor) {
+                        Tier2Probe.reanchorProgress()
+                    }
+                    for ((key, sessionId) in refs) {
+                        // 订阅（主通道）：桌面端要先把会话挂到本客户端上才认后续
+                        // 对话 RPC，订阅本身也会立刻推一份 snapshot。每轮都调：
+                        // 桥可能还没开（第一拍总是这样），订阅成功后是幂等空操作，
+                        // 失败就在下一轮自然重试。
+                        Tier2Probe.subscribeProgress(key, sessionId) { _, id, text ->
+                            pushLivePreview(key, id, text)
                         }
-                    } finally {
-                        liveFetchInFlight = false
                     }
                 }
             }
             mainHandler.postDelayed(this, LIVE_PROGRESS_POLL_MS)
         }
     }
-
-    @Volatile
-    private var liveFetchInFlight = false
 
     private fun pushLivePreview(key: String, sessionId: String, text: String) {
         mainHandler.post {

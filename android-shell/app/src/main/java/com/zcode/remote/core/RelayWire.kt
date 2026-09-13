@@ -39,29 +39,26 @@ object RelayWire {
     const val METHOD_RESYNC_SI = "resyncSessionsIndexV4"
 
     /**
-     * 对话详情尾窗（M4，流体云跟手的取数口）。
+     * 对话详情尾窗（**已判定为死路，保留常量只作记录**）。
      *
-     * 请求 `{sessionId, limit}` → 应答 `{rows, atSeq, atLogEpoch, hasMore}`（行结构
-     * 与页面 `onDynamicConversationFrame` 里的行完全同构，见 docs/05 快照
-     * src-DHgFesxz.js 的行联合）。它是**请求-应答**，每次都是一份新的尾窗快照，
-     * 所以原生侧不需要 delta/缺口状态机：取最后一次应答里的最后一行即可，
-     * 这正是不照搬整台 conversation store 的原因。
+     * 请求 `{...workspaceScope, sessionId, limit}` → 应答 `{rows, atSeq, atLogEpoch,
+     * hasMore}`，行结构与 `onDynamicConversationFrame` 里的行完全同构。
+     * 真机实测（pre.84/85/87）：原生侧调用**每次都 20s 超时**，带上 workspace
+     * scope 也一样，订阅建立之后也一样——桌面端就是不回这个包。改用下面的
+     * 订阅通道（[METHOD_SUBSCRIBE_CONV]）取快照，别再回到拉取这条路。
      */
     const val METHOD_ROWS_RANGE = "conversationRowsRangeV4"
-    const val ROWS_RANGE_MAX_LIMIT = 200
 
     /**
-     * 对话详情**订阅**（M4 的主通道）。页面侧同一套：
+     * 对话详情**订阅**（M4 的主通道，已在真机验证）。页面侧同一套：
      * `subscribeConversationV4({...workspaceScope, sessionId, visibility?})` →
      * `ack.subscriptionId`，帧走事件 `onDynamicConversationFrame`（物理信封 →
      * 逻辑帧 `{topic, subscriptionId, fromSeq, toSeq, payload:{kind:'snapshot'|'deltas'}}`；
      * `deltas` 的 op 有 `row.appended` / `row.upserted` / `row.removed` /
      * `row.delta{rowId,path,append}` / `state.updated`）。
      *
-     * 为什么订阅是主通道、拉取只是补充：桌面端对远端的推送稀疏，但**订阅是唯一
-     * 能让桌面端把这份会话"挂到本客户端上"的动作**——真机实测，只开
-     * sessions-index 订阅的桥去调 conversationRowsRangeV4 永远不会回包
-     * （20s 超时），而页面自己在有对话订阅时调同一个方法就正常。
+     * 订阅一建立，桌面端立刻推一份 snapshot（整窗行）——这就是"最新进展"的第一
+     * 手来源；此后靠 `row.delta` 跟进，再由壳侧周期重挂兜住推送稀疏。
      */
     const val EVENT_CONVERSATION_FRAME = "onDynamicConversationFrame"
     const val METHOD_SUBSCRIBE_CONV = "subscribeConversationV4"

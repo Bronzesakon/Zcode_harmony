@@ -95,31 +95,6 @@ object Tier2Probe {
     fun isRunning(): Boolean = phase != Phase.IDLE && phase != Phase.CLOSED
 
     /**
-     * M4：拉一次某任务的对话详情（阻塞，调用方负责放到后台线程）。
-     * 未接管 / 该工作区没有桥 / 调用失败一律返回 null——调用方保留现有文案。
-     * 两种 null 各有一行日志（失败 vs 尾窗里没有可展示的行），排障时能分开看。
-     */
-    fun fetchProgress(workspaceKey: String, sessionId: String): String? {
-        val manager = bridgeManager ?: return null
-        return try {
-            val text = manager.fetchProgress(workspaceKey, sessionId)
-            if (text == null) {
-                if (emptyProgressLogged.add(workspaceKey)) {
-                    Diagnostics.log("debug", "Tier2: $workspaceKey 尾窗暂无可展示进展（保留原文案）")
-                }
-            } else {
-                emptyProgressLogged.remove(workspaceKey)
-            }
-            text
-        } catch (e: Exception) {
-            Diagnostics.log("debug", "Tier2: 拉取对话详情失败（$workspaceKey）: ${e.message}")
-            null
-        }
-    }
-
-    private val emptyProgressLogged = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
-
-    /**
      * M4：订阅某任务的对话详情（**主通道**）→ 回调最新进展文本。
      * 未接管 / 该工作区没有桥时静默无操作（调用方下一轮再试）。
      */
@@ -133,6 +108,16 @@ object Tier2Probe {
             manager.subscribeProgress(workspaceKey, sessionId, onProgress)
         } catch (e: Exception) {
             Diagnostics.log("debug", "Tier2: 订阅对话详情失败（$workspaceKey）: ${e.message}")
+        }
+    }
+
+    /** 周期重挂：逼桌面端再推一份对话快照（推送稀疏时的保险）。 */
+    fun reanchorProgress() {
+        val manager = bridgeManager ?: return
+        try {
+            manager.reanchorProgress()
+        } catch (e: Exception) {
+            Diagnostics.log("debug", "Tier2: 重挂对话订阅失败: ${e.message}")
         }
     }
 

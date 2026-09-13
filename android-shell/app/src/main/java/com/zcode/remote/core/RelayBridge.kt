@@ -246,164 +246,6 @@ class BridgeSession(
         }.start()
     }
 
-    /**
-     * 拉一次对话详情尾窗并取"当前进展"文本（M4：流体云跟手的取数口）。
-     *
-     * 会阻塞（最长 [timeoutMs]），调用方必须放到后台线程。
-     *
-     * 为什么用请求-应答而不是订阅帧：真机实测（2026-09-13，页面侧 `页面开销`
-     * 逐 10s 统计）显示桌面端对远端的**推送是稀疏的**——快照到达之后整段只有
-     * 心跳帧、入站字符数为 0，任务正在流式输出时也一样。会话索引里的 preview
-     * 又只在轮次边界变（它就是"最后一条消息的开头"）。所以"跟手"只能靠主动拉：
-     * 每次拉回一份新的尾窗，取最后一行即可，不需要 delta/缺口状态机。
-     */
-    fun fetchProgressText(sessionId: String, limit: Int = 20, timeoutMs: Long = 20_000): String? {
-        if (closed) return null
-        // 参数必须带 **workspace scope**：页面侧 rowsRange 发的是
-        // `{...workspaceScope, sessionId, beforeRowId?, limit}`（快照 index @547217），
-        // 少 workspacePath 桌面端不会回包——真机 2026-09-13 实测：只发
-        // `{sessionId, limit}` 时每次调用都 20s 超时。
-        val args = JSONObject(scope.toString())
-            .put("sessionId", sessionId)
-            .put("limit", limit.coerceIn(1, RelayWire.ROWS_RANGE_MAX_LIMIT))
-        val result = channels.callBlocking(
-            RelayWire.CHANNEL_CONVERSATION,
-            RelayWire.METHOD_ROWS_RANGE,
-            listOf<Any?>(args),
-            timeoutMs,
-        ) as? JSONObject ?: return null
-        return RelayWire.progressTextFromRows(result.optJSONArray("rows"))
-    }
-
-    // ---------------------------------------------- M4：对话详情订阅（跟手主通道）
-
-    private var convListenerId = -1L
-    private val convAssembler = RelayWire.LogicalFrameAssembler()
-    private val convSubscriptions = ConcurrentHashMap<String, String>()
-    private val convTails = ConcurrentHashMap<String, RelayWire.ConversationTail>()
-    private val convLastText = ConcurrentHashMap<String, String>()
-    private val convAttempting = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
-
-    @Volatile
-    private var convSink: ((String, String, String) -> Unit)? = null
-
-    /**
-     * 订阅某会话的对话详情，并把"最新进展"文本回调出去（会话 id、文本）。
-     *
-     * 这是 M4 的**主通道**：真机实测（pre.84/85）只开 sessions-index 订阅的桥去
-     * 调 `conversationRowsRangeV4` 永远不回包（每次 20s 超时），而页面自己在有
-     * 对话订阅时调同一个方法就正常——桌面端要先把这份会话挂到客户端上，才认
-     * 后续的对话 RPC。订阅本身还会立刻推一份 snapshot（整窗行），所以第一条
-     * 进展不用等。
-     *
-     * 幂等且**可反复调用**：已订阅→立即返回；有在飞的尝试→跳过（避免每 12 s
-     * 的轮询把订阅请求叠起来）；失败后下一轮自然重试（真机踩过：调用方若把
-     * "试过一次"记成终态，第一个轮询拍（桥还没开）就会把该会话永久拉黑）。
-     */
-    fun subscribeConversationProgress(
-        sessionId: String,
-        onProgress: (sessionId: String, text: String) -> Unit,
-    ) {
-        if (closed) return
-        convSink = { _, id, text -> onProgress(id, text) }
-        if (convSubscriptions.containsKey(sessionId)) return
-        if (!convAttempting.add(sessionId)) return
-        installConversationListener()
-        Thread {
-            try {
-                val args = JSONObject(scope.toString()).put("sessionId", sessionId)
-                val result = channels.callBlocking(
-                    RelayWire.CHANNEL_CONVERSATION,
-                    RelayWire.METHOD_SUBSCRIBE_CONV,
-                    listOf<Any?>(args),
-                    30_000,
-                ) as? JSONObject
-                val ack = result?.optJSONObject("ack")
-                val subId = ack?.optString("subscriptionId").orEmpty()
-                if (ack == null || subId.isEmpty()) {
-                    onLogLine("conversation subscribe: no ack.subscriptionId for $sessionId")
-                    return@Thread
-                }
-                convSubscriptions[sessionId] = subId
-                convTails.putIfAbsent(sessionId, RelayWire.ConversationTail())
-                onLogLine("subscribed conversation for $sessionId (${ack.optString("mode")})")
-            } catch (e: Exception) {
-                onLogLine("conversation subscribe failed for $sessionId: ${e.message}")
-            } finally {
-                convAttempting.remove(sessionId)
-            }
-        }.start()
-    }
-
-    /** 必须先注册监听再订阅：ACK 之前到达的帧按 topic 缓冲在桌面端，不怕早发。 */
-    private fun installConversationListener() {
-        if (convListenerId >= 0) return
-        convListenerId = channels.listenEvent(
-            RelayWire.CHANNEL_CONVERSATION,
-            RelayWire.EVENT_CONVERSATION_FRAME,
-            JSONObject(scope.toString()),
-        ) { data -> onConversationWire(data) }
-    }
-
-    private fun onConversationWire(data: Any?) {
-        val frame = convAssembler.acceptEnvelope(data as? JSONObject) ?: return
-        val topic = frame.optString("topic")
-        if (!topic.startsWith("conversation/")) return
-        val subId = frame.optString("subscriptionId")
-        var sessionId: String? = null
-        for ((session, sub) in convSubscriptions) {
-            if (sub == subId) {
-                sessionId = session
-                break
-            }
-        }
-        val id = sessionId ?: return
-        val tail = convTails.getOrPut(id) { RelayWire.ConversationTail() }
-        val payload = frame.optJSONObject("payload") ?: return
-        when (payload.optString("kind")) {
-            "snapshot" -> tail.applySnapshot(payload.optJSONObject("snapshot"))
-            "deltas" -> tail.applyDeltas(payload.optJSONArray("deltas"))
-            else -> return
-        }
-        val text = tail.latestProgressText() ?: return
-        if (convLastText[id] == text) return
-        convLastText[id] = text
-        convSink?.invoke(workspaceKey, id, text)
-    }
-
-    private fun unsubscribeConversations() {
-        for ((session, subId) in convSubscriptions) {
-            try {
-                val args = JSONObject(scope.toString())
-                    .put("subscriptionId", subId)
-                channels.callBlocking(
-                    RelayWire.CHANNEL_CONVERSATION,
-                    RelayWire.METHOD_UNSUBSCRIBE_CONV,
-                    listOf<Any?>(args),
-                    10_000,
-                )
-                onLogLine("unsubscribed conversation for $session")
-            } catch (e: Exception) {
-                // 尽力而为
-            }
-        }
-        convSubscriptions.clear()
-        convTails.clear()
-        convLastText.clear()
-        if (convListenerId >= 0) {
-            try {
-                channels.removeListener(
-                    RelayWire.CHANNEL_CONVERSATION,
-                    RelayWire.EVENT_CONVERSATION_FRAME,
-                    convListenerId,
-                )
-            } catch (e: Exception) {
-                // 关闭路径不再抛
-            }
-            convListenerId = -1L
-        }
-    }
-
     /** 摘监听 + 退订（尽力而为）。 */
     fun closeBridge() {
         if (closed) return
@@ -506,15 +348,6 @@ class BridgeManager(
     }
 
     /**
-     * 拉某工作区的对话详情（M4）。桥不存在/已关/调用失败都返回 null——
-     * 调用方保留现有文案，绝不用空串覆盖。
-     */
-    fun fetchProgress(key: String, sessionId: String, limit: Int = 20): String? {
-        val bridge = bridges[key] ?: return null
-        return bridge.fetchProgressText(sessionId, limit)
-    }
-
-    /**
      * 订阅某工作区的对话详情（M4 主通道）→ 回调"最新进展"文本。
      */
     fun subscribeProgress(
@@ -524,6 +357,17 @@ class BridgeManager(
     ) {
         val bridge = bridges[key] ?: return
         bridge.subscribeConversationProgress(sessionId) { id, text -> onProgress(key, id, text) }
+    }
+
+    /** 周期重挂（见 [BridgeSession.reanchorConversations]）。 */
+    fun reanchorProgress() {
+        for (bridge in bridges.values) {
+            try {
+                bridge.reanchorConversations()
+            } catch (e: Exception) {
+                onLogLine("reanchor conversation failed: ${e.message}")
+            }
+        }
     }
 
     /** relay `data` payload 分发：桥帧 / 桥开启应答 / 工作区列表应答。 */
