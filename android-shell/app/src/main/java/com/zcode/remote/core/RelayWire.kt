@@ -174,7 +174,7 @@ object RelayWire {
         }
     }
 
-    private fun jsonOf(value: Any?): Any = when (value) {
+    private fun jsonOf(value: Any): Any = when (value) {
         is JSONObject -> value
         is Map<*, *> -> {
             val o = JSONObject()
@@ -340,7 +340,8 @@ object RelayWire {
             assembly.fragments[fragmentIndex] = chunk
             if (assembly.received != assembly.fragmentCount) return null
             assemblies.remove(messageSeq)
-            val message = assembly.fragments.reduce { acc, part -> acc + (part ?: ByteArray(0)) }
+            val parts = assembly.fragments.map { requireNotNull(it) { "missing fragment" } }
+            val message = parts.reduce { acc, part -> acc + part }
             if (message.size != assembly.messageBytes) {
                 onLog("rpc message $messageSeq size mismatch")
                 return null
