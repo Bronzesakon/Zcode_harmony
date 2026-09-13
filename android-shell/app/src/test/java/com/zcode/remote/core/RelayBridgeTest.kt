@@ -137,9 +137,7 @@ class RelayBridgeTest {
         assertEquals("/repo/a", update.getString("key"))
         assertEquals("任务一", update.getJSONArray("sessions").getJSONObject(0).getString("title"))
         // ack 已回给桌面端（Initialize 与四步应答都走 rpc-frame 交付）。
-        assertTrue(outbound.any {
-            it.optString("zcode_type") == "rpc-frame-ack" && it.optLong("ackMessageSeq") > 0
-        })
+        assertTrue("desktop must receive rpc-frame-acks, got ${desktop.acks}", desktop.acks.any { it > 0 })
         desktop.deskStop()
     }
 
@@ -162,9 +160,12 @@ class RelayBridgeTest {
         val desktop = ManagerDesktop(outbound, manager, workspaces)
         desktop.mgrStart()
         manager.beginCoverage(workspaces)
-        assertTrue("one healthy workspace must stream", updatesLatch(updates, 1).await(15, TimeUnit.SECONDS))
+        assertTrue(
+            "one healthy workspace must stream; logs=$logs",
+            updatesLatch(updates, 1).await(15, TimeUnit.SECONDS),
+        )
         assertEquals("/repo/healthy", updates.first().getString("key"))
-        assertTrue(logs.any { it.contains("bridge open failed for /repo/broken") })
+        assertTrue("the failing workspace must be logged, got $logs", logs.any { it.contains("bridge open failed for /repo/broken") })
         desktop.mgrStop()
         manager.disposeEverything("test end")
     }
@@ -178,11 +179,16 @@ class RelayBridgeTest {
         private val assembler = RelayWire.FrameAssembler("br-1")
         private val stop = AtomicBoolean(false)
         private var repliedSubscribe = false
+        val acks = ConcurrentLinkedQueue<Long>()
         private val thread = Thread {
             while (!stop.get()) {
                 val payload = outbound.poll()
                 if (payload == null) {
                     Thread.sleep(5)
+                    continue
+                }
+                if (payload.optString("zcode_type") == "rpc-frame-ack") {
+                    acks.add(payload.optLong("ackMessageSeq"))
                     continue
                 }
                 if (payload.optString("zcode_type") != "rpc-frame") continue

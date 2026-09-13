@@ -312,13 +312,24 @@ class BridgeManager(
             for (workspace in workspaces) {
                 if (Thread.currentThread().isInterrupted) return@Thread
                 if (opened >= maxWorkspaces) break
+                var bridge: BridgeSession? = null
                 try {
-                    val bridge = openBridgeBlocking(workspace) ?: continue
-                    bridge.runHandshake()
+                    bridge = openBridgeBlocking(workspace) ?: continue
+                    // 必须先注册再握手：四步握手的应答帧经 acceptRelayPayload
+                    // 按 idToKey→bridges 路由回来，注册晚了会全部落空（超时）。
                     bridges[bridge.workspaceKey] = bridge
+                    bridge.runHandshake()
                     opened += 1
                     onLogLine("bridge ready for ${bridge.workspaceKey} (${bridge.bridgeSessionId})")
                 } catch (e: Exception) {
+                    if (bridge != null) {
+                        bridges.remove(bridge.workspaceKey)
+                        try {
+                            bridge.closeBridge()
+                        } catch (closeError: Exception) {
+                            // 关闭路径不再抛
+                        }
+                    }
                     onLogLine("bridge open failed for ${workspace.optString("workspacePath")}: ${e.message}")
                 }
                 try {
