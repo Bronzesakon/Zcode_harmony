@@ -174,7 +174,8 @@ object RelayWire {
         }
     }
 
-    private fun jsonOf(value: Any): Any = when (value) {
+    private fun jsonOf(value: Any?): Any = when (value) {
+        null -> JSONObject.NULL
         is JSONObject -> value
         is Map<*, *> -> {
             val o = JSONObject()
