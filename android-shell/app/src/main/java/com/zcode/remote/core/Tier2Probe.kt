@@ -99,6 +99,22 @@ object Tier2Probe {
      *   且配对成功后启动桥覆盖 + 断线自动重连）。
      */
     fun start(newCreds: RelayCreds, durationMs: Long = 60_000L) {
+        startInternal(newCreds, durationMs, takeoverOverride = null)
+    }
+
+    /**
+     * 真机验证用：接管语义（开覆盖 + 重连）跑固定时长后自动交还，
+     * 让 `tier2_takeover` 诊断指令能在不依赖"后台判死"的情况下验证 M3b/c。
+     */
+    fun startTakeoverForTest(autoStopMs: Long) {
+        val c = creds ?: run {
+            Diagnostics.log("warn", "Tier2: 凭证未就绪，无法启动接管验证")
+            return
+        }
+        startInternal(c, durationMs = -1L, takeoverOverride = autoStopMs)
+    }
+
+    private fun startInternal(newCreds: RelayCreds, durationMs: Long, takeoverOverride: Long?) {
         if (isRunning()) {
             Diagnostics.log("warn", "Tier2: 已在运行（phase=$phase），忽略重复启动")
             return
@@ -115,7 +131,16 @@ object Tier2Probe {
             "Tier2: 启动原生直连探针（${if (persistent) "接管模式" else "duration=${durationMs / 1000}s"}，凭证仅内存）",
         )
         connectNow()
-        if (durationMs > 0) {
+        if (takeoverOverride != null) {
+            durationTimer = java.util.Timer(true).apply {
+                schedule(
+                    object : java.util.TimerTask() {
+                        override fun run() = stop("接管验证到点")
+                    },
+                    takeoverOverride,
+                )
+            }
+        } else if (durationMs > 0) {
             durationTimer = java.util.Timer(true).apply {
                 schedule(
                     object : java.util.TimerTask() {

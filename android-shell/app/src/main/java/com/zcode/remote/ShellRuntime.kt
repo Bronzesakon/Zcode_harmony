@@ -366,6 +366,11 @@ object ShellRuntime {
         Tier2Probe.stop("手动停止")
     }
 
+    /** 诊断指令 tier2_takeover：接管语义（桥覆盖 + 会话事件）跑固定时长后自动交还。 */
+    fun startTier2TakeoverForTest(autoStopMs: Long = 90_000L) {
+        Tier2Probe.startTakeoverForTest(autoStopMs)
+    }
+
     fun evaluateJs(script: String) {
         val evaluator = jsEvaluator
         if (evaluator == null) {

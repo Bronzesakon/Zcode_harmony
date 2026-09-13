@@ -763,6 +763,11 @@ class MainActivity : AppCompatActivity() {
                 ShellRuntime.stopTier2Probe()
                 return
             }
+            "tier2_takeover" -> {
+                // 接管语义验证：配对 → 桥覆盖 → 原生解码会话事件 → 自动交还。
+                ShellRuntime.startTier2TakeoverForTest(90_000L)
+                return
+            }
         }
         pendingDiag = cmd
         diagAttempts = 0
