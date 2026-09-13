@@ -830,37 +830,70 @@ android-shell/
 
 ### 一句话状态
 
-`pre` @ `538f67d`；**最后一个改动 `app/` 的提交是 `538f67d`**（标题回退自动恢复），
-CI 全绿，滚动预发布直链已含它；真机装的是 **`1.0.0-pre.50`**（**不含此功能**，验收需覆盖安装）。
+`pre` @ `8a3dfe7`（**本地已提交；本轮最后一次 `git push` 被本机 TLS 抖动挡下，可能还没上远端**
+——以 `git rev-parse --short origin/pre` 为准，若不是 `8a3dfe7` 就先重试推送）。
+真机装的是 `1.0.0-pre.90`，**不含最后一版「订阅顺序」修复**（要装机才能验，见下）。
+本轮把三件事从机制上重做（旧实现全部作废）：
 
-本轮（第九轮，过夜长任务）从 `a3a57f5` 起共 **27 个提交**，每次推送都触发过 CI（其中三轮失败：
-资源链接、测试里的 `const`、动态配色 lambda 元数——都按 CI 报错修好后转绿）。
-**用户给的 11 条改动/取证要求全部交付并真机验收**（清单与证据见晨间报告）：
-去应用栏 + 状态栏三态动态取色、顶部避让 / 底部沉浸、MiuiX 设置页、长按快捷方式（官方图标）、
-通知标题 `状态 · 任务名`、完成卡片、fault 收敛 3×→1×。
+| 需求 | 机制 | 真机验证 |
+| --- | --- | --- |
+| 进任务详情 **5 s 内没出对话详情就刷新**（用户拍板的铁判准） | 双入口信标（页面自己的 `subscribeConversationV4`/`conversationRowsRangeV4` RPC + 对话视图 DOM 标记）→ 5 s 到点看「页面自述就绪」（`store.connect.completed` / 订阅确认 / 时间线有行 / 信标后桥有入站帧），没有就**直接** reload（不再走"轻推"那一档）；15 s 最小间隔 + 2 次上限只作终止性；**判定窗不被重试顺延** | ✅ 点进任务 → 5 s 未就绪 → 刷新 → 重载后 1.65 s 内容就绪；热打开不刷（日志逐条可对） |
+| 切后台**直接原生接管连接**并持续把对话详情推到流体云 | 退后台 5 s（宽限）→ 原生接管（relay 单控制端互斥，页面必然被顶掉）→ 原生 `subscribeConversationV4` 订阅在跑任务的对话（**必须在索引订阅之前**，见下），解码 snapshot/deltas 取"最新一行"→ 覆盖通知/流体云文案；每 4 拍（≈48 s）重挂一次订阅逼桌面端再推快照 | ⚠️ **部分验证**：18:35 那次订阅成功并解出「正在执行 Bash」；**20:0x 复测全是 30 s 超时**（根因＝顺序错，已修但未装机）。刷新率由重挂周期决定（桌面端首屏后不推帧） |
+| 原生接管把页面顶掉后不能留 KICKED 终态 | 注入层识别 relay 的 `{type:'error',code:'KICKED'}`；在后台被顶就记一笔，回前台 1.5 s 后自动重载页面（等原生交还槽位），配对成功清零、上限 2 次 | ✅ 回前台 → 1.5 s 重载 → 3 s 内重新配对，无 KICKED 残留 |
+
+### 下一步（新会话第一件事）
+
+1. `git push origin pre`（TLS 抖动就重试）→ `python tools/watch_ci.py --watch` 等绿 →
+   下载覆盖安装（直链 `…/releases/download/android-pre/zcode-remote.apk`，先对 `.md5`）。
+2. **验订阅顺序**：退后台触发接管，日志里应看到
+   `subscribed conversation for sess_… (snapshot, 帧已收 N 个)` **紧挨在** `subscribed sessions-index for …` 之前；
+   若又是 `conversation subscribe failed … timed out` → 顺序修复没生效或假设仍不完整，
+   下一招是**把对话订阅放到独立第二座桥**（那座桥不订阅索引，dispose 时一起关）。
+3. **验流体云真跟手**（判据必须三条同时成立，别再看单一信号）：
+   每 ~40 s 采样一次 `python tools/notif_dump.py`，同时 `date` ——
+   `android.text` 变了 **且** `when` 与系统时间对齐 **且** 与本刻实际动作对得上。
+   已知**会骗人的信号**：`when` 前进（任何 store 更新都会重发通知，正文可能仍是冻结的 live preview）。
+4. 回前台看 `KICKED 自愈：1.5s 后重载页面` + 3 s 内 `relay socket open` 重新配对。
+
+### 本轮用真机换来的四条硬事实（别再重新发现）
+
+1. **`subscribeConversationV4` 必须早于 `subscribeSessionsIndexV4`**（同一座桥）。
+   两次日志对照：18:35 对话订阅抢在索引订阅前发出 → 立刻 ACK(snapshot)；
+   20:0x 索引订阅先发 → 同一座桥上对话订阅**永远不回包**（每 36 s 重试、连续 12 分钟全超时）。
+   索引订阅带 `runtimePolicy: existing-only`，看把这座桥的 runtime 钉成了索引用途。
+   修法：握手在 `hello/initialize` 之后**同步地**先订对话（`runningSessionsProvider` 注入在跑会话），再订索引。
+2. **`conversationRowsRangeV4` 在原生侧是死路**：带 workspace scope、订阅建立之后，
+   调用仍然每次 20 s 超时。已从轮询里删掉，常量留在 `RelayWire` 只作记录。
+3. **桌面端在首屏快照之后一个帧都不推**（pre.87 实测 73 分钟零帧）。所以"跟手"只能靠
+   **周期重挂订阅**（退订+重订阅逼一份新 snapshot），刷新率＝重挂周期。
+4. **`KICKED` 是 relay 的 `error` 帧**（`{type:'error', code:'KICKED'}`），
+   页面收到即进终态页且不自愈；行结构在 `docs/05` 快照的 `src-DHgFesxz.js`。
+
+### 写给自己：本轮的两次误报（别重复）
+
+本轮我先报"原生接管跑通"、又报"重挂生效"，两次都被用户当场用日志打回：
+第一次只凭 `活进展 … 正在执行 Bash` 一行（那是一小时前那份快照）就下结论；
+第二次把 `when` 前进当成内容刷新（其实任何 store 更新都会重发通知）。
+**规矩**：涉及"流体云在跟手"的结论，必须在同一时刻同时核对 `android.text`、`when` 与系统时间，
+再回日志找对应的那一拍；只凭单一信号一律不算验过。
 
 ### 未结项（按优先级，按这个顺序做）
 
-1. **标题回退/内容不加载：两级直刷已实现，待真机验收**。口径（用户定）：进对话信标
-   （subscribe 或 rows-range）后 **+3s 查 DOM**——状态 A 头部回退「新建任务」、状态 B 输入框灰/禁用
-   → 直接刷新；**+10s 查协议**——信标后页面桥零入站帧（17:29 实录证明存在"标题正确+输入框可用+
-   内容不来"的形态，DOM 判不出，只能看流量）→ 刷新。唯一保留 15s 最小间隔（防死循环的终止性必需）。
-   验收：覆盖安装最新 pre → 冷状态首次打开会话 → 正常 9–22s 自愈不触发；卡住则 3s/10s 刷新 + 日志
-   `进对话 3s 未就绪（…）` / `进对话 10s 内容零下发…`。桌面端拒答 `readSession` 的根因（调研报告 §八）仍待那边回答。
-   **同窗口第二次报障：上传卡 0% 复发**（13:20 桌面重启后 4 小时内复发）——日志窗口内没有上传尝试，
+1. **【先做】** 推送 + 装机复验「订阅顺序」修复与流体云跟手，见上面「下一步（新会话第一件事）」
+   第 1–4 步。**当前 R2 只算部分验证**：注入层侧的就绪判据与接管触发都已真机验过，
+   但"流体云持续跟手"这一条在 pre.90 上复测失败（订阅超时），修复未装机。
+2. **上传卡 0% 复发过一次**（13:20 桌面重启后 4 小时内），日志窗口内没有上传尝试——
    需要一份**包含完整上传链路**的日志（清日志 → 试传 → 等 1 分钟 → 导出）。
-2. **「已完成」卡片尚未被一次真实完成触发**（`已完成 · 任务名`，15 秒自动收）。
+   桌面端拒答 `readSession` 的根因（调研报告 §八）仍待那边回答。
+3. **「已完成」卡片尚未被一次真实完成触发**（`已完成 · 任务名`，15 秒自动收）。
    机制与 C1 出卡同一条 promoted 路径、单测钉住；要看现场就等一次任务完成，看
    `dumpsys notification --noredact` 里标题以「已完成 · 」开头的记录 + 日志 `任务完成: …`。
-3. **键盘上抬本轮没重测**。上一轮已真机验证并结案；本轮只把「键盘弹起时」的底部内边距从
-   `max(系统栏,键盘)` 改成 `键盘`，而键盘弹起时 `ime.bottom ≥ bars.bottom` 恒成立，数值与旧行为一致。
-   用户若要求补测再做（进会话 → 点输入框 → 看页面是否上抬）。
-4. **08:11 一次瞬时现象**：网页显示「运行中」但壳侧没有运行中卡片，08:20 重启进程后又有。
-   已加 `工作区相位 …` 取证行（实测 `running×1`，说明分类没错）。**下次再遇到再查**，
-   看 `工作区相位` + `订阅状态` 两行即可区分"帧没到"还是"到了没发通知"。
-5. 「项目现状」里其余从未验证过的项：悬浮弹窗的四条 `dumpsys`（已知问题 A）、
-   上传链路与通知细节（P4）。**流体云出卡（P3）已结案**：真机截图确认出卡 + 状态栏芯片。
-6. 正式版 tag 命名空间：安卓 `tags: ['v*']` 与鸿蒙版共用，建议改 `android-v*`——**待用户点头**。
+4. **后台长测（一直没做）**：熄屏过夜，看原生泵与重挂在系统挂起后是否仍成立
+   （熄屏后 ColorOS 是否连原生也挂起还没测——若被挂起，接管的重连会断）。
+5. **键盘上抬本轮没重测**（上一轮已真机验证并结案，本轮只改了键盘弹起时的底部内边距，数值与旧行为一致）。
+6. **08:11 一次瞬时现象**：网页显示「运行中」但壳侧没有运行中卡片，08:20 重启进程后又有。
+   已加 `工作区相位 …` 取证行（实测 `running×1`，说明分类没错）。**下次再遇到再查**。
+7. 正式版 tag 命名空间：安卓 `tags: ['v*']` 与鸿蒙版共用，建议改 `android-v*`——**待用户点头**。
 
 ### 已完成（本轮，别再重做）
 
@@ -907,7 +940,7 @@ cd android-shell
 python tools/check_kotlin_structure.py     # 一秒：括号配平 / 包名与目录一致 / 合并残留
 python tools/check_resources.py            # 一秒：每个 @type/name 是否都有定义
 node --test                                # 68 项（protocol + inject）
-python tools/watch_ci.py --watch           # 匿名读 CI 状态与编译错误注解
+python tools/watch_ci.py                   # 匿名读 CI 状态与编译错误注解（单次读取；失败/取消时退出码非 0）
 bash tools/device_check.sh                 # 真机一键验收（取包→装→清日志→跑→打印全部判据）
 ```
 
@@ -955,74 +988,86 @@ inject.js 现供给 sink，原生日志出 `页面: …` 行；
 **测试点（adb 驱动）**：`am start -a com.zcode.remote.action.DIAG --es diag_cmd kick_test|l1_test|vitals`——
 kick_test = Tier2 可行性实验（同凭证开第二条 WebSocket，观察 relay 的 KICK/takeover 语义，旧连接是否被踢），
 l1_test = 手动轻推，vitals = DOM 体征快照。JS 68 项测试全绿（快刷 6 项按看门狗语义重写）。
-### 本轮（第十一轮）目标：Tier2 原生直连——渲染器死了监控也不能断
+**第十一轮（2026-09-13 白天）**：Tier2 原生直连（M1 探针 / M2 生命周期 / M3a 线协议 / M3b 桥引擎 /
+M3c 事件解码 / 静默看门狗）落地并 CI 全绿，真机端到端在 16:05 自然跑通一次
+（`Tier2: ★接管配对成功（matched）` → 桥覆盖 2 个工作区）。
 
-**为什么**：Tier1（共享页面 socket + 注入层）在渲染器被冻结/杀死时整层失效；更糟的是
-**判死信号也来自那一层**，所以连"该接管了"都感知不到（2026-09-13 真机现场：熄屏后日志与
-流体云双双定格、进程 FGS 存活、电池策略并未被重置）。Tier2 = 原生自己连 relay、自己开桥、
-自己解码任务事件，全程不经 WebView。
+**第十二轮即本轮（2026-09-13 傍晚，本机时间线）**：用户三条硬要求 + 一次现场事故，全部按机制重做。
+事故与根因见「本轮目标」；结论一句话：**桌面端对远端的推送是稀疏的**（页面拿到快照后整段只有心跳帧、
+入站字符数为 0；对话订阅在首屏快照之后 73 分钟零帧），所以"跟手"只能靠**主动重挂**，
+而"判死"只能认**渲染器不答话**（认链路静默会把活页面踢死，16:05 就是这么断的）。
 
-**已完成（pre.53→pre.60，全部 CI 绿）**
+### 本轮（第十二轮）目标：三件事都从机制上重做
 
-| 里程碑 | 内容 | 关键提交 |
-|---|---|---|
-| M1 探针 | WSS + HMAC 质询应答配对（算法与页面逐字对齐，golden 向量入单测）；**KICK 语义定案：配对层面单控制端互斥，并行不可行** | `f093b8c` 之前 |
-| M2 生命周期 | 接管触发（Tier1 判死 + 桌面在线门）+ 前台交还 | `bd72358` `40d3e77` |
-| M3a 线协议 | `core/RelayWire.kt`：值编解码 / varint / CRC32 / rpc-frame 分片重组 / ChannelClient body（golden 对照） | `22ff5ba`→`4aa54a9` |
-| M3b 桥引擎 | `core/RelayBridge.kt`：Initialize 门控、promise 配对、四步握手、resync、Initialize-先于-ready 竞态缓冲 | `09a2d89` `6a1dcbe` |
-| M3c 事件解码 | `core/SessionsIndexState.kt`：快照 / deltas / 缺口重同步 → 与注入层 `post('sessions')` 同构的更新 → `ShellRuntime.acceptNativeSessions` → 通知与流体云 | 同上 |
-| 静默看门狗 | 常驻原生看门狗（5s 一跳）+ 25s 判死窗 + `userIsAway`（后台**或熄屏**）+ 桌面在线门 | `7ceeadd` `1701e2c` |
+| # | 用户要求 | 关键设计（别再退回旧实现） | 关键提交 |
+| --- | --- | --- | --- |
+| 1 | 进任务详情 **5 s 内加载不出对话详情（铁判准）直接触发页面刷新** | 双信标（RPC + DOM 视图）起窗；到点看**页面自述的就绪证据**，没有就直接 reload；**窗口不被重试顺延**（旧写法被页面每 10 s 的重试一路拖到 ~9 s 才刷） | `a73656c` `4f6bea3` `4168acd` |
+| 2 | 切后台**直接原生接管连接**，继续获取对话详情推送到流体云 | 退后台 5 s 宽限 → 原生接管（页面必被顶，KICK 互斥）→ 原生订阅对话详情（snapshot + deltas → "最新一行"）→ 覆盖通知/流体云；**对话订阅必须早于索引订阅**（`8a3dfe7` 把顺序写死） | `aa519b2` `ca152d7` `6671de5` `aa41734` `0ede853` `48031eb` `8a3dfe7` |
+| 3 | 接管后页面停在 **KICKED 终态**（用户当场指出的问题） | 注入层识别 relay `{type:'error',code:'KICKED'}` → 后台被顶就记一笔 → 回前台 1.5 s 后自动重载页面（等原生交还槽位） | `a73656c` |
 
-**未竟（按此顺序做）**
+**接管触发判据（一次真机事故换来的）**：只认「原生多久没收到注入层 liveness」。liveness 由原生泵每 10 s
+用 `evaluateJavascript` 驱动，渲染器冻结/被杀即整段停摆；**链路静默不算判死**——桌面端安静不等于我们瞎了，
+接管同样拿不到帧，代价却是把页面顶掉（16:05 那次误判让流体云断供一小时）。
 
-1. **真机端到端验证 M3b/c —— 唯一未验项**。装最新 pre 包后：
-   ```bash
-   ADB="C:/Program Files/UotanToolbox/Bin/platform-tools/adb.exe"; S="3B6F5RE8GCL3LYY7"
-   MSYS_NO_PATHCONV=1 "$ADB" -s "$S" shell "am start -f 0x20000000 -n com.zcode.remote/.MainActivity      -a com.zcode.remote.action.DIAG --es diag_cmd tier1_silence_test"
-   ```
-   期望日志依次（拉回本地读，设备端 grep 中文会碎）：
-   `Tier1 静默测试：强制判死并立即巡检` → `Tier2: 用户已离开且 Tier1 判死（静默 Ns），原生接管配对与任务事件`
-   → `Tier2: ★接管配对成功（matched）` → `workspace list: N` → `bridge ready for <key>` ×N
-   → `[<key>] subscribed sessions-index for <key>` → **`工作区相位 <key>：…`（原生解码的铁证）**。
-   同时流体云应继续更新：`dumpsys notification --noredact | grep -A3 'id=202385'` 看 text 变化。
-   验完回前台，期望 `Tier2: 前台交还完成` + 页面恢复（必要时 `ACTION_RELOAD` 兜底）。
-   **两条同时成立才算通过**：原生 `工作区相位` 在涨 **且** 页面侧 `页面: …` 已停（页面确实被顶掉）。
-2. 通过后做接管的生产化收尾评审：接管期间通知/流体云文案是否标注"原生接管中"；
-   `userAway` 是否需要额外反例（投屏/车机等"亮屏但没人看"的场景）。
-3. **后台长测（一直没做）**：熄屏过夜，看 `后台链路静默 Ns` 是否出现、流体云是否跟手、
-   Tier2 是否按预期接管与交还。
-4. 并发会话留的 `lastPairStatus` 半成品（注入层赋值但变量未声明，直接编译会炸）：
-   补丁在 `/tmp/concurrent-pair-status.patch`，等那边补完声明并接上消费者再合入。
+**M4 取数通道的真机结论（照抄别再试错）**：
+* `conversationRowsRangeV4`（拉取）**原生侧永远超时**（每次 20 s，带上 workspace scope、订阅建立之后也一样）
+  → 已从轮询里删掉，常量留在 `RelayWire` 只作记录；
+* `subscribeConversationV4`（订阅）**可用，但有顺序要求**：`{...workspaceScope, sessionId}` + 先注册
+  `onDynamicConversationFrame` 监听再订阅 → ACK 带 `subscriptionId`，随即推一份 `snapshot`
+  （行窗口 → `RelayWire.ConversationTail` 取"最新一行"：`assistantText.text`（超长留尾巴）/ 正在跑的 `toolCall` / 跑着的 `subagent`）；
+  **但它必须发在 `subscribeSessionsIndexV4` 之前**——索引订阅先上桥之后，同一座桥上的对话订阅
+  永远不回包（20:0x 实测：每 36 s 重试、连续 12 分钟全超时；18:35 成功那次纯属轮询线程抢到了正确顺序）。
+  `8a3dfe7` 把顺序写死：握手在 `hello/initialize` 之后同步先订对话（`runningSessionsProvider` 注入在跑会话），再订索引；
+* 此后桌面端**不再推帧**（73 分钟零帧实测）→ 每 4 拍（≈48 s）**重挂订阅**（退订+重订阅）逼一份新快照，
+  这是"跟手"的唯一来源。诊断行：`活进展 <key>：<文本>`、`subscribed conversation for … (帧已收 N 个)`、
+  `reanchor conversation for … (距上次共收 N 个帧)`。
 
-**当前状态（2026-09-13 傍晚）**
-- `pre` HEAD = `1f1d55c`，CI 全绿（js / build+单测 / prerelease）。
-- 真机（USB `3B6F5RE8GCL3LYY7`、无线 `192.168.0.185:33633`）机上还是 `1701e2c` 包，
-  **`1f1d55c` 未装机**——做第 1 项前先装机。
-- 诊断指令全集（统一 `am start -f 0x20000000 -n com.zcode.remote/.MainActivity -a com.zcode.remote.action.DIAG --es diag_cmd <cmd>`）：
-  `vitals`｜`l1_test`（轻推 socket）｜`kick_test`（第二条 WS 观察 KICK）｜`degrade_test`（已否决的 B 路线）｜
-  `tier2_test`（配对+覆盖 60s）｜`tier2_stop`｜`tier2_takeover`（接管 90s 自动交还）｜
+### 未竟（按此顺序）
+
+1. **顺序修复（`8a3dfe7`）的真机复验**——这是本轮唯一没验完的一条，判据与步骤见上面
+   「下一步（新会话第一件事）」。**关键**：别再只看 `when`；要 `android.text` 变化 + `when` 与
+   系统时间对齐 + 与本刻实际动作对得上，三条同时成立才算跟手。
+2. 后台长测（一直没做）：熄屏过夜，看重挂周期在系统挂起后是否仍成立（原生泵在后台是活的，
+   但**熄屏后 ColorOS 是否连原生也挂起**还没测——若被挂起，Tier2 的重连会断，需要在设置里
+   放开电池白名单后复测）。
+3. 接管生产化收尾：接管期间通知/流体云是否标注"原生接管中"；`userAway` 是否需要额外反例（投屏/车机）。
+4. 并发会话留的 `lastPairStatus` 半成品（注入层赋值但变量未声明）：补丁在 `/tmp/concurrent-pair-status.patch`。
+5. 旧的未结项仍在：完成卡片未被真实完成触发过、键盘上抬未重测、08:11 瞬时现象、
+   正式版 tag 命名空间 `android-v*`（待用户点头）。
+
+### 当前状态（2026-09-13 21:00 前后，本轮收尾）
+
+- 本地 `pre` HEAD = `8a3dfe7`（本轮 11 个提交）；**远端 `origin/pre` 停在 `48031eb`**——
+  最后一次推送被本机 TLS 抖动挡下，**先重试 `git push origin pre`**。
+- 真机装 `1.0.0-pre.90`（＝`48031eb`），**不含 `8a3dfe7` 的订阅顺序修复**；装机后在跑验证。
+- 已装机并真机验过的：R1 铁判准刷新的正向路径、R3 KICKED 自愈、R2a 退后台 5 s 接管与桥覆盖。
+- **未验**：修复后的对话订阅能否稳定回包、流体云是否真的跟手（判据见「下一步」）。
+- **诊断指令全集**（统一 `am start -f 0x20000000 -n com.zcode.remote/.MainActivity -a com.zcode.remote.action.DIAG --es diag_cmd <cmd>`）：
+  `vitals`｜`l1_test`（轻推 socket）｜`kick_test`（第二条 WS 观察 KICK）｜`degrade_test`｜
+  `tier2_test`（配对+覆盖 60 s）｜`tier2_stop`｜`tier2_takeover`（接管 90 s 自动交还）｜
   `tier1_silence_test`（强制判死，走静默接管路径）。
+- 真机取数命令（本机专属）：`MSYS_NO_PATHCONV=1 "$ADB" -s 3B6F5RE8GCL3LYY7 exec-out cat …/zcode-shell.log > x.log`
+  （设备端 grep 中文会碎）；流体云现状用 `python tools/notif_dump.py`（打印 title/text/`when`）。
 
 ### 工作环境（新会话必读）
 
 - **本机没有 JDK / Android SDK：编译与单测只能靠 CI。** 任何 Kotlin/资源改动 =
   `git push origin pre` → CI（js 静态检查 + `:app:testReleaseUnitTest` + APK）→
   滚动预发布 `android-pre`（固定直链 `…/releases/download/android-pre/zcode-remote.apk`，
-  下载覆盖安装即最新）。**本地无法编译，类型/语法错误只能等 CI 回报。**
-- **本地能跑的检查**：`node --test`（69 项，JS 协议与注入）、
-  `python tools/check_kotlin_structure.py`（括号配平 / 包名 / 同文件重名——**不同嵌套类里的同名
-  fun 也会被点名**，`override fun` 豁免）、`python tools/check_resources.py`；
-  读 CI 用 `python tools/watch_ci.py`（含 `e:` 注解行）。
-- **网络**：本机到 github.com 间歇性 TLS 失败（`git push`、API 都要重试循环）；
+  下载覆盖安装即最新）。**本地无法编译**——本轮 3 次 CI 失败全是本地看不到的类型错误
+  （可空接收者、误删方法后的 Unresolved reference），push 前务必把改动的 Kotlin 通读一遍。
+- **本地能跑的检查**：`node --test`（73 项）、`python tools/check_kotlin_structure.py`
+  （括号配平 / 包名 / 同文件重名——**不同嵌套类里的同名 fun 也会被点名**，改名即可）、
+  `python tools/check_resources.py`；读 CI 用 `python tools/watch_ci.py`（含 `e:` 注解行；
+  单次读取，退出码 0=全绿、1=失败/取消/零 job/`--watch` 超时，**`--watch` 长驻会被宿主取消**）。
+- **网络**：本机到 github.com 间歇性 TLS 失败（`git push`、API、下载都要重试循环）；
   `api.github.com` 匿名限流 60/h ——优先用 `watch_ci.py`。
-- **设备侧**：`MSYS_NO_PATHCONV=1` + 显式 `-s <serial>`；日志在
-  `/sdcard/Android/data/com.zcode.remote/files/logs/zcode-shell.log`，用 `exec-out cat` 拉回本地读
-  （设备端 grep 中文会碎）；进程死因看 `dumpsys activity exit-info com.zcode.remote`；
-  流体云内容看 `dumpsys notification --noredact`（`id=202385`）。
-- **K2 编译坑（本轮踩过）**：CI 的 Kotlin 编译器不接受把 `try{}catch{}` 直接当 `return` 操作数
-  （报 "Unexpected token" / "Return type mismatch: expected Boolean, actual Any"），
-  改成朴素 `if` + `return` 即过。
-- **org.json 坑**：JVM（maven 包）与 Android 的序列化行为不一致（转义差异），
-  故 `RelayWire` 的 JSON tag 编码用自写 writer（JS `JSON.stringify` 语义），不依赖 org.json。
-- **工作区纪律**：只 stage `android-shell` 自己的改动（`git add android-shell` 子树）；
-  并发会话会动 `inject.js`（见未竟第 4 条），提交前先看 `git diff` 里有没有别人的半成品。
+- **设备侧**：`MSYS_NO_PATHCONV=1` + 显式 `-s <serial>`（USB `3B6F5RE8GCL3LYY7`）；日志在
+  `/sdcard/Android/data/com.zcode.remote/files/logs/zcode-shell.log`；进程死因看
+  `dumpsys activity exit-info com.zcode.remote`；流体云看 `dumpsys notification --noredact`。
+- **端口/坐标**：无线调试端口每次都变（mDNS 现取）；点 WebView 内容前先
+  `adb_ui_find`/`uiautomator dump` 拿真实 bounds，别按渲染图估（会偏约 1.4 倍）。
+- **`conversationRowsRangeV4` 是死路**、**`KICKED` 是 relay 的 `error` 帧**、
+  **对话行结构在 `docs/05` 快照的 `src-DHgFesxz.js`**——这三条别再重新发现一遍。
+- **工作区纪律**：只 stage `android-shell` 自己的改动（`git add android-shell/app ...`）；
+  并发会话会动 `entry/src/main/ets/pages/Index.ets` 与 `docs/`（提交前先看 `git diff`）。

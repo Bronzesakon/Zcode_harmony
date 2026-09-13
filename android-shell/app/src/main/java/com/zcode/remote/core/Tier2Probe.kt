@@ -95,17 +95,27 @@ object Tier2Probe {
     fun isRunning(): Boolean = phase != Phase.IDLE && phase != Phase.CLOSED
 
     /**
-     * M4：订阅某任务的对话详情（**主通道**）→ 回调最新进展文本。
-     * 未接管 / 该工作区没有桥时静默无操作（调用方下一轮再试）。
+     * M4：对话进展的出口（ShellRuntime 注入：工作区键、会话 id、文本）。
+     * 接管开始时挂上，桥把"最新一行"解出来就回调到这里。
      */
-    fun subscribeProgress(
-        workspaceKey: String,
-        sessionId: String,
-        onProgress: (workspaceKey: String, sessionId: String, text: String) -> Unit,
-    ) {
+    @Volatile
+    var progressSink: ((workspaceKey: String, sessionId: String, text: String) -> Unit)? = null
+
+    /**
+     * M4：某工作区当前在跑的会话（ShellRuntime 注入）。握手时用它把对话订阅
+     * **抢在索引订阅之前**发出去——顺序错了桌面端就永远不回包（见 runHandshake）。
+     */
+    @Volatile
+    var runningSessionsProvider: ((workspaceKey: String) -> List<String>)? = null
+
+    /**
+     * M4：订阅某任务的对话详情。未接管 / 该工作区没有桥时静默无操作
+     * （调用方下一轮再试）。阻塞，调用方自己保证在后台线程。
+     */
+    fun subscribeProgress(workspaceKey: String, sessionId: String) {
         val manager = bridgeManager ?: return
         try {
-            manager.subscribeProgress(workspaceKey, sessionId, onProgress)
+            manager.subscribeProgress(workspaceKey, sessionId)
         } catch (e: Exception) {
             Diagnostics.log("debug", "Tier2: 订阅对话详情失败（$workspaceKey）: ${e.message}")
         }
@@ -240,6 +250,14 @@ object Tier2Probe {
                 }
             },
             onLogLine = { line -> Diagnostics.log("debug", line) },
+            progressSink = { key, sessionId, text ->
+                try {
+                    progressSink?.invoke(key, sessionId, text)
+                } catch (e: Exception) {
+                    Diagnostics.log("warn", "Tier2: 活进展回调失败 ${e.message}")
+                }
+            },
+            runningSessions = { key -> runningSessionsProvider?.invoke(key).orEmpty() },
         )
         bridgeManager = manager
         Thread {

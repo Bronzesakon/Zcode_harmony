@@ -174,7 +174,7 @@ class BridgeSession(
      * 四步握手（阻塞，跑在专属线程）：hello → initialize(clientHello) →
      * subscribe → listen。任何一步失败抛 WireException，由管理器记日志跳过。
      */
-    fun runHandshake() {
+    fun runHandshake(progressSessions: List<String> = emptyList()) {
         channels.callBlocking(RelayWire.CHANNEL_CONVERSATION, "helloConversationV4", emptyList<Any?>(), 45_000)
         val clientHello = JSONObject()
             .put("kind", "clientHello")
@@ -188,6 +188,17 @@ class BridgeSession(
             listOf<Any?>(clientHello),
             45_000,
         )
+        // M4：**必须先订阅对话，再订阅索引**。真机两次对照（2026-09-13）：
+        //   18:35 轮询线程抢在握手前把 subscribeConversationV4 发出去
+        //        → 立刻回 ACK(snapshot)，进展可用；
+        //   20:0x 索引订阅先发（原来的写法）→ 同一座桥上 subscribeConversationV4
+        //        **永远不回包**（每 36s 重试、连续 12 分钟全超时）。
+        // 索引订阅带 runtimePolicy=existing-only，看来会把这座桥的 runtime 钉死成
+        // 索引用途。所以这里同步地、显式地把它排在索引订阅之前（阻塞约 1.5s，
+        // 换确定性——别再靠线程竞争去撞对顺序）。
+        for (session in progressSessions) {
+            subscribeConversationProgress(session)
+        }
         val subscribeArgs = JSONObject(scope.toString())
             .put("runtimePolicy", "existing-only")
         val result = channels.callBlocking(
@@ -259,52 +270,48 @@ class BridgeSession(
     @Volatile
     private var convFrames = 0
 
+    /** M4 进展回调（BridgeManager 建桥时挂上：握手与轮询共用）。 */
     @Volatile
-    private var convSink: ((String, String, String) -> Unit)? = null
+    var progressListener: ((sessionId: String, text: String) -> Unit)? = null
 
     /**
-     * 订阅某会话的对话详情，并把"最新进展"文本回调出去。
+     * 订阅某会话的对话详情。**同步阻塞**（调用方自己保证在后台线程）——顺序是
+     * 语义的一部分，见 [runHandshake] 里的两次真机对照：对话订阅必须早于索引订阅。
      *
-     * 幂等且**可反复调用**：已订阅→立即返回；有在飞的尝试→跳过（避免每 12 s
-     * 的轮询把订阅请求叠起来）；失败后下一轮自然重试（真机踩过：调用方若把
-     * "试过一次"记成终态，第一个轮询拍（桥还没开）就会把该会话永久拉黑）。
+     * 幂等且可反复调用：已订阅→立即返回；有在飞的尝试→跳过；失败后由调用方下一轮
+     * 重试（真机踩过：调用方若把"试过一次"记成终态，第一个轮询拍（桥还没开）
+     * 就会把该会话永久拉黑）。
      */
-    fun subscribeConversationProgress(
-        sessionId: String,
-        onProgress: (sessionId: String, text: String) -> Unit,
-    ) {
+    fun subscribeConversationProgress(sessionId: String) {
         if (closed) return
-        convSink = { _, id, text -> onProgress(id, text) }
         if (convSubscriptions.containsKey(sessionId)) return
         if (!convAttempting.add(sessionId)) return
         installConversationListener()
-        Thread {
-            try {
-                val args = JSONObject(scope.toString()).put("sessionId", sessionId)
-                val result = channels.callBlocking(
-                    RelayWire.CHANNEL_CONVERSATION,
-                    RelayWire.METHOD_SUBSCRIBE_CONV,
-                    listOf<Any?>(args),
-                    30_000,
-                ) as? JSONObject
-                val ack = result?.optJSONObject("ack")
-                val subId = ack?.optString("subscriptionId").orEmpty()
-                if (ack == null || subId.isEmpty()) {
-                    onLogLine("conversation subscribe: no ack.subscriptionId for $sessionId")
-                    return@Thread
-                }
-                convSubscriptions[sessionId] = subId
-                convTails.putIfAbsent(sessionId, RelayWire.ConversationTail())
-                onLogLine(
-                    "subscribed conversation for $sessionId (${ack.optString("mode")}, " +
-                        "帧已收 ${convFrames} 个)",
-                )
-            } catch (e: Exception) {
-                onLogLine("conversation subscribe failed for $sessionId: ${e.message}")
-            } finally {
-                convAttempting.remove(sessionId)
+        try {
+            val args = JSONObject(scope.toString()).put("sessionId", sessionId)
+            val result = channels.callBlocking(
+                RelayWire.CHANNEL_CONVERSATION,
+                RelayWire.METHOD_SUBSCRIBE_CONV,
+                listOf<Any?>(args),
+                30_000,
+            ) as? JSONObject
+            val ack = result?.optJSONObject("ack")
+            val subId = ack?.optString("subscriptionId").orEmpty()
+            if (ack == null || subId.isEmpty()) {
+                onLogLine("conversation subscribe: no ack.subscriptionId for $sessionId")
+                return
             }
-        }.start()
+            convSubscriptions[sessionId] = subId
+            convTails.putIfAbsent(sessionId, RelayWire.ConversationTail())
+            onLogLine(
+                "subscribed conversation for $sessionId (${ack.optString("mode")}, " +
+                    "帧已收 ${convFrames} 个)",
+            )
+        } catch (e: Exception) {
+            onLogLine("conversation subscribe failed for $sessionId: ${e.message}")
+        } finally {
+            convAttempting.remove(sessionId)
+        }
     }
 
     /**
@@ -319,7 +326,6 @@ class BridgeSession(
         if (closed) return
         for (session in convSubscriptions.keys.toList()) {
             val subId = convSubscriptions.remove(session) ?: continue
-            val sink = convSink
             Thread {
                 try {
                     val args = JSONObject(scope.toString()).put("subscriptionId", subId)
@@ -333,9 +339,7 @@ class BridgeSession(
                     // 尽力而为：退订失败也不影响重订阅（会带新的 subscriptionId）
                 }
                 onLogLine("reanchor conversation for $session (距上次共收 ${convFrames} 个帧)")
-                subscribeConversationProgress(session) { id, text ->
-                    sink?.invoke(workspaceKey, id, text)
-                }
+                subscribeConversationProgress(session)
             }.start()
         }
     }
@@ -374,7 +378,7 @@ class BridgeSession(
         val text = tail.latestProgressText() ?: return
         if (convLastText[id] == text) return
         convLastText[id] = text
-        convSink?.invoke(workspaceKey, id, text)
+        progressListener?.invoke(id, text)
     }
 
     private fun unsubscribeConversations() {
@@ -455,6 +459,10 @@ class BridgeManager(
     private val sendPayloadOut: (JSONObject) -> Unit,
     private val onSessionsUpdate: (JSONObject) -> Unit,
     private val onLogLine: (String) -> Unit,
+    /** M4：把某工作区的对话进展回调出去（工作区键、会话 id、文本）。 */
+    private val progressSink: ((String, String, String) -> Unit)? = null,
+    /** M4：握手时要抢在索引订阅之前订的会话（该工作区当前在跑的任务）。 */
+    private val runningSessions: (String) -> List<String> = { emptyList() },
     private val maxWorkspaces: Int = 12,
 ) {
     private val relayPending = ConcurrentHashMap<String, PendingRelayRequest>()
@@ -482,13 +490,20 @@ class BridgeManager(
                 if (opened >= maxWorkspaces) break
                 var bridge: BridgeSession? = null
                 try {
-                    bridge = openBridgeBlocking(workspace) ?: continue
+                    // 用非空局部量：闭包里捕获可空 var 会让智能转换失效（K2 直接报错）。
+                    val openedBridge = openBridgeBlocking(workspace) ?: continue
+                    bridge = openedBridge
+                    openedBridge.progressListener = { sessionId, text ->
+                        progressSink?.invoke(openedBridge.workspaceKey, sessionId, text)
+                    }
                     // 必须先注册再握手：四步握手的应答帧经 acceptRelayPayload
                     // 按 idToKey→bridges 路由回来，注册晚了会全部落空（超时）。
-                    bridges[bridge.workspaceKey] = bridge
-                    bridge.runHandshake()
+                    bridges[openedBridge.workspaceKey] = openedBridge
+                    openedBridge.runHandshake(runningSessions(openedBridge.workspaceKey))
                     opened += 1
-                    onLogLine("bridge ready for ${bridge.workspaceKey} (${bridge.bridgeSessionId})")
+                    onLogLine(
+                        "bridge ready for ${openedBridge.workspaceKey} (${openedBridge.bridgeSessionId})",
+                    )
                 } catch (e: Exception) {
                     if (bridge != null) {
                         bridges.remove(bridge.workspaceKey)
@@ -513,13 +528,9 @@ class BridgeManager(
     /**
      * 订阅某工作区的对话详情（M4 主通道）→ 回调"最新进展"文本。
      */
-    fun subscribeProgress(
-        key: String,
-        sessionId: String,
-        onProgress: (workspaceKey: String, sessionId: String, text: String) -> Unit,
-    ) {
+    fun subscribeProgress(key: String, sessionId: String) {
         val bridge = bridges[key] ?: return
-        bridge.subscribeConversationProgress(sessionId) { id, text -> onProgress(key, id, text) }
+        bridge.subscribeConversationProgress(sessionId)
     }
 
     /** 周期重挂（见 [BridgeSession.reanchorConversations]）。 */

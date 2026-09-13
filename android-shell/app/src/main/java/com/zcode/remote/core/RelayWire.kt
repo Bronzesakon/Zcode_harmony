@@ -525,7 +525,7 @@ object RelayWire {
     }
 
     private fun progressTextFromRow(row: JSONObject): String? = when (row.optString("kind")) {
-        "assistantText" -> row.optString("text")
+        "assistantText" -> progressTail(row.optString("text"))
         "toolCall" -> when (row.optString("status")) {
             "inputStreaming", "pendingApproval", "running" ->
                 "正在执行 " + row.optString("toolName").ifBlank { "工具" }
@@ -534,11 +534,28 @@ object RelayWire {
         "subagent" -> when (row.optString("status")) {
             "running" -> row.optString("summaryText").ifBlank {
                 "子任务 " + row.optString("subagentType").ifBlank { "运行中" }
-            }
+            }.let { progressTail(it) }
             else -> null
         }
         else -> null
     }
+
+    /**
+     * 进展文本太长时只留**尾巴**。
+     *
+     * 真机教训（2026-09-13 晚）：一开始原样取整段正文，结果流体云卡片的可见部分
+     * 永远是这段消息的**开头**——消息在涨，可见内容却一直不变，用户看着就是"又
+     * 卡住了"（他当场抓到 pre.87 的 73 分钟静默，其中一个成因正是"文案对、看不出
+     * 在动"）。取尾巴保证"最新发生的事"落在可见区域。
+     */
+    private fun progressTail(text: String): String {
+        val collapsed = text.replace(Regex("\\s+"), " ").trim()
+        if (collapsed.length <= PROGRESS_MAX_CHARS) return collapsed
+        return "…" + collapsed.substring(collapsed.length - PROGRESS_MAX_CHARS + 1)
+    }
+
+    /** 卡片正文的字符上限（超出只看尾巴）。 */
+    private const val PROGRESS_MAX_CHARS = 120
 
     // ------------------------------------- 对话详情：逻辑帧的行窗口（M4 订阅面）
 

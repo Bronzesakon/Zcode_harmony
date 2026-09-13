@@ -237,6 +237,24 @@ class RelayWireTest {
     }
 
     @Test
+    fun `progress text keeps the tail of a long message`() {
+        val long = "开头" + "x".repeat(200) + "最新发生的事"
+        val text = RelayWire.progressTextFromRows(
+            rows(JSONObject().put("kind", "assistantText").put("text", long)),
+        )
+        assertNotNull(text)
+        assertTrue("长正文必须留尾巴", text!!.endsWith("最新发生的事"))
+        assertTrue("超长要截断", text.length <= 121)
+        assertTrue("截断要有省略号", text.startsWith("…"))
+        // 换行会被折叠成空格（通知卡片不渲染换行）
+        val wrapped = RelayWire.progressTextFromRows(
+            rows(JSONObject().put("kind", "assistantText").put("text", "第一行
+第二行")),
+        )
+        assertEquals("第一行 第二行", wrapped)
+    }
+
+    @Test
     fun `progress text is null when nothing is displayable`() {
         assertNull(RelayWire.progressTextFromRows(null))
         assertNull(RelayWire.progressTextFromRows(org.json.JSONArray()))
