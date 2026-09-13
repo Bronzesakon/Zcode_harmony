@@ -753,6 +753,17 @@ class MainActivity : AppCompatActivity() {
     private fun runDiagCommand(cmd: String) {
         if (cmd.isEmpty()) return
         Diagnostics.log("info", "诊断指令: $cmd")
+        // Tier2 是原生侧实验，不走注入层。
+        when (cmd) {
+            "tier2_test" -> {
+                ShellRuntime.startTier2Probe(60_000L)
+                return
+            }
+            "tier2_stop" -> {
+                ShellRuntime.stopTier2Probe()
+                return
+            }
+        }
         pendingDiag = cmd
         diagAttempts = 0
         tryDiag()

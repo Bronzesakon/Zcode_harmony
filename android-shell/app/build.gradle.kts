@@ -151,5 +151,8 @@ dependencies {
     // ZXing core is pulled transitively; no GMS dependency anywhere.
     implementation("com.journeyapps:zxing-android-embedded:4.3.0")
 
+    // Tier2：原生直连 relay 的 WebSocket 客户端（后台接管实验/兜底）。
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+
     testImplementation("junit:junit:4.13.2")
 }

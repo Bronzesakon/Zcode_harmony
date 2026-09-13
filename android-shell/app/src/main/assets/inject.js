@@ -275,6 +275,35 @@
     // 原文。两者都是会话凭证级内容，只留内存、绝不进日志（safePath 只留路径）。
     var lastRelayUrl = null;
     var lastAuthInitText = null;
+    // Tier2（原生直连 relay）凭证移交：URL + sid/hash/mid，一次性 post 给原生，
+    // 原生仅驻内存。凭证参数名与页面一致（sid=deviceSid, hash=passHash, mid=deviceMid）。
+    var relayCredsPosted = false;
+
+    function maybePostRelayCreds() {
+        if (relayCredsPosted || !lastRelayUrl) {
+            return;
+        }
+        var query;
+        try {
+            query = new URL(G.location.href).searchParams;
+        } catch (e) {
+            return;
+        }
+        var sid = query.get('sid') || '';
+        var hash = query.get('hash') || '';
+        var mid = query.get('mid') || '';
+        if (!sid || !hash) {
+            return;
+        }
+        relayCredsPosted = true;
+        post('relaycreds', {
+            url: lastRelayUrl,
+            deviceSid: sid,
+            passHash: hash,
+            deviceMid: mid
+        });
+        diag('info', 'Tier2: relay 凭证已移交原生（仅内存，不落日志）');
+    }
 
     function installWebSocketHook() {
         if (typeof NativeWebSocket !== 'function') {
@@ -391,6 +420,7 @@
         }
         if (url) {
             lastRelayUrl = url;
+            maybePostRelayCreds();
         }
         if (knownSockets) {
             knownSockets.add(socket);
@@ -929,6 +959,7 @@
             // Learned, never logged: it is a session credential.
             deviceSid = frame.device_sid;
             lastAuthInitText = text;
+            maybePostRelayCreds();
             return;
         }
         if (frame.type === 'auth_ack' || frame.type === 'pair_status_ack') {

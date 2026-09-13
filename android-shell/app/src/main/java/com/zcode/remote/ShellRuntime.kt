@@ -309,6 +309,24 @@ object ShellRuntime {
         jsEvaluator = evaluator
     }
 
+    /** Tier2 原生直连 relay 的凭证（注入层移交，仅内存，不落日志）。 */
+    @Volatile
+    private var relayCreds: RelayCreds? = null
+
+    /** 诊断指令 tier2_test：原生直连探针跑一轮（默认 60s 自动关闭）。 */
+    fun startTier2Probe(durationMs: Long = 60_000L) {
+        val c = relayCreds
+        if (c == null) {
+            Diagnostics.log("warn", "Tier2: 凭证未就绪（页面还没移交 relaycreds），稍后重试")
+            return
+        }
+        Tier2Probe.start(c, durationMs)
+    }
+
+    fun stopTier2Probe() {
+        Tier2Probe.stop("手动停止")
+    }
+
     fun evaluateJs(script: String) {
         val evaluator = jsEvaluator
         if (evaluator == null) {
@@ -440,6 +458,26 @@ object ShellRuntime {
                         "debug",
                         "页面体征(${data.optString("why")}): ${data.optJSONObject("vitals")}",
                     )
+                }
+                "relaycreds" -> {
+                    // Tier2（原生直连 relay）凭证：注入层一次性移交，仅驻内存。
+                    // 任何日志路径都不得打印这些字段（sid/hash/mid 红线）。
+                    if (relayCreds != null) return
+                    val data = root.optJSONObject("data") ?: return
+                    val wsUrl = data.optString("url")
+                    val deviceSid = data.optString("deviceSid")
+                    val passHash = data.optString("passHash")
+                    if (wsUrl.isEmpty() || deviceSid.isEmpty() || passHash.isEmpty()) {
+                        Diagnostics.log("warn", "Tier2: relaycreds 字段不全，忽略")
+                        return
+                    }
+                    relayCreds = RelayCreds(
+                        wsUrl = wsUrl,
+                        deviceSid = deviceSid,
+                        passHash = passHash,
+                        deviceMid = data.optString("deviceMid").ifBlank { null },
+                    )
+                    Diagnostics.log("info", "Tier2: relay 凭证已接收（仅内存）")
                 }
                 "pagestate" -> {
                     // Which visual state the page is in, and which theme it
