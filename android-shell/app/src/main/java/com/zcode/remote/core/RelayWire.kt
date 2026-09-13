@@ -59,14 +59,14 @@ object RelayWire {
             buf = buf.copyOf(size)
         }
 
-        fun byte(value: Int): ByteWriter {
+        fun writeByte(value: Int): ByteWriter {
             ensure(1)
             buf[len++] = (value and 0xFF).toByte()
             return this
         }
 
         /** LEB128 无符号 32 位（与 JS `value >>> 0` 语义一致）。 */
-        fun varint(value: Long): ByteWriter {
+        fun writeVarint(value: Long): ByteWriter {
             ensure(5)
             var v = value and 0xFFFFFFFFL
             do {
@@ -78,7 +78,7 @@ object RelayWire {
             return this
         }
 
-        fun bytes(arr: ByteArray): ByteWriter {
+        fun writeBytes(arr: ByteArray): ByteWriter {
             ensure(arr.size)
             arr.copyInto(buf, len)
             len += arr.size
@@ -94,16 +94,16 @@ object RelayWire {
 
         val remaining: Int get() = data.size - pos
 
-        fun byte(): Int {
+        fun readByte(): Int {
             if (pos >= data.size) throw WireException("ByteReader: out of data")
             return data[pos++].toInt() and 0xFF
         }
 
-        fun varint(): Long {
+        fun readVarint(): Long {
             var value = 0L
             var shift = 0
             while (pos < data.size) {
-                val b = byte()
+                val b = readByte()
                 if (shift == 28 && (b and 0xF0) != 0) throw WireException("ByteReader: varint overflow")
                 value = value or ((b and 0x7F).toLong() shl shift)
                 if (b and 0x80 == 0) return value and 0xFFFFFFFFL
@@ -113,7 +113,7 @@ object RelayWire {
             throw WireException("ByteReader: truncated varint")
         }
 
-        fun bytes(n: Int): ByteArray {
+        fun readBytes(n: Int): ByteArray {
             if (n < 0 || pos + n > data.size) throw WireException("ByteReader: cannot read $n bytes")
             val out = data.copyOfRange(pos, pos + n)
             pos += n
@@ -146,30 +146,30 @@ object RelayWire {
 
     fun encodeValue(writer: ByteWriter, value: Any?) {
         when (value) {
-            null -> writer.byte(0)
+            null -> writer.writeByte(0)
             is String -> {
                 val str = value.toByteArray(Charsets.UTF_8)
-                writer.byte(1).varint(str.size.toLong()).bytes(str)
+                writer.writeByte(1).writeVarint(str.size.toLong()).writeBytes(str)
             }
             is ByteArray -> {
-                writer.byte(3).varint(value.size.toLong()).bytes(value)
+                writer.writeByte(3).writeVarint(value.size.toLong()).writeBytes(value)
             }
             is List<*> -> {
-                writer.byte(4).varint(value.size.toLong())
+                writer.writeByte(4).writeVarint(value.size.toLong())
                 for (item in value) encodeValue(writer, item)
             }
             is Int -> {
                 require(value in 0..0x7FFFFFFF) { "value: int out of range $value" }
-                writer.byte(6).varint(value.toLong())
+                writer.writeByte(6).writeVarint(value.toLong())
             }
             is Long -> {
                 require(value in 0..0x7FFFFFFF) { "value: int out of range $value" }
-                writer.byte(6).varint(value)
+                writer.writeByte(6).writeVarint(value)
             }
             // 其余（布尔/浮点/对象）按页面参照走 JSON tag。
             else -> {
                 val json = jsonOf(value).toString().toByteArray(Charsets.UTF_8)
-                writer.byte(5).varint(json.size.toLong()).bytes(json)
+                writer.writeByte(5).writeVarint(json.size.toLong()).writeBytes(json)
             }
         }
     }
@@ -193,31 +193,31 @@ object RelayWire {
 
     /** JSON 值的长度预计算与顺序无关；页面端 JSON.parse 不在乎键序。 */
     fun decodeValue(reader: ByteReader): Any? {
-        return when (val tag = reader.byte()) {
+        return when (val tag = reader.readByte()) {
             0 -> null
             1 -> {
-                val len = reader.varint().toInt()
+                val len = reader.readVarint().toInt()
                 if (len > MAX_VALUE_BYTES) throw WireException("value: string too large")
-                String(reader.bytes(len), Charsets.UTF_8)
+                String(reader.readBytes(len), Charsets.UTF_8)
             }
             2, 3 -> {
-                val n = reader.varint().toInt()
+                val n = reader.readVarint().toInt()
                 if (n > MAX_VALUE_BYTES) throw WireException("value: bytes too large")
-                reader.bytes(n)
+                reader.readBytes(n)
             }
             4 -> {
-                val count = reader.varint().toInt()
+                val count = reader.readVarint().toInt()
                 if (count > MAX_CONTAINER_ITEMS) throw WireException("value: array too large")
                 val arr = ArrayList<Any?>(count)
                 for (i in 0 until count) arr.add(decodeValue(reader))
                 arr
             }
             5 -> {
-                val jlen = reader.varint().toInt()
+                val jlen = reader.readVarint().toInt()
                 if (jlen > MAX_VALUE_BYTES) throw WireException("value: object too large")
-                JSONObject(String(reader.bytes(jlen), Charsets.UTF_8))
+                JSONObject(String(reader.readBytes(jlen), Charsets.UTF_8))
             }
-            6 -> reader.varint().toInt()
+            6 -> reader.readVarint().toInt()
             else -> throw WireException("value: unknown tag $tag")
         }
     }
