@@ -253,17 +253,16 @@ object ShellRuntime {
                 liveProgressThread.execute {
                     try {
                         for ((key, sessionId) in refs) {
-                            val text = Tier2Probe.fetchProgress(key, sessionId) ?: continue
-                            mainHandler.post {
-                                val update = store.applyLivePreview(sessionId, text)
-                                if (update.running.isNotEmpty()) {
-                                    Diagnostics.log(
-                                        "debug",
-                                        "活进展 $key：${text.replace('\n', ' ').take(60)}",
-                                    )
-                                    applyUpdate(update)
+                            // ① 订阅（主通道）：桌面端要先把会话挂到本客户端上才认
+                            //    后续对话 RPC，订阅本身也会立刻推一份 snapshot。
+                            if (convSubscribeTried.add(sessionId)) {
+                                Tier2Probe.subscribeProgress(key, sessionId) { _, id, text ->
+                                    pushLivePreview(key, id, text)
                                 }
                             }
+                            // ② 拉取（补充）：推送稀疏时靠它把尾窗刷新回来。
+                            val text = Tier2Probe.fetchProgress(key, sessionId) ?: continue
+                            pushLivePreview(key, sessionId, text)
                         }
                     } finally {
                         liveFetchInFlight = false
@@ -277,16 +276,33 @@ object ShellRuntime {
     @Volatile
     private var liveFetchInFlight = false
 
+    /** 本次接管里已经尝试过订阅的会话（避免每 12s 重复发订阅）。 */
+    private val convSubscribeTried = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    private fun pushLivePreview(key: String, sessionId: String, text: String) {
+        mainHandler.post {
+            val update = store.applyLivePreview(sessionId, text)
+            if (update.running.isNotEmpty()) {
+                Diagnostics.log(
+                    "debug",
+                    "活进展 $key：${text.replace('\n', ' ').take(60)}",
+                )
+                applyUpdate(update)
+            }
+        }
+    }
+
     private fun startLiveProgressPolling() {
         if (livePolling) return
         livePolling = true
         mainHandler.post(liveProgressPoller)
     }
 
-    /** 交还前台：停止拉取，并把活进展清掉（此后以页面供的会话索引为准）。 */
+    /** 交还前台：停止拉取/订阅，并把活进展清掉（此后以页面供的会话索引为准）。 */
     private fun stopLiveProgressPolling() {
         livePolling = false
         mainHandler.removeCallbacks(liveProgressPoller)
+        convSubscribeTried.clear()
         store.clearLivePreviews()
     }
 

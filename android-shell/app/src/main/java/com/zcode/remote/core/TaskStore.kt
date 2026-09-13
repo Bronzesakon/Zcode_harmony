@@ -136,7 +136,21 @@ class TaskStore {
             tasks = tasks,
         )
         val notify = notifyState.apply(key, tasks)
+        forgetStaleLivePreviews()
         return buildUpdate(notify)
+    }
+
+    /**
+     * 任务离开运行集就不该再留着活进展：否则同一 sessionId 下次再跑起来时，
+     * 旧进度会先顶掉会话索引给的新文案（M4 的活进展只对"正在跑"有意义）。
+     */
+    private fun forgetStaleLivePreviews() {
+        if (livePreviews.isEmpty()) return
+        val running = HashSet<String>()
+        for (workspace in workspaces.values) {
+            for (task in workspace.running) running.add(task.sessionId)
+        }
+        livePreviews.keys.retainAll(running)
     }
 
     /** Drops a workspace entirely, e.g. when its bridge is gone for good. */

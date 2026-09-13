@@ -50,6 +50,23 @@ object RelayWire {
     const val METHOD_ROWS_RANGE = "conversationRowsRangeV4"
     const val ROWS_RANGE_MAX_LIMIT = 200
 
+    /**
+     * 对话详情**订阅**（M4 的主通道）。页面侧同一套：
+     * `subscribeConversationV4({...workspaceScope, sessionId, visibility?})` →
+     * `ack.subscriptionId`，帧走事件 `onDynamicConversationFrame`（物理信封 →
+     * 逻辑帧 `{topic, subscriptionId, fromSeq, toSeq, payload:{kind:'snapshot'|'deltas'}}`；
+     * `deltas` 的 op 有 `row.appended` / `row.upserted` / `row.removed` /
+     * `row.delta{rowId,path,append}` / `state.updated`）。
+     *
+     * 为什么订阅是主通道、拉取只是补充：桌面端对远端的推送稀疏，但**订阅是唯一
+     * 能让桌面端把这份会话"挂到本客户端上"的动作**——真机实测，只开
+     * sessions-index 订阅的桥去调 conversationRowsRangeV4 永远不会回包
+     * （20s 超时），而页面自己在有对话订阅时调同一个方法就正常。
+     */
+    const val EVENT_CONVERSATION_FRAME = "onDynamicConversationFrame"
+    const val METHOD_SUBSCRIBE_CONV = "subscribeConversationV4"
+    const val METHOD_UNSUBSCRIBE_CONV = "unsubscribeConversationV4"
+
     const val MAX_MESSAGE_BYTES = 16 * 1024 * 1024
     const val MAX_FRAGMENT_BYTES = 512 * 1024
     const val MAX_FRAGMENTS = 64
@@ -439,6 +456,49 @@ object RelayWire {
     // ------------------------------------------------------- 对话详情 → 进展文本
 
     /**
+     * 对话详情的逻辑帧装配：物理信封 → 逻辑帧。
+     *
+     * `kind='complete'` 直接给 `frame`；`kind='fragment'` 按 `logicalFrameId`
+     * 缓存 `dataBase64` 分片，凑齐后 base64 解码成 JSON 文本再解析（对应页面
+     * `_Te` 里的 begin/bind/accept 分片重组）。凑不齐返回 null——下一帧再来。
+     */
+    class LogicalFrameAssembler {
+        private val pending = HashMap<String, Array<String?>>()
+
+        fun acceptEnvelope(envelope: JSONObject?): JSONObject? {
+            val env = envelope ?: return null
+            when (env.optString("kind")) {
+                "complete" -> return env.optJSONObject("frame")
+                "fragment" -> {
+                    val id = env.optString("logicalFrameId")
+                    val count = env.optInt("fragmentCount", 0)
+                    val index = env.optInt("fragmentIndex", -1)
+                    if (id.isEmpty() || count <= 0 || count > MAX_FRAGMENTS) return null
+                    if (index < 0 || index >= count) return null
+                    val slots = pending.getOrPut(id) { arrayOfNulls(count) }
+                    if (slots.size != count) {
+                        pending.remove(id)
+                        return null
+                    }
+                    slots[index] = env.optString("dataBase64")
+                    if (slots.any { it == null }) return null
+                    pending.remove(id)
+                    val text = try {
+                        String(java.util.Base64.getDecoder().decode(slots.joinToString("")))
+                    } catch (e: Exception) {
+                        return null
+                    }
+                    return try {
+                        JSONObject(text)
+                    } catch (e: Exception) {
+                        null
+                    }
+                }
+            }
+            return null
+        }
+    }
+    /**
      * 从 `conversationRowsRangeV4` 的 rows 里取出"当前进展"那一行文字。
      *
      * 行是按 `kind` 判别的联合（快照 docs/05 `src-DHgFesxz.js` @100327–@105291）：
@@ -481,5 +541,128 @@ object RelayWire {
             else -> null
         }
         else -> null
+    }
+
+    // ------------------------------------- 对话详情：逻辑帧的行窗口（M4 订阅面）
+
+    /**
+     * 对话详情逻辑帧的行窗口 + `deltas` 归并。
+     *
+     * 只维护"最后若干行"（[TAIL_ROWS]）——流体云要的是最新一行，不是整段历史，
+     * 所以不需要照搬页面的整台 conversation store（它还要管 availability、
+     * plan、usage、queue 等一整套状态）。
+     *
+     * 已实现的 op：`row.appended` / `row.upserted` / `row.removed` /
+     * `row.delta`（`text` / `inputText` / `output.text` / `summaryText`）/
+     * `state.updated`（对某行的浅合并）。缺任何一个都不影响"最新一行"的正确性，
+     * 因为下一次 snapshot（重订阅/重同步）会把整窗拉回来重置。
+     */
+    class ConversationTail {
+        private var rows = JSONArray()
+
+        val size: Int get() = rows.length()
+
+        fun applySnapshot(snapshot: JSONObject?) {
+            val window = snapshot?.optJSONObject("rows")?.optJSONArray("window")
+            rows = window ?: JSONArray()
+            trim()
+        }
+
+        fun applyDeltas(deltas: JSONArray?) {
+            if (deltas == null) return
+            for (i in 0 until deltas.length()) {
+                val op = deltas.optJSONObject(i) ?: continue
+                when (op.optString("op")) {
+                    "row.appended" -> {
+                        op.optJSONObject("row")?.let { rows.put(it) }
+                    }
+                    "row.upserted" -> {
+                        val row = op.optJSONObject("row") ?: continue
+                        val at = indexOfRow(row.optString("rowId"))
+                        if (at >= 0) rows.put(at, row) else rows.put(row)
+                    }
+                    "row.removed" -> {
+                        val fromRowId = op.optString("fromRowId")
+                        if (fromRowId.isEmpty()) {
+                            rows = JSONArray()
+                        } else {
+                            val at = indexOfRow(fromRowId)
+                            if (at > 0) {
+                                val kept = JSONArray()
+                                for (j in at until rows.length()) kept.put(rows.opt(j))
+                                rows = kept
+                            }
+                        }
+                    }
+                    "row.delta" -> applyRowDelta(op)
+                    "state.updated" -> applyStatePatch(op)
+                }
+            }
+            trim()
+        }
+
+        /** 最新一行的"进展"文本；没有可展示的行时返回 null。 */
+        fun latestProgressText(): String? = progressTextFromRows(rows)
+
+        private fun applyRowDelta(op: JSONObject) {
+            val rowId = op.optString("rowId")
+            val at = indexOfRow(rowId)
+            if (at < 0) return
+            val row = rows.optJSONObject(at) ?: return
+            val append = op.optString("append")
+            if (append.isEmpty()) return
+            when (op.optString("path")) {
+                "text" -> if (row.optString("kind") == "assistantText" ||
+                    row.optString("kind") == "reasoning"
+                ) {
+                    row.put("text", row.optString("text") + append)
+                }
+                "inputText" -> if (row.optString("kind") == "toolCall") {
+                    row.put("inputText", row.optString("inputText") + append)
+                }
+                "summaryText" -> if (row.optString("kind") == "subagent") {
+                    row.put("summaryText", row.optString("summaryText") + append)
+                }
+                "output.text" -> if (row.optString("kind") == "toolCall") {
+                    val output = row.optJSONObject("output") ?: JSONObject()
+                    output.put("text", output.optString("text") + append)
+                    row.put("output", output)
+                }
+            }
+        }
+
+        private fun applyStatePatch(op: JSONObject) {
+            val patch = op.optJSONObject("patch") ?: return
+            val rowId = patch.optString("rowId")
+            if (rowId.isEmpty()) return
+            val at = indexOfRow(rowId)
+            if (at < 0) return
+            val row = rows.optJSONObject(at) ?: return
+            val keys = patch.keys()
+            while (keys.hasNext()) {
+                val key = keys.next()
+                if (key != "rowId") row.put(key, patch.opt(key))
+            }
+        }
+
+        private fun indexOfRow(rowId: String): Int {
+            if (rowId.isEmpty()) return -1
+            for (i in 0 until rows.length()) {
+                if (rows.optJSONObject(i)?.optString("rowId") == rowId) return i
+            }
+            return -1
+        }
+
+        private fun trim() {
+            if (rows.length() <= TAIL_ROWS) return
+            val kept = JSONArray()
+            for (i in rows.length() - TAIL_ROWS until rows.length()) kept.put(rows.opt(i))
+            rows = kept
+        }
+
+        private companion object {
+            /** 只留这么多行：流体云要的是最新一行，往前都是浪费。 */
+            const val TAIL_ROWS = 60
+        }
     }
 }

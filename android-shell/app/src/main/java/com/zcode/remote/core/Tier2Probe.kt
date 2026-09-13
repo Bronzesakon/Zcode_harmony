@@ -120,6 +120,23 @@ object Tier2Probe {
     private val emptyProgressLogged = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
 
     /**
+     * M4：订阅某任务的对话详情（**主通道**）→ 回调最新进展文本。
+     * 未接管 / 该工作区没有桥时静默无操作（调用方下一轮再试）。
+     */
+    fun subscribeProgress(
+        workspaceKey: String,
+        sessionId: String,
+        onProgress: (workspaceKey: String, sessionId: String, text: String) -> Unit,
+    ) {
+        val manager = bridgeManager ?: return
+        try {
+            manager.subscribeProgress(workspaceKey, sessionId, onProgress)
+        } catch (e: Exception) {
+            Diagnostics.log("debug", "Tier2: 订阅对话详情失败（$workspaceKey）: ${e.message}")
+        }
+    }
+
+    /**
      * @param durationMs 探针存活时长；<=0 表示接管模式（持久，直到 [stop]，
      *   且配对成功后启动桥覆盖 + 断线自动重连）。
      */
