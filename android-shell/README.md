@@ -1005,6 +1005,13 @@ l1_test = 手动轻推，vitals = DOM 体征快照。JS 68 项测试全绿（快
   pair_status 判读结论：对「无帧 vs AI 无产出」无区分力（那是任务活动判据的事，
   已实现），其残余价值（桌面在线门）已用现有 `relayPaired` 一行吸收；
   lastPairStatus 半成品补丁继续暂缓于 `/tmp/concurrent-pair-status.patch`。
-- **M3（未开工，下一轮主体）**：原生任务事件解码——工作区桥 4-RPC +
-  rpc-frame 编解码（varint/crc32/分片/ChannelClient body）的 Kotlin 移植，
-  参照 zcode-protocol.js 与其 Node 测试；落地后后台接管才有通知/实况窗数据。
+- **M3a 已落地（`22ff5ba`→`4aa54a9`，CI 全绿）**：relay 桥线上协议的 Kotlin 移植
+  （`core/RelayWire.kt`）——值编解码（7 tag）、LEB128 varint（32 位语义）、CRC32-IEEE、
+  rpc-frame 出站分片+入站重组（乱序/校验/冲突重置/ack）、ChannelClient body 组装解析。
+  golden vectors 由 zcode-protocol.js 离线生成、Kotlin 字节级对齐、CI 单测守护。
+  过程中的三个坑已修：结构检查器同文件重名启发式（读写方法改名规避）、
+  JVM/Android org.json 序列化行为不一致（JSON tag 编码改自带 writer，JS stringify 语义）、
+  METHOD_* 不在 JS 导出面（golden 向量曾把方法名编成 null——向量错、移植对）。
+- **M3（未开工，下一轮主体）**：M3b——ChannelClient 状态机（promise 配对/事件监听）
+  + 桥开启流程（workspace-list/bridge-open 信封）接 Tier2Probe；M3c——sessions-index
+  snapshot/delta 解码 → 任务事件 → 通知/实况窗数据。
