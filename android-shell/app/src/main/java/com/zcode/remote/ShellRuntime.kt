@@ -326,8 +326,12 @@ object ShellRuntime {
     @Volatile
     private var relayCreds: RelayCreds? = null
 
-    /** Tier1 后台静默超过该时长即视为判死，Tier2 原生接管配对。 */
-    private const val TIER2_TAKEOVER_SILENCE_MS = 60_000L
+    /**
+     * Tier1 静默超过该时长即视为判死，Tier2 原生接管配对与任务事件。
+     * 25s：用户要求"30 秒内必须接管"；正常链路的 liveness/心跳节拍是 10s，
+     * 25s 容得下两次迟到，配合 5s 一跳的看门狗最坏 30s 内动手。
+     */
+    private const val TIER2_TAKEOVER_SILENCE_MS = 25_000L
 
     /**
      * 最后一次收到注入层 liveness 报告的墙钟时刻。
@@ -348,13 +352,14 @@ object ShellRuntime {
      * 流体云随之定格（日志停在熄屏那一刻）。后台与熄屏必须同等对待。
      */
     private fun userIsAway(): Boolean {
-        if (!appIsForeground) return true
-        return try {
-            val power = appContext.getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
-            !power.isInteractive
-        } catch (e: Exception) {
-            false
+        if (!appIsForeground) {
+            return true
         }
+        val power = appContext.getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
+        if (power == null) {
+            return false
+        }
+        return !power.isInteractive
     }
 
     /**
@@ -362,17 +367,24 @@ object ShellRuntime {
      * 判据：用户已离开 + 静默超过阈值 + 最后已知配对为 matched（桌面在线）。
      */
     private fun checkTier1Silence() {
-        if (lastLivenessAt <= 0L || !userIsAway()) return
-        val silenceNow = SystemClock.elapsedRealtime() - lastLivenessAt
-        val reported = liveness?.let {
-            if (it.lastInboundAtElapsed > 0) {
-                SystemClock.elapsedRealtime() - it.lastInboundAtElapsed
-            } else {
-                Long.MAX_VALUE
-            }
-        } ?: Long.MAX_VALUE
-        val silence = minOf(silenceNow, reported)
-        maybeTakeOverInBackground(silence.coerceAtMost(Long.MAX_VALUE))
+        if (lastLivenessAt <= 0L) {
+            return
+        }
+        if (!userIsAway()) {
+            return
+        }
+        val now = SystemClock.elapsedRealtime()
+        val silenceByReport = now - lastLivenessAt
+        var silenceByLink = Long.MAX_VALUE
+        val snapshot = liveness
+        if (snapshot != null && snapshot.lastInboundAtElapsed > 0) {
+            silenceByLink = now - snapshot.lastInboundAtElapsed
+        }
+        var silence = silenceByReport
+        if (silenceByLink < silence) {
+            silence = silenceByLink
+        }
+        maybeTakeOverInBackground(silence)
     }
 
     /** Tier1 静默看门狗：每 15s 一跳，前台/后台/熄屏都在岗。 */
@@ -383,13 +395,13 @@ object ShellRuntime {
             } catch (e: Exception) {
                 Diagnostics.log("warn", "Tier1 看门狗异常: ${e.message}")
             }
-            mainHandler.postDelayed(this, 15_000L)
+            mainHandler.postDelayed(this, 5_000L)
         }
     }
 
     fun startTier1Watchdog() {
         mainHandler.removeCallbacks(tier1Watchdog)
-        mainHandler.postDelayed(tier1Watchdog, 15_000L)
+        mainHandler.postDelayed(tier1Watchdog, 5_000L)
     }
 
     /**
