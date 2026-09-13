@@ -259,7 +259,11 @@ class BridgeSession(
      */
     fun fetchProgressText(sessionId: String, limit: Int = 20, timeoutMs: Long = 20_000): String? {
         if (closed) return null
-        val args = JSONObject()
+        // 参数必须带 **workspace scope**：页面侧 rowsRange 发的是
+        // `{...workspaceScope, sessionId, beforeRowId?, limit}`（快照 index @547217），
+        // 少 workspacePath 桌面端不会回包——真机 2026-09-13 实测：只发
+        // `{sessionId, limit}` 时每次调用都 20s 超时。
+        val args = JSONObject(scope.toString())
             .put("sessionId", sessionId)
             .put("limit", limit.coerceIn(1, RelayWire.ROWS_RANGE_MAX_LIMIT))
         val result = channels.callBlocking(
