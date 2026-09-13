@@ -1728,6 +1728,25 @@
     /** Upload-named page RPCs get explicit lines: that is the file-send chain. */
     var UPLOAD_RPC_RE = /upload|attachment|artifact/i;
 
+    /**
+     * 进对话信标（页面自己发出的会话请求）。**已有在跑的判定窗就不重置**——
+     * 重置会把"5 s 铁判准"变成"5 s + 每次重试顺延"：真机实测正是这样拖到 ~9 s
+     * 才刷（页面 transport 的 await 门控让订阅请求晚 4 s 才发出去，信标跟着晚）。
+     * 窗口只由"进入对话"那一刻起算，DOM 视图信标通常几百毫秒内就到。
+     */
+    function noteConversationEntryBeacon(method, args) {
+        var age = fallbackState.beaconAt ? Date.now() - fallbackState.beaconAt : -1;
+        var session = args && args.sessionId ? String(args.sessionId) : '';
+        if (age >= 0 && age < FALLBACK_CHECK_MS) {
+            diag('debug', '进对话信标 ' + method + (session ? '（' + session + '）' : '') +
+                '落在此前已武装的 5s 窗内，不顺延');
+            return;
+        }
+        diag('debug', '进对话信标 ' + method + (session ? '（' + session + '）' : '') +
+            '→ 武装 5s 铁判准');
+        scheduleFallbackCheck();
+    }
+
     function notePageRpcCall(call) {
         if (!call) {
             return;
@@ -1736,7 +1755,7 @@
             diag('info', '页面上传调用开始：' + call.name);
         }
         if (FALLBACK_ENTRY_METHODS[call.name]) {
-            scheduleFallbackCheck();
+            noteConversationEntryBeacon(call.name, call.args);
         }
     }
 
@@ -1755,6 +1774,7 @@
     /** Test and console debugging surface for the fast refresh. */
     G.__zcodeShellFallback = {
         note: notePageRpcCall,
+        beacon: noteConversationEntryBeacon,
         check: fallbackCheck,
         ready: noteConversationReady,
         readyReasons: conversationReadyReasons,

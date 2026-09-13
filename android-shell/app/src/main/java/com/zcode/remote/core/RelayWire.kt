@@ -484,7 +484,7 @@ object RelayWire {
                     if (slots.any { it == null }) return null
                     pending.remove(id)
                     val text = try {
-                        String(java.util.Base64.getDecoder().decode(slots.joinToString("")))
+                        String(java.util.Base64.getDecoder().decode(slots.joinToString("")), Charsets.UTF_8)
                     } catch (e: Exception) {
                         return null
                     }

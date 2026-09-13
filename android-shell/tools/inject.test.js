@@ -1310,6 +1310,31 @@ test('进对话铁判准：链路换代那一拍不判（页面正按自己的�
     }
 });
 
+test('进对话铁判准：窗口内的重复信标不顺延（页面重试不会把 5s 拖长）', () => {
+    const page = setupPage();
+    const {reloads, restore} = stubReload();
+    try {
+        appendHeader(page, '新建任务');
+        appendComposer(page, '向 ZCode 提问…', false);
+        FB().note({name: 'zcode-agent.subscribeConversationV4', args: {sessionId: 'sess_1'}});
+        const first = FB().state().beaconAt;
+        // 卡住时页面每 ~10s 重发一次同样的请求；真机实测这些重试把判定一路
+        // 顺延到 ~9s 才刷，所以窗口起点必须钉在第一次进对话那一刻。
+        FB().note({name: 'zcode-agent.conversationRowsRangeV4', args: {sessionId: 'sess_1'}});
+        assert.strictEqual(FB().state().beaconAt, first,
+            'a retry must not slide the deadline');
+        assert.ok(findPost(page.posts, 'diag', (d) =>
+            d.message.includes('落在此前已武装的 5s 窗内')).length === 1);
+        assert.strictEqual(reloads.length, 0, 'no reload before the deadline');
+    } finally {
+        if (FB().timer()) {
+            clearTimeout(FB().timer());
+        }
+        restore();
+        page.teardown();
+    }
+});
+
 test('进对话铁判准：页面真实发出的信标会武装 5s 判定', () => {
     const page = setupPage();
     try {

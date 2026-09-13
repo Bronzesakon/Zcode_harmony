@@ -316,7 +316,7 @@ class BridgeSession(
                 ) as? JSONObject
                 val ack = result?.optJSONObject("ack")
                 val subId = ack?.optString("subscriptionId").orEmpty()
-                if (subId.isEmpty()) {
+                if (ack == null || subId.isEmpty()) {
                     onLogLine("conversation subscribe: no ack.subscriptionId for $sessionId")
                     return@Thread
                 }
