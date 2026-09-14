@@ -524,11 +524,8 @@ object RelayWire {
      * 取法：**从最新一行往前找第一行能给出"进展"的**——
      *   * `assistantText` → `text`（流式期间由 `row.delta path=text` 持续加长，
      *     所以拉到的就是此刻正在写的正文）；
-     *   * `toolCall` 且状态在跑（inputStreaming/pendingApproval/running）→
-     *     「正在执行 <toolName>」；已结束的工具调用跳过，继续往前找正文；
-     *   * `subagent` 且在跑 → `summaryText`，空则「子任务 <type> 运行中」；
-     *   * `reasoning`（思考）跳过——它不是用户要看的"进展"；
-     *   * `userInput`/`turnHeader`/其它 跳过。
+     *   * `toolCall` / `subagent` / `reasoning` / `userInput` / `turnHeader` /
+     *     其它一律跳过——见 [progressTextFromRow] 的真机教训。
      *
      * 全都给不出人话时返回 null：调用方要保留原有 preview，**不要**拿空串覆盖。
      */
@@ -542,19 +539,16 @@ object RelayWire {
         return null
     }
 
+    /**
+     * 卡片正文只认 assistantText：与网页会话列表的 lastAssistantPreview 同语义。
+     *
+     * 真机反馈（2026-09-14 早）：把「正在执行 <工具名>」写上流体云，用户看到的
+     * 是对话输出**之外**的东西（tool call 的执行状态），观感像跑题。工具调用与
+     * 子代理行一律不上卡片——当前轮还没有正文时，tail 里仍保留着上一轮的
+     * assistantText，卡片沿用之（正是网页会话列表的行为）。
+     */
     private fun progressTextFromRow(row: JSONObject): String? = when (row.optString("kind")) {
         "assistantText" -> progressTail(row.optString("text"))
-        "toolCall" -> when (row.optString("status")) {
-            "inputStreaming", "pendingApproval", "running" ->
-                "正在执行 " + row.optString("toolName").ifBlank { "工具" }
-            else -> null
-        }
-        "subagent" -> when (row.optString("status")) {
-            "running" -> row.optString("summaryText").ifBlank {
-                "子任务 " + row.optString("subagentType").ifBlank { "运行中" }
-            }.let { progressTail(it) }
-            else -> null
-        }
         else -> null
     }
 

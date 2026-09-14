@@ -265,6 +265,7 @@ class BridgeSession(
     private val convSubscriptions = ConcurrentHashMap<String, String>()
     private val convTails = ConcurrentHashMap<String, RelayWire.ConversationTail>()
     private val convLastText = ConcurrentHashMap<String, String>()
+    private val convFramesBySession = ConcurrentHashMap<String, Int>()
     private val pendingConversationFrames = ConcurrentHashMap<String, MutableList<JSONObject>>()
     private val convResyncing = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
     private val reanchorRunning = java.util.concurrent.atomic.AtomicBoolean(false)
@@ -318,6 +319,7 @@ class BridgeSession(
             convSubscriptions[sessionId] = subId
             convTails[sessionId] = RelayWire.ConversationTail()
             convLastText.remove(sessionId)
+            convFramesBySession.remove(sessionId)
             pendingConversationFrames.remove(subId)?.forEach { onConversationWire(it) }
             onLogLine(
                 "subscribed conversation for $sessionId (${ack.optString("mode")}, " +
@@ -338,8 +340,17 @@ class BridgeSession(
      * `when` 冻在原地。所以"最新进展"不能只赌 push：每隔一段时间重挂一次，
      * 最坏也只慢一个重挂周期，而不会回到几十分钟级的滞后。
      */
+    /** 当前已建立的对话订阅，用于桥回收时恢复同一批会话。 */
+    fun conversationSessionIds(): List<String> = convSubscriptions.keys.toList()
+
+    /** 桥是否还挂着对话订阅（回收决策用：没挂过就没什么可重锚的）。 */
+    fun hasConversationSubscriptions(): Boolean = convSubscriptions.isNotEmpty()
+
+    /** 复制工作区 scope，避免桥回收线程持有可变对象。 */
+    fun scopeCopy(): JSONObject = JSONObject(scope.toString())
+
     /** 周期性重挂：保留对话订阅，在同一 subscription 上强制请求新 snapshot。 */
-    fun reanchorConversations() {
+    fun reanchorConversations(onFailure: () -> Unit = {}) {
         if (closed || !reanchorRunning.compareAndSet(false, true)) return
         val entries = convSubscriptions.entries.toList()
         if (entries.isEmpty()) {
@@ -351,6 +362,7 @@ class BridgeSession(
                 for ((session, subId) in entries) {
                     if (closed || !convResyncing.add(session)) continue
                     try {
+                        val beforeFrames = convFramesBySession[session] ?: 0
                         val base = JSONObject(scope.toString())
                             .put("subscriptionId", subId)
                             .put("forceSnapshot", true)
@@ -364,11 +376,24 @@ class BridgeSession(
                             RelayWire.CHANNEL_CONVERSATION,
                             RelayWire.METHOD_RESYNC_CONV,
                             listOf<Any?>(base),
-                            20_000,
+                            8_000,
                         )
+                        // 判据是**这个会话**收到新帧，不是全局计数——别的会话的
+                        // 帧不能证明这条订阅还活着。
+                        val deadline = System.currentTimeMillis() + 3_000L
+                        while (!closed && (convFramesBySession[session] ?: 0) == beforeFrames &&
+                            System.currentTimeMillis() < deadline
+                        ) {
+                            Thread.sleep(50L)
+                        }
+                        if (closed || (convFramesBySession[session] ?: 0) == beforeFrames) {
+                            throw RelayWire.WireException("resync returned without a conversation frame")
+                        }
                         onLogLine("reanchor conversation for $session (force snapshot)")
                     } catch (e: Exception) {
                         onLogLine("conversation resync failed for $session: ${e.message}")
+                        onFailure()
+                        return@Thread
                     } finally {
                         convResyncing.remove(session)
                     }
@@ -421,6 +446,7 @@ class BridgeSession(
             }
             return
         }
+        convFramesBySession[id] = (convFramesBySession[id] ?: 0) + 1
         val tail = convTails.getOrPut(id) { RelayWire.ConversationTail() }
         val payload = frame.optJSONObject("payload") ?: return
         val frameLogEpoch = frame.optString("logEpoch").takeIf { it.isNotEmpty() }
@@ -456,6 +482,7 @@ class BridgeSession(
         convLastText.clear()
         pendingConversationFrames.clear()
         convResyncing.clear()
+        convFramesBySession.clear()
         if (convListenerId >= 0) {
             try {
                 channels.removeListener(
@@ -527,9 +554,11 @@ class BridgeManager(
     private val bridgesById = ConcurrentHashMap<String, BridgeSession>()
     private val idToKey = ConcurrentHashMap<String, String>()
     private var bridgeGeneration = 0L
+    private val recycleInFlight = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    /** [disposeEverything] 后为 true：回收线程不得再开新桥（manager 已无人消费）。 */
     @Volatile
     private var disposed = false
-    private val reanchorRunning = java.util.concurrent.atomic.AtomicBoolean(false)
 
     /**
      * 桥开启在飞窗口的缓冲：桌面端会在 ready 应答**之前**就推送 Initialize
@@ -593,15 +622,70 @@ class BridgeManager(
         bridge.subscribeConversationProgress(sessionId)
     }
 
-    /** 周期重挂（见 [BridgeSession.reanchorConversations]）。 */
+    /**
+     * 周期重挂（见 [BridgeSession.reanchorConversations]）。两级：
+     * 先 resyncConversationV4(forceSnapshot)；该订阅 8s 内没出新对话帧就认为
+     * 这座桥被 sessions-index 钉死了（真机 09-13 20:0x 的形态：索引订阅后
+     * 对话订阅永远不回包）——整桥回收，按「对话先于索引」重新握手 + 恢复原批
+     * 会话订阅。回收在独立线程跑，`recycleInFlight` 防并发重入。
+     */
     fun reanchorProgress() {
         for (bridge in bridges.values) {
+            val key = bridge.workspaceKey
+            val sessions = bridge.conversationSessionIds()
+            val scope = bridge.scopeCopy()
             try {
-                bridge.reanchorConversations()
+                bridge.reanchorConversations(onFailure = {
+                    recycleBridge(key, scope, sessions)
+                })
             } catch (e: Exception) {
-                onLogLine("reanchor conversation failed: ${e.message}")
+                onLogLine("reanchor conversation failed for $key: ${e.message}")
             }
         }
+    }
+
+    /**
+     * 二级回收：同一工作区整桥重建。先取快照（旧桥可能并发关闭中，取不到就
+     * 用 resync 时刻的快照兜底），再 close + 移出路由表，最后重新握手并把
+     * 原有会话订阅全部恢复。失败只记日志——下一拍 reanchor 会再试。
+     */
+    private fun recycleBridge(key: String, scope: JSONObject, sessions: List<String>) {
+        if (!recycleInFlight.add(key)) return
+        Thread {
+            try {
+                if (disposed) {
+                    onLogLine("tier2 bridge recycle skipped for $key (manager disposed)")
+                    return@Thread
+                }
+                val old = bridges[key]
+                if (old != null) {
+                    bridges.remove(key, old)
+                    bridgesById.remove(old.bridgeSessionId, old)
+                    idToKey.remove(old.bridgeSessionId)
+                    try {
+                        old.closeBridge()
+                    } catch (e: Exception) {
+                        // 关闭路径不再抛
+                    }
+                }
+                // 工作区对象可以由 scope 重建（openBridgeBlocking 只取这两个字段）。
+                val workspace = JSONObject()
+                    .put("workspacePath", scope.optString("workspacePath", ""))
+                if (scope.optString("workspaceIdentity", "").isNotEmpty()) {
+                    workspace.put("workspaceIdentity", scope.optString("workspaceIdentity"))
+                }
+                val reopened = openBridgeBlocking(workspace) ?: return@Thread
+                reopened.progressListener = { sessionId, text ->
+                    progressSink?.invoke(reopened.workspaceKey, sessionId, text)
+                }
+                reopened.runHandshake(sessions)
+                onLogLine("tier2 bridge recycled for $key (${sessions.size} session(s) restored)")
+            } catch (e: Exception) {
+                onLogLine("tier2 bridge recycle failed for $key: ${e.message}")
+            } finally {
+                recycleInFlight.remove(key)
+            }
+        }.start()
     }
 
     /** relay `data` payload 分发：桥帧 / 桥开启应答 / 工作区列表应答。 */
@@ -724,6 +808,7 @@ class BridgeManager(
     }
 
     fun disposeEverything(reason: String) {
+        disposed = true
         for ((_, bridge) in bridges) {
             try {
                 bridge.closeBridge()

@@ -261,8 +261,8 @@ class RelayWireTest {
     }
 
     @Test
-    fun `progress text skips finished tool calls and reasoning`() {
-        // 最新是已结束的工具调用、再下面是思考过程：都不算"进展"，继续往前找正文。
+    fun `progress text skips tool calls and reasoning`() {
+        // 最新是工具调用、再下面是思考过程：都不算"进展"，继续往前找正文。
         val text = RelayWire.progressTextFromRows(
             rows(
                 JSONObject().put("kind", "assistantText").put("text", "正文在这里"),
@@ -274,25 +274,24 @@ class RelayWireTest {
     }
 
     @Test
-    fun `progress text names a running tool`() {
+    fun `progress text skips running tools and subagents`() {
+        // 2026-09-14 真机反馈：工具名上卡片 = 显示"对话输出之外的东西"。
+        // 语义改为只认 assistantText（对齐网页 lastAssistantPreview）：
+        // 运行中的 toolCall / subagent 不再上卡片，沿用上一段正文。
         val text = RelayWire.progressTextFromRows(
             rows(
                 JSONObject().put("kind", "assistantText").put("text", "开始验证"),
                 JSONObject().put("kind", "toolCall").put("toolName", "Bash").put("status", "running"),
             ),
         )
-        assertEquals("正在执行 Bash", text)
-    }
-
-    @Test
-    fun `progress text falls back to a running subagent summary`() {
-        val text = RelayWire.progressTextFromRows(
+        assertEquals("开始验证", text)
+        val runningSubagent = RelayWire.progressTextFromRows(
             rows(
                 JSONObject().put("kind", "subagent").put("status", "running")
                     .put("subagentType", "explore").put("summaryText", "正在挖协议"),
             ),
         )
-        assertEquals("正在挖协议", text)
+        assertNull(runningSubagent)
     }
 
     @Test
