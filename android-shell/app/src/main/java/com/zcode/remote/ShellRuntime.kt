@@ -336,6 +336,22 @@ object ShellRuntime {
                 applyUpdate(update)
             }
         }
+        // 会话流自带的运行态（turnHeader.state）：controller 流拿不到时的兜底，
+        // 也是真机上更常见的那条路。
+        Tier2Probe.turnStateSink = turn@{ key, sessionId, running ->
+            if (epoch != liveEpoch || !userIsAway()) return@turn
+            mainHandler.post {
+                if (epoch != liveEpoch || !userIsAway() || !livePolling) return@post
+                val update = store.applyConversationRunState(key, sessionId, running)
+                if (update.running.isNotEmpty() || update.removedIds.isNotEmpty()) {
+                    Diagnostics.log(
+                        "debug",
+                        "会话运行态：${if (running) "在跑" else "结束"} · $sessionId",
+                    )
+                }
+                applyUpdate(update)
+            }
+        }
         Tier2Probe.runningSessionsProvider = { key ->
             store.runningTaskRefs().filter { it.first == key }.map { it.second }
         }
@@ -348,6 +364,7 @@ object ShellRuntime {
         liveEpoch += 1
         Tier2Probe.progressSink = null
         Tier2Probe.liveTaskSink = null
+        Tier2Probe.turnStateSink = null
         Tier2Probe.runningSessionsProvider = null
         mainHandler.removeCallbacks(liveProgressPoller)
         store.clearLivePreviews()

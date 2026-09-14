@@ -261,6 +261,50 @@ class RelayWireTest {
     }
 
     @Test
+    fun `turn running reads the newest turn header state`() {
+        val running = RelayWire.ConversationTail()
+        running.applySnapshot(
+            org.json.JSONObject().put(
+                "rows",
+                org.json.JSONObject().put(
+                    "window",
+                    org.json.JSONArray()
+                        .put(JSONObject().put("kind", "userInput").put("text", "开始"))
+                        .put(JSONObject().put("kind", "turnHeader").put("state", "running")),
+                ),
+            ),
+        )
+        assertEquals(true, running.turnRunning())
+
+        val done = RelayWire.ConversationTail()
+        done.applySnapshot(
+            org.json.JSONObject().put(
+                "rows",
+                org.json.JSONObject().put(
+                    "window",
+                    org.json.JSONArray()
+                        .put(JSONObject().put("kind", "turnHeader").put("state", "completedSuccess"))
+                        .put(JSONObject().put("kind", "assistantText").put("text", "好了")),
+                ),
+            ),
+        )
+        assertEquals(false, done.turnRunning())
+
+        // 尾窗里没有 turnHeader 时判定不了——返回 null，别乱猜。
+        val unknown = RelayWire.ConversationTail()
+        unknown.applySnapshot(
+            org.json.JSONObject().put(
+                "rows",
+                org.json.JSONObject().put(
+                    "window",
+                    org.json.JSONArray().put(JSONObject().put("kind", "assistantText").put("text", "x")),
+                ),
+            ),
+        )
+        assertNull(unknown.turnRunning())
+    }
+
+    @Test
     fun `progress text skips tool calls and reasoning`() {
         // 最新是工具调用、再下面是思考过程：都不算"进展"，继续往前找正文。
         val text = RelayWire.progressTextFromRows(

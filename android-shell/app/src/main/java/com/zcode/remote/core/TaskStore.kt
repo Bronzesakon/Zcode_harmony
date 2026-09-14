@@ -83,6 +83,15 @@ class TaskStore {
     private val liveTitles = HashMap<LivePreviewKey, String>()
 
     /**
+     * 会话流推出的运行态（`turnHeader.state`）——controller 流拿不到时的兜底。
+     *
+     * 优先级：controller 覆盖 > 会话流运行态 > sessions-index 持久态。
+     * 为什么需要它：真机上 `subscribeControllerV4` 会超时（那条流看来由桌面端
+     * 窗口进程提供，而原生接管正好把页面顶掉），只靠 SI 的持久态，卡片会冻死。
+     */
+    private val conversationPhases = HashMap<LivePreviewKey, String>()
+
+    /**
      * M4：原生实拉的"对话详情"文本，按 sessionId 覆盖会话索引里的 preview。
      *
      * 为什么需要它：会话索引的 preview 语义是"最后一条消息的开头"，只在**轮次
@@ -213,23 +222,23 @@ class TaskStore {
         return recompute()
     }
 
-    /** 合成一个工作区的任务表：SI 持久态 + controller 运行态覆盖。 */
+    /** 合成一个工作区的任务表：SI 持久态 + controller/会话流运行态覆盖。 */
     private fun effectiveTasks(key: String, persisted: List<TaskSnapshot>): List<TaskSnapshot> {
-        if (livePhases.isEmpty()) return persisted
+        if (livePhases.isEmpty() && conversationPhases.isEmpty()) return persisted
         val merged = ArrayList<TaskSnapshot>(persisted.size + 4)
         val seen = HashSet<String>(persisted.size)
         for (task in persisted) {
             seen.add(task.sessionId)
-            val live = livePhases[LivePreviewKey(key, task.sessionId)]
-            merged.add(if (live == null) task else task.copy(phase = live))
+            val overlay = phaseOverlay(key, task.sessionId)
+            merged.add(if (overlay == null) task else task.copy(phase = overlay))
         }
-        for ((liveKey, phase) in livePhases) {
-            if (liveKey.workspaceKey != key || liveKey.sessionId in seen) continue
+        for (task in livePhases.keys + conversationPhases.keys) {
+            if (task.workspaceKey != key || task.sessionId in seen) continue
             merged.add(
                 TaskSnapshot(
-                    sessionId = liveKey.sessionId,
-                    title = liveTitles[liveKey].orEmpty(),
-                    phase = phase,
+                    sessionId = task.sessionId,
+                    title = liveTitles[task].orEmpty(),
+                    phase = phaseOverlay(key, task.sessionId).orEmpty(),
                     preview = "",
                     pendingInteractionId = "",
                     lastActivityAt = 0L,
@@ -238,6 +247,31 @@ class TaskStore {
             )
         }
         return merged
+    }
+
+    /** 三级优先级：controller 覆盖 > 会话流运行态 > 无（用 SI 的持久态）。 */
+    private fun phaseOverlay(key: String, sessionId: String): String? {
+        val id = LivePreviewKey(key, sessionId)
+        return livePhases[id] ?: conversationPhases[id]
+    }
+
+    /**
+     * 会话流推出的运行态落地（会话 id 维度，整表替换由调用方保证）。
+     */
+    @Synchronized
+    fun applyConversationRunState(workspaceKey: String, sessionId: String, running: Boolean): Update {
+        val id = LivePreviewKey(workspaceKey, sessionId)
+        val phase = if (running) "running" else "completedSuccess"
+        if (conversationPhases[id] == phase) {
+            return Update(emptyList(), emptyList(), emptyList(), emptyList())
+        }
+        conversationPhases[id] = phase
+        for (workspace in workspaces.values.toList()) {
+            workspaces[workspace.key] = workspace.copy(
+                tasks = effectiveTasks(workspace.key, persistedTasks[workspace.key].orEmpty()),
+            )
+        }
+        return recompute()
     }
 
     /** controller 只给了路径时的兜底标题：取路径末段（与 SI 的 title 规则一致）。 */
@@ -293,6 +327,7 @@ class TaskStore {
         notifyState.forget(key)
         livePhases.keys.removeIf { it.workspaceKey == key }
         liveTitles.keys.removeIf { it.workspaceKey == key }
+        conversationPhases.keys.removeIf { it.workspaceKey == key }
         livePreviews.keys.removeIf { it.workspaceKey == key }
         livePreviewAt.keys.removeIf { it.workspaceKey == key }
         return buildUpdate(NotifyUpdate(running = emptyList(), completed = emptyList(), attention = emptyList()))
@@ -304,6 +339,7 @@ class TaskStore {
         persistedTasks.clear()
         livePhases.clear()
         liveTitles.clear()
+        conversationPhases.clear()
         notifyState.reset()
         livePreviews.clear()
         livePreviewAt.clear()

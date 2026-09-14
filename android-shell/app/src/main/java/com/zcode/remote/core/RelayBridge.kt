@@ -122,6 +122,8 @@ class BridgeSession(
     private val onLogLine: (String) -> Unit,
     /** controller 流（运行态）变化时的回调：整表投影，见 [ControllerTasksState.liveTasks]。 */
     private val onLiveTasks: ((List<ControllerTasksState.LiveTask>) -> Unit)? = null,
+    /** 会话流推出的运行态（`turnHeader.state`）：会话 id、是否在跑。 */
+    private val onTurnState: ((sessionId: String, running: Boolean) -> Unit)? = null,
 ) {
     private val senderSeq = java.util.concurrent.atomic.AtomicLong(0)
     private var messageSeq = 0L
@@ -213,10 +215,6 @@ class BridgeSession(
         for (session in progressSessions) {
             subscribeConversationProgress(session)
         }
-        // 运行态流（controller/tasks-index）排在会话订阅之后、索引订阅之前——它
-        // 与索引同属"全局流"，而索引订阅的 existing-only 会把 runtime 钉成索引
-        // 用途（见上），所以让 controller 也抢在它前面。
-        subscribeControllerTasks()
         val subscribeArgs = JSONObject(scope.toString())
             .put("runtimePolicy", "existing-only")
         val result = channels.callBlocking(
@@ -237,6 +235,10 @@ class BridgeSession(
             scope,
         ) { data -> onSessionsWire(data) }
         onLogLine("subscribed sessions-index for $workspaceKey")
+        // 运行态流排最后：它**不是**覆盖的充分条件（真机实测 controller 订阅会
+        // 超时——这条流看起来由桌面端的窗口进程提供，而接管正好把页面顶掉），
+        // 所以绝不能让它挡住握手主路径。失败了也只有一行日志。
+        subscribeControllerTasks()
     }
 
     private fun onSessionsWire(data: Any?) {
@@ -353,7 +355,9 @@ class BridgeSession(
                 RelayWire.CHANNEL_CONVERSATION,
                 RelayWire.METHOD_SUBSCRIBE_CONTROLLER,
                 listOf<Any?>(args),
-                30_000,
+                // 短超时：这条流拿不到时我们还有会话尾窗的 turn 状态兜底，
+                // 没必要让 30s 的超时拖住覆盖线程。
+                12_000,
             ) as? JSONObject
             val subId = result?.optJSONObject("ack")?.optString("subscriptionId").orEmpty()
             if (subId.isEmpty()) {
@@ -582,6 +586,9 @@ class BridgeSession(
         }.start()
     }
 
+    /** 会话流推出的运行态（变化才上报）：sessionId → 归一 phase。 */
+    private val convRunState = ConcurrentHashMap<String, String>()
+
     /** 必须先注册监听再订阅：ACK 之前到达的帧按 topic 缓冲在桌面端，不怕早发。 */
     private fun installConversationListener() {
         if (closed || convListenerId >= 0 ||
@@ -649,10 +656,24 @@ class BridgeSession(
             }
             else -> return
         }
+        reportTurnState(id, tail)
         val text = tail.latestProgressText() ?: return
         if (convLastText[id] == text) return
         convLastText[id] = text
         progressListener?.invoke(id, text)
+    }
+
+    /**
+     * 会话流自带的运行态（`turnHeader.state`）→ 通知层的运行态覆盖。
+     *
+     * 只在**变化**时上报，避免每帧都推一次。
+     */
+    private fun reportTurnState(sessionId: String, tail: RelayWire.ConversationTail) {
+        val running = tail.turnRunning() ?: return
+        val key = if (running) "running" else "completedSuccess"
+        if (convRunState[sessionId] == key) return
+        convRunState[sessionId] = key
+        onTurnState?.invoke(sessionId, running)
     }
 
     /**
@@ -797,6 +818,8 @@ class BridgeManager(
     private val runningSessions: (String) -> List<String> = { emptyList() },
     /** 运行态流（controller/tasks-index）整表回调，见 [ControllerTasksState]。 */
     private val liveTaskSink: ((List<ControllerTasksState.LiveTask>) -> Unit)? = null,
+    /** 会话流运行态回调（工作区键、会话 id、是否在跑）——controller 拿不到时的兜底。 */
+    private val turnStateSink: ((String, String, Boolean) -> Unit)? = null,
     private val maxWorkspaces: Int = 12,
 ) {
     private val relayPending = ConcurrentHashMap<String, PendingRelayRequest>()
@@ -1054,6 +1077,9 @@ class BridgeManager(
             onSessionsUpdate = onSessionsUpdate,
             onLogLine = onLogLine,
             onLiveTasks = liveTaskSink,
+            onTurnState = turnStateSink?.let { sink ->
+                { sessionId, running -> sink(key, sessionId, running) }
+            },
         )
         // Register before replaying: frames arriving after ready route directly to this instance.
         if (bridges.putIfAbsent(key, bridge) != null) {

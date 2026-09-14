@@ -110,6 +110,15 @@ object Tier2Probe {
     var liveTaskSink: ((List<ControllerTasksState.LiveTask>) -> Unit)? = null
 
     /**
+     * 会话流运行态出口（兜底）：controller 流拿不到时，用会话尾窗的
+     * `turnHeader.state` 判"在跑"。真机实测 controller 订阅会超时（那条流
+     * 看来由桌面窗口进程提供，而接管正好顶掉页面），没有这条兜底，
+     * 后台卡片就会冻在接管那一刻。
+     */
+    @Volatile
+    var turnStateSink: ((workspaceKey: String, sessionId: String, running: Boolean) -> Unit)? = null
+
+    /**
      * M4：某工作区当前在跑的会话（ShellRuntime 注入）。握手时用它把对话订阅
      * **抢在索引订阅之前**发出去——顺序错了桌面端就永远不回包（见 runHandshake）。
      */
@@ -279,6 +288,13 @@ object Tier2Probe {
                     liveTaskSink?.invoke(tasks)
                 } catch (e: Exception) {
                     Diagnostics.log("warn", "Tier2: 运行态回调失败 ${e.message}")
+                }
+            },
+            turnStateSink = { key, sessionId, running ->
+                try {
+                    turnStateSink?.invoke(key, sessionId, running)
+                } catch (e: Exception) {
+                    Diagnostics.log("warn", "Tier2: 会话运行态回调失败 ${e.message}")
                 }
             },
         )

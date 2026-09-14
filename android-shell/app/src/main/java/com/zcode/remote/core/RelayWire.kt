@@ -672,6 +672,28 @@ object RelayWire {
         /** 最新一行的"进展"文本；没有可展示的行时返回 null。 */
         fun latestProgressText(): String? = progressTextFromRows(rows)
 
+        /**
+         * 会话尾窗里的**运行态**：最后一条 `turnHeader` 的 `state`。
+         *
+         * 这是 Tier2 后台跟踪的可靠运行态来源——`sessions-index` 的 `phase` 只在
+         * 轮次边界变，`controller/tasks-index` 又拿不到（真机 `subscribeControllerV4
+         * timed out`，那条流看来由桌面端窗口进程提供，而接管恰好顶掉页面），而
+         * 会话流本身一直跟着最新状态：`turnHeader.state == 'running'` 就是"在跑"
+         * （bundle 里 UI 也是这么判的：`_?.state === 'running'`）。
+         *
+         * 返回 null = 尾窗里还没有 turnHeader（判定不了，别乱猜）。
+         */
+        fun turnRunning(): Boolean? {
+            for (i in rows.length() - 1 downTo 0) {
+                val row = rows.optJSONObject(i) ?: continue
+                if (row.optString("kind") != "turnHeader") continue
+                val state = row.optString("state")
+                if (state.isEmpty()) return null
+                return state == "running" || state == "pending"
+            }
+            return null
+        }
+
         private fun applyRowDelta(op: JSONObject) {
             val rowId = op.optString("rowId")
             val at = indexOfRow(rowId)

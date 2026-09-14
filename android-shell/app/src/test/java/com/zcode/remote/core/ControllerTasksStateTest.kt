@@ -133,4 +133,53 @@ class ControllerTasksStateTest {
         state.bind("sub-1")
         assertFalse(state.applyWire(deltas("sub-1", 0L, 1L)))
     }
+
+    @Test
+    fun `conversation run state outranks the persisted phase`() {
+        // 真机形态：sessions-index 说"全完成"，而会话流还在跑——卡片必须活着。
+        val store = TaskStore()
+        store.applyWorkspace(
+            key = "/repo/a",
+            title = "a",
+            path = "/repo/a",
+            identity = "",
+            source = "active",
+            tasks = listOf(
+                TaskSnapshot(
+                    sessionId = "sess_a",
+                    title = "任务一",
+                    phase = "completedSuccess",
+                    preview = "",
+                    pendingInteractionId = "",
+                    lastActivityAt = 1L,
+                    hasBackgroundWork = false,
+                ),
+            ),
+        )
+        val update = store.applyConversationRunState("/repo/a", "sess_a", true)
+        assertEquals(1, update.running.size)
+        assertEquals(listOf("/repo/a" to "sess_a"), store.runningTaskRefs())
+        // 一轮结束 → 完成卡片，并退出运行集。
+        val done = store.applyConversationRunState("/repo/a", "sess_a", false)
+        assertEquals(1, done.completed.size)
+        assertEquals(0, store.runningTaskRefs().size)
+    }
+
+    @Test
+    fun `controller live status outranks the conversation run state`() {
+        val store = TaskStore()
+        store.applyConversationRunState("/repo/a", "sess_a", true)
+        store.applyLiveTasks(
+            listOf(
+                ControllerTasksState.LiveTask(
+                    workspaceKey = "/repo/a",
+                    sessionId = "sess_a",
+                    title = "任务一",
+                    phase = "completedSuccess",
+                    liveStatus = "completed",
+                ),
+            ),
+        )
+        assertEquals(0, store.runningTaskRefs().size)
+    }
 }
