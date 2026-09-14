@@ -323,8 +323,8 @@ object ShellRuntime {
         }
         // 运行态（controller/tasks-index）是后台期间"哪些任务在跑"的唯一正源：
         // 没有它，sessions-index 的持久态会把 store 覆盖成"全完成"，活进展无处可去。
-        Tier2Probe.liveTaskSink = { tasks ->
-            if (epoch != liveEpoch || !userIsAway()) return@liveTaskSink
+        Tier2Probe.liveTaskSink = live@{ tasks ->
+            if (epoch != liveEpoch || !userIsAway()) return@live
             mainHandler.post {
                 if (epoch != liveEpoch || !userIsAway() || !livePolling) return@post
                 val update = store.applyLiveTasks(tasks)
