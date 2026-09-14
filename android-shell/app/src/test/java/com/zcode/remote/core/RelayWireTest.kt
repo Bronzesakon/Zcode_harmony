@@ -235,6 +235,20 @@ class RelayWireTest {
         assertEquals("旧", tail.latestProgressText())
     }
     @Test
+    fun `conversation tail carries frame base for resync`() {
+        val tail = RelayWire.ConversationTail()
+        tail.applySnapshot(
+            JSONObject().put("rows", JSONObject().put("window", JSONArray())),
+            logEpoch = "epoch-7",
+            seq = 42,
+        )
+        assertEquals("epoch-7", tail.logEpoch())
+        assertEquals(42L, tail.seq())
+        tail.applyDeltas(JSONArray(), seq = 43)
+        assertEquals(43L, tail.seq())
+    }
+
+    @Test
     fun `progress text takes the newest assistant text`() {
         val text = RelayWire.progressTextFromRows(
             rows(

@@ -63,6 +63,7 @@ object RelayWire {
     const val EVENT_CONVERSATION_FRAME = "onDynamicConversationFrame"
     const val METHOD_SUBSCRIBE_CONV = "subscribeConversationV4"
     const val METHOD_UNSUBSCRIBE_CONV = "unsubscribeConversationV4"
+    const val METHOD_RESYNC_CONV = "resyncConversationV4"
 
     const val MAX_MESSAGE_BYTES = 16 * 1024 * 1024
     const val MAX_FRAGMENT_BYTES = 512 * 1024
@@ -585,21 +586,29 @@ object RelayWire {
      *
      * 已实现的 op：`row.appended` / `row.upserted` / `row.removed` /
      * `row.delta`（`text` / `inputText` / `output.text` / `summaryText`）/
-     * `state.updated`（对某行的浅合并）。缺任何一个都不影响"最新一行"的正确性，
+     * `state.updated`（会话级元数据，不改行）。缺任何一个都不影响"最新一行"的正确性，
      * 因为下一次 snapshot（重订阅/重同步）会把整窗拉回来重置。
      */
     class ConversationTail {
         private var rows = JSONArray()
+        private var currentLogEpoch: String? = null
+        private var currentSeq = 0L
+
+        fun logEpoch(): String? = currentLogEpoch
+        fun seq(): Long = currentSeq
 
         val size: Int get() = rows.length()
 
-        fun applySnapshot(snapshot: JSONObject?) {
+        fun applySnapshot(snapshot: JSONObject?, logEpoch: String? = null, seq: Long? = null) {
             val window = snapshot?.optJSONObject("rows")?.optJSONArray("window")
             rows = window ?: JSONArray()
+            currentLogEpoch = logEpoch?.takeIf { it.isNotEmpty() }
+                ?: snapshot?.optString("logEpoch")?.takeIf { it.isNotEmpty() }
+            if (seq != null) currentSeq = seq
             trim()
         }
 
-        fun applyDeltas(deltas: JSONArray?) {
+        fun applyDeltas(deltas: JSONArray?, seq: Long? = null) {
             if (deltas == null) return
             for (i in 0 until deltas.length()) {
                 val op = deltas.optJSONObject(i) ?: continue
@@ -633,6 +642,7 @@ object RelayWire {
                     "state.updated" -> applyStatePatch(op)
                 }
             }
+            if (seq != null) currentSeq = seq
             trim()
         }
 

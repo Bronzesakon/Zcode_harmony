@@ -266,9 +266,8 @@ class BridgeSession(
     private val convTails = ConcurrentHashMap<String, RelayWire.ConversationTail>()
     private val convLastText = ConcurrentHashMap<String, String>()
     private val pendingConversationFrames = ConcurrentHashMap<String, MutableList<JSONObject>>()
-    @Volatile
-    private var reanchorRunning = false
-    private val reanchoringSessions = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private val convResyncing = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private val reanchorRunning = java.util.concurrent.atomic.AtomicBoolean(false)
     private val installingConversationListener = java.util.concurrent.atomic.AtomicBoolean(false)
     private val convAttempting = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
 
@@ -293,8 +292,7 @@ class BridgeSession(
     }
 
     private fun subscribeConversationProgressInternal(sessionId: String, fromReanchor: Boolean) {
-        if (closed || (!fromReanchor && reanchoringSessions.contains(sessionId))) return
-        if (convSubscriptions.containsKey(sessionId)) return
+        if (closed) return
         if (!convAttempting.add(sessionId)) return
         installConversationListener()
         if (convListenerId < 0) {
@@ -340,38 +338,43 @@ class BridgeSession(
      * `when` 冻在原地。所以"最新进展"不能只赌 push：每隔一段时间重挂一次，
      * 最坏也只慢一个重挂周期，而不会回到几十分钟级的滞后。
      */
-    @Synchronized
+    /** 周期性重挂：保留对话订阅，在同一 subscription 上强制请求新 snapshot。 */
     fun reanchorConversations() {
-        if (closed || reanchorRunning) return
-        val sessions = convSubscriptions.keys.toList()
-        if (sessions.isEmpty()) return
-        reanchorRunning = true
+        if (closed || !reanchorRunning.compareAndSet(false, true)) return
+        val entries = convSubscriptions.entries.toList()
+        if (entries.isEmpty()) {
+            reanchorRunning.set(false)
+            return
+        }
         Thread {
             try {
-                for (session in sessions) {
-                    if (closed) break
-                    val subId = convSubscriptions.remove(session) ?: continue
-                    reanchoringSessions.add(session)
+                for ((session, subId) in entries) {
+                    if (closed || !convResyncing.add(session)) continue
                     try {
-                        val args = JSONObject(scope.toString()).put("subscriptionId", subId)
+                        val base = JSONObject(scope.toString())
+                            .put("subscriptionId", subId)
+                            .put("forceSnapshot", true)
+                        val tail = convTails[session]
+                        if (tail != null && !tail.logEpoch().isNullOrEmpty()) {
+                            base.put("base", JSONObject()
+                                .put("logEpoch", tail.logEpoch())
+                                .put("seq", tail.seq()))
+                        }
                         channels.callBlocking(
                             RelayWire.CHANNEL_CONVERSATION,
-                            RelayWire.METHOD_UNSUBSCRIBE_CONV,
-                            listOf<Any?>(args),
-                            8_000,
+                            RelayWire.METHOD_RESYNC_CONV,
+                            listOf<Any?>(base),
+                            20_000,
                         )
+                        onLogLine("reanchor conversation for $session (force snapshot)")
                     } catch (e: Exception) {
-                        // 尽力而为：退订失败也不影响重订阅。
+                        onLogLine("conversation resync failed for $session: ${e.message}")
+                    } finally {
+                        convResyncing.remove(session)
                     }
-                    convTails.remove(session)
-                    convLastText.remove(session)
-                    onLogLine("reanchor conversation for $session (距上次共收 ${convFrames} 个帧)")
-                    reanchoringSessions.remove(session)
-                    subscribeConversationProgressInternal(session, fromReanchor = true)
                 }
             } finally {
-                reanchoringSessions.clear()
-                reanchorRunning = false
+                reanchorRunning.set(false)
             }
         }.start()
     }
@@ -420,9 +423,11 @@ class BridgeSession(
         }
         val tail = convTails.getOrPut(id) { RelayWire.ConversationTail() }
         val payload = frame.optJSONObject("payload") ?: return
+        val frameLogEpoch = frame.optString("logEpoch").takeIf { it.isNotEmpty() }
+        val frameSeq = frame.optLong("toSeq", -1L).takeIf { it >= 0L }
         when (payload.optString("kind")) {
-            "snapshot" -> tail.applySnapshot(payload.optJSONObject("snapshot"))
-            "deltas" -> tail.applyDeltas(payload.optJSONArray("deltas"))
+            "snapshot" -> tail.applySnapshot(payload.optJSONObject("snapshot"), frameLogEpoch, frameSeq)
+            "deltas" -> tail.applyDeltas(payload.optJSONArray("deltas"), frameSeq)
             else -> return
         }
         val text = tail.latestProgressText() ?: return
@@ -522,6 +527,9 @@ class BridgeManager(
     private val bridgesById = ConcurrentHashMap<String, BridgeSession>()
     private val idToKey = ConcurrentHashMap<String, String>()
     private var bridgeGeneration = 0L
+    @Volatile
+    private var disposed = false
+    private val reanchorRunning = java.util.concurrent.atomic.AtomicBoolean(false)
 
     /**
      * 桥开启在飞窗口的缓冲：桌面端会在 ready 应答**之前**就推送 Initialize
