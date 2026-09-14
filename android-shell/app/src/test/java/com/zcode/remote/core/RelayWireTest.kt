@@ -1,5 +1,6 @@
 package com.zcode.remote.core
 
+import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -292,8 +293,7 @@ class RelayWireTest {
         assertTrue("截断要有省略号", text.startsWith("…"))
         // 换行会被折叠成空格（通知卡片不渲染换行）
         val wrapped = RelayWire.progressTextFromRows(
-            rows(JSONObject().put("kind", "assistantText").put("text", "第一行
-第二行")),
+            rows(JSONObject().put("kind", "assistantText").put("text", "第一行\n第二行")),
         )
         assertEquals("第一行 第二行", wrapped)
     }
