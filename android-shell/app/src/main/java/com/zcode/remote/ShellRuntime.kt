@@ -7,6 +7,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import com.zcode.remote.core.Diagnostics
+import com.zcode.remote.core.NotifyState
 import com.zcode.remote.core.Prefs
 import com.zcode.remote.core.RelayCreds
 import com.zcode.remote.core.SurvivalVerdict
@@ -320,6 +321,21 @@ object ShellRuntime {
         Tier2Probe.progressSink = { key, sessionId, text ->
             if (epoch == liveEpoch) pushLivePreview(key, sessionId, text)
         }
+        // 运行态（controller/tasks-index）是后台期间"哪些任务在跑"的唯一正源：
+        // 没有它，sessions-index 的持久态会把 store 覆盖成"全完成"，活进展无处可去。
+        Tier2Probe.liveTaskSink = { tasks ->
+            if (epoch != liveEpoch || !userIsAway()) return@liveTaskSink
+            mainHandler.post {
+                if (epoch != liveEpoch || !userIsAway() || !livePolling) return@post
+                val update = store.applyLiveTasks(tasks)
+                val running = tasks.count { it.phase in NotifyState.RUNNING_PHASES }
+                Diagnostics.log(
+                    "debug",
+                    "运行态：${tasks.size} 个任务（running=$running）",
+                )
+                applyUpdate(update)
+            }
+        }
         Tier2Probe.runningSessionsProvider = { key ->
             store.runningTaskRefs().filter { it.first == key }.map { it.second }
         }
@@ -331,6 +347,7 @@ object ShellRuntime {
         livePolling = false
         liveEpoch += 1
         Tier2Probe.progressSink = null
+        Tier2Probe.liveTaskSink = null
         Tier2Probe.runningSessionsProvider = null
         mainHandler.removeCallbacks(liveProgressPoller)
         store.clearLivePreviews()

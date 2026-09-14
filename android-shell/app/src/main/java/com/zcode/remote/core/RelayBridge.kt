@@ -115,9 +115,13 @@ class BridgeSession(
     val scope: JSONObject,
     val bridgeSessionId: String,
     val bridgeGeneration: Long,
+    /** 桌面端在 bridge-ready 里给的恢复标识；身份三元组的一部分，缺了 ack 会被丢。 */
+    val recoveryId: String? = null,
     private val sendPayloadOut: (JSONObject) -> Unit,
     private val onSessionsUpdate: (JSONObject) -> Unit,
     private val onLogLine: (String) -> Unit,
+    /** controller 流（运行态）变化时的回调：整表投影，见 [ControllerTasksState.liveTasks]。 */
+    private val onLiveTasks: ((List<ControllerTasksState.LiveTask>) -> Unit)? = null,
 ) {
     private val senderSeq = java.util.concurrent.atomic.AtomicLong(0)
     private var messageSeq = 0L
@@ -148,12 +152,20 @@ class BridgeSession(
     }
 
     private fun sendAck(messageSeq: Long) {
-        sendPayloadOut(
-            JSONObject()
-                .put("zcode_type", "rpc-frame-ack")
-                .put("bridgeSessionId", bridgeSessionId)
-                .put("ackMessageSeq", messageSeq),
-        )
+        // **身份三元组必须齐全**：桌面端对入站 payload 做
+        // `bridgeSessionId && bridgeGeneration && recoveryId` 全等匹配
+        // （bundle `a2t()`），缺字段的 ack 会被直接丢弃。少了 bridgeGeneration
+        // 的后果不是"ack 白发"这么轻：桌面端的 replay buffer 会因"发出去的消息
+        // 从未被确认"而持续累积，约 45s 后把整座桥判为 degraded
+        // （`remote.rpcFrame.ackGraceExceeded`），此后该桥所有 RPC 都不再应答、
+        // 推送也停——真机连续三天看到的"新桥好一分钟、随后订阅/resync 集体超时、
+        // 只能靠整桥回收续命"就是它（2026-09-14 源码审计定案）。
+        val ack = JSONObject()
+            .put("zcode_type", "rpc-frame-ack")
+            .put("bridgeSessionId", bridgeSessionId)
+            .put("bridgeGeneration", bridgeGeneration)
+        if (!recoveryId.isNullOrEmpty()) ack.put("recoveryId", recoveryId)
+        sendPayloadOut(ack.put("ackMessageSeq", messageSeq))
     }
 
     @Synchronized
@@ -167,6 +179,7 @@ class BridgeSession(
                 ((bytes.size + RelayWire.MAX_FRAGMENT_BYTES - 1) / RelayWire.MAX_FRAGMENT_BYTES).toLong(),
             ) + 1,
             bridgeGeneration = bridgeGeneration,
+            recoveryId = recoveryId,
         )
         for (frame in frames) sendPayloadOut(frame)
     }
@@ -200,6 +213,10 @@ class BridgeSession(
         for (session in progressSessions) {
             subscribeConversationProgress(session)
         }
+        // 运行态流（controller/tasks-index）排在会话订阅之后、索引订阅之前——它
+        // 与索引同属"全局流"，而索引订阅的 existing-only 会把 runtime 钉成索引
+        // 用途（见上），所以让 controller 也抢在它前面。
+        subscribeControllerTasks()
         val subscribeArgs = JSONObject(scope.toString())
             .put("runtimePolicy", "existing-only")
         val result = channels.callBlocking(
@@ -303,6 +320,127 @@ class BridgeSession(
     @Volatile
     private var convFrames = 0
 
+    // ------------------------------------------- 运行态流（controller/tasks-index）
+
+    private val controllerState = ControllerTasksState()
+    private var controllerListenerId = -1L
+    private var controllerSubscriptionId: String? = null
+    private val controllerResyncing = java.util.concurrent.atomic.AtomicBoolean(false)
+    private val installingControllerListener = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /**
+     * 订阅运行态流。**失败不致命**：拿不到它时行为退回"只有 sessions-index
+     * 的持久态"，即接管后的卡片会冻住——所以失败必须留在日志里，别静默。
+     */
+    private fun subscribeControllerTasks() {
+        if (closed || controllerSubscriptionId != null) return
+        if (!installingControllerListener.compareAndSet(false, true)) return
+        try {
+            if (!channels.awaitReady(30_000)) return
+            synchronized(this) {
+                if (!closed && controllerListenerId < 0) {
+                    controllerListenerId = channels.listenEvent(
+                        RelayWire.CHANNEL_CONVERSATION,
+                        RelayWire.EVENT_CONTROLLER_FRAME,
+                        null,
+                    ) { data -> onControllerWire(data) }
+                }
+            }
+            val args = JSONObject()
+                .put("topic", RelayWire.TOPIC_CONTROLLER_TASKS)
+                .put("visibility", "foreground")
+            val result = channels.callBlocking(
+                RelayWire.CHANNEL_CONVERSATION,
+                RelayWire.METHOD_SUBSCRIBE_CONTROLLER,
+                listOf<Any?>(args),
+                30_000,
+            ) as? JSONObject
+            val subId = result?.optJSONObject("ack")?.optString("subscriptionId").orEmpty()
+            if (subId.isEmpty()) {
+                onLogLine("controller subscribe: no ack.subscriptionId")
+                return
+            }
+            controllerSubscriptionId = subId
+            controllerState.bind(subId)
+            onLogLine("subscribed controller tasks-index for $workspaceKey")
+        } catch (e: Exception) {
+            onLogLine("controller subscribe failed for $workspaceKey: ${e.message}")
+        } finally {
+            installingControllerListener.set(false)
+        }
+    }
+
+    private fun onControllerWire(data: Any?) {
+        val wire = data as? JSONObject ?: return
+        val topic = wire.optString("topic", "")
+        if (topic != RelayWire.TOPIC_CONTROLLER_TASKS) return
+        if (controllerState.applyWire(wire)) {
+            onLiveTasks?.invoke(controllerState.liveTasks())
+        }
+        if (controllerState.needsResync) {
+            controllerState.needsResync = false
+            resyncController()
+        }
+    }
+
+    private fun resyncController() {
+        val subId = controllerSubscriptionId ?: return
+        if (!controllerResyncing.compareAndSet(false, true)) return
+        Thread {
+            try {
+                val args = JSONObject()
+                    .put("subscriptionId", subId)
+                    .put("forceSnapshot", true)
+                    .put(
+                        "base",
+                        controllerState.logEpoch?.let {
+                            JSONObject().put("logEpoch", it).put("seq", controllerState.seq)
+                        } ?: JSONObject.NULL,
+                    )
+                channels.callBlocking(
+                    RelayWire.CHANNEL_CONVERSATION,
+                    RelayWire.METHOD_RESYNC_CONTROLLER,
+                    listOf<Any?>(args),
+                    15_000,
+                )
+                onLogLine("resynced controller tasks-index for $workspaceKey")
+            } catch (e: Exception) {
+                onLogLine("controller resync failed for $workspaceKey: ${e.message}")
+            } finally {
+                controllerResyncing.set(false)
+            }
+        }.start()
+    }
+
+    private fun unsubscribeController() {
+        val subId = controllerSubscriptionId ?: return
+        controllerSubscriptionId = null
+        try {
+            val args = JSONObject().put("subscriptionId", subId)
+            channels.callBlocking(
+                RelayWire.CHANNEL_CONVERSATION,
+                RelayWire.METHOD_UNSUBSCRIBE_CONTROLLER,
+                listOf<Any?>(args),
+                2_000,
+            )
+        } catch (e: Exception) {
+            // 尽力而为
+        }
+        if (controllerListenerId >= 0) {
+            try {
+                channels.removeListener(
+                    RelayWire.CHANNEL_CONVERSATION,
+                    RelayWire.EVENT_CONTROLLER_FRAME,
+                    controllerListenerId,
+                )
+            } catch (e: Exception) {
+                // 关闭路径不再抛
+            }
+            controllerListenerId = -1L
+        }
+        controllerState.resetState()
+    }
+
     /** M4 进展回调（BridgeManager 建桥时挂上：握手与轮询共用）。 */
     @Volatile
     var progressListener: ((sessionId: String, text: String) -> Unit)? = null
@@ -335,7 +473,11 @@ class BridgeSession(
         try {
             val args = JSONObject(scope.toString())
                 .put("sessionId", sessionId)
-                .put("visibility", "background")
+            // **不传 visibility**：网页端的会话订阅只发 {topic, base}（bundle
+            // store.connect），从不带 visibility。我们此前硬编码
+            // visibility:"background"——按 schema 它是合法值，但真机表现是
+            // "首屏快照之后再无任何 delta 推送、同桥 RPC 也逐渐变聋"，与网页端
+            // 前台订阅的行为不符。对齐网页端：省略该字段。
             val result = channels.callBlocking(
                 RelayWire.CHANNEL_CONVERSATION,
                 RelayWire.METHOD_SUBSCRIBE_CONV,
@@ -489,13 +631,76 @@ class BridgeSession(
         val frameSeq = frame.optLong("toSeq", -1L).takeIf { it >= 0L }
         when (payload.optString("kind")) {
             "snapshot" -> tail.applySnapshot(payload.optJSONObject("snapshot"), frameLogEpoch, frameSeq)
-            "deltas" -> tail.applyDeltas(payload.optJSONArray("deltas"), frameSeq)
+            "deltas" -> {
+                // 缺口规则（网页端 applyFrame 的同款）：没有基线时来的 deltas 不可信；
+                // 有基线但 fromSeq 对不上本地 seq 就是断档——都必须先补，不能盲接。
+                val fromSeq = frame.optLong("fromSeq", -1L)
+                val localSeq = tail.seq()
+                val hasBase = !tail.logEpoch().isNullOrEmpty()
+                if (!hasBase || (fromSeq >= 0L && localSeq > 0L && fromSeq != localSeq)) {
+                    onLogLine(
+                        "conversation gap for $id (fromSeq=$fromSeq local=$localSeq " +
+                            "hasBase=$hasBase) — recovering",
+                    )
+                    recoverConversation(id, forceSnapshot = !hasBase)
+                    return
+                }
+                tail.applyDeltas(payload.optJSONArray("deltas"), frameSeq)
+            }
             else -> return
         }
         val text = tail.latestProgressText() ?: return
         if (convLastText[id] == text) return
         convLastText[id] = text
         progressListener?.invoke(id, text)
+    }
+
+    /**
+     * 单会话缺口恢复（网页端 issueRecovery 的同款语义）：
+     * 有基线时用 `base` 便宜地补；没基线只能 `forceSnapshot`。
+     * 回包 `subscriptionId` 与当前订阅不一致 = 订阅已换代（网页端
+     * `resyncGenerationMismatch`）；`notOwned` 则说明订阅已不属于本连接——
+     * 这两种都按网页端做法**重订这 1 个会话**，而不是整桥回收。
+     */
+    private fun recoverConversation(sessionId: String, forceSnapshot: Boolean) {
+        val subId = convSubscriptions[sessionId] ?: return
+        if (!convResyncing.add(sessionId)) return
+        Thread {
+            try {
+                val tail = convTails[sessionId]
+                val hasBase = tail != null && !tail.logEpoch().isNullOrEmpty()
+                val args = JSONObject(scope.toString()).put("subscriptionId", subId)
+                args.put(
+                    "base",
+                    if (hasBase) {
+                        JSONObject().put("logEpoch", tail!!.logEpoch()).put("seq", tail!!.seq())
+                    } else {
+                        JSONObject.NULL
+                    },
+                )
+                if (forceSnapshot || !hasBase) args.put("forceSnapshot", true)
+                val result = channels.callBlocking(
+                    RelayWire.CHANNEL_CONVERSATION,
+                    RelayWire.METHOD_RESYNC_CONV,
+                    listOf<Any?>(args),
+                    15_000,
+                ) as? JSONObject
+                val ackSub = result?.optJSONObject("ack")?.optString("subscriptionId").orEmpty()
+                if (ackSub.isNotEmpty() && ackSub != subId) {
+                    throw RelayWire.WireException("fault.subscription.resyncGenerationMismatch")
+                }
+                onLogLine("conversation recovered for $sessionId (base=$hasBase)")
+            } catch (e: Exception) {
+                onLogLine("conversation recovery failed for $sessionId: ${e.message}")
+                if (e.message?.contains("notOwned") == true) {
+                    convSubscriptions.remove(sessionId)
+                    convTails.remove(sessionId)
+                    subscribeConversationProgress(sessionId)
+                }
+            } finally {
+                convResyncing.remove(sessionId)
+            }
+        }.start()
     }
 
     private fun unsubscribeConversations() {
@@ -538,6 +743,11 @@ class BridgeSession(
     fun closeBridge() {
         if (closed) return
         closed = true
+        try {
+            unsubscribeController()
+        } catch (e: Exception) {
+            // 关闭路径不再抛
+        }
         try {
             unsubscribeConversations()
         } catch (e: Exception) {
@@ -585,6 +795,8 @@ class BridgeManager(
     private val progressSink: ((String, String, String) -> Unit)? = null,
     /** M4：握手时要抢在索引订阅之前订的会话（该工作区当前在跑的任务）。 */
     private val runningSessions: (String) -> List<String> = { emptyList() },
+    /** 运行态流（controller/tasks-index）整表回调，见 [ControllerTasksState]。 */
+    private val liveTaskSink: ((List<ControllerTasksState.LiveTask>) -> Unit)? = null,
     private val maxWorkspaces: Int = 12,
 ) {
     private val relayPending = ConcurrentHashMap<String, PendingRelayRequest>()
@@ -784,6 +996,7 @@ class BridgeManager(
         val key = workspaceKeyOf(workspace) ?: return null
         val bridgeSessionId = randomWireId("zcshell-bridge")
         val requestId = randomWireId("zcshell-bopen")
+        val recoveryId = randomWireId("zcshell-recovery")
         val scope = JSONObject().put("workspacePath", workspace.optString("workspacePath", ""))
         val identity = workspace.optString("workspaceIdentity", "")
         if (identity.isNotEmpty()) scope.put("workspaceIdentity", identity)
@@ -795,6 +1008,7 @@ class BridgeManager(
                 .put("requestId", requestId)
                 .put("bridgeSessionId", bridgeSessionId)
                 .put("bridgeGeneration", bridgeGeneration)
+                .put("recoveryId", recoveryId)
                 .put("workspaceKey", key),
         )
         val reply = try {
@@ -808,7 +1022,13 @@ class BridgeManager(
         if (reply.optString("zcode_type") == "workspace-bridge-error") {
             inflightOpenId = null
             preOpenBuffer.clear()
-            throw RelayWire.WireException(reply.optString("error", "workspace-bridge-error"))
+            // schema 要求 reason + error 两个字段都在；只读 error 会丢掉原因码
+            // （desktop-bootstrap-timeout / relay-unavailable 是可重试的）。
+            val reason = reply.optString("reason", "unexpected-error")
+            val error = reply.optString("error", "")
+            throw RelayWire.WireException(
+                if (error.isEmpty()) reason else "$reason: $error",
+            )
         }
         val info = reply.optJSONObject("bridge") ?: JSONObject()
         val actualId = info.optString("bridgeSessionId").ifEmpty { bridgeSessionId }
@@ -817,6 +1037,11 @@ class BridgeManager(
         } else {
             bridgeGeneration
         }
+        // 身份三元组的第三项：客户端自生成、在 open/数据帧/ack 三处保持一致
+        // （网页端也是自己生成 recoveryId 再带进 workspace-bridge-open）。
+        val recovery = reply.optString("recoveryId").takeIf { it.isNotEmpty() }
+            ?: info.optString("recoveryId").takeIf { it.isNotEmpty() }
+            ?: recoveryId
         idToKey[actualId] = key
         idToKey[bridgeSessionId] = key
         val bridge = BridgeSession(
@@ -824,9 +1049,11 @@ class BridgeManager(
             scope = scope,
             bridgeSessionId = actualId,
             bridgeGeneration = generation,
+            recoveryId = recovery,
             sendPayloadOut = sendPayloadOut,
             onSessionsUpdate = onSessionsUpdate,
             onLogLine = onLogLine,
+            onLiveTasks = liveTaskSink,
         )
         // Register before replaying: frames arriving after ready route directly to this instance.
         if (bridges.putIfAbsent(key, bridge) != null) {

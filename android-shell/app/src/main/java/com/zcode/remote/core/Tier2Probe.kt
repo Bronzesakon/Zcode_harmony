@@ -103,6 +103,13 @@ object Tier2Probe {
     var progressSink: ((workspaceKey: String, sessionId: String, text: String) -> Unit)? = null
 
     /**
+     * 运行态出口（controller/tasks-index 的整表投影，见 [ControllerTasksState]）。
+     * 与 [progressSink] 同时挂上：运行态决定"哪些任务值得跟踪"，进展决定"卡片正文"。
+     */
+    @Volatile
+    var liveTaskSink: ((List<ControllerTasksState.LiveTask>) -> Unit)? = null
+
+    /**
      * M4：某工作区当前在跑的会话（ShellRuntime 注入）。握手时用它把对话订阅
      * **抢在索引订阅之前**发出去——顺序错了桌面端就永远不回包（见 runHandshake）。
      */
@@ -267,6 +274,13 @@ object Tier2Probe {
                 }
             },
             runningSessions = { key -> runningSessionsProvider?.invoke(key).orEmpty() },
+            liveTaskSink = { tasks ->
+                try {
+                    liveTaskSink?.invoke(tasks)
+                } catch (e: Exception) {
+                    Diagnostics.log("warn", "Tier2: 运行态回调失败 ${e.message}")
+                }
+            },
         )
         bridgeManager = manager
         Thread {

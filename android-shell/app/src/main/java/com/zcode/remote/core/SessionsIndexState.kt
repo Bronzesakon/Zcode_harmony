@@ -60,9 +60,9 @@ data class SessionEntry(
 }
 
 /**
- * 逻辑帧分片重组上限（与 JS MAX_LOGICAL_FRAGMENTS 一致）。
+ * 逻辑帧分片重组上限（与协议 `logicalFrameAssemblyMaxFragments` 一致）。
  */
-private const val MAX_LOGICAL_FRAGMENTS = 64
+private const val MAX_LOGICAL_FRAGMENTS = 1024
 
 class SessionsIndexState {
 
@@ -169,6 +169,10 @@ class SessionsIndexState {
                 seq = toSeq
             }
             "deltas" -> {
+                // 旧帧/重复帧先丢：网页端在比较 fromSeq 之前就 `if(toSeq<=seq) return`。
+                // 少了这一步，乱序到达的旧帧会被判成"断档"，把 resync 打成风暴
+                // （真机 pre.97：300ms 内 6-10 发并发 resyncSessionsIndexV4）。
+                if (toSeq <= seq) return false
                 val fromSeq = if (frame.has("fromSeq") && !frame.isNull("fromSeq")) {
                     frame.optLong("fromSeq")
                 } else {

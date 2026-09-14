@@ -66,6 +66,23 @@ class TaskStore {
     private var previousRunningIds: Set<Int> = emptySet()
 
     /**
+     * sessions-index 给的**持久态**任务表（每个工作区一份，`applyWorkspace` 写）。
+     * 与运行态分开存，是因为两者的更新来源完全不同：SI 只在轮次边界变，
+     * controller 流才是"此刻在跑"。
+     */
+    private val persistedTasks = HashMap<String, List<TaskSnapshot>>()
+
+    /**
+     * 运行态覆盖层（`controller/tasks-index` 的 `liveStatus`，键为工作区+会话）。
+     *
+     * 真机 2026-09-14 定案：SI 的 `phase` 在接管后把 store 覆盖成"全部完成"，
+     * 而桌面端其实一直在推 controller 流——我们从没订过它，于是
+     * `runningTaskRefs()` 变空、活进展被丢、流体云卡片冻死。
+     */
+    private val livePhases = HashMap<LivePreviewKey, String>()
+    private val liveTitles = HashMap<LivePreviewKey, String>()
+
+    /**
      * M4：原生实拉的"对话详情"文本，按 sessionId 覆盖会话索引里的 preview。
      *
      * 为什么需要它：会话索引的 preview 语义是"最后一条消息的开头"，只在**轮次
@@ -140,6 +157,7 @@ class TaskStore {
         tasks: List<TaskSnapshot>,
     ): Update {
         val previous = workspaces[key]
+        persistedTasks[key] = tasks
         // A changed title/scope must not lose the task list; a genuinely new
         // task list must not inherit stale phases, which NotifyState handles
         // per key anyway.
@@ -149,17 +167,108 @@ class TaskStore {
             path = path.ifEmpty { previous?.path ?: "" },
             identity = identity.ifEmpty { previous?.identity ?: "" },
             source = source,
-            tasks = tasks,
+            tasks = effectiveTasks(key, tasks),
         )
-        val notify = notifyState.apply(key, tasks)
-        val completed = notify.completed.map { event ->
-            event.copy(
-                finalPreview = livePreviews[LivePreviewKey(key, event.task.sessionId)]
-                    ?: event.task.preview,
+        return recompute()
+    }
+
+    /**
+     * controller 流（运行态）整表落地：`liveStatus` 归一到壳侧 phase 词汇后覆盖
+     * SI 的 `phase`，并给"正在跑但 SI 里还没有"的工作区补出任务条目。
+     *
+     * 整表替换（不是增量合并）：controller 快照本身就是全量，缺省即删除。
+     */
+    @Synchronized
+    fun applyLiveTasks(tasks: List<ControllerTasksState.LiveTask>): Update {
+        livePhases.clear()
+        liveTitles.clear()
+        for (task in tasks) {
+            val key = LivePreviewKey(task.workspaceKey, task.sessionId)
+            livePhases[key] = task.phase
+            liveTitles[key] = task.title
+        }
+        for (workspace in workspaces.values.toList()) {
+            workspaces[workspace.key] = workspace.copy(
+                tasks = effectiveTasks(workspace.key, persistedTasks[workspace.key].orEmpty()),
             )
         }
+        // 只有"在跑/等待"的任务才值得为它凭空建一个工作区，否则光是索引里的
+        // 历史会话就能把 store 撑满。
+        val newcomers = LinkedHashMap<String, Boolean>()
+        for (task in tasks) {
+            if (task.phase in NotifyState.RUNNING_PHASES && task.workspaceKey !in workspaces) {
+                newcomers[task.workspaceKey] = true
+            }
+        }
+        for (key in newcomers.keys) {
+            workspaces[key] = Workspace(
+                key = key,
+                title = workspaceTitleOf(key),
+                path = "",
+                identity = "",
+                source = "controller",
+                tasks = effectiveTasks(key, emptyList()),
+            )
+        }
+        return recompute()
+    }
+
+    /** 合成一个工作区的任务表：SI 持久态 + controller 运行态覆盖。 */
+    private fun effectiveTasks(key: String, persisted: List<TaskSnapshot>): List<TaskSnapshot> {
+        if (livePhases.isEmpty()) return persisted
+        val merged = ArrayList<TaskSnapshot>(persisted.size + 4)
+        val seen = HashSet<String>(persisted.size)
+        for (task in persisted) {
+            seen.add(task.sessionId)
+            val live = livePhases[LivePreviewKey(key, task.sessionId)]
+            merged.add(if (live == null) task else task.copy(phase = live))
+        }
+        for ((liveKey, phase) in livePhases) {
+            if (liveKey.workspaceKey != key || liveKey.sessionId in seen) continue
+            merged.add(
+                TaskSnapshot(
+                    sessionId = liveKey.sessionId,
+                    title = liveTitles[liveKey].orEmpty(),
+                    phase = phase,
+                    preview = "",
+                    pendingInteractionId = "",
+                    lastActivityAt = 0L,
+                    hasBackgroundWork = false,
+                )
+            )
+        }
+        return merged
+    }
+
+    /** controller 只给了路径时的兜底标题：取路径末段（与 SI 的 title 规则一致）。 */
+    private fun workspaceTitleOf(key: String): String {
+        val parts = key.split('/', '\\').filter { it.isNotEmpty() }
+        return parts.lastOrNull() ?: key
+    }
+
+    /**
+     * 从当前 [workspaces] 重新推一遍通知状态。
+     *
+     * 两个数据源（SI / controller）最终都汇到这里，所以完成卡片、运行卡片、
+     * 关注请求都只按"最终相位的转移"判定——不会因为来源不同而重复或漏发。
+     */
+    private fun recompute(): Update {
+        val completed = ArrayList<CompletionEvent>()
+        val attention = ArrayList<AttentionEvent>()
+        for (workspace in workspaces.values) {
+            val notify = notifyState.apply(workspace.key, workspace.tasks)
+            for (event in notify.completed) {
+                completed.add(
+                    event.copy(
+                        finalPreview = livePreviews[LivePreviewKey(workspace.key, event.task.sessionId)]
+                            ?: event.task.preview,
+                    )
+                )
+            }
+            attention.addAll(notify.attention)
+        }
         forgetStaleLivePreviews()
-        return buildUpdate(notify.copy(completed = completed))
+        return buildUpdate(NotifyUpdate(emptyList(), completed, attention))
     }
 
     /**
@@ -180,7 +289,10 @@ class TaskStore {
     @Synchronized
     fun removeWorkspace(key: String): Update {
         workspaces.remove(key)
+        persistedTasks.remove(key)
         notifyState.forget(key)
+        livePhases.keys.removeIf { it.workspaceKey == key }
+        liveTitles.keys.removeIf { it.workspaceKey == key }
         livePreviews.keys.removeIf { it.workspaceKey == key }
         livePreviewAt.keys.removeIf { it.workspaceKey == key }
         return buildUpdate(NotifyUpdate(running = emptyList(), completed = emptyList(), attention = emptyList()))
@@ -189,6 +301,9 @@ class TaskStore {
     @Synchronized
     fun reset(): Update {
         workspaces.clear()
+        persistedTasks.clear()
+        livePhases.clear()
+        liveTitles.clear()
         notifyState.reset()
         livePreviews.clear()
         livePreviewAt.clear()

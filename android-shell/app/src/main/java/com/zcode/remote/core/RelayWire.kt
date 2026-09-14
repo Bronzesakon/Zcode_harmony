@@ -65,9 +65,38 @@ object RelayWire {
     const val METHOD_UNSUBSCRIBE_CONV = "unsubscribeConversationV4"
     const val METHOD_RESYNC_CONV = "resyncConversationV4"
 
+    /**
+     * controller 流（**运行态的唯一正源**）。
+     *
+     * `sessions-index` 的 `phase` 只在轮次边界变（"完成"是持久态），真正的
+     * "此刻在跑"由 `controller/tasks-index` 的任务条目 `liveStatus` 承载。
+     * 网页端由 `windowControllerTaskListRegistry` 订阅两条 controller topic
+     * （`controller/workspaces` + `controller/tasks-index`），帧走
+     * `onDynamicControllerFrame`，缺口用 `resyncControllerV4` 补。
+     */
+    const val TOPIC_CONTROLLER_TASKS = "controller/tasks-index"
+    const val EVENT_CONTROLLER_FRAME = "onDynamicControllerFrame"
+    const val METHOD_SUBSCRIBE_CONTROLLER = "subscribeControllerV4"
+    const val METHOD_UNSUBSCRIBE_CONTROLLER = "unsubscribeControllerV4"
+    const val METHOD_RESYNC_CONTROLLER = "resyncControllerV4"
+
     const val MAX_MESSAGE_BYTES = 16 * 1024 * 1024
-    const val MAX_FRAGMENT_BYTES = 512 * 1024
+    /**
+     * 单帧字节上限 = 桌面端的 `maxFrameBytes`（1024*1024）。
+     *
+     * 曾经是 512KiB（桌面端的一半）：出站没问题，但**入站**的
+     * `FrameAssembler` 用同一个常量卡 512KiB~1MiB 的帧，会静默丢弃大快照的
+     * 分片（bundle `maxFrameBytes:1024*1024`，2026-09-14 审计修正）。
+     */
+    const val MAX_FRAGMENT_BYTES = 1024 * 1024
     const val MAX_FRAGMENTS = 64
+
+    /**
+     * 逻辑帧的分片数上限：协议允许到 1024（bundle
+     * `logicalFrameAssemblyMaxFragments:1024`），远高于物理帧的 64。用 64 去卡
+     * 逻辑帧会把长会话的大快照整份丢掉。
+     */
+    const val MAX_LOGICAL_FRAGMENTS = 1024
     private const val MAX_VALUE_BYTES = 16 * 1024 * 1024
     private const val MAX_CONTAINER_ITEMS = 100_000
 
@@ -478,7 +507,7 @@ object RelayWire {
                     val id = env.optString("logicalFrameId")
                     val count = env.optInt("fragmentCount", 0)
                     val index = env.optInt("fragmentIndex", -1)
-                    if (id.isEmpty() || count <= 0 || count > MAX_FRAGMENTS ||
+                    if (id.isEmpty() || count <= 0 || count > MAX_LOGICAL_FRAGMENTS ||
                         index < 0 || index >= count
                     ) return null
                     val encoded = env.optString("dataBase64")
