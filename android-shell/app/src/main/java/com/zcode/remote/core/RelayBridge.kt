@@ -455,7 +455,7 @@ class BridgeSession(
         convTails.clear()
         convLastText.clear()
         pendingConversationFrames.clear()
-        reanchoringSessions.clear()
+        convResyncing.clear()
         if (convListenerId >= 0) {
             try {
                 channels.removeListener(
