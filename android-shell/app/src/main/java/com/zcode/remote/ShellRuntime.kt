@@ -241,9 +241,11 @@ object ShellRuntime {
     // 前台时段不做：那时连接在页面手里（单控制端互斥），订不了也拉不了。
     private const val LIVE_PROGRESS_POLL_MS = 12_000L
 
-    /** 每这么多拍重挂一次（12s × 4 ≈ 48s）。真机实测桌面端推完首屏快照后就不再推，
-     *  所以刷新率完全由这个周期决定；48s 是"跟手"与"少打扰桌面端"的折中。 */
-    private const val LIVE_REANCHOR_EVERY_POLLS = 4
+    /** 每这么多拍重挂一次（12s × 2 ≈ 24s）。真机实测桌面端推完首屏快照后就不再推，
+     *  所以刷新率完全由这个周期决定；pre.96 实测 48s 一拍时卡片肉眼可见地"半分钟
+     *  不动"，24s 与"对话轮之间几秒一条正文"的节奏更接近，成本只是每 24s 一次
+     *  resync（正常时它只是轻量应答，不再像旧版那样必然超时触发重开）。 */
+    private const val LIVE_REANCHOR_EVERY_POLLS = 2
 
     @Volatile
     private var livePolling = false

@@ -240,8 +240,14 @@ class BridgeSession(
         val args = JSONObject(scope.toString())
             .put("subscriptionId", subId)
             .put("runtimePolicy", "existing-only")
+        // base 是必填可空字段：网页端始终传 base（无基线时显式 null）。省略整个
+        // 字段会被桌面端 zod 拒收——真机 2026-09-14 日志里每一条 sessions-index
+        // resync 都死于 "expected object, received undefined"，索引缺口从此永远
+        // 补不上，桥随后整个变僵尸（只剩二级回收能救）。
         if (state.logEpoch != null) {
             args.put("base", JSONObject().put("logEpoch", state.logEpoch).put("seq", state.seq))
+        } else {
+            args.put("base", JSONObject.NULL)
         }
         onLogLine("resync sessions-index for $workspaceKey (gap at seq ${state.seq})")
         Thread {
@@ -366,12 +372,16 @@ class BridgeSession(
                         val base = JSONObject(scope.toString())
                             .put("subscriptionId", subId)
                             .put("forceSnapshot", true)
+                        // 与 SI resync 同理：base 必填可空，无基线时显式 null。
                         val tail = convTails[session]
-                        if (tail != null && !tail.logEpoch().isNullOrEmpty()) {
-                            base.put("base", JSONObject()
-                                .put("logEpoch", tail.logEpoch())
-                                .put("seq", tail.seq()))
-                        }
+                        base.put(
+                            "base",
+                            if (tail != null && !tail.logEpoch().isNullOrEmpty()) {
+                                JSONObject().put("logEpoch", tail.logEpoch()).put("seq", tail.seq())
+                            } else {
+                                JSONObject.NULL
+                            },
+                        )
                         channels.callBlocking(
                             RelayWire.CHANNEL_CONVERSATION,
                             RelayWire.METHOD_RESYNC_CONV,
@@ -470,7 +480,8 @@ class BridgeSession(
                     RelayWire.CHANNEL_CONVERSATION,
                     RelayWire.METHOD_UNSUBSCRIBE_CONV,
                     listOf<Any?>(args),
-                    10_000,
+                    // 僵尸桥的退订大概率也无人应答：短超时即可，别拖住后面的重开。
+                    2_000,
                 )
                 onLogLine("unsubscribed conversation for $session")
             } catch (e: Exception) {
@@ -526,7 +537,8 @@ class BridgeSession(
                 RelayWire.CHANNEL_CONVERSATION,
                 RelayWire.METHOD_UNSUBSCRIBE_SI,
                 listOf<Any?>(args),
-                15_000,
+                // 同上：关闭路径短超时。
+                2_000,
             )
         } catch (e: Exception) {
             // 尽力而为
@@ -682,6 +694,21 @@ class BridgeManager(
                 onLogLine("tier2 bridge recycled for $key (${sessions.size} session(s) restored)")
             } catch (e: Exception) {
                 onLogLine("tier2 bridge recycle failed for $key: ${e.message}")
+                // 旧桥已从 bridges 摘除：下一拍 reanchorProgress 找不到桥、也不会再
+                // 触发回收——活进展会永久停更。15s 后补一次重试（一次性）。
+                if (!disposed) {
+                    Thread {
+                        try {
+                            Thread.sleep(15_000L)
+                        } catch (e: InterruptedException) {
+                            return@Thread
+                        }
+                        if (!disposed && bridges[key] == null && !recycleInFlight.contains(key)) {
+                            onLogLine("tier2 bridge recycle retrying for $key")
+                            recycleBridge(key, scope, sessions)
+                        }
+                    }.start()
+                }
             } finally {
                 recycleInFlight.remove(key)
             }
@@ -720,7 +747,14 @@ class BridgeManager(
         return pending.reply
     }
 
-    private fun openBridgeBlocking(workspace: JSONObject): BridgeSession? {
+    /** 桥开启串行锁：inflightOpenId/preOpenBuffer 是单例字段，并发开两座桥
+     * （周期重锚回收 + 初始覆盖同时到）会交叉污染对方的 Initialize 缓冲。 */
+    private val openLock = Object()
+
+    private fun openBridgeBlocking(workspace: JSONObject): BridgeSession? =
+        synchronized(openLock) { openBridgeBlockingLocked(workspace) }
+
+    private fun openBridgeBlockingLocked(workspace: JSONObject): BridgeSession? {
         val key = workspaceKeyOf(workspace) ?: return null
         val bridgeSessionId = randomWireId("zcshell-bridge")
         val requestId = randomWireId("zcshell-bopen")
