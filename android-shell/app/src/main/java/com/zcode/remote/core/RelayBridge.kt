@@ -235,8 +235,24 @@ class BridgeSession(
         }
     }
 
+    /** SI resync 节流：缺口帧成串到达时每帧都置 needsResync，曾造成 300ms 内
+     * 6-10 发并发的 resync 风暴（每发都是一次桌面端全量索引重放）。 */
+    @Volatile
+    private var siResyncAt = 0L
+    @Volatile
+    private var siResyncPending = false
+
     private fun requestResync() {
         val subId = subscriptionId ?: return
+        val now = System.currentTimeMillis()
+        if (siResyncPending || now - siResyncAt < 5_000L) {
+            // 冷却窗内再遇缺口：留个标记，冷却到期由在飞的那发补上（它带 base，
+            // 桌面端会从 base.seq 重放缺口）。不丢需求，也不再叠加请求。
+            siResyncPending = true
+            return
+        }
+        siResyncAt = now
+        siResyncPending = false
         val args = JSONObject(scope.toString())
             .put("subscriptionId", subId)
             .put("runtimePolicy", "existing-only")
@@ -258,6 +274,11 @@ class BridgeSession(
                     listOf<Any?>(args),
                     30_000,
                 )
+                // 成功归来后若冷却窗内又撞上缺口，按一次补射。
+                if (siResyncPending && System.currentTimeMillis() - siResyncAt >= 5_000L) {
+                    siResyncPending = false
+                    requestResync()
+                }
             } catch (e: Exception) {
                 onLogLine("resync failed for $workspaceKey: ${e.message}")
             }
@@ -300,6 +321,11 @@ class BridgeSession(
 
     private fun subscribeConversationProgressInternal(sessionId: String, fromReanchor: Boolean) {
         if (closed) return
+        // 幂等：已订阅就不再重复订阅。真机 pre.97 定案——轮询每 12s 无条件重订会把
+        // subscriptionId 换掉，桌面端把旧订阅判成 fault.subscription.notOwned，同一拍
+        // 的重锚 resync 必然失败并触发整桥回收，形成"每 24s 回收一次"的死循环，桥
+        // 永远稳定不下来。订阅建立后的保鲜交给 resyncConversationV4(forceSnapshot)。
+        if (convSubscriptions.containsKey(sessionId)) return
         if (!convAttempting.add(sessionId)) return
         installConversationListener()
         if (convListenerId < 0) {
