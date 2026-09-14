@@ -460,7 +460,14 @@ object RelayWire {
      * `_Te` 里的 begin/bind/accept 分片重组）。凑不齐返回 null——下一帧再来。
      */
     class LogicalFrameAssembler {
-        private val pending = HashMap<String, Array<String?>>()
+        private class Pending(
+            val count: Int,
+            val parts: Array<ByteArray?>,
+        ) {
+            var received = 0
+        }
+
+        private val pending = HashMap<String, Pending>()
 
         fun acceptEnvelope(envelope: JSONObject?): JSONObject? {
             val env = envelope ?: return null
@@ -470,23 +477,33 @@ object RelayWire {
                     val id = env.optString("logicalFrameId")
                     val count = env.optInt("fragmentCount", 0)
                     val index = env.optInt("fragmentIndex", -1)
-                    if (id.isEmpty() || count <= 0 || count > MAX_FRAGMENTS) return null
-                    if (index < 0 || index >= count) return null
-                    val slots = pending.getOrPut(id) { arrayOfNulls(count) }
-                    if (slots.size != count) {
-                        pending.remove(id)
-                        return null
-                    }
-                    slots[index] = env.optString("dataBase64")
-                    if (slots.any { it == null }) return null
-                    pending.remove(id)
-                    val text = try {
-                        String(java.util.Base64.getDecoder().decode(slots.joinToString("")), Charsets.UTF_8)
+                    if (id.isEmpty() || count <= 0 || count > MAX_FRAGMENTS ||
+                        index < 0 || index >= count
+                    ) return null
+                    val encoded = env.optString("dataBase64")
+                    if (encoded.isEmpty()) return null
+                    val bytes = try {
+                        java.util.Base64.getDecoder().decode(encoded)
                     } catch (e: Exception) {
                         return null
                     }
+                    val current = pending[id]
+                    if (current != null && current.count != count) {
+                        pending.remove(id)
+                        return null
+                    }
+                    val assembly = current ?: Pending(count, arrayOfNulls(count)).also { pending[id] = it }
+                    if (assembly.parts[index] == null) assembly.received += 1
+                    assembly.parts[index] = bytes
+                    if (assembly.received != count) return null
+                    pending.remove(id)
+                    val joined = assembly.parts.flatMap { it?.asList().orEmpty() }.toByteArray()
+                    val logicalBytes = env.optInt("logicalBytes", -1)
+                    if (logicalBytes >= 0 && joined.size != logicalBytes) return null
+                    val expected = env.optJSONObject("checksum")?.optString("value")
+                    if (!expected.isNullOrEmpty() && crc32Hex(joined) != expected) return null
                     return try {
-                        JSONObject(text)
+                        JSONObject(String(joined, Charsets.UTF_8))
                     } catch (e: Exception) {
                         null
                     }
@@ -593,7 +610,7 @@ object RelayWire {
                     "row.upserted" -> {
                         val row = op.optJSONObject("row") ?: continue
                         val at = indexOfRow(row.optString("rowId"))
-                        if (at >= 0) rows.put(at, row) else rows.put(row)
+                        if (at >= 0) rows.put(at, row)
                     }
                     "row.removed" -> {
                         val fromRowId = op.optString("fromRowId")
@@ -601,10 +618,14 @@ object RelayWire {
                             rows = JSONArray()
                         } else {
                             val at = indexOfRow(fromRowId)
-                            if (at > 0) {
-                                val kept = JSONArray()
-                                for (j in at until rows.length()) kept.put(rows.opt(j))
-                                rows = kept
+                            rows = when {
+                                at < 0 -> rows
+                                at == 0 -> JSONArray()
+                                else -> {
+                                    val kept = JSONArray()
+                                    for (j in 0 until at) kept.put(rows.opt(j))
+                                    kept
+                                }
                             }
                         }
                     }
@@ -646,17 +667,8 @@ object RelayWire {
         }
 
         private fun applyStatePatch(op: JSONObject) {
-            val patch = op.optJSONObject("patch") ?: return
-            val rowId = patch.optString("rowId")
-            if (rowId.isEmpty()) return
-            val at = indexOfRow(rowId)
-            if (at < 0) return
-            val row = rows.optJSONObject(at) ?: return
-            val keys = patch.keys()
-            while (keys.hasNext()) {
-                val key = keys.next()
-                if (key != "rowId") row.put(key, patch.opt(key))
-            }
+            // state.updated patches conversation-store metadata, not a row.
+            // The tail only models rows, so there is deliberately nothing to mutate.
         }
 
         private fun indexOfRow(rowId: String): Int {

@@ -189,7 +189,8 @@ object ShellRuntime {
     fun onAppForegroundChanged(foreground: Boolean) {
         appIsForeground = foreground
         if (foreground) {
-            // Tier2 交还：后台接管持有的配对必须先释放，页面自己的重连才可能
+            appIsForeground = true
+            evaluateJs("window.__zcodeShellSetAppForeground && window.__zcodeShellSetAppForeground(true);")
             // 成功；重连后 runtime 已死，由卡死看门狗的僵尸档走刷新恢复。
             if (Tier2Probe.isRunning()) {
                 Tier2Probe.stop("回前台交还")
@@ -211,6 +212,8 @@ object ShellRuntime {
             verdictPending = true
             requestLivenessReport()
         } else {
+            appIsForeground = false
+            evaluateJs("window.__zcodeShellSetAppForeground && window.__zcodeShellSetAppForeground(false);")
             startHeartbeatPump()
             lastLivenessAt = SystemClock.elapsedRealtime()
             backgroundStartedAt = SystemClock.elapsedRealtime()
@@ -248,29 +251,42 @@ object ShellRuntime {
     @Volatile
     private var livePolls = 0
 
+    @Volatile
+    private var livePollInFlight = false
+
+    @Volatile
+    private var liveEpoch = 0L
+
     private val liveProgressThread = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
         Thread(r, "zcode-live-progress").apply { isDaemon = true }
     }
 
     private val liveProgressPoller = object : Runnable {
         override fun run() {
-            if (appIsForeground || !Tier2Probe.isRunning()) {
-                livePolling = false
+            if (!userIsAway()) {
+                return
+            }
+            if (!livePolling) {
                 return
             }
             val refs = store.runningTaskRefs()
             livePolls += 1
-            if (refs.isNotEmpty()) {
+            if (refs.isNotEmpty() && !livePollInFlight) {
                 val reanchor = livePolls % LIVE_REANCHOR_EVERY_POLLS == 0
+                val epoch = liveEpoch
+                livePollInFlight = true
                 liveProgressThread.execute {
-                    if (reanchor) {
-                        Tier2Probe.reanchorProgress()
-                    }
-                    for ((key, sessionId) in refs) {
-                        // 订阅（主通道）：桥一出生就订好了（见 runHandshake——顺序
-                        // 必须是"先对话后索引"），这里只是兜住"接管期间新起任务"的
-                        // 情况；已订阅时是幂等空操作，失败下一轮自然重试。
-                        Tier2Probe.subscribeProgress(key, sessionId)
+                    try {
+                        if (epoch != liveEpoch || !userIsAway() || !Tier2Probe.isRunning()) return@execute
+                        if (reanchor) {
+                            Tier2Probe.reanchorProgress()
+                        }
+                        for ((key, sessionId) in refs) {
+                            if (epoch != liveEpoch) break
+                            Tier2Probe.subscribeProgress(key, sessionId)
+                        }
+                    } finally {
+                        livePollInFlight = false
                     }
                 }
             }
@@ -279,8 +295,10 @@ object ShellRuntime {
     }
 
     private fun pushLivePreview(key: String, sessionId: String, text: String) {
+        val epoch = liveEpoch
         mainHandler.post {
-            val update = store.applyLivePreview(sessionId, text)
+            if (epoch != liveEpoch || !userIsAway() || !livePolling) return@post
+            val update = store.applyLivePreview(key, sessionId, text)
             if (update.running.isNotEmpty()) {
                 Diagnostics.log(
                     "debug",
@@ -294,7 +312,12 @@ object ShellRuntime {
     private fun startLiveProgressPolling() {
         if (livePolling) return
         livePolling = true
-        Tier2Probe.progressSink = { key, sessionId, text -> pushLivePreview(key, sessionId, text) }
+        liveEpoch += 1
+        livePollInFlight = false
+        val epoch = liveEpoch
+        Tier2Probe.progressSink = { key, sessionId, text ->
+            if (epoch == liveEpoch) pushLivePreview(key, sessionId, text)
+        }
         Tier2Probe.runningSessionsProvider = { key ->
             store.runningTaskRefs().filter { it.first == key }.map { it.second }
         }
@@ -304,6 +327,9 @@ object ShellRuntime {
     /** 交还前台：停止拉取/订阅，并把活进展清掉（此后以页面供的会话索引为准）。 */
     private fun stopLiveProgressPolling() {
         livePolling = false
+        liveEpoch += 1
+        Tier2Probe.progressSink = null
+        Tier2Probe.runningSessionsProvider = null
         mainHandler.removeCallbacks(liveProgressPoller)
         store.clearLivePreviews()
     }
@@ -354,12 +380,20 @@ object ShellRuntime {
     @Volatile
     private var appIsForeground = true
 
+    @Volatile
+    private var externalPickerActive = false
+
+    @Volatile
+    private var heartbeatPumpRunning = false
+
+    private var lastAwayState = false
+
     private var pumpDispatches = 0
     private var pumpDispatchesForVerdict = 0
 
     private val pumpRunnable = object : Runnable {
         override fun run() {
-            if (!appIsForeground) {
+            if (userIsAway()) {
                 if (jsEvaluator != null) {
                     pumpDispatches += 1
                     evaluateJs("window.__zcodeShellHeartbeat && window.__zcodeShellHeartbeat();")
@@ -370,11 +404,14 @@ object ShellRuntime {
                 // 原生巡检：渲染器冻结时注入层的 liveness 会整段停摆，这里仍能判死并接管。
                 checkTier1Silence()
                 mainHandler.postDelayed(this, PUMP_INTERVAL_MS)
-            }
-        }
+            } else {
+                heartbeatPumpRunning = false
+            }        }
     }
 
     private fun startHeartbeatPump() {
+        if (heartbeatPumpRunning) return
+        heartbeatPumpRunning = true
         mainHandler.removeCallbacks(pumpRunnable)
         pumpDispatches = 0
         mainHandler.postDelayed(pumpRunnable, PUMP_INTERVAL_MS)
@@ -385,6 +422,7 @@ object ShellRuntime {
     }
 
     private fun stopHeartbeatPump() {
+        heartbeatPumpRunning = false
         mainHandler.removeCallbacks(pumpRunnable)
         if (pumpDispatches > 0) {
             Diagnostics.log("debug", "后台心跳泵已停止，本次共发出 $pumpDispatches 次")
@@ -478,13 +516,25 @@ object ShellRuntime {
      * 自愈，流体云从此断供——链路安静归页面自己的心跳看门狗管，接管只认
      * "渲染器不答话"。
      */
+    fun setExternalPickerActive(active: Boolean) {
+        externalPickerActive = active
+        if (active) {
+            rendererProbeToken += 1
+            Diagnostics.log("debug", "系统文件选择器打开，暂停后台接管")
+        } else {
+            Diagnostics.log("debug", "系统文件选择器关闭，恢复后台接管判定")
+        }
+    }
+
     private fun checkTier1Silence() {
         if (lastLivenessAt <= 0L) {
             return
         }
-        if (!userIsAway()) {
+        if (externalPickerActive) {
+            Diagnostics.log("debug", "Tier2: 系统文件选择器期间不接管")
             return
         }
+        if (!userIsAway()) return
         maybeTakeOverInBackground(SystemClock.elapsedRealtime() - lastLivenessAt)
     }
 
@@ -492,6 +542,19 @@ object ShellRuntime {
     private val tier1Watchdog = object : Runnable {
         override fun run() {
             try {
+                val away = userIsAway()
+                if (away && !lastAwayState) {
+                    evaluateJs("window.__zcodeShellSetAppForeground && window.__zcodeShellSetAppForeground(false);")
+                    startHeartbeatPump()
+                    if (!externalPickerActive) scheduleBackgroundTakeover()
+                } else if (!away && lastAwayState) {
+                    evaluateJs("window.__zcodeShellSetAppForeground && window.__zcodeShellSetAppForeground(true);")
+                    if (Tier2Probe.isRunning()) {
+                        Tier2Probe.stop("亮屏/回前台交还")
+                    }
+                    stopHeartbeatPump()
+                }
+                lastAwayState = away
                 checkTier1Silence()
             } catch (e: Exception) {
                 Diagnostics.log("warn", "Tier1 看门狗异常: ${e.message}")
@@ -535,7 +598,7 @@ object ShellRuntime {
         requestLivenessReport()
         mainHandler.postDelayed({
             if (token != rendererProbeToken) return@postDelayed
-            if (appIsForeground) return@postDelayed
+            if (!userIsAway()) return@postDelayed
             val since = SystemClock.elapsedRealtime() - lastLivenessAt
             val why = if (since >= RENDERER_PROBE_MS) {
                 "渲染器已冻结（注入层 ${since / 1000}s 零应答）"
@@ -563,6 +626,7 @@ object ShellRuntime {
 
     /** 执行接管（前置条件已满足，只做最后两道门）。 */
     private fun takeOverNow(reason: String) {
+        if (externalPickerActive) return
         if (!userIsAway()) return
         if (Tier2Probe.isRunning()) return
         // 桌面活着才接管：最后一次 pair ack 非 matched（桌面休眠/离线）时，
@@ -611,7 +675,11 @@ object ShellRuntime {
             }, 2_000L)
             return
         }
-        Tier2Probe.startTakeoverForTest(autoStopMs)
+        val c = relayCreds ?: run {
+            Diagnostics.log("warn", "Tier2: 凭证未就绪，无法启动接管验证")
+            return
+        }
+        Tier2Probe.startTakeoverForTest(c, autoStopMs)
     }
 
     fun evaluateJs(script: String) {
@@ -748,9 +816,8 @@ object ShellRuntime {
                     )
                 }
                 "relaycreds" -> {
-                    // Tier2（原生直连 relay）凭证：注入层一次性移交，仅驻内存。
+                    // Tier2（原生直连 relay）凭证：注入层移交，仅驻内存。
                     // 任何日志路径都不得打印这些字段（sid/hash/mid 红线）。
-                    if (relayCreds != null) return
                     val data = root.optJSONObject("data") ?: return
                     val wsUrl = data.optString("url")
                     val deviceSid = data.optString("deviceSid")
@@ -759,14 +826,16 @@ object ShellRuntime {
                         Diagnostics.log("warn", "Tier2: relaycreds 字段不全，忽略")
                         return
                     }
+                    if (Tier2Probe.isRunning()) {
+                        Diagnostics.log("debug", "Tier2: 接管期间忽略页面凭证刷新")
+                        return
+                    }
                     relayCreds = RelayCreds(
                         wsUrl = wsUrl,
                         deviceSid = deviceSid,
                         passHash = passHash,
                         deviceMid = data.optString("deviceMid").ifBlank { null },
                     )
-                    // Tier2 接管期间的任务事件直接进原生 TaskStore/通知链路
-                    // （M3c）：与注入层 post('sessions') 的更新形状同构。
                     Tier2Probe.sessionsSink = { update -> acceptNativeSessions(update) }
                     Diagnostics.log("info", "Tier2: relay 凭证已接收（仅内存）")
                 }
@@ -961,7 +1030,11 @@ object ShellRuntime {
                     workspaceTitle = workspace.title,
                     task = task,
                     status = status,
-                    body = com.zcode.remote.core.NotifyState.formatBody(task.preview, workspace.title),
+                    body = com.zcode.remote.core.NotifyState.formatBody(
+                        task.preview,
+                        workspace.title,
+                    ),
+                    activityAt = task.lastActivityAt,
                 )
             }
         }

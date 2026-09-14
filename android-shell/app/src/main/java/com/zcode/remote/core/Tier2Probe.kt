@@ -73,6 +73,7 @@ object Tier2Probe {
     private var ackCount = 0
     private var startedAtMs = 0L
     private var persistent = false
+    @Volatile
     private var stopping = false
     private var reconnectAttempt = 0
     private var durationTimer: java.util.Timer? = null
@@ -143,12 +144,8 @@ object Tier2Probe {
      * 真机验证用：接管语义（开覆盖 + 重连）跑固定时长后自动交还，
      * 让 `tier2_takeover` 诊断指令能在不依赖"后台判死"的情况下验证 M3b/c。
      */
-    fun startTakeoverForTest(autoStopMs: Long) {
-        val c = creds ?: run {
-            Diagnostics.log("warn", "Tier2: 凭证未就绪，无法启动接管验证")
-            return
-        }
-        startInternal(c, durationMs = -1L, takeoverOverride = autoStopMs)
+    fun startTakeoverForTest(newCreds: RelayCreds, autoStopMs: Long) {
+        startInternal(newCreds, durationMs = -1L, takeoverOverride = autoStopMs)
     }
 
     private fun startInternal(newCreds: RelayCreds, durationMs: Long, takeoverOverride: Long?) {
@@ -198,6 +195,9 @@ object Tier2Probe {
         }
     }
 
+    private fun isCurrent(webSocket: WebSocket): Boolean =
+        !stopping && phase != Phase.CLOSED && socket === webSocket
+
     private fun connectNow() {
         val c = creds ?: return
         phase = Phase.CONNECTING
@@ -214,31 +214,40 @@ object Tier2Probe {
 
     fun stop(reason: String) {
         stopping = true
+        phase = Phase.CLOSED
         durationTimer?.cancel()
         durationTimer = null
         heartbeatTimer?.cancel()
         heartbeatTimer = null
         reconnectTimer?.cancel()
         reconnectTimer = null
-        bridgeManager?.disposeEverything(reason)
+        val manager = bridgeManager
         bridgeManager = null
         val s = socket
         socket = null
         val lasted = (System.currentTimeMillis() - startedAtMs) / 1000
         Diagnostics.log(
             "warn",
-            "Tier2: 关闭（$reason）phase=$phase 存活=${lasted}s 心跳=$heartbeatCount ack=$ackCount",
+            "Tier2: 关闭（$reason）存活=${lasted}s 心跳=$heartbeatCount ack=$ackCount",
         )
         try {
             s?.close(1000, "tier2 done")
         } catch (e: Exception) {
             Diagnostics.log("warn", "Tier2: close 异常 ${e.message}")
         }
-        phase = Phase.CLOSED
+        if (manager != null) {
+            Thread {
+                try {
+                    manager.disposeEverything(reason)
+                } catch (e: Exception) {
+                    Diagnostics.log("debug", "Tier2: 后台清理桥失败 ${e.message}")
+                }
+            }.start()
+        }
     }
 
     private fun startCoverage() {
-        if (bridgeManager != null) return
+        if (stopping || phase == Phase.CLOSED || bridgeManager != null) return
         creds ?: return
         val manager = BridgeManager(
             sendPayloadOut = { payload -> sendBusinessPayload(payload, quiet = false) },
@@ -262,7 +271,9 @@ object Tier2Probe {
         bridgeManager = manager
         Thread {
             try {
+                if (stopping || phase == Phase.CLOSED || bridgeManager !== manager) return@Thread
                 val workspaces = manager.listWorkspacesBlocking()
+                if (stopping || phase == Phase.CLOSED || bridgeManager !== manager) return@Thread
                 if (workspaces.isEmpty()) {
                     Diagnostics.log("warn", "Tier2: 接管模式拿到空工作区列表")
                     return@Thread
@@ -298,6 +309,7 @@ object Tier2Probe {
 
     private val listener = object : WebSocketListener() {
         override fun onOpen(webSocket: WebSocket, response: okhttp3.Response) {
+            if (!isCurrent(webSocket)) return
             phase = Phase.AUTHENTICATING
             val c = creds ?: return
             val init = JSONObject().apply {
@@ -315,6 +327,7 @@ object Tier2Probe {
         }
 
         override fun onMessage(webSocket: WebSocket, text: String) {
+            if (!isCurrent(webSocket)) return
             val frame = try {
                 JSONObject(text)
             } catch (e: Exception) {
@@ -369,20 +382,21 @@ object Tier2Probe {
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: okhttp3.Response?) {
-            if (stopping || phase == Phase.CLOSED) return
+            if (!isCurrent(webSocket)) return
             phase = Phase.CLOSED
             Diagnostics.log("warn", "Tier2: 连接失败 ${t.javaClass.simpleName}: ${t.message?.take(120)}")
             scheduleReconnect()
         }
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-            if (stopping || phase == Phase.CLOSED) return
+            if (!isCurrent(webSocket)) return
             phase = Phase.CLOSED
             Diagnostics.log("warn", "Tier2: 对端关闭 code=$code reason=${reason.take(60)}")
             scheduleReconnect()
         }
 
         override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+            if (!isCurrent(webSocket)) return
             // relay 终端协议是 JSON 文本帧；二进制帧出现即记录不处理。
             Diagnostics.log("debug", "Tier2: 收到二进制帧 ${bytes.size}B（忽略）")
         }

@@ -190,6 +190,50 @@ class RelayWireTest {
     }
 
     @Test
+    fun `logical fragments decode bytes independently before joining`() {
+        val frame = JSONObject()
+            .put("topic", "conversation/ws")
+            .put("subscriptionId", "sub-1")
+            .put("payload", JSONObject().put("kind", "snapshot"))
+        val bytes = frame.toString().toByteArray(Charsets.UTF_8)
+        val first = bytes.copyOfRange(0, 7)
+        val second = bytes.copyOfRange(7, bytes.size)
+        val assembler = RelayWire.LogicalFrameAssembler()
+        val base = JSONObject()
+            .put("kind", "fragment")
+            .put("logicalFrameId", "lf")
+            .put("fragmentCount", 2)
+            .put("logicalBytes", bytes.size)
+            .put("checksum", JSONObject().put("value", RelayWire.crc32Hex(bytes)))
+        val one = JSONObject(base.toString()).put("fragmentIndex", 1)
+            .put("dataBase64", java.util.Base64.getEncoder().encodeToString(second))
+        val zero = JSONObject(base.toString()).put("fragmentIndex", 0)
+            .put("dataBase64", java.util.Base64.getEncoder().encodeToString(first))
+        assertNull(assembler.acceptEnvelope(one))
+        val decoded = assembler.acceptEnvelope(zero)
+        assertEquals("conversation/ws", decoded!!.getString("topic"))
+    }
+
+    @Test
+    fun `conversation tail removes suffix and ignores unknown upsert`() {
+        val tail = RelayWire.ConversationTail()
+        tail.applySnapshot(
+            JSONObject().put("rows", JSONObject().put("window", rows(
+                JSONObject().put("rowId", "r1").put("kind", "assistantText").put("text", "旧"),
+                JSONObject().put("rowId", "r2").put("kind", "assistantText").put("text", "新"),
+            )))
+        )
+        tail.applyDeltas(JSONArray().put(
+            JSONObject().put("op", "row.removed").put("fromRowId", "r2")
+        ))
+        assertEquals("旧", tail.latestProgressText())
+        tail.applyDeltas(JSONArray().put(
+            JSONObject().put("op", "row.upserted")
+                .put("row", JSONObject().put("rowId", "missing").put("kind", "assistantText").put("text", "不应追加"))
+        ))
+        assertEquals("旧", tail.latestProgressText())
+    }
+    @Test
     fun `progress text takes the newest assistant text`() {
         val text = RelayWire.progressTextFromRows(
             rows(

@@ -20,6 +20,8 @@ import com.zcode.remote.core.PromotionPolicy
 import com.zcode.remote.core.TaskStatus
 import com.zcode.remote.core.TaskStore
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * All notification rendering.
@@ -57,7 +59,8 @@ class Notifier(private val context: Context) {
         }
 
     /** Ids of the completion cards currently showing, so cleanup does not race. */
-    private val completionCards: MutableSet<Int> = ConcurrentHashMap.newKeySet()
+    private val completionCards = ConcurrentHashMap<Int, Long>()
+    private val completionGeneration = AtomicLong(0L)
 
     /** True when the user has not granted POST_NOTIFICATIONS (API 33+). */
     fun notificationsEnabled(): Boolean = manager.areNotificationsEnabled()
@@ -126,7 +129,7 @@ class Notifier(private val context: Context) {
         val end = base + NotifyState.COMPLETION_CARD_RANGE
         for (notification in active) {
             val id = notification.id
-            if (id in base until end && !completionCards.contains(id)) {
+            if (id in base until end && !completionCards.containsKey(id)) {
                 Diagnostics.info("清理上次进程遗留的完成卡片 (id=$id)")
                 manager.cancel(id)
             }
@@ -191,7 +194,10 @@ class Notifier(private val context: Context) {
         val promoted = PromotionPolicy.choose(update.running)
         if (update.running.isNotEmpty() && lastPromotedCount != promoted.size) {
             lastPromotedCount = promoted.size
-            Diagnostics.info(LiveUpdate.describeEligibility(context, channelImportanceMin = false))
+            val platform = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+            val channel = platform?.getNotificationChannel(CHANNEL_RUNNING)
+            val atOrBelowMin = channel?.importance?.let { it <= NotificationManager.IMPORTANCE_MIN } ?: false
+            Diagnostics.info(LiveUpdate.describeEligibility(context, channelImportanceMin = atOrBelowMin))
         }
         if (update.running.isEmpty()) {
             manager.cancel(ID_GROUP_SUMMARY)
@@ -220,9 +226,7 @@ class Notifier(private val context: Context) {
                 .setSmallIcon(R.drawable.ic_stat_zcode)
                 .setContentTitle(item.title)
                 .setContentText(item.body)
-                // BigTextStyle is one of the four styles Android will promote, so
-                // no ProgressStyle is needed to reach the fluid cloud. (A
-                // percentage bar would mean nothing for a coding task anyway.)
+                .setWhen(item.activityAt.takeIf { it > 0L } ?: System.currentTimeMillis())
                 .setStyle(NotificationCompat.BigTextStyle().bigText(item.body))
                 .setContentIntent(pending)
                 .setGroup(GROUP_RUNNING)
@@ -281,7 +285,7 @@ class Notifier(private val context: Context) {
         } else {
             R.string.notification_title_completed
         }
-        val preview = task.preview.trim()
+        val preview = event.finalPreview.trim()
         val text = if (preview.isEmpty()) task.displayTitle else "${task.displayTitle}\n$preview"
         val id = nextId()
         val notification = NotificationCompat.Builder(context, CHANNEL_COMPLETED)
@@ -323,7 +327,7 @@ class Notifier(private val context: Context) {
         // name (not the task title, which is already in the title row): a
         // completion card with no progress to show still says which workspace it
         // came from.
-        val body = NotifyState.formatBody(task.preview, workspaceNameOf(event.workspaceKey))
+        val body = NotifyState.formatBody(event.finalPreview, workspaceNameOf(event.workspaceKey))
         val pending = taskIntent(event.workspaceKey, task.sessionId, task.displayTitle, index = id)
         val builder = NotificationCompat.Builder(context, CHANNEL_RUNNING)
             .setSmallIcon(R.drawable.ic_stat_zcode)
@@ -344,9 +348,10 @@ class Notifier(private val context: Context) {
             Diagnostics.log("warn", "发送完成卡片失败: ${e.message}")
             return
         }
-        completionCards.add(id)
+        val generation = completionGeneration.incrementAndGet()
+        completionCards[id] = generation
         mainHandler.postDelayed({
-            if (completionCards.remove(id)) {
+            if (completionCards[id] == generation && completionCards.remove(id, generation)) {
                 manager.cancel(id)
             }
         }, COMPLETION_CARD_MS + CARD_CLEANUP_SLACK_MS)
@@ -429,14 +434,18 @@ class Notifier(private val context: Context) {
     }
 
     /** Ids for the transient (completion / attention) notifications. */
-    private var transientId = ID_TRANSIENT_BASE
+    private val transientId = AtomicInteger(ID_TRANSIENT_BASE)
 
     private fun nextId(): Int {
-        transientId += 1
-        if (transientId > ID_TRANSIENT_BASE + 100_000) {
-            transientId = ID_TRANSIENT_BASE + 1
+        while (true) {
+            val current = transientId.get()
+            val next = if (current >= ID_TRANSIENT_BASE + 100_000) {
+                ID_TRANSIENT_BASE + 1
+            } else {
+                current + 1
+            }
+            if (transientId.compareAndSet(current, next)) return next
         }
-        return transientId
     }
 
     companion object {

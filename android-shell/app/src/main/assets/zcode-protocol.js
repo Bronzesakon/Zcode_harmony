@@ -1112,6 +1112,7 @@
         this._pageRpcSlowMs = typeof options.pageRpcSlowMs === 'number' ?
             options.pageRpcSlowMs : PAGE_RPC_SLOW_MS;
         this._pageBridgeTrafficAt = 0;
+        this._pageConversationTrafficAt = 0;
         this._pageRpc = {
             pending: {},
             calls: 0,
@@ -1149,7 +1150,11 @@
         return this._pageBridgeTrafficAt || 0;
     };
 
-    /** How many page RPCs are awaiting a reply right now (0 when idle). */
+    RemoteClient.prototype.lastPageConversationTrafficAt = function () {
+        return this._pageConversationTrafficAt || 0;
+    };
+
+
     RemoteClient.prototype.inFlightPageRpcs = function () {        var count = 0;
         for (var slot in this._pageRpc.pending) {
             count += 1;
@@ -2127,6 +2132,10 @@
         }
         if (!Array.isArray(header) || typeof header[0] !== 'number') {
             return;
+        }
+        if (header[0] === RES_EVENT_FIRE && data && typeof data === 'object' &&
+            typeof data.topic === 'string' && data.topic.indexOf('conversation/') === 0) {
+            this._pageConversationTrafficAt = Date.now();
         }
         if (header[0] === RES_PROMISE_SUCCESS || header[0] === RES_PROMISE_ERROR ||
             header[0] === RES_PROMISE_ERROR_OBJ) {

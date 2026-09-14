@@ -32,6 +32,7 @@ class TaskStore {
         val task: TaskSnapshot,
         val status: TaskStatus,
         val body: String,
+        val activityAt: Long = task.lastActivityAt,
     ) {
         /**
          * The card's title row: `状态 · 任务名` (D15 — the status word is a prefix
@@ -76,35 +77,49 @@ class TaskStore {
      * 生命周期：接管期间由 [applyLivePreview] 写入，回前台交还时由
      * [clearLivePreviews] 清空（那时页面重新供数，以会话索引为准）。
      */
-    private val livePreviews = HashMap<String, String>()
+    private data class LivePreviewKey(val workspaceKey: String, val sessionId: String)
 
-    /** Workspaces currently subscribed, for the diagnostics screen. */
+    private val livePreviews = HashMap<LivePreviewKey, String>()
+    private val livePreviewAt = HashMap<LivePreviewKey, Long>()
+
+    @Synchronized
     fun workspaces(): List<Workspace> = workspaces.values.toList()
 
+    @Synchronized
     fun workspaceCount(): Int = workspaces.size
 
+    @get:Synchronized
     val hasRunningTasks: Boolean
         get() = workspaces.values.any { it.running.isNotEmpty() }
 
     /** 正在跑的任务（工作区键、会话 id）——原生拉取对话详情的清单。 */
+    @Synchronized
     fun runningTaskRefs(): List<Pair<String, String>> =
         workspaces.values.flatMap { ws -> ws.running.map { ws.key to it.sessionId } }
 
     /**
      * 覆盖某任务的"活进展"文案并重建通知。文本没变时返回空 Update（不打扰系统）。
      */
-    fun applyLivePreview(sessionId: String, text: String): Update {
+    @Synchronized
+    fun applyLivePreview(workspaceKey: String, sessionId: String, text: String): Update {
         val trimmed = text.trim()
-        if (trimmed.isEmpty() || livePreviews[sessionId] == trimmed) {
+        if (trimmed.isEmpty()) {
             return Update(emptyList(), emptyList(), emptyList(), emptyList())
         }
-        livePreviews[sessionId] = trimmed
+        val key = LivePreviewKey(workspaceKey, sessionId)
+        if (livePreviews[key] == trimmed) {
+            return Update(emptyList(), emptyList(), emptyList(), emptyList())
+        }
+        livePreviews[key] = trimmed
+        livePreviewAt[key] = System.currentTimeMillis()
         return buildUpdate(NotifyUpdate(running = emptyList(), completed = emptyList(), attention = emptyList()))
     }
 
     /** 交还前台：活进展不再是数据源，交给页面自己的会话索引。 */
+    @Synchronized
     fun clearLivePreviews() {
         livePreviews.clear()
+        livePreviewAt.clear()
     }
 
     /**
@@ -115,6 +130,7 @@ class TaskStore {
      * sends a full snapshot followed by deltas, and the JS side always hands us
      * a complete list, so absence means removal.
      */
+    @Synchronized
     fun applyWorkspace(
         key: String,
         title: String,
@@ -136,8 +152,14 @@ class TaskStore {
             tasks = tasks,
         )
         val notify = notifyState.apply(key, tasks)
+        val completed = notify.completed.map { event ->
+            event.copy(
+                finalPreview = livePreviews[LivePreviewKey(key, event.task.sessionId)]
+                    ?: event.task.preview,
+            )
+        }
         forgetStaleLivePreviews()
-        return buildUpdate(notify)
+        return buildUpdate(notify.copy(completed = completed))
     }
 
     /**
@@ -146,23 +168,30 @@ class TaskStore {
      */
     private fun forgetStaleLivePreviews() {
         if (livePreviews.isEmpty()) return
-        val running = HashSet<String>()
+        val running = HashSet<LivePreviewKey>()
         for (workspace in workspaces.values) {
-            for (task in workspace.running) running.add(task.sessionId)
+            for (task in workspace.running) running.add(LivePreviewKey(workspace.key, task.sessionId))
         }
         livePreviews.keys.retainAll(running)
+        livePreviewAt.keys.retainAll(running)
     }
 
     /** Drops a workspace entirely, e.g. when its bridge is gone for good. */
+    @Synchronized
     fun removeWorkspace(key: String): Update {
         workspaces.remove(key)
         notifyState.forget(key)
+        livePreviews.keys.removeIf { it.workspaceKey == key }
+        livePreviewAt.keys.removeIf { it.workspaceKey == key }
         return buildUpdate(NotifyUpdate(running = emptyList(), completed = emptyList(), attention = emptyList()))
     }
 
+    @Synchronized
     fun reset(): Update {
         workspaces.clear()
         notifyState.reset()
+        livePreviews.clear()
+        livePreviewAt.clear()
         val removed = previousRunningIds.toList()
         previousRunningIds = emptySet()
         return Update(running = emptyList(), removedIds = removed, completed = emptyList(), attention = emptyList())
@@ -180,9 +209,11 @@ class TaskStore {
                         task = task,
                         status = notifyState.statusOf(task),
                         body = NotifyState.formatBody(
-                            livePreviews[task.sessionId] ?: task.preview,
+                            livePreviews[LivePreviewKey(workspace.key, task.sessionId)] ?: task.preview,
                             workspace.title,
                         ),
+                        activityAt = livePreviewAt[LivePreviewKey(workspace.key, task.sessionId)]
+                            ?: task.lastActivityAt,
                     )
                 )
             }

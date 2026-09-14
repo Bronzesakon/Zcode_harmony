@@ -376,6 +376,7 @@ class MainActivity : AppCompatActivity() {
                 }
                 pendingFileCallback?.onReceiveValue(null)
                 pendingFileCallback = filePathCallback
+                ShellRuntime.setExternalPickerActive(true)
                 showUploadSourceDialog(fileChooserParams)
                 return true
             }
@@ -577,7 +578,6 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
-        notifyForegroundState(true)
         // Ask the injected layer for fresh counters: if we just came back from a
         // long background stint, this is what resolves the survival verdict.
         ShellRuntime.requestLivenessReport()
@@ -592,7 +592,6 @@ class MainActivity : AppCompatActivity() {
     override fun onPause() {
         // Intentionally NOT calling webView.onPause(): it would suspend the
         // page's timers (including its relay heartbeat).
-        notifyForegroundState(false)
         super.onPause()
     }
 
@@ -618,6 +617,7 @@ class MainActivity : AppCompatActivity() {
         // sit waiting on that input forever.
         pendingFileCallback?.onReceiveValue(null)
         pendingFileCallback = null
+        ShellRuntime.setExternalPickerActive(false)
         // Drop the evaluator: it closes over this Activity's binding.
         ShellRuntime.setJsEvaluator(null)
         ShellRuntime.setPageStateListener(null)
@@ -869,6 +869,7 @@ class MainActivity : AppCompatActivity() {
     private fun deliverPickedFiles(uris: List<Uri>) {
         val callback = pendingFileCallback ?: return
         pendingFileCallback = null
+        ShellRuntime.setExternalPickerActive(false)
         Diagnostics.info(
             if (uris.isEmpty()) "文件选择已取消"
             else "已选择 ${uris.size} 个文件，交回网页：${describePickedFiles(uris)}"

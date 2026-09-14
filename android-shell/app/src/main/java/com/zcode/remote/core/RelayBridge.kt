@@ -156,6 +156,7 @@ class BridgeSession(
         )
     }
 
+    @Synchronized
     private fun sendFragmented(bytes: ByteArray) {
         messageSeq += 1
         val frames = RelayWire.fragmentMessage(
@@ -264,6 +265,11 @@ class BridgeSession(
     private val convSubscriptions = ConcurrentHashMap<String, String>()
     private val convTails = ConcurrentHashMap<String, RelayWire.ConversationTail>()
     private val convLastText = ConcurrentHashMap<String, String>()
+    private val pendingConversationFrames = ConcurrentHashMap<String, MutableList<JSONObject>>()
+    @Volatile
+    private var reanchorRunning = false
+    private val reanchoringSessions = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private val installingConversationListener = java.util.concurrent.atomic.AtomicBoolean(false)
     private val convAttempting = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
 
     /** 收到的对话帧计数（诊断用：区分"桌面端不推"与"我们丢帧"）。 */
@@ -283,12 +289,22 @@ class BridgeSession(
      * 就会把该会话永久拉黑）。
      */
     fun subscribeConversationProgress(sessionId: String) {
-        if (closed) return
+        subscribeConversationProgressInternal(sessionId, fromReanchor = false)
+    }
+
+    private fun subscribeConversationProgressInternal(sessionId: String, fromReanchor: Boolean) {
+        if (closed || (!fromReanchor && reanchoringSessions.contains(sessionId))) return
         if (convSubscriptions.containsKey(sessionId)) return
         if (!convAttempting.add(sessionId)) return
         installConversationListener()
+        if (convListenerId < 0) {
+            convAttempting.remove(sessionId)
+            return
+        }
         try {
-            val args = JSONObject(scope.toString()).put("sessionId", sessionId)
+            val args = JSONObject(scope.toString())
+                .put("sessionId", sessionId)
+                .put("visibility", "background")
             val result = channels.callBlocking(
                 RelayWire.CHANNEL_CONVERSATION,
                 RelayWire.METHOD_SUBSCRIBE_CONV,
@@ -302,7 +318,9 @@ class BridgeSession(
                 return
             }
             convSubscriptions[sessionId] = subId
-            convTails.putIfAbsent(sessionId, RelayWire.ConversationTail())
+            convTails[sessionId] = RelayWire.ConversationTail()
+            convLastText.remove(sessionId)
+            pendingConversationFrames.remove(subId)?.forEach { onConversationWire(it) }
             onLogLine(
                 "subscribed conversation for $sessionId (${ack.optString("mode")}, " +
                     "帧已收 ${convFrames} 个)",
@@ -322,36 +340,61 @@ class BridgeSession(
      * `when` 冻在原地。所以"最新进展"不能只赌 push：每隔一段时间重挂一次，
      * 最坏也只慢一个重挂周期，而不会回到几十分钟级的滞后。
      */
+    @Synchronized
     fun reanchorConversations() {
-        if (closed) return
-        for (session in convSubscriptions.keys.toList()) {
-            val subId = convSubscriptions.remove(session) ?: continue
-            Thread {
-                try {
-                    val args = JSONObject(scope.toString()).put("subscriptionId", subId)
-                    channels.callBlocking(
-                        RelayWire.CHANNEL_CONVERSATION,
-                        RelayWire.METHOD_UNSUBSCRIBE_CONV,
-                        listOf<Any?>(args),
-                        8_000,
-                    )
-                } catch (e: Exception) {
-                    // 尽力而为：退订失败也不影响重订阅（会带新的 subscriptionId）
+        if (closed || reanchorRunning) return
+        val sessions = convSubscriptions.keys.toList()
+        if (sessions.isEmpty()) return
+        reanchorRunning = true
+        Thread {
+            try {
+                for (session in sessions) {
+                    if (closed) break
+                    val subId = convSubscriptions.remove(session) ?: continue
+                    reanchoringSessions.add(session)
+                    try {
+                        val args = JSONObject(scope.toString()).put("subscriptionId", subId)
+                        channels.callBlocking(
+                            RelayWire.CHANNEL_CONVERSATION,
+                            RelayWire.METHOD_UNSUBSCRIBE_CONV,
+                            listOf<Any?>(args),
+                            8_000,
+                        )
+                    } catch (e: Exception) {
+                        // 尽力而为：退订失败也不影响重订阅。
+                    }
+                    convTails.remove(session)
+                    convLastText.remove(session)
+                    onLogLine("reanchor conversation for $session (距上次共收 ${convFrames} 个帧)")
+                    reanchoringSessions.remove(session)
+                    subscribeConversationProgressInternal(session, fromReanchor = true)
                 }
-                onLogLine("reanchor conversation for $session (距上次共收 ${convFrames} 个帧)")
-                subscribeConversationProgress(session)
-            }.start()
-        }
+            } finally {
+                reanchoringSessions.clear()
+                reanchorRunning = false
+            }
+        }.start()
     }
 
     /** 必须先注册监听再订阅：ACK 之前到达的帧按 topic 缓冲在桌面端，不怕早发。 */
     private fun installConversationListener() {
-        if (convListenerId >= 0) return
-        convListenerId = channels.listenEvent(
-            RelayWire.CHANNEL_CONVERSATION,
-            RelayWire.EVENT_CONVERSATION_FRAME,
-            JSONObject(scope.toString()),
-        ) { data -> onConversationWire(data) }
+        if (closed || convListenerId >= 0 ||
+            !installingConversationListener.compareAndSet(false, true)
+        ) return
+        try {
+            if (!channels.awaitReady(30_000)) return
+            synchronized(this) {
+                if (!closed && convListenerId < 0) {
+                    convListenerId = channels.listenEvent(
+                        RelayWire.CHANNEL_CONVERSATION,
+                        RelayWire.EVENT_CONVERSATION_FRAME,
+                        JSONObject(scope.toString()),
+                    ) { data -> onConversationWire(data) }
+                }
+            }
+        } finally {
+            installingConversationListener.set(false)
+        }
     }
 
     private fun onConversationWire(data: Any?) {
@@ -367,7 +410,14 @@ class BridgeSession(
                 break
             }
         }
-        val id = sessionId ?: return
+        val id = sessionId ?: run {
+            pendingConversationFrames.compute(subId) { _, frames ->
+                val out = frames ?: ArrayList()
+                if (out.size < 8) out.add(frame)
+                out
+            }
+            return
+        }
         val tail = convTails.getOrPut(id) { RelayWire.ConversationTail() }
         val payload = frame.optJSONObject("payload") ?: return
         when (payload.optString("kind")) {
@@ -399,6 +449,8 @@ class BridgeSession(
         convSubscriptions.clear()
         convTails.clear()
         convLastText.clear()
+        pendingConversationFrames.clear()
+        reanchoringSessions.clear()
         if (convListenerId >= 0) {
             try {
                 channels.removeListener(
@@ -467,6 +519,7 @@ class BridgeManager(
 ) {
     private val relayPending = ConcurrentHashMap<String, PendingRelayRequest>()
     private val bridges = ConcurrentHashMap<String, BridgeSession>()
+    private val bridgesById = ConcurrentHashMap<String, BridgeSession>()
     private val idToKey = ConcurrentHashMap<String, String>()
     private var bridgeGeneration = 0L
 
@@ -496,9 +549,6 @@ class BridgeManager(
                     openedBridge.progressListener = { sessionId, text ->
                         progressSink?.invoke(openedBridge.workspaceKey, sessionId, text)
                     }
-                    // 必须先注册再握手：四步握手的应答帧经 acceptRelayPayload
-                    // 按 idToKey→bridges 路由回来，注册晚了会全部落空（超时）。
-                    bridges[openedBridge.workspaceKey] = openedBridge
                     openedBridge.runHandshake(runningSessions(openedBridge.workspaceKey))
                     opened += 1
                     onLogLine(
@@ -506,7 +556,9 @@ class BridgeManager(
                     )
                 } catch (e: Exception) {
                     if (bridge != null) {
-                        bridges.remove(bridge.workspaceKey)
+                        bridges.remove(bridge.workspaceKey, bridge)
+                        bridgesById.remove(bridge.bridgeSessionId, bridge)
+                        idToKey.remove(bridge.bridgeSessionId)
                         try {
                             bridge.closeBridge()
                         } catch (closeError: Exception) {
@@ -554,8 +606,7 @@ class BridgeManager(
                 pending?.latch?.countDown()
             }
             "rpc-frame", "rpc-frame-ack" -> {
-                val key = idToKey[payload.optString("bridgeSessionId")]
-                val bridge = key?.let { bridges[it] }
+                val bridge = bridgesById[payload.optString("bridgeSessionId")]
                 if (bridge != null) {
                     bridge.acceptBridgePayload(payload)
                 } else if (inflightOpenId != null) {
@@ -616,7 +667,6 @@ class BridgeManager(
         }
         idToKey[actualId] = key
         idToKey[bridgeSessionId] = key
-        inflightOpenId = null
         val bridge = BridgeSession(
             workspaceKey = key,
             scope = scope,
@@ -626,7 +676,13 @@ class BridgeManager(
             onSessionsUpdate = onSessionsUpdate,
             onLogLine = onLogLine,
         )
-        // 回放竞态窗口里到达的帧（Initialize 通常在其中）。
+        // Register before replaying: frames arriving after ready route directly to this instance.
+        if (bridges.putIfAbsent(key, bridge) != null) {
+            bridge.closeBridge()
+            return null
+        }
+        bridgesById[actualId] = bridge
+        idToKey[actualId] = key
         val replayIds = setOf(bridgeSessionId, actualId)
         while (true) {
             val buffered = preOpenBuffer.poll() ?: break
@@ -634,6 +690,7 @@ class BridgeManager(
                 bridge.acceptBridgePayload(buffered)
             }
         }
+        inflightOpenId = null
         return bridge
     }
 
@@ -667,6 +724,7 @@ class BridgeManager(
             }
         }
         bridges.clear()
+        bridgesById.clear()
         idToKey.clear()
         relayPending.clear()
         onLogLine("tier2 bridges disposed ($reason)")

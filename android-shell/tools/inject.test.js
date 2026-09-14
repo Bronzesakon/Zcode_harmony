@@ -1158,15 +1158,20 @@ test('进对话铁判准：信标后页面桥有入站帧 → 判就绪不刷', 
         socket.receive({type: 'pair_status_ack', pair_status: 'matched'});
         FB().note({name: 'zcode-agent.subscribeConversationV4', args: {sessionId: 'sess_hot'}});
         assert.ok(FB().timer() !== null, 'the beacon arms the 5s deadline');
-        // 信标之后桌面端回了数据（页面桥入站 rpc-frame）——内容在路上。
-        const ok = encodeBody([page.protocol.RES_PROMISE_SUCCESS, 77], {rows: []});
-        for (const payload of fragment(ok, 'page-bridge-13', 1)) {
+        // 信标之后桌面端回了真实对话动态事件——内容在路上。
+        const conversation = encodeBody([page.protocol.RES_EVENT_FIRE, 77], {
+            topic: 'conversation/ws',
+            subscriptionId: 'sub-hot',
+            kind: 'complete',
+            frame: {payload: {kind: 'snapshot', snapshot: {rows: {window: []}}}}
+        });
+        for (const payload of fragment(conversation, 'page-bridge-13', 1)) {
             socket.receive({type: 'data', payload});
         }
         FB().check();
-        assert.strictEqual(reloads.length, 0, 'content already flowing must never reload');
+        assert.strictEqual(reloads.length, 0, 'conversation traffic must not reload');
         assert.ok(findPost(page.posts, 'diag', (d) =>
-            d.message.includes('已就绪（页面桥有入站帧）')).length === 1);
+            d.message.includes('对话流有新帧')).length === 1);
     } finally {
         restore();
         page.teardown();
@@ -1209,7 +1214,7 @@ test('进对话铁判准：页面日志的订阅确认也算就绪', () => {
     }
 });
 
-test('进对话铁判准：5s 到点零就绪 → 直接刷新（不经过轻推）', () => {
+test('进对话恢复：5s 无详情先最小内推，仍失败才整体刷新', () => {
     const page = setupPage();
     const {reloads, restore} = stubReload();
     try {
@@ -1217,20 +1222,23 @@ test('进对话铁判准：5s 到点零就绪 → 直接刷新（不经过轻推
         appendComposer(page, '向 ZCode 提问…', false);
         FB().note({name: 'zcode-agent.subscribeConversationV4', args: {sessionId: 'sess_a'}});
         FB().check();
-        assert.strictEqual(reloads.length, 1, 'the hard deadline reloads directly');
+        assert.strictEqual(reloads.length, 0, 'first deadline should try the minimum nudge');
         assert.ok(findPost(page.posts, 'diag', (d) =>
-            d.message.includes('进对话 5s 未出对话详情（标题回退）')).length === 1);
+            d.message.includes('先尝试最小内推')).length === 1);
         assert.ok(findPost(page.posts, 'diag', (d) =>
-            d.message.includes('第 1/2 次刷新页面')).length === 1);
-        assert.strictEqual(FB().stall().armed, false,
-            'the stall ladder (nudge first) is not on this path any more');
+            d.message.includes('卡死轻推')).length === 1);
+        clearTimeout(FB().timer());
+        FB().check();
+        assert.strictEqual(reloads.length, 1, 'fallback reload follows a failed nudge');
+        assert.ok(findPost(page.posts, 'diag', (d) =>
+            d.message.includes('整体刷新页面')).length === 1);
     } finally {
         restore();
         page.teardown();
     }
 });
 
-test('进对话铁判准：状态 B（真标题 + 输入框禁用）同样直接刷', () => {
+test('进对话恢复：状态 B 也先内推再保底刷新', () => {
     const page = setupPage();
     const {reloads, restore} = stubReload();
     try {
@@ -1238,9 +1246,12 @@ test('进对话铁判准：状态 B（真标题 + 输入框禁用）同样直接
         appendComposer(page, null, true);
         FB().note({name: 'zcode-agent.conversationRowsRangeV4', args: {sessionId: 'sess_b'}});
         FB().check();
-        assert.strictEqual(reloads.length, 1, 'a greyed composer with no content still reloads');
+        assert.strictEqual(reloads.length, 0, 'state B first tries a minimum nudge');
         assert.ok(findPost(page.posts, 'diag', (d) =>
-            d.message.includes('（输入框未就绪）')).length === 1);
+            d.message.includes('输入框未就绪')).length === 1);
+        clearTimeout(FB().timer());
+        FB().check();
+        assert.strictEqual(reloads.length, 1, 'state B falls back to reload after the nudge');
     } finally {
         restore();
         page.teardown();
@@ -1255,7 +1266,13 @@ test('进对话铁判准：15s 间隔内不连刷；到期再刷；2 次到顶�
         appendComposer(page, '向 ZCode 提问…', false);
         FB().note({name: 'zcode-agent.subscribeConversationV4', args: {sessionId: 'sess_1'}});
         FB().check();
-        assert.strictEqual(reloads.length, 1, 'the first deadline reloads');
+        assert.strictEqual(reloads.length, 0, 'the first deadline nudges without reload');
+        assert.ok(findPost(page.posts, 'diag', (d) => d.message.includes('先尝试最小内推')).length === 1);
+        clearTimeout(FB().timer());
+
+        // 内推后仍卡住：下一次检查才进入整体刷新保底
+        FB().check();
+        assert.strictEqual(reloads.length, 1, 'the failed nudge falls back to reload');
 
         // 刷新后的新页面里信标重来，仍旧卡着：间隔内 → 不刷，只顺延复查
         FB().note({name: 'zcode-agent.conversationRowsRangeV4', args: {sessionId: 'sess_1'}});
@@ -1267,7 +1284,7 @@ test('进对话铁判准：15s 间隔内不连刷；到期再刷；2 次到顶�
         // 间隔到期：再判 → 第 2/2 次刷新
         FB().stall().lastReloadAt = Date.now() - 16000;
         FB().check();
-        assert.strictEqual(reloads.length, 2, 'after the gap a stuck page reloads again');
+        assert.strictEqual(reloads.length, 2, 'after the gap the second fallback reloads');
 
         // 第三次仍卡着：到顶 → 放弃
         FB().stall().lastReloadAt = Date.now() - 16000;

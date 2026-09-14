@@ -31,7 +31,7 @@ object PromotionPolicy {
         return running
             .sortedWith(
                 compareByDescending<TaskStore.RunningNotification> { it.status == TaskStatus.WAITING }
-                    .thenByDescending { it.task.lastActivityAt }
+                    .thenByDescending { it.activityAt }
             )
             .take(max)
             .mapTo(LinkedHashSet()) { it.id }

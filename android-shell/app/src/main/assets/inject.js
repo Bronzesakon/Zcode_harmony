@@ -972,6 +972,10 @@
             linkWindow.acks += 1;
             if (relayPaired) {
                 // 配对成功＝链路真的回来了，KICKED 自愈的连续计数到此清零。
+                if (kickedAwayAt) {
+                    kickedAwayAt = 0;
+                    diag('info', '页面在后台重新配对成功，取消待处理的 KICKED 自愈');
+                }
                 if (kickedHealCount() > 0) {
                     storeSet(KICKED_HEAL_STORE, '0');
                 }
@@ -1466,8 +1470,9 @@
         'zcode-agent.subscribeConversationV4': 1,
         'zcode-agent.conversationRowsRangeV4': 1
     };
-    /** 铁判准窗：信标后 5 s（用户拍板值，不要再调大）。 */
-    var FALLBACK_CHECK_MS = 5000;
+    /** 进入会话后先给页面 3s 自己恢复；进行中流文本连续 5s 不更新也触发同一恢复梯子。 */
+    var FALLBACK_CHECK_MS = 3000;
+    var CONVERSATION_STALE_MS = 5000;
     var FALLBACK_RELOAD_GAP_MS = 15000;
     var FALLBACK_STORE_AT = 'zcodeShellFastRefreshAt';
 
@@ -1478,7 +1483,8 @@
         beaconGen: 0,
         readyAt: 0,
         readyBy: '',
-        chatView: false
+        chatView: false,
+        nudgedAt: 0
     };
     var clientGenSeq = 0;
 
@@ -1598,6 +1604,7 @@
         fallbackState.beaconGen = client ? client.gen : 0;
         fallbackState.readyAt = 0;
         fallbackState.readyBy = '';
+        fallbackState.nudgedAt = 0;
     }
 
     /**
@@ -1635,9 +1642,10 @@
             // 体征读不到不算证据，也不算反证
         }
         var clientNow = client;
-        if (clientNow && typeof clientNow.lastPageBridgeTrafficAt === 'function' &&
-            clientNow.lastPageBridgeTrafficAt() >= state.beaconAt) {
-            reasons.push('页面桥有入站帧');
+        var conversationAt = clientNow && typeof clientNow.lastPageConversationTrafficAt === 'function' ?
+            clientNow.lastPageConversationTrafficAt() : 0;
+        if (conversationAt && conversationAt >= state.beaconAt) {
+            reasons.push('对话流有新帧');
         }
         return reasons;
     }
@@ -1661,7 +1669,7 @@
         var clientNow = client;
         if (state.beaconGen && (!clientNow || clientNow.gen !== state.beaconGen)) {
             diag('debug', '进对话 5s 判定：期间链路换代（' +
-                (clientNow ? '第 ' + state.beaconGen + '→' + clientNow.gen + ' 代' : '客户端已销毁') +
+                (clientNow ? '第 ' + state.beaconGen + '→' + clientNow.gen : '客户端已销毁') +
                 '），本轮不判（页面正按自己的梯子重连）');
             return;
         }
@@ -1685,7 +1693,14 @@
             el = 'DOM 不可读';
         }
         diag('warn', '进对话 5s 未出对话详情' + (el ? '（' + el + '）' : '') +
-            '：直接刷新页面');
+            '：先尝试最小内推（重建页面 relay 连接）');
+        if (!state.nudgedAt) {
+            state.nudgedAt = Date.now();
+            nudgeReconnect('进对话 5s 未出详情');
+            fallbackTimer = setTimeout(fallbackCheck, STALL_RELOAD_MS);
+            return;
+        }
+        diag('warn', '最小内推后仍未出对话详情：整体刷新页面');
         reloadForMissingConversation('进对话 5s 未出对话详情');
     }
 
@@ -1729,7 +1744,7 @@
     var UPLOAD_RPC_RE = /upload|attachment|artifact/i;
 
     /**
-     * 进对话信标（页面自己发出的会话请求）。**已有在跑的判定窗就不重置**——
+     * 进对话信标（页面自己发出的会话请求）。已有在跑的判定窗就不重置——
      * 重置会把"5 s 铁判准"变成"5 s + 每次重试顺延"：真机实测正是这样拖到 ~9 s
      * 才刷（页面 transport 的 await 门控让订阅请求晚 4 s 才发出去，信标跟着晚）。
      * 窗口只由"进入对话"那一刻起算，DOM 视图信标通常几百毫秒内就到。
@@ -1837,6 +1852,7 @@
         gaveUp: false,
         lastReloadAt: 0,
         skipNudge: false,
+        streamStalled: false,
         // 连续刷新计数的内存权威；sessionStorage 是跨 reload 边界的镜像
         // （storage 可能被拒，内存值仍保住单次加载内的上限语义）。
         reloadCount: parseInt((function () {
@@ -2077,7 +2093,30 @@
         }
     }
 
-    /** 页面日志事件 → 看门狗布防/撤防 + 进对话铁判准的就绪信号。 */
+    function conversationStreamStallTick() {
+        try {
+            if (!appForeground || !relayPaired || !fallbackState.chatView || stallState.gaveUp) {
+                return;
+            }
+            var at = client && typeof client.lastPageConversationTrafficAt === 'function' ?
+                client.lastPageConversationTrafficAt() : 0;
+            if (!at || Date.now() - at < CONVERSATION_STALE_MS) {
+                return;
+            }
+            if (!stallState.armed) {
+                stallArm('前台对话流连续 ' + Math.round((Date.now() - at) / 1000) + 's 无新动态', false);
+            }
+        } catch (e) {
+            // Recovery monitoring must never affect the page.
+        }
+    }
+
+    function startConversationStreamMonitor() {
+        if (G.__zcodeShellConversationMonitor) return;
+        G.__zcodeShellConversationMonitor = setInterval(conversationStreamStallTick, 1000);
+    }
+
+
     function notePageLogEvent(name) {
         if (PAGE_LOG_STALL_EVENTS[name]) {
             if (vitalsStalled(readVitals())) {
@@ -2831,7 +2870,7 @@
     } catch (e) {
         diag('error', 'WebSocket hook 失败: ' + e);
     }
-    startHeartbeat();
+    startConversationStreamMonitor();
     installLongTaskObserver();
     post('ready', {href: location.href, subscribeAll: config().subscribeAll !== false});
     reportLiveness();

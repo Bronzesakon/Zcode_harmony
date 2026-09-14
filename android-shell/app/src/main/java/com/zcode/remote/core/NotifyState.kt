@@ -44,6 +44,7 @@ data class CompletionEvent(
     val workspaceKey: String,
     val task: TaskSnapshot,
     val failed: Boolean,
+    val finalPreview: String = task.preview,
 )
 
 /** A task that needs the user's attention (permission / input request). */
@@ -122,7 +123,13 @@ class NotifyState {
             val now = nowPhases[sessionId] ?: continue
             if (now !in TERMINAL_PHASES) continue
             val task = byId.getValue(sessionId)
-            completed.add(CompletionEvent(workspaceKey, task, failed = now in FAILED_PHASES))
+            completed.add(
+                CompletionEvent(
+                    workspaceKey,
+                    task,
+                    failed = now in FAILED_PHASES,
+                )
+            )
         }
 
         // A task that vanished from the list must not fire a completion later
