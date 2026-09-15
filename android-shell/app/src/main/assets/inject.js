@@ -810,6 +810,12 @@
      * duplicate with rpc-transport-fault, and the reopen loop keeps hammering the
      * channel the user's own conversation request is queued on.
      */
+    /**
+     * 页面**自己**正在显示的那个工作区（后台上承唯一该开桥的那一个）。
+     * 来源是页面自己发的 `workspace-bridge-open` 帧；变化时才上报一次（见 observeText）。
+     */
+    var lastPageWorkspace = '';
+
     var pageCoverage = {
         passive: {},
         outboundListenIds: {},
@@ -1162,6 +1168,25 @@
             // is sending my file" signature (reported in 页面开销).
             linkWindow.outFrames += 1;
             linkWindow.outChars += text.length;
+            // 页面**自己**在看的那个工作区/任务：它的 `workspace-bridge-open` 帧里
+            // 就带着 `workspaceKey`（有时还有 `taskId`）。这是后台原生承载唯一该开桥的
+            // 那一个——真机 2026-09-16 定案：原生扫全部工作区会让桌面端把 host 收掉
+            // （docs/16 §8/§10），而页面自己永远只开它正在看的那个。转给原生（只记
+            // 键名，不含内容）。
+            try {
+                if (frame.payload.zcode_type === 'workspace-bridge-open') {
+                    var wsKey = frame.payload.workspaceKey;
+                    if (typeof wsKey === 'string' && wsKey.length > 0 && wsKey !== lastPageWorkspace) {
+                        lastPageWorkspace = wsKey;
+                        post('pagews', {
+                            key: wsKey,
+                            taskId: typeof frame.payload.taskId === 'string' ? frame.payload.taskId : ''
+                        });
+                    }
+                }
+            } catch (e) {
+                // 观测失败绝不影响页面自己的发送
+            }
             try {
                 ensureClient().acceptObservedPayload(frame.payload, true);
             } catch (e) {

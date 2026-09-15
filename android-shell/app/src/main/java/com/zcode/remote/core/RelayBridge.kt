@@ -331,10 +331,40 @@ class BridgeSession(
     private val installingControllerListener = java.util.concurrent.atomic.AtomicBoolean(false)
 
     /**
+     * controller 流（运行态 `controller/tasks-index`）总开关。
+     *
+     * ⚠️ **默认关闭**（2026-09-16 01:16 真机定案，而且是**致命**的那一条）：
+     * 原生桥对 `zcode-agent.onDynamicControllerFrame` 的那次 `rpc:listen` 会让**桌面端
+     * host 进程当场 `uncaughtException` 并自毁**：
+     * ```
+     * [rpc:listen] zcode-agent.onDynamicSessionsIndexFrame subscribed   ← 索引流没问题
+     * [rpc:listen] zcode-agent.onDynamicControllerFrame  FAIL {"name":"Error",…}
+     * uncaughtException origin=uncaughtException: …
+     * disposing host resources, reason=uncaughtException:uncaughtException
+     * → [task-realtime] unregistered host + host process (local-1) exited with code 1
+     * ```
+     * 配对→崩溃的间隔**固定 4.3 秒**，本轮三次复现（01:05 / 01:13 / 01:16），
+     * 每次之后桌面端远程控制整体失效（所有 `workspace-bridge` 回 `desktop-disconnected`）、
+     * 页面也跟着 bootstrap 失败。这条流不是"拿不到"的问题，是"**会把桌面端打崩**"。
+     *
+     * 运行态本来就有第二条腿（会话流 `turnHeader.state` → `TaskStore.applyConversationRunState`，
+     * 见 ShellRuntime 的三级优先级：controller > 会话流 > SI 持久态），所以关掉它只损失
+     * "controller 提供的更精确的 liveStatus"。要实验时改这里，**但要知道代价**。
+     */
+    private val controllerStreamEnabled = false
+
+    /**
      * 订阅运行态流。**失败不致命**：拿不到它时行为退回"只有 sessions-index
      * 的持久态"，即接管后的卡片会冻住——所以失败必须留在日志里，别静默。
      */
     private fun subscribeControllerTasks() {
+        if (!controllerStreamEnabled) {
+            Diagnostics.log(
+                "info",
+                "controller 流已停用（那次 rpc:listen 会让桌面端 host 崩，运行态走会话流兜底）",
+            )
+            return
+        }
         if (closed || controllerSubscriptionId != null) return
         if (!installingControllerListener.compareAndSet(false, true)) return
         try {

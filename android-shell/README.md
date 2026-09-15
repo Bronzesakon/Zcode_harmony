@@ -443,17 +443,22 @@ zcode-remote.apk -> CN=ZCode Remote, OU=Mobile, O=ZCode, L=Unknown, ST=Unknown, 
 13. **页面自身的 RPC 要与我们的 bridge 分开看，且「页面覆盖情况」必须活过 relay 重连。** 被动观测也记录页面自己的 promise 调用/回复（`_tracePageCall` / `_tracePageResult` → 日志里的 `页面调用慢`、`页面调用失败`、`页面 RPC 10s`），因为「点进任务不出内容」那个请求是**页面的**，壳的 bridge 永远看不到。硬约束：① 页面已覆盖的工作区**绝不重复开 bridge**，这份认知由 `inject.js` 的 `pageCoverage` 跨 `resetClient()` 存活（第一轮正是它在重连后丢失，导致重复 bridge 与 `rpc-transport-fault` 死循环）；② `_observeInboundRpc` 里 promise 回复按 `(bridgeSessionId, id)` 配对，**不要求先学到工作区**，否则页面 bridge 的回复会被静默丢掉；③ 「页面拥有某工作区」不能只凭一个证据——页面开了 bridge（入站 `workspace-bridge-ready` 且 id 不在 `_requestedBridgeIds` 里）**且**桌面端确实拒掉我们的 bridge，两者同时成立才永久放弃（`_pageOwned`）；④ 同一条 relay 连接内 fault 超过 `_maxReopens`（**现行值 0**，即首次 fault 不再重开）就停止重开，跨连接另设冷却 `FAULT_COOLDOWN_CONNECTIONS=3` / `FAULT_COOLDOWN_MS=10 分钟`（连续 3 条连接都 fault 就冷却 10 分钟，到期自动重试）；⑤ burst 的每一站之前 `awaitPageIdle()`，让路预算整个 burst 共享（8s），故 `主动订阅完成：用时` 可能到 ~19s 是**刻意的**。
 14. **只读壳（`SHELL_READ_ONLY = true`，2026-09-15 定案）：壳永不关闭页面的 socket、永不自动重载页面。** 真机把三种自伤来源抓齐了——`socket.close() 被调用 … 来自 …` 那行会点名调用者：`nudgeReconnect ← fallbackCheck`（"进对话 5s 铁判准"，**40 秒里 10 次**）、`forceReconnect ← G.__zcodeShellSetAppForeground`（**回一次前台拆一次**，20:53:04）、`forceReconnect ← heartbeatTick ← G.__zcodeShellHeartbeat`（18:24 / 18:35 / 19:40 / 20:56）。拆掉的每一次都是**页面正用着的那条** relay 连接，用户看到的"发消息转圈 / 要重连 n 次才出来 / 返回页面是它自己在重连"全是它的下游。对照实验（`diag_cmd passive_off`，这些手段全部失去 socket 句柄）：页面自己的订阅 ack 之后 **5 分钟零生命周期事件**。**壳对页面的写入面只允许五处**：① document-start 的滚动条 CSS；② **退后台之后**每 10s 一帧 `pair_status_query`（前台一帧都不写——页面自己的 10s 心跳在前台是准的，见第 6 条）；③ KICKED 终态时回前台的自愈重载（终态页面自己回不来，只有手动"重新连接"）；④ 通知点击后的定位点击；⑤ **回前台死链兜底重载**（2026-09-15 晚加，**待真机验证**：静默 >60s ＋ 5s 观察窗零入站帧 ＋ 对话 0 行，三条齐了才重载，5 分钟限流；判据是"页面已经失败"，不是"我们怀疑它失败"）。**要新增任何写操作之前，先回答两句："页面自己做不到这件事吗？"以及"我怎么知道它已经失败了？"**
 15. **「后台 60 秒墙」= Chromium 的网络栈在后台死掉，不是 App 没网、不是壳的问题（2026-09-16 凌晨定案，别再重查）。** 判据是同刻三件事：墙内页面**新建** `fetch` 挂住 76s（既不成功也不失败）；同刻**原生 Java** 裸 TCP `ok 67ms`、HTTPS `HTTP 200 276ms`；同刻原生 WebSocket 1 秒内 `★配对成功（matched）`。墙的形状是**僵尸连接**：`socket readyState=1(OPEN)`、`paired true`、壳每 10s 仍在发探针，却连 ack 都没有，且**没有任何 close 事件**；连页面自己 `close()` 都卡在 CLOSING（帧发不出去）。**这一条把"页面侧自救"整类方案全部证伪**（合成 `online` 送到了页面也没用），所以：① **落地形态**是「判死 → 原生接管 → 回前台交还」（「未结项」2 的路线 B 的真正形态，触发条件见 `ShellRuntime.maybeStartNativeCarrier`：入站帧静默 ≥35s，**不是**老的"退后台 5 秒"）；② 反向不变式：**页面链路一旦自己活了（入站帧 <35s），原生立刻交还**，任何时刻只有一侧持连接；③ 判死时页面那条连接早已是僵尸，且它的网络栈是死的 ⇒ **`KICKED` 帧根本送不到页面**，页面不会进终态（这正是老路径 K1 风险的解）；④ **回前台不需要重载**：原生先交还，页面可见性恢复后 Chromium 网络栈复活，页面自己的 `recoverConnection` 会重拨；只有页面**已经掉进失败态**（`i4t.dispose` 之后自己回不来）才由 `__zcodeShellAfterCarrierReturn` 兜底重载一次（交还后 8s、无 OPEN socket、零入站帧，5 分钟限流）；⑤ 诊断判据三件套（**后台可调用**，`am broadcast` 不碰可见性）：`net_probe`（原生网络）、`bg_http`（Chromium 侧新连接）、`bg_state`（链路现场），用法见 `docs/16-…md` §4.3。
-16. **原生承载的硬前置：window 控制面（2026-09-16 00:52 的真机 A/B 定案，别再漏）**。原生只做
-    relay 配对（"裸终端"）会让**桌面端在 4.3 秒后拆掉自己的 window host**（`[task-realtime] unregistered host`
-    + `host process (local-1) exited with code 1`），而且这**早于任何开桥**；host 一没，桌面端远程控制整体失效、
-    页面 bootstrap 也失败。对照基线（只让页面自己开桥）45 秒无异常。机制：页面的身份来自 window 控制面
-    （`bootstrap` → `/ws/remote-control/window/<token>` 拿 `mobileConnectionId` → 桥请求带
-    `X-ZCode-Mobile-Connection-Id`），桌面端据此把接入归属到窗口；裸 relay 配对没有归属，就被收掉。
-    **所以 `ShellRuntime.carrierEnabled` 默认 false**（打开就会毁掉桌面端，不能留默认开启）；
-    要转正必须先补那五步（读 token → bootstrap → window socket → 带头的 workspace-bridge → 再订会话），
-    取证与步骤见 `docs/16-…md` §8。**实验期间 `carrier_on` 之后，记得重启一次 ZCode 把 host 拉回来。**
-
----
+16. **后台承载已经把"后台跟手"做通了，而且真凶是我们自己的一条 `rpc:listen`（2026-09-16 01:16 定案）。**
+    先前的错误归因：00:52 观察到"原生配对后桌面端 4.3 秒拆 host"，一度以为"裸终端配对没有窗口归属、
+    必须补 window 控制面"。**真凶在桌面端日志里写得很清楚**：
+    `[rpc:listen] zcode-agent.onDynamicControllerFrame FAIL` → `uncaughtException` →
+    `disposing host resources` → `unregistered host` + `host process exited with code 1`——
+    原生桥为拿"运行态"对 **`controller/tasks-index`** 的那次订阅会让桌面端 host 进程当场抛未捕获异常并自毁。
+    修法：`RelayBridge.controllerStreamEnabled = false`（运行态本就有会话流 `turnHeader.state` 兜底，
+    三级优先级 controller > 会话流 > SI）。**`t=` token / window 控制面那条路因此作废，不用走了。**
+    配套两条同轮定案：① 只开**页面自己正在显示**的那个工作区的桥（`pageWorkspaceKey`，注入层从页面自己的
+    `workspace-bridge-open` 帧里取；扫全部工作区会让桌面端每次新建再拆 host）；② 配对后照页面顺序补
+    `mobile-diagnostic` / `mobile-view-state-update` / `bootstrap-request` 三帧（`Tier2Probe.sendBootstrapThenCoverage`）。
+    **验收（01:43–01:50，App 在后台、Chromium 网络已死）**：`subscribed conversation for sess_…` →
+    `会话运行态：在跑` → `活进展 E:\Zcode_harmony：## 第N节…`（第二/三/四/五节按时间推进）；
+    手机同刻 `id=175654 title=运行中 · 有线ADB连接继续调试` + 正文=正在写的那一节 + `shortCriticalText=运行中`；
+    **回前台不需要重载**（`relay socket open (#2)` 0.9s 自恢复，兜底重载一次都没触发）；桌面端 host 零异常。
+    取证与逐行现场见 `docs/16-…md` §10。
 
 ## 任务通知（这是壳存在的理由）
 
@@ -713,35 +718,32 @@ MSYS_NO_PATHCONV=1 "$ADB" devices -l                 # 确认出现设备
 
 ### 一句话状态
 
-真机当前跑的是**本机出的 `1.0.0-local.137`**（本地 keystore 同签名，`adb install -r` 覆盖安装，
-**零 CI 消耗**；v130–v137 都是 2026-09-16 凌晨为"后台 60 秒墙"做的实验件）。`pre` 分支与滚动预发布
+真机当前跑的是**本机出的 `1.0.0-local.142`**（本地 keystore 同签名，`adb install -r` 覆盖安装，
+**零 CI 消耗**；v130–v142 都是 2026-09-16 凌晨为"后台 60 秒墙"做的实验件）。`pre` 分支与滚动预发布
 `android-pre` 停在 **`764235e`**；只读壳那轮是本地快照提交 `c8c93e2`、收尾文档 `c5f9407`，
 **均仅本地、未推送**；`docs/15-…md`、`docs/16-…md` 与根目录历史 APK 仍未跟踪。
 
-**2026-09-16 凌晨（第十六轮）四条结论**：
+**2026-09-16 凌晨（第十六轮）：后台 60 秒墙 → 原生承载 → 端到端打通。五条结论**：
 1. **根因**：退后台约 60–70s 后 **Chromium 的网络栈整条停止工作**。同刻三证：墙内页面新建
-   `fetch` 挂住 76s（既不成功也不失败）；**原生 Java** 裸 TCP `ok 67ms`、HTTPS `HTTP 200 276ms`；
-   原生 WebSocket 1 秒内 `★配对成功（matched）`。墙的形状是**僵尸连接**（`socket=1(OPEN)`、
-   `paired true`、探针照发、零 ack、无 close 事件；连页面 `close()` 都卡在 CLOSING）。
-   ⇒ **页面侧自救整类方案被证伪**（合成 `online` 送到页面也没用），只有换承载层。
-2. **承载形态已跑通**：`判死（入站帧静默 ≥35s）→ 原生接管 → 回前台交还`。真机：触发行
-   `后台原生承载：入站帧静默 41s …` → `★接管配对成功`（0.5s）；后台上承期间原生心跳/ack
-   持续（139s 那次 13/14）；`DEVICE_OFFLINE` 后 10s 自动重连并重新配对；回前台
-   `Tier2: 关闭（回前台交还）`、无 KICKED。**回前台不需要重载**（页面自己 `recoverConnection` 重拨）；
-   只有页面已进失败态才由 v133 的 `__zcodeShellAfterCarrierReturn` 兜底重载一次。
-3. **但它现在默认关闭**：原生"裸终端"配对会在 **4.3 秒**后让桌面端拆掉自己的 window host
-   （干净 A/B 见「实现要点」16 与 `docs/16-…md` §8）——**必须先补 window 控制面**才能转正。
-   这是本轮最重要的新增约束。
-4. **造流通道打通**：`adb input text` 进不了 WebView（复现），但新增的
-   **`tools/cdp.mjs`（CDP over adb forward）**能真实输入：`Input.insertText` 被 Lexical 接受、
-   点 `button[data-testid="v4-composer-send"]` 发送成功（时间线 660 → 662 行、`running×1`）。
-   端到端验收因此随时可做——**只差 window 控制面那五步**。
+   `fetch` 挂住 76s；**原生 Java** 裸 TCP `ok 67ms`、HTTPS `HTTP 200 276ms`；原生 WebSocket
+   1 秒内 `★配对成功`。墙的形状是**僵尸连接**（`OPEN` + `paired` + 探针照发 + 零 ack + 无 close
+   事件，连页面 `close()` 都卡 CLOSING）⇒ **页面侧自救整类方案被证伪**，只能换承载层。
+2. **承载形态跑通**：`判死（入站帧静默 ≥35s）→ 原生接管 → 回前台交还`。后台上承期间原生
+   心跳/ack 持续（128s 那次 12/13），`DEVICE_OFFLINE` 后自动重连重新配对。
+3. **中途的坑（已修，别再误判）**：原生桥订 `controller/tasks-index` 的那次 `rpc:listen` 会让
+   **桌面端 host 进程当场 `uncaughtException` 自毁**（配对后固定 4.3 秒；三次复现）；
+   关掉它（`controllerStreamEnabled=false`，运行态走会话流兜底）后桌面端零异常。
+   我曾因此误判"必须补 window 控制面"——**那条路作废**（「实现要点」16）。
+4. **端到端验收通过（01:43–01:50，App 在后台、Chromium 已死）**：原生 `subscribed conversation`
+   → `会话运行态：在跑` → `活进展：## 第N节…`（节次随时间推进）；手机同刻
+   `运行中 · 有线ADB连接继续调试` + 正文=正在写的那一节 + `shortCriticalText=运行中`。
+5. **回前台不需要重载**（用户问题的最终答案）：交还后页面自己 0.9s `relay socket open (#2)`，
+   兜底重载判据正确、一次都没触发。
 
-**目标（用户拍板，两条，未变）**：
-1. **前台**：对话流跟手——前提是"壳不碰页面链路"，判据见「下一步」第 4 条。
-2. **后台/锁屏**：应用常驻接收并跟踪**各对话流**，推到流体云显示（ColorOS 侧已授权完全后台行为）。
-   **承载层已换成原生并跑通**，但它与桌面端的 window 归属冲突（第 3 条）——补完 window 控制面即可验收。
-
+**目标（用户拍板，两条）**：
+1. **前台**：对话流跟手——"壳不碰页面链路"（只读壳），判据见「下一步」第 4 条。
+2. **后台/锁屏**：常驻接收各对话流并推到流体云——**机制与真机验收都已通过（第 4 条）**；
+   还欠的是**小时级长测**与**熄屏工况**（「下一步」第 2 条）。
 **上一轮（第十四轮，2026-09-14/15）定案并修掉的四处机制**（历史；机制细节仍然有效，别再重做）：
 
 | 缺陷 | 真机症状 | 定案依据 |
@@ -763,40 +765,23 @@ store 三级优先级：controller > 会话流 > SI 持久态）；controller �
 
 ### 下一步（新会话第一件事）
 
-0. **补 window 控制面，然后才能打开后台承载（当前唯一的前置）**：原生"裸终端"配对 4.3 秒后
-   会让桌面端拆掉 window host（「实现要点」16 / `docs/16-…md` §8）。步骤：
-   ① 注入层把页面 URL 里的 window token 交给原生（**已定位：查询串里的 `t=`**，2026-09-16 01:08
-   用 CDP 读出；同串还有 `sid/hash/mid/name/app_version`；**是凭证，只进内存不落日志**）；
-   ② `POST {relayOrigin}/api/remote-control/windows/bootstrap/<token>`；
-   ③ 开 `/ws/remote-control/window/<token>`，收 `window-control-ready` 拿 `windowControlSessionId`
-   + `mobileConnectionId`（**一次性握手 socket，收到即关**）；④ 用
-   `POST /api/remote-control/windows/<token>/workspace-bridge` 带 `X-ZCode-Mobile-Connection-Id`
-   开桥（取代现在的 relay 侧开桥）；⑤ 再把 relay 的会话订阅接上。
-   验收判据：做完 ①–④ 后 `carrier_on` 不再出现桌面端 `unregistered host`（用下面 1 的 A/B 法验）。
-1. **后台承载的端到端验收**（本轮的收尾动作，前置=0）：让手机进一个**在跑任务**的会话
-   （用 `tools/cdp.mjs` 造流，见「实现要点」16 与本条末尾），然后：
-   ① 退后台（`input keyevent KEYCODE_HOME`）→ 第 4~7 窗出现
-   `后台原生承载：入站帧静默 3Xs…` 与 `Tier2: ★接管配对成功（matched）`；
-   ② 之后 `活进展 <key>：…` / `页面正文 <key>：…` 持续出现，流体云正文跟着变
-   （判据仍是「同刻核对 `android.text`、`when` 与系统时间」）；
-   ③ 回前台：`Tier2: 关闭（回前台交还）存活=Ns 心跳=n ack=m` + **页面自己**
-   `socket.close() … ← i4t.recoverConnection` + `relay socket open (#N)`，**没有**壳发起的重载、
-   **没有** KICKED；只有页面已进失败态才允许出现 `交还兜底：…重载一次`。
-   **造流一条命令**（`tools/cdp.mjs`，需要先 `wvdebug_on` + `forward`）：进会话 → `type "<提示词>"`
-   → `eval "...querySelector('button[data-testid=\"v4-composer-send\"]').click()"`。
-2. **后台长测（过夜）**：补完 0 之后，亮屏挂后台 2 小时以上，看原生承载的 `存活`/`心跳`/`ack`
-   是否线性增长、有没有被 ColorOS 掐掉；然后再做**熄屏**工况（本轮全部是亮屏 + 主页）。
-3. **流体云正文最后一跳（页面那条路）**：`对话帧 N（正文 M 字）` 里"正文"至今**始终 0 字**
-   （v129 的 23:09 窗口仍是 `正文 0 字`，而帧在流：`对话帧 30 → 64`）。要判的是
-   "页面自己那条流有没有走进观测通路"（看有没有 `入站 topic 首次出现(N)：conversation/…`）。
-4. **只读壳 + 两条对策的复验**（v129 已验过大半）：进对话连发 4 条以上消息，判据仍是
-   ① `socket.close() 被调用 … 来自 …` 只有页面自己那两处（`i4t.dispose` 启动、`i4t.reconnectNow` 回前台）；
+0. **后台承载已经能用了（v142，默认开启）**，剩下的都是"把它跑久、跑全"：
+   `carrierEnabled=true`、只开页面当前工作区的桥、配对后补三帧（见「实现要点」16）。
+   现在**不要再动 controller 流**（打开它就会打崩桌面端）；运行态靠会话流兜底。
+1. **小时级长测（最该先做的）**：造一条长任务（`tools/cdp.mjs`，见「实现要点」17），
+   退后台挂 **1–2 小时**，看 ① `活进展` 是否持续、② `Tier2: 关闭（回前台交还）存活=Ns 心跳=n ack=m`
+   的 n/m 是否线性增长、③ 中途有没有 ColorOS 掐掉、④ 桌面端 `unregistered host` 是否恒为 0。
+2. **熄屏工况**：本轮全部是亮屏 + 主页。熄屏后 Chromium 侧照样会死（甚至更早），
+   要验的是**原生承载在熄屏下还活着**（前台服务 + 完整后台放行）；若被挂起，回到
+   「平台约束」里 ColorOS 的那几个开关。
+3. **前台跟手的回归**（只读壳那套判据仍然有效）：进对话连发 4 条以上消息，
+   ① `socket.close() 被调用 … 来自 …` 只有页面自己那两处（`i4t.dispose`、`i4t.reconnectNow`）；
    ② 没有壳发起的自动重载；③ `页面开销` 每 10s 一条且**前台 `探针 0`**；
    ④ 启动有 `可见性劫持已停用：…`；⑤ 回前台页面自己 1~2s 内重拨并照旧收帧。
-5. **`healDeadLinkOnResume` 仍未验证**：要验它，用诊断指令 `deadlink_test`（伪造静默 120s）或真去后台 7 分钟再回。
-6. **Chromium 侧为什么会在后台死**：只知现象与边界（Java 侧同刻完全正常），没定位到哪一层。
-   要定案得做进程/cgroup 级取证；本轮没手段。**不要再花时间在"注入层救后台"上**（已证伪）。
-
+4. **`healDeadLinkOnResume` 与交还兜底的负向验证**：本轮两次都"链路已自行恢复、不介入"，
+   正向（真该重载时重载）仍未被触发过——用 `deadlink_test` 伪造静默可验正向。
+5. **Chromium 侧为什么会在后台死**：只知现象与边界（Java 侧同刻完全正常），没定位到哪一层。
+   要定案得做进程/cgroup 级取证；**不要再花时间在"注入层救后台"上**（已证伪）。
 ### 本轮用真机 + 源码换来的硬事实（别再重新发现）
 
 1. **桌面端对入站 payload 做身份三元组匹配**（`bridgeSessionId` + `bridgeGeneration` + `recoveryId`）。

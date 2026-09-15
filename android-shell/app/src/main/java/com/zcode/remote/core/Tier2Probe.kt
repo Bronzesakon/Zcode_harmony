@@ -77,6 +77,15 @@ object Tier2Probe {
     private var stopping = false
     private var reconnectAttempt = 0
     private var durationTimer: java.util.Timer? = null
+
+    /** 页面正在显示的工作区（只为它开桥）；空串=未知，退回全量覆盖。 */
+    @Volatile
+    private var onlyWorkspace: String = ""
+
+    /** 页面正在显示的任务（view-state 帧里要用；空串=未知）。 */
+    @Volatile
+    private var onlyTaskId: String = ""
+
     private var heartbeatTimer: java.util.Timer? = null
     private var reconnectTimer: java.util.Timer? = null
 
@@ -151,9 +160,22 @@ object Tier2Probe {
     /**
      * @param durationMs 探针存活时长；<=0 表示接管模式（持久，直到 [stop]，
      *   且配对成功后启动桥覆盖 + 断线自动重连）。
+     * @param onlyWorkspace 页面**自己**正在显示的工作区键：只为它开桥。空串表示注入层
+     *   还没上报，退回全量覆盖（有让桌面端拆 host 的风险，见 [startCoverage] 的注释）。
      */
-    fun start(newCreds: RelayCreds, durationMs: Long = 60_000L) {
-        startInternal(newCreds, durationMs, takeoverOverride = null)
+    fun start(
+        newCreds: RelayCreds,
+        durationMs: Long = 60_000L,
+        onlyWorkspace: String = "",
+        onlyTaskId: String = "",
+    ) {
+        startInternal(
+            newCreds,
+            durationMs,
+            takeoverOverride = null,
+            onlyWorkspace = onlyWorkspace,
+            onlyTaskId = onlyTaskId,
+        )
     }
 
     /**
@@ -161,15 +183,29 @@ object Tier2Probe {
      * 让 `tier2_takeover` 诊断指令能在不依赖"后台判死"的情况下验证 M3b/c。
      */
     fun startTakeoverForTest(newCreds: RelayCreds, autoStopMs: Long) {
-        startInternal(newCreds, durationMs = -1L, takeoverOverride = autoStopMs)
+        startInternal(
+            newCreds,
+            durationMs = -1L,
+            takeoverOverride = autoStopMs,
+            onlyWorkspace = "",
+            onlyTaskId = "",
+        )
     }
 
-    private fun startInternal(newCreds: RelayCreds, durationMs: Long, takeoverOverride: Long?) {
+    private fun startInternal(
+        newCreds: RelayCreds,
+        durationMs: Long,
+        takeoverOverride: Long?,
+        onlyWorkspace: String = "",
+        onlyTaskId: String = "",
+    ) {
         if (isRunning()) {
             Diagnostics.log("warn", "Tier2: 已在运行（phase=$phase），忽略重复启动")
             return
         }
         creds = newCreds
+        this.onlyWorkspace = onlyWorkspace
+        this.onlyTaskId = onlyTaskId
         persistent = durationMs <= 0
         stopping = false
         reconnectAttempt = 0
@@ -262,6 +298,91 @@ object Tier2Probe {
         }
     }
 
+    /**
+     * 配对之后的**第一帧业务数据**：`bootstrap-request`，然后才开桥。
+     *
+     * 这是 2026-09-16 01:12 用 CDP 抓页面自己的那一轮接入录下来的逐帧顺序
+     * （`tools/cdp-capture.mjs`）：
+     * ```
+     * auth_init → auth_challenge → auth_response → auth_ack(pair_status=matched)
+     * → {zcode_type:'bootstrap-request'}        ← 响应约 24 KB
+     * → {zcode_type:'workspace-bridge-open'}    ← 响应约 0.5 KB
+     * → rpc-frame / rpc-frame-ack …
+     * ```
+     * **我们此前整条链路都跳过了 bootstrap**（原生 `BridgeManager` 与注入层
+     * `zcode-protocol.js` 都直接从 `workspace-list-request` 开始）。后果不是"少拿一份数据"，
+     * 而是桌面端**不认这次接入**：干净 A/B 显示原生裸配对之后 4.3 秒桌面端就
+     * `[task-realtime] unregistered host` + `host process (local-1) exited with code 1`
+     * （docs/16 §8）——bootstrap 很可能就是"把这次终端登记成移动连接/窗口归属"的那一步。
+     *
+     * 顺序照页面来：先发 bootstrap，给它 1.2s 收响应（真机实测 300ms 内就回，24KB），
+     * 再开桥覆盖。
+     */
+    private fun sendBootstrapThenCoverage() {
+        if (stopping || phase == Phase.CLOSED || bridgeManager != null) return
+        // ① 页面配对后**立刻**发的两帧（2026-09-16 01:12 抓包逐帧录下来的顺序）：
+        //    mobile-diagnostic(state-transition: paired) 与 mobile-view-state-update。
+        //    后者带着 `viewState.activeWorkspaceKey/activeTaskId`——**这很可能就是桌面端
+        //    给新终端绑定窗口的依据**：真机 A/B 显示，裸配对（不发这两帧）之后 4.3 秒
+        //    桌面端就 `unregistered host`（docs/16 §8/§10），而页面自己的重连从不触发它。
+        val now = System.currentTimeMillis()
+        sendBusinessPayload(
+            JSONObject()
+                .put("zcode_type", "mobile-diagnostic")
+                .put("event", "state-transition")
+                .put("timestamp", now)
+                .put("state", "paired")
+                .put("previousState", "authenticating")
+                .put("visibilityState", "hidden")
+                .put("online", true),
+            quiet = false,
+        )
+        if (onlyWorkspace.isNotEmpty()) {
+            val viewState = JSONObject()
+                .put("activeWorkspaceKey", onlyWorkspace)
+                .put("updatedAt", now)
+            if (onlyTaskId.isNotEmpty()) {
+                viewState.put("activeTaskId", onlyTaskId)
+            }
+            sendBusinessPayload(
+                JSONObject()
+                    .put("zcode_type", "mobile-view-state-update")
+                    .put("viewState", viewState)
+                    .put(
+                        "deviceInfo",
+                        JSONObject()
+                            .put("platform", "web")
+                            .put("version", "web")
+                            .put("name", "mobile-browser")
+                            .put("language", "zh-CN")
+                            .put("timeZone", java.util.TimeZone.getDefault().id),
+                    ),
+                quiet = false,
+            )
+            Diagnostics.log(
+                "info",
+                "Tier2: 已发 mobile-view-state-update（工作区 $onlyWorkspace" +
+                    (if (onlyTaskId.isEmpty()) "" else " · 任务 $onlyTaskId") + "）",
+            )
+        }
+        // ② 然后是 bootstrap-request（页面顺序：diagnostic → bootstrap → bridge-open）。
+        sendBusinessPayload(
+            JSONObject()
+                .put("zcode_type", "bootstrap-request")
+                .put("requestId", "zcshell-bootstrap-" + java.util.UUID.randomUUID()),
+            quiet = false,
+        )
+        Diagnostics.log("warn", "Tier2: 已发 bootstrap-request（补上页面配对后的第一步，1.2s 后开桥）")
+        java.util.Timer(true).schedule(
+            object : java.util.TimerTask() {
+                override fun run() {
+                    startCoverage()
+                }
+            },
+            1200L,
+        )
+    }
+
     private fun startCoverage() {
         if (stopping || phase == Phase.CLOSED || bridgeManager != null) return
         creds ?: return
@@ -317,7 +438,28 @@ object Tier2Probe {
                     val key = workspaceKeyOf(workspace)
                     if (key == null) 0 else runningSessionsProvider?.invoke(key).orEmpty().size
                 }
-                manager.beginCoverage(ordered)
+                // **只开页面自己在看的那个工作区**（2026-09-16 定案）：页面自己永远只开一个桥
+                // （它当前显示的 workspace，带 taskId），而原生扫全部 7 个工作区时桌面端会在
+                // 4 秒后把 host 收掉（`unregistered host` + `host process exited`，docs/16 §8/§10）。
+                // 有页面工作区就只开它；没有（注入层还没上报）才退回"按在跑任务排序的全量"。
+                val only = onlyWorkspace
+                val targets = if (only.isNotEmpty()) {
+                    val hit = ordered.filter { workspaceKeyOf(it) == only }
+                    if (hit.isNotEmpty()) {
+                        Diagnostics.log("info", "Tier2: 只开页面当前工作区的桥：$only")
+                        hit
+                    } else {
+                        Diagnostics.log(
+                            "warn",
+                            "Tier2: 页面工作区 $only 不在桌面端列表里（${ordered.size} 个），退回全量覆盖",
+                        )
+                        ordered
+                    }
+                } else {
+                    Diagnostics.log("warn", "Tier2: 注入层还没上报页面工作区，退回全量覆盖（有拆 host 风险）")
+                    ordered
+                }
+                manager.beginCoverage(targets)
             } catch (e: Exception) {
                 Diagnostics.log("warn", "Tier2: 覆盖启动失败 ${e.message}")
             }
@@ -402,12 +544,20 @@ object Tier2Probe {
                                 "Tier2: ★配对成功（matched）——实验模式，同时开桥覆盖（验证 M3b/c 解码）",
                             )
                         }
-                        startCoverage()
+                        sendBootstrapThenCoverage()
                     }
                 }
                 "data" -> {
                     // 业务帧路由（M3b）：rpc-frame / 桥开启应答 / 工作区列表应答。
                     val payload = frame.optJSONObject("payload") ?: return
+                    val kind = payload.optString("zcode_type")
+                    if (kind.startsWith("bootstrap")) {
+                        // 只记大小与类型：bootstrap 响应可能带凭证，内容绝不落日志。
+                        Diagnostics.log(
+                            "info",
+                            "Tier2: 收到 $kind（${text.length} 字符）",
+                        )
+                    }
                     bridgeManager?.acceptRelayPayload(payload)
                 }
                 "error" -> {

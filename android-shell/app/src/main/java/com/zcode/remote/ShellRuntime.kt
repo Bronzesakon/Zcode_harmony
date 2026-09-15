@@ -570,23 +570,34 @@ object ShellRuntime {
     /**
      * 后台承载总开关。
      *
-     * ⚠️ **默认关闭**（2026-09-16 00:52 真机 A/B 定案）：原生以"裸终端"身份接管 relay
-     * 配对，会让**桌面端拆掉自己的 window host** —— 判据是干净的 A/B：
-     *   · 基线（只有页面自己的桥）：`registered host` 后 45s 无异常；
-     *   · 一旦跑 `tier2_test`（原生配对）：`★配对成功` 之后 **4.3 秒**就
-     *     `[task-realtime] unregistered host` + `host process (local-1) exited with code 1`，
-     *     **早于任何开桥**（桥在 +13s 才开始，且之后全部 `desktop-disconnected`）。
-     * 后果是桌面端的远程控制整体失效，页面也跟着 bootstrap 失败。
+     * **默认开启**（2026-09-16 01:20 恢复）。曾经在 00:52 临时改成 false，因为那时发现
+     * "原生配对会让桌面端 4.3 秒后拆掉自己的 window host"。**那个问题已定位并修掉，
+     * 而且不在原生配对本身**：真凶是原生桥对 `zcode-agent.onDynamicControllerFrame`
+     * 的那次 `rpc:listen`——它让桌面端 host 进程当场 `uncaughtException` 并自毁
+     * （桌面端日志：`[rpc:listen] … onDynamicControllerFrame FAIL` → `uncaughtException`
+     * → `disposing host resources` → `unregistered host` + `host process exited with code 1`）。
+     * 关掉那条流（`RelayBridge.controllerStreamEnabled = false`；运行态本来就有会话流
+     * `turnHeader.state` 兜底）之后真机复验：原生配对 + 开桥，桌面端 host **稳定存活、
+     * 无 uncaughtException**，桥也开在正确的工作区上。
      *
-     * 结论：**原生接管必须同时提供 window 控制面**（页面自己那条路：
-     * `bootstrap` → `/ws/remote-control/window/<token>` 拿 `mobileConnectionId` →
-     * `POST /workspace-bridge` 带 `X-ZCode-Mobile-Connection-Id`），否则桌面端认为
-     * 这次连接没有窗口归属，就把 host 收掉。这条路没落地之前，本开关保持关闭，
-     * 免得留下"打开后台承载就毁掉桌面端"的有害行为。
-     * 取证与 A/B 现场见 `docs/16-后台60秒墙-根因取证与原生承载.md` §6。
+     * 配套两处（同轮真机定案）：① 只开**页面自己正在显示**的那个工作区的桥
+     * （`pageWorkspaceKey`）——扫全部工作区会让桌面端每次新建再拆 host；
+     * ② 配对后照页面顺序补 `mobile-diagnostic` / `mobile-view-state-update` /
+     * `bootstrap-request` 三帧（见 `Tier2Probe.sendBootstrapThenCoverage`）。
      */
     @Volatile
-    private var carrierEnabled = false
+    private var carrierEnabled = true
+
+    /**
+     * 页面当前显示的工作区/任务（由注入层从页面自己的 `workspace-bridge-open` 帧里取，见
+     * `pagews` 事件）。后台原生承载**只**为它开桥——与页面自己的行为一致，也是真机定案：
+     * 扫全部工作区会触发桌面端拆 host（docs/16 §8/§10）。
+     */
+    @Volatile
+    private var pageWorkspaceKey = ""
+
+    @Volatile
+    private var pageWorkspaceTaskId = ""
 
     private var carrierStarted = false
 
@@ -659,7 +670,12 @@ object ShellRuntime {
             "后台原生承载：入站帧静默 ${age / 1000}s（门槛 ${STALL_SILENCE_MS / 1000}s，" +
                 "Chromium 网络栈已死）——原生接管 relay 连接并订阅在跑会话，推到流体云",
         )
-        Tier2Probe.start(creds, durationMs = 0L)
+        Tier2Probe.start(
+            creds,
+            durationMs = 0L,
+            onlyWorkspace = pageWorkspaceKey,
+            onlyTaskId = pageWorkspaceTaskId,
+        )
         startLiveProgressPolling()
     }
 
@@ -832,7 +848,12 @@ object ShellRuntime {
                     Diagnostics.log("warn", "后台原生承载：凭证未就绪")
                 } else {
                     carrierStarted = true
-                    Tier2Probe.start(creds, durationMs = 0L)
+                    Tier2Probe.start(
+            creds,
+            durationMs = 0L,
+            onlyWorkspace = pageWorkspaceKey,
+            onlyTaskId = pageWorkspaceTaskId,
+        )
                     startLiveProgressPolling()
                 }
                 return true
@@ -1130,7 +1151,12 @@ object ShellRuntime {
         // recovering. Native authentication is the authoritative check; it will
         // only take the relay slot after the server returns matched.
         val c = relayCreds ?: return
-        Tier2Probe.start(c, durationMs = 0L)
+        Tier2Probe.start(
+            c,
+            durationMs = 0L,
+            onlyWorkspace = pageWorkspaceKey,
+            onlyTaskId = pageWorkspaceTaskId,
+        )
         Diagnostics.log(
             "warn",
             "Tier2: $reason——原生接管配对与任务事件（回前台/亮屏自动交还）",
@@ -1312,6 +1338,17 @@ object ShellRuntime {
                     val sessionId = data.optString("topic").substringAfterLast('/')
                     if (sessionId.isEmpty()) return
                     onConversationText(sessionId, text)
+                }
+                "pagews" -> {
+                    // 页面**自己**正在显示的工作区（来自它自己的 workspace-bridge-open 帧）。
+                    // 后台原生承载只该为这一个开桥：真机 2026-09-16 定案——扫全部工作区会让
+                    // 桌面端把 host 收掉（docs/16 §8/§10）。这是凭证无关的键名，可以进日志。
+                    val data = root.optJSONObject("data") ?: return
+                    val key = data.optString("key")
+                    if (key.isEmpty()) return
+                    pageWorkspaceKey = key
+                    pageWorkspaceTaskId = data.optString("taskId")
+                    Diagnostics.log("info", "页面当前工作区（原生承载的唯一目标）：$key")
                 }
                 "pagevitals" -> {
                     // DOM 体征快照（卡死看门狗布防/撤防/放弃时的现场）。
