@@ -765,7 +765,8 @@ store 三级优先级：controller > 会话流 > SI 持久态）；controller �
 
 0. **补 window 控制面，然后才能打开后台承载（当前唯一的前置）**：原生"裸终端"配对 4.3 秒后
    会让桌面端拆掉 window host（「实现要点」16 / `docs/16-…md` §8）。步骤：
-   ① 注入层把页面 URL 里的 window token 交给原生（它已经在页面里，读一次即可）；
+   ① 注入层把页面 URL 里的 window token 交给原生（**已定位：查询串里的 `t=`**，2026-09-16 01:08
+   用 CDP 读出；同串还有 `sid/hash/mid/name/app_version`；**是凭证，只进内存不落日志**）；
    ② `POST {relayOrigin}/api/remote-control/windows/bootstrap/<token>`；
    ③ 开 `/ws/remote-control/window/<token>`，收 `window-control-ready` 拿 `windowControlSessionId`
    + `mobileConnectionId`（**一次性握手 socket，收到即关**）；④ 用
