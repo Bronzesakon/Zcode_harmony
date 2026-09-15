@@ -567,6 +567,9 @@ object ShellRuntime {
      */
     private const val STALL_SILENCE_MS = 35_000L
 
+    /** 页面刚动过 socket（重拨中）后的静默期：见 [lastSocketMarkForStall]。 */
+    private const val CARRIER_REQUIET_AFTER_SOCKET_MS = 20_000L
+
     /**
      * 后台承载总开关。
      *
@@ -603,6 +606,17 @@ object ShellRuntime {
 
     /** 刚刚交还过（前台分支读一次并清掉）：只在这条路径上安排"页面没恢复才重载"的兜底。 */
     private var carrierHandedBack = false
+
+    /**
+     * 防误判用的 socket 生命周期观测：静默期内 socket 计数变了 ⇒ 页面在重拨，等它。
+     *
+     * 现场（2026-09-16 02:21，回前台那一下）：页面自己 `recoverConnection → reconnectNow`
+     * 已经打出 `relay socket open (#2)`，但注入层的"入站帧年龄"还是旧值（`inboundAgo=622s`，
+     * 因为新 socket 还没收到第一帧），承载于是误判"链路已死"并接管——**把刚恢复的页面 KICK 了**。
+     * 20s 是"重拨 + 首帧到达"的经验窗口（真机那次 ~6s 就恢复了）。
+     */
+    private var lastSocketMarkForStall = -1L
+    private var lastSocketChangeAt = 0L
     private var nudgeCount = 0
     private var lastNudgeAt = 0L
     private var pendingNudgeAt = 0L
@@ -642,9 +656,40 @@ object ShellRuntime {
      * 只判"完全没有任何入站帧"——健康链路上壳的探针一定有 ack（真机健康窗
      * `链路 ack 1~5/10s`），连 ack 都没有就不是"桌面端安静"，是链路已死。
      */
+    /**
+     * 后台原生承载：把连接交给原生。
+     *
+     * 只判"完全没有任何入站帧"——健康链路上壳的探针一定有 ack（真机健康窗
+     * `链路 ack 1~5/10s`），连 ack 都没有就不是"桌面端安静"，是链路已死。
+     */
     private fun maybeStartNativeCarrier() {
         if (!carrierEnabled) return
         val age = lastInboundAgeMs() ?: return
+        val now = SystemClock.elapsedRealtime()
+
+        // 防误判：页面**刚刚**开过新 socket（重拨中）时不要接管。
+        //
+        // 现场（2026-09-16 02:21，回前台那一下）：页面自己 `recoverConnection → reconnectNow`
+        // 已经打出 `relay socket open (#2)`，但注入层的"入站帧年龄"还是旧值（`inboundAgo=622s`，
+        // 因为新 socket 还没收到第一帧），承载于是误判"链路已死"并接管——**把刚恢复的页面 KICK 了**
+        // （日志：`页面连接被顶掉（relay 返回 KICKED，应用在后台）`）。
+        // 判据：socket 生命周期计数在静默期内变过 ⇒ 页面在自救，等它；要求"最近 20s 没动过 socket"。
+        val socketMark = nudgeMark()
+        if (socketMark != lastSocketMarkForStall) {
+            lastSocketMarkForStall = socketMark
+            lastSocketChangeAt = now
+        }
+        val sinceSocketChange = now - lastSocketChangeAt
+        if (sinceSocketChange < CARRIER_REQUIET_AFTER_SOCKET_MS) {
+            if (age >= STALL_SILENCE_MS) {
+                Diagnostics.log(
+                    "info",
+                    "后台原生承载：页面 ${sinceSocketChange / 1000}s 前刚动过 socket（在重拨），本轮不接管",
+                )
+            }
+            return
+        }
+
         if (age < STALL_SILENCE_MS) {
             // 页面链路自己活着（或已恢复）⇒ 原生必须让位，绝不能两条连着。
             if (carrierStarted) {
@@ -670,6 +715,7 @@ object ShellRuntime {
             "后台原生承载：入站帧静默 ${age / 1000}s（门槛 ${STALL_SILENCE_MS / 1000}s，" +
                 "Chromium 网络栈已死）——原生接管 relay 连接并订阅在跑会话，推到流体云",
         )
+        acquireCarrierWakeLock()
         Tier2Probe.start(
             creds,
             durationMs = 0L,
@@ -679,8 +725,54 @@ object ShellRuntime {
         startLiveProgressPolling()
     }
 
+    // ------------------------------------------------- 承载期间的 wake lock
+    //
+    // 为什么需要：承载走通之后，瓶颈从"Chromium 网络栈在后台死掉"变成"**熄屏后 CPU 睡眠**"。
+    // 前台服务（specialUse）只保证**进程**活着，不保证 **CPU 醒着**：CPU 一睡，原生的
+    // 12s 心跳与上游帧读取都会停，桌面端约 60s 后就判死——那就等于在锁屏场景下白做。
+    // docs/15 §7.1 的官方基线里正有这一条：`PARTIAL_WAKE_LOCK`「even after the user
+    // presses the power button」。
+    //
+    // 纪律：**只在这两种条件同时成立时持有**——① 应用在后台或熄屏（`userIsAway()`）
+    // 且 ② 原生承载在跑。前台一律不持有；交还/停止/失败路径都会释放（见
+    // [releaseCarrierWakeLock] 与 `clearCarrierState`）。
+
+    private var carrierWakeLock: android.os.PowerManager.WakeLock? = null
+
+    private fun acquireCarrierWakeLock() {
+        if (carrierWakeLock?.isHeld == true) return
+        try {
+            val pm = appContext.getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+            val lock = pm.newWakeLock(
+                android.os.PowerManager.PARTIAL_WAKE_LOCK,
+                "zcode-remote:carrier",
+            )
+            lock.setReferenceCounted(false)
+            lock.acquire()
+            carrierWakeLock = lock
+            Diagnostics.log("info", "后台原生承载：已持有 PARTIAL_WAKE_LOCK（熄屏下心跳才能继续跑）")
+        } catch (e: Exception) {
+            // 权限没给 / 系统拒绝都不致命：承载照跑，只是熄屏后可能被 CPU 睡眠拖住。
+            Diagnostics.log("warn", "申请 wake lock 失败（熄屏可能被挂起）: ${e.message}")
+        }
+    }
+
+    private fun releaseCarrierWakeLock() {
+        val lock = carrierWakeLock ?: return
+        carrierWakeLock = null
+        try {
+            if (lock.isHeld) {
+                lock.release()
+                Diagnostics.log("info", "后台原生承载：已释放 wake lock")
+            }
+        } catch (e: Exception) {
+            Diagnostics.log("warn", "释放 wake lock 失败: ${e.message}")
+        }
+    }
+
     /** 交还时清账（由 [onAppForegroundChanged] 的前台分支调用）。 */
     private fun clearCarrierState() {
+        releaseCarrierWakeLock()
         carrierStarted = false
         nudgeCount = 0
         pendingNudgeAt = 0L

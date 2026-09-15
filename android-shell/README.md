@@ -459,6 +459,20 @@ zcode-remote.apk -> CN=ZCode Remote, OU=Mobile, O=ZCode, L=Unknown, ST=Unknown, 
     手机同刻 `id=175654 title=运行中 · 有线ADB连接继续调试` + 正文=正在写的那一节 + `shortCriticalText=运行中`；
     **回前台不需要重载**（`relay socket open (#2)` 0.9s 自恢复，兜底重载一次都没触发）；桌面端 host 零异常。
     取证与逐行现场见 `docs/16-…md` §10。
+17. **承载期间的 wake lock（熄屏工况的前置）**：前台服务只保证**进程**活着，不保证 **CPU 醒着**——
+    熄屏后 CPU 一睡，原生 12s 心跳与上游帧读取都会停，桌面端约 60s 就判死（docs/15 §7.1 的官方
+    基线里就有这条：`PARTIAL_WAKE_LOCK`「even after the user presses the power button」）。
+    实现：`ShellRuntime.acquireCarrierWakeLock()` / `releaseCarrierWakeLock()`，**只在
+    "应用在后台或熄屏 且 原生承载在跑"时持有**，前台/交还/停止一律释放；manifest 加 `WAKE_LOCK`
+    权限，申请失败只记一行（承载照跑，只是熄屏可能被挂起）。
+18. **造流通道：`tools/cdp.mjs`（CDP over adb forward）**。`adb input tap` + `input text`
+    **进不了 WebView 输入框**（README 早记过，2026-09-16 又复现一次：截图里输入框始终是占位符、
+    也没弹键盘）；注入层"塞字"也会被页面的 **Lexical 受控编辑器**清掉（现场：`填进去又被清空`）。
+    CDP 的 `Input.insertText` 是渲染器认的真实输入：`node tools/cdp.mjs type "<文本>"`
+    → 再点 `button[data-testid="v4-composer-send"]`（**回车不发送**）就发出去了。
+    前置：`diag_cmd wvdebug_on` + `node tools/cdp.mjs forward`（脚本自动取 pid 对应的 socket 名）。
+    配套 `tools/cdp-capture.mjs` 用 Network 域抓页面自己的接入契约（逐帧、凭证只留长度）——
+    本轮"配对后该发哪几帧"就是它录出来的。
 
 ## 任务通知（这是壳存在的理由）
 
@@ -960,8 +974,15 @@ MSYS_NO_PATHCONV=1 "$ADB" -s "$S" shell "L=/sdcard/Android/data/com.zcode.remote
 第十六轮（2026-09-16 凌晨，v130–v137 全部本机出包直装真机）：**60 秒墙定案为"Chromium 网络栈在后台死掉"**，
 落地"判死 → 原生接管 → 回前台交还"（触发/交还/兜底三处），新增后台可调用的 `DiagReceiver` 诊断通道、
 原生网络判据 `net_probe`、**CDP 工具 `tools/cdp.mjs`**（真机造流唯一可用通道），
-取证归档进 `docs/16-…md`；**并发现原生裸终端配平会让桌面端 4.3 秒后拆掉 window host ⇒
-window 控制面是硬前置，`carrierEnabled` 因此默认 false**。**未验收：原生订阅 → 正文 → 流体云的端到端一跳。**
+取证归档进 `docs/16-…md`。**同日 01:43 追加：端到端打通**——真凶是原生桥对 `controller/tasks-index`
+的那次 `rpc:listen`（会让桌面端 host 当场 `uncaughtException` 自毁，配对后固定 4.3 秒；我一度误判成
+"要补 window 控制面"）；关掉它 + 只开页面当前工作区的桥 + 补 `mobile-diagnostic`/`mobile-view-state-update`/
+`bootstrap-request` 三帧之后，后台里 `subscribed conversation` → `活进展：## 第N节…`，手机上
+`运行中 · 任务名` 卡片与 `shortCriticalText` 同刻跟手；**回前台不需要重载**（页面自己 0.9s 重拨，
+兜底重载未触发）。同日再加 `WAKE_LOCK`（熄屏工况的前置）。**02:10–02:25 追加：熄屏工况通过**——
+`mWakefulness=Dozing` 下 8 分钟 `Tier2在跑=true` 全程保持、`reanchor` 往返成功、卡片照常更新、
+桌面端零新增异常；并补了**防误判护栏**（02:21 回前台那一下误接管把刚恢复的页面 KICK 了：判死前
+先看 socket 生命周期计数，20s 内动过就等）。小时级长测在跑（见「下一步」1）。
 **第十轮即本轮（2026-09-12 晚）**：网页代码全面审计（`docs/05/分析-壳端注入点审计-*.md`）后落地四件事——
 ① **页面日志汇**：生产页面的全部生命周期自述只走 `window.zcode?.log`（此前无人接收、静默丢弃），
 inject.js 现供给 sink，原生日志出 `页面: …` 行；

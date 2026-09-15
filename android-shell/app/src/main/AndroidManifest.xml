@@ -5,6 +5,10 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
+    <!-- 后台承载期间持 PARTIAL_WAKE_LOCK：前台服务只保证进程活着，不保证 CPU 醒着；
+         熄屏后 CPU 一睡，原生心跳与上游帧读取都会停（docs/15 §7.1 的官方基线里有这一条）。 -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
     <!-- QR scanning -->
     <uses-permission android:name="android.permission.CAMERA" />
 
