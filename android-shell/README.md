@@ -982,7 +982,10 @@ MSYS_NO_PATHCONV=1 "$ADB" -s "$S" shell "L=/sdcard/Android/data/com.zcode.remote
 兜底重载未触发）。同日再加 `WAKE_LOCK`（熄屏工况的前置）。**02:10–02:25 追加：熄屏工况通过**——
 `mWakefulness=Dozing` 下 8 分钟 `Tier2在跑=true` 全程保持、`reanchor` 往返成功、卡片照常更新、
 桌面端零新增异常；并补了**防误判护栏**（02:21 回前台那一下误接管把刚恢复的页面 KICK 了：判死前
-先看 socket 生命周期计数，20s 内动过就等）。小时级长测在跑（见「下一步」1）。
+先看 socket 生命周期计数，20s 内动过就等）。**一小时长测（v144）全程通过**：亮屏挂后台 60 分钟、
+30 个采样点**每一拍都是 `Tier2在跑=true`**、`reanchor` 往返 79+ 次全部成功、桌面端
+`unregistered/uncaughtException` 计数**从基线到结束一字未变**；v145 又补了另两条
+wake lock 释放路径（自查发现）。
 **第十轮即本轮（2026-09-12 晚）**：网页代码全面审计（`docs/05/分析-壳端注入点审计-*.md`）后落地四件事——
 ① **页面日志汇**：生产页面的全部生命周期自述只走 `window.zcode?.log`（此前无人接收、静默丢弃），
 inject.js 现供给 sink，原生日志出 `页面: …` 行；

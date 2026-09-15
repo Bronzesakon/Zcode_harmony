@@ -646,6 +646,7 @@ object ShellRuntime {
         if (!enabled && Tier2Probe.isRunning()) {
             Tier2Probe.stop("后台承载被关闭")
             stopLiveProgressPolling()
+            releaseCarrierWakeLock()
             carrierStarted = false
         }
     }
@@ -699,6 +700,7 @@ object ShellRuntime {
                 )
                 Tier2Probe.stop("页面链路已恢复")
                 stopLiveProgressPolling()
+                releaseCarrierWakeLock()
                 carrierStarted = false
             }
             return
@@ -1140,6 +1142,11 @@ object ShellRuntime {
                     if (Tier2Probe.isRunning()) {
                         Tier2Probe.stop("亮屏/回前台交还")
                     }
+                    // 亮屏（应用可能仍在后台）：承载停了就得把 wake lock 与状态一起清掉，
+                    // 否则锁会一直 held 到下一次进前台（耗电）。
+                    stopLiveProgressPolling()
+                    releaseCarrierWakeLock()
+                    carrierStarted = false
                     stopHeartbeatPump()
                 }
                 lastAwayState = away
