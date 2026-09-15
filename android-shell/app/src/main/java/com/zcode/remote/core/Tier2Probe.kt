@@ -308,7 +308,16 @@ object Tier2Probe {
                     Diagnostics.log("warn", "Tier2: 接管模式拿到空工作区列表")
                     return@Thread
                 }
-                manager.beginCoverage(workspaces)
+                // **有在跑任务的工作区排最前**：真机 2026-09-15 定案——桌面端对
+                // "页面正在看的那个窗口工作区"只在我们刚把页面顶掉后的很短一段时间里
+                // 肯开桥（11:52 那次 6 s 内成功；等循环走到它时已过 16 s，就变成
+                // `desktop-disconnected: 未找到桌面窗口 host process`）。
+                // 所以别按列表顺序慢慢开，先把要跟踪的那个抢下来。
+                val ordered = workspaces.sortedByDescending { workspace ->
+                    val key = workspaceKeyOf(workspace)
+                    if (key == null) 0 else runningSessionsProvider?.invoke(key).orEmpty().size
+                }
+                manager.beginCoverage(ordered)
             } catch (e: Exception) {
                 Diagnostics.log("warn", "Tier2: 覆盖启动失败 ${e.message}")
             }
