@@ -2823,8 +2823,254 @@
         }
     };
 
+    // -----------------------------------------------------------------------
+    // 诊断：往会话输入框里发一条消息（**只为造流做端到端验收**，不参与生产逻辑）
+    //
+    // 为什么需要：验收"后台承载能把正文推到流体云"必须先有一条持续输出的会话，
+    // 而 adb 灌不进 WebView 的输入框（`input text` 实测无效、uiautomator 也读不到
+    // WebView 内部节点）。注入层就在页面里，可以走 React 认得的写法：
+    // 原生 value setter + `input` 事件，然后派发完整指针序列点发送（或回车）。
+    //
+    // 先 `probe_composer` 看清 DOM，再 `compose|<文本>` 发送；两条都只由 adb 显式触发。
+    // -----------------------------------------------------------------------
+
+    /** 候选输入框：textarea 优先，其次 contenteditable。 */
+    function findComposer() {
+        var cands = [];
+        try {
+            cands = document.querySelectorAll('textarea, [contenteditable="true"], [role="textbox"]');
+        } catch (e) {
+            return null;
+        }
+        var best = null;
+        for (var i = 0; i < cands.length; i++) {
+            var el = cands[i];
+            var r = null;
+            try {
+                r = el.getBoundingClientRect();
+            } catch (e2) {
+                r = null;
+            }
+            if (!r || r.width < 40 || r.height < 16) {
+                continue;
+            }
+            if (!best || r.top > best.rect.top) {
+                best = {el: el, rect: r};
+            }
+        }
+        return best;
+    }
+
+    function describeElement(el) {
+        if (!el) {
+            return 'null';
+        }
+        var r = null;
+        try {
+            r = el.getBoundingClientRect();
+        } catch (e) {
+            r = null;
+        }
+        return '<' + String(el.tagName).toLowerCase() + '>' +
+            ' type=' + (el.getAttribute && el.getAttribute('type')) +
+            ' aria=' + (el.getAttribute && el.getAttribute('aria-label')) +
+            ' ph=' + (el.getAttribute && el.getAttribute('placeholder')) +
+            ' disabled=' + (el.disabled === true) +
+            ' box=' + (r ? Math.round(r.left) + ',' + Math.round(r.top) + ' ' +
+                Math.round(r.width) + 'x' + Math.round(r.height) : '?');
+    }
+
+    /** 把页面底部所有可点的东西列出来，好认出发送键。 */
+    G.__zcodeShellProbeComposer = function () {
+        try {
+            var found = findComposer();
+            diag('info', '输入框探测：' + (found ? describeElement(found.el) : '没找到 textarea/contenteditable'));
+            var btns = [];
+            try {
+                btns = document.querySelectorAll('button, [role="button"], [type="submit"]');
+            } catch (e) {
+                btns = [];
+            }
+            var lines = [];
+            for (var i = 0; i < btns.length && lines.length < 12; i++) {
+                var el = btns[i];
+                var r = null;
+                try {
+                    r = el.getBoundingClientRect();
+                } catch (e3) {
+                    r = null;
+                }
+                if (!r || r.width < 8 || r.height < 8) {
+                    continue;
+                }
+                if (r.top < (G.innerHeight || 800) * 0.55) {
+                    continue;   // 只看下半屏（输入区）
+                }
+                lines.push(describeElement(el) +
+                    ' text=' + String(el.textContent || '').trim().substring(0, 12));
+            }
+            diag('info', '发送键候选（下半屏 ' + lines.length + ' 个）：' + lines.join(' | '));
+            return true;
+        } catch (e) {
+            diag('warn', '输入框探测失败: ' + e);
+            return false;
+        }
+    };
+
+    /** 找发送键：贴着输入框右侧那一颗（排除列表/工具条上的按钮）。 */
+    function findSendButton(composerRect) {
+        var cands = [];
+        try {
+            cands = document.querySelectorAll('button, [role="button"], [type="submit"]');
+        } catch (e) {
+            return null;
+        }
+        var fallback = null;
+        for (var i = 0; i < cands.length; i++) {
+            var el = cands[i];
+            var r = null;
+            try {
+                r = el.getBoundingClientRect();
+            } catch (e2) {
+                r = null;
+            }
+            if (!r || r.width < 8 || r.height < 8 || el.disabled === true) {
+                continue;
+            }
+            var label = String((el.getAttribute && (el.getAttribute('aria-label') ||
+                el.getAttribute('title'))) || '') + String(el.textContent || '');
+            if (label.indexOf('发送') >= 0 || label.indexOf('发送消息') >= 0 ||
+                label.indexOf('Send') >= 0 || label.indexOf('提交') >= 0) {
+                return el;
+            }
+            // 贴着输入框（同一行、在它右边）的那一颗才算候选；列表/工具条上的按钮
+            // 上下都可能撞进来，所以只在"垂直重叠输入框"的窄带里找。
+            if (!composerRect) {
+                continue;
+            }
+            var vOverlap = r.bottom > composerRect.top + 2 && r.top < composerRect.bottom - 2;
+            if (!vOverlap) {
+                continue;
+            }
+            if (r.left < composerRect.right - 24) {
+                continue;
+            }
+            if (!fallback || r.left > fallback.rect.left) {
+                fallback = {el: el, rect: r};
+            }
+        }
+        return fallback ? fallback.el : null;
+    }
+
+    /**
+     * 往输入框里塞字。
+     *
+     * 页面用的是 **React 受控的 contenteditable div**（`vitals` 探测到
+     * `<div> box=29,651 306x40`），直接赋 `textContent` 不生效——React 的受控值会
+     * 在下一个 render 里被清掉（真机 00:36:58 现场：`填入=""`）。所以先走
+     * `execCommand('insertText')`（Chromium 里等价于真实输入，React 认），
+     * 失败再退到"赋 textContent + 派发 beforeinput/input（inputType=insertText）"。
+     *
+     * @return 塞完之后输入框里的实际内容（截断）。
+     */
+    function fillComposer(el, text) {
+        try {
+            el.focus();
+        } catch (e) {
+            // focus 失败不致命
+        }
+        var ok = false;
+        try {
+            ok = document.execCommand && document.execCommand('insertText', false, text);
+        } catch (e2) {
+            ok = false;
+        }
+        if (!ok) {
+            try {
+                el.textContent = text;
+                var init = {bubbles: true, cancelable: true, inputType: 'insertText', data: text};
+                var ev;
+                try {
+                    ev = new G.InputEvent('beforeinput', init);
+                } catch (e3) {
+                    ev = new G.Event('beforeinput', {bubbles: true, cancelable: true});
+                }
+                el.dispatchEvent(ev);
+                try {
+                    ev = new G.InputEvent('input', init);
+                } catch (e4) {
+                    ev = new G.Event('input', {bubbles: true});
+                }
+                el.dispatchEvent(ev);
+            } catch (e5) {
+                diag('warn', '填入退路失败: ' + e5);
+            }
+        }
+        try {
+            return String(el.textContent === undefined ? el.value : el.textContent).substring(0, 40);
+        } catch (e6) {
+            return '?';
+        }
+    }
+
+    /**
+     * 填入文本并发送。`compose|<文本>`；只由 adb 显式触发。
+     * 返回一行摘要字符串（原生日志与它对齐看时序）。
+     */
+    G.__zcodeShellComposeSend = function (text) {
+        try {
+            if (!text) {
+                return '空文本，未发送';
+            }
+            var found = findComposer();
+            if (!found) {
+                diag('warn', '发送失败：页面里找不到输入框');
+                return 'no-composer';
+            }
+            var el = found.el;
+            var filled = fillComposer(el, text);
+            if (!filled) {
+                diag('warn', '发送失败：填进去又被清空（受控输入没认这次输入）· ' + describeElement(el));
+                return 'fill-rejected';
+            }
+            var btn = findSendButton(found.rect);
+            var how = 'none';
+            if (btn) {
+                clickElement(btn);
+                how = 'click:' + describeElement(btn);
+            } else {
+                // 退路：回车（多数聊天 UI 用 Enter 发送）
+                try {
+                    el.focus();
+                    ['keydown', 'keypress', 'keyup'].forEach(function (type) {
+                        el.dispatchEvent(new G.KeyboardEvent(type, {
+                            key: 'Enter', code: 'Enter', keyCode: 13, which: 13,
+                            bubbles: true, cancelable: true
+                        }));
+                    });
+                    how = 'enter';
+                } catch (e) {
+                    how = 'enter-failed:' + e;
+                }
+            }
+            diag('warn', '已发送输入：填入="' + filled + '" · 方式=' + how + ' · ' +
+                describeElement(el));
+            return 'sent=' + how;
+        } catch (e) {
+            diag('warn', '发送失败: ' + e);
+            return 'error:' + e;
+        }
+    };
+
     G.__zcodeShellDiag = function (cmd) {
         try {
+            if (cmd === 'probe_composer') {
+                return G.__zcodeShellProbeComposer();
+            }
+            if (cmd.indexOf('compose|') === 0) {
+                G.__zcodeShellComposeSend(cmd.substring(8));
+                return true;
+            }
             if (cmd === 'bg_redial') {
                 G.__zcodeShellNudgeRecover('event');
                 return true;

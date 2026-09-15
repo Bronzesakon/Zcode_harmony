@@ -567,8 +567,26 @@ object ShellRuntime {
      */
     private const val STALL_SILENCE_MS = 35_000L
 
+    /**
+     * 后台承载总开关。
+     *
+     * ⚠️ **默认关闭**（2026-09-16 00:52 真机 A/B 定案）：原生以"裸终端"身份接管 relay
+     * 配对，会让**桌面端拆掉自己的 window host** —— 判据是干净的 A/B：
+     *   · 基线（只有页面自己的桥）：`registered host` 后 45s 无异常；
+     *   · 一旦跑 `tier2_test`（原生配对）：`★配对成功` 之后 **4.3 秒**就
+     *     `[task-realtime] unregistered host` + `host process (local-1) exited with code 1`，
+     *     **早于任何开桥**（桥在 +13s 才开始，且之后全部 `desktop-disconnected`）。
+     * 后果是桌面端的远程控制整体失效，页面也跟着 bootstrap 失败。
+     *
+     * 结论：**原生接管必须同时提供 window 控制面**（页面自己那条路：
+     * `bootstrap` → `/ws/remote-control/window/<token>` 拿 `mobileConnectionId` →
+     * `POST /workspace-bridge` 带 `X-ZCode-Mobile-Connection-Id`），否则桌面端认为
+     * 这次连接没有窗口归属，就把 host 收掉。这条路没落地之前，本开关保持关闭，
+     * 免得留下"打开后台承载就毁掉桌面端"的有害行为。
+     * 取证与 A/B 现场见 `docs/16-后台60秒墙-根因取证与原生承载.md` §6。
+     */
     @Volatile
-    private var carrierEnabled = true
+    private var carrierEnabled = false
 
     private var carrierStarted = false
 
@@ -831,6 +849,31 @@ object ShellRuntime {
             }
             "net_probe" -> {
                 nativeNetProbe("adb")
+                return true
+            }
+            // WebView 远程调试（CDP）开关：验收"造流"要用它——adb 的 input text 进不了
+            // WebView 的输入框（真机实测两次），而 CDP 的 Input.insertText 是渲染器认的
+            // 真实输入。这是**测试通道**，用完记得关（设置页里也有同一个开关）。
+            "wvdebug_on" -> {
+                try {
+                    prefs.webViewDebugging = true
+                    android.webkit.WebView.setWebContentsDebuggingEnabled(true)
+                    Diagnostics.log(
+                        "warn",
+                        "WebView 远程调试已开启（CDP）——adb forward 后可用 tools/cdp.mjs 驱动页面",
+                    )
+                } catch (e: Exception) {
+                    Diagnostics.log("warn", "开启 WebView 远程调试失败: ${e.message}")
+                }
+                return true
+            }
+            "wvdebug_off" -> {
+                try {
+                    prefs.webViewDebugging = false
+                    Diagnostics.log("warn", "WebView 远程调试开关已关闭（重启应用后生效）")
+                } catch (e: Exception) {
+                    Diagnostics.log("warn", "关闭 WebView 远程调试失败: ${e.message}")
+                }
                 return true
             }
             "stall_state" -> {
