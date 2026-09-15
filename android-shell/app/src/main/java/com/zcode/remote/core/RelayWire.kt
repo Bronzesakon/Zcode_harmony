@@ -577,25 +577,39 @@ object RelayWire {
      * assistantText，卡片沿用之（正是网页会话列表的行为）。
      */
     private fun progressTextFromRow(row: JSONObject): String? = when (row.optString("kind")) {
-        "assistantText" -> progressTail(row.optString("text"))
+        "assistantText" -> progressHead(row.optString("text"))
         else -> null
     }
 
     /**
-     * 进展文本太长时只留**尾巴**。
+     * 进展文本太长时留**开头**（用户 2026-09-15 明确要求：**从消息开头开始取字**，
+     * 不是取尾巴）。
      *
-     * 真机教训（2026-09-13 晚）：一开始原样取整段正文，结果流体云卡片的可见部分
-     * 永远是这段消息的**开头**——消息在涨，可见内容却一直不变，用户看着就是"又
-     * 卡住了"（他当场抓到 pre.87 的 73 分钟静默，其中一个成因正是"文案对、看不出
-     * 在动"）。取尾巴保证"最新发生的事"落在可见区域。
+     * ⚠️ 这里原先取的是尾巴，理由记在下面，想改回去之前请先读完：
+     * 真机教训（2026-09-13 晚）：原样取整段正文时，流体云卡片的可见部分永远是这段
+     * 消息的**开头**——消息在涨、可见内容却不变，用户看着就是"又卡住了"（pre.87 那次
+     * 73 分钟静默的成因之一正是"文案对、看不出在动"）。当时因此改成取尾巴。
+     *
+     * **取开头会把那个代价重新带回来**：一段正文越长，卡片前半段越久不变。现在可以
+     * 接受的理由：① 用户要的是"能读到这轮在说什么"，不是"看出它在动"；② 被提升的
+     * 卡片默认展开，可见字数比折叠态多；③ 状态栏芯片（运行中/等待确认）与常驻通知的
+     * 更新仍在动，不是整体静止。**若真机再出现"卡片像卡住"，第一个该回滚的就是这里。**
      */
-    private fun progressTail(text: String): String {
+    private fun progressHead(text: String): String {
         val collapsed = text.replace(Regex("\\s+"), " ").trim()
         if (collapsed.length <= PROGRESS_MAX_CHARS) return collapsed
-        return "…" + collapsed.substring(collapsed.length - PROGRESS_MAX_CHARS + 1)
+        return collapsed.substring(0, PROGRESS_MAX_CHARS - 1) + "…"
     }
 
-    /** 卡片正文的字符上限（超出只看尾巴）。 */
+    /**
+     * 公开入口：[progressHead] 的对外形态。
+     *
+     * 页面自带对话流送来的正文（注入层解出来后走 `convtext` 消息）也用它压成一行，
+     * 好让"原生接管"与"页面自带流"两条数据源落进卡片时是**同一套口径**。
+     */
+    fun progressHeadOf(text: String): String = progressHead(text)
+
+    /** 卡片正文的字符上限（超出只看开头）。 */
     private const val PROGRESS_MAX_CHARS = 120
 
     // ------------------------------------- 对话详情：逻辑帧的行窗口（M4 订阅面）

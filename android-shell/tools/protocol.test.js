@@ -887,5 +887,306 @@ test('lastPageBridgeTrafficAt：页面桥入站 rpc-frame 盖章，我方桥与�
         'outbound page frames are not desktop deliveries');
 });
 
+// ---------------------------------------------------------------------------
+// 对话流 → 卡片正文（流体云"流式跟手"的数据源）
+//
+// 帧契约（与 Kotlin 侧 RelayWire 的解码注释同一份）：
+//   {topic, subscriptionId, fromSeq, toSeq, payload:{kind:'snapshot'|'deltas'}}
+//   snapshot → payload.rows.window = [row…]
+//   deltas   → payload.ops = [{op:'row.appended'|'row.upserted'|'row.delta', …}]
+//   row.delta = {rowId, path:'text', append}
+// 这几条钉的就是"哪些行能上卡片、增量怎么拼"——真机上唯一验不了的是"桌面端到底发不发
+// 帧"，而那不是这段代码能决定的。
+// ---------------------------------------------------------------------------
+
+function convSnapshot(topic, rows) {
+    return {topic: topic, payload: {kind: 'snapshot', rows: {window: rows}}};
+}
+
+function convDeltas(topic, ops) {
+    return {topic: topic, payload: {kind: 'deltas', ops: ops}};
+}
+
+test('conversation text: a snapshot yields the last assistantText row', () => {
+    const {client} = makeClient();
+    client._trackConversationText(convSnapshot('conversation/sess_1', [
+        {kind: 'userInput', rowId: 1, text: '问题'},
+        {kind: 'assistantText', rowId: 2, text: '第一段'},
+        {kind: 'toolCall', rowId: 3, toolName: 'Bash', status: 'running'},
+        {kind: 'assistantText', rowId: 4, text: '第二段正文'}
+    ]));
+    const got = client.latestConversationText();
+    assert.ok(got, 'a snapshot with an assistantText row must be reportable');
+    assert.strictEqual(got.text, '第二段正文');
+    assert.strictEqual(got.topic, 'conversation/sess_1');
+    assert.strictEqual(got.rowId, 4);
+});
+
+test('conversation text: deltas append to the tracked row, and only to it', () => {
+    const {client} = makeClient();
+    client._trackConversationText(convSnapshot('conversation/sess_2', [
+        {kind: 'assistantText', rowId: 9, text: '开头'}
+    ]));
+    client._trackConversationText(convDeltas('conversation/sess_2', [
+        {op: 'row.delta', rowId: 9, path: 'text', append: '，继续'},
+        // 别的行（我们没在跟）的增量必须丢掉，否则会把两段正文拼在一起。
+        {op: 'row.delta', rowId: 99, path: 'text', append: '别人的增量'},
+        // 同行的别的路径（工具的输入）不上卡片。
+        {op: 'row.delta', rowId: 9, path: 'inputText', append: '工具输入'}
+    ]));
+    assert.strictEqual(client.latestConversationText().text, '开头，继续');
+});
+
+test('conversation text: only assistantText rows feed the card', () => {
+    const {client} = makeClient();
+    client._trackConversationText(convSnapshot('conversation/sess_3', [
+        {kind: 'assistantText', rowId: 1, text: '正文'}
+    ]));
+    client._trackConversationText(convDeltas('conversation/sess_3', [
+        {op: 'row.appended', row: {kind: 'toolCall', rowId: 2, toolName: 'Bash', status: 'running'}},
+        {op: 'row.upserted', row: {kind: 'subagent', rowId: 3, summaryText: '正在挖协议'}},
+        {op: 'row.upserted', row: {kind: 'reasoning', rowId: 4, text: '在心里想'}}
+    ]));
+    assert.strictEqual(client.latestConversationText().text, '正文',
+        '工具调用 / 子代理 / reasoning 都不许覆盖正文（2026-09-14 真机反馈）');
+});
+
+test('conversation text: the most recently updated topic wins', () => {
+    const {client} = makeClient();
+    client._trackConversationText(convSnapshot('conversation/sess_a', [
+        {kind: 'assistantText', rowId: 1, text: 'A 的正文'}
+    ]));
+    client._trackConversationText(convSnapshot('conversation/sess_b', [
+        {kind: 'assistantText', rowId: 1, text: 'B 的正文'}
+    ]));
+    assert.strictEqual(client.latestConversationText().topic, 'conversation/sess_b');
+    assert.strictEqual(client.latestConversationText().text, 'B 的正文');
+    // 没有正文的 topic 不给东西（调用方要保留原 preview，不要拿空串覆盖）。
+    const {client: empty} = makeClient();
+    empty._trackConversationText(convSnapshot('conversation/sess_c', [
+        {kind: 'turnHeader', rowId: 1, state: 'running'}
+    ]));
+    assert.strictEqual(empty.latestConversationText(), null);
+});
+
+// ---------------------------------------------------------------------------
+// **真实的线格式**（2026-09-15 真机打出来的三层嵌套，别再照文档猜）
+//
+//   data  = { wireVersion, kind:'complete', deliveryKind, logicalFrameId,
+//             logicalFrameOrdinal, topic, subscriptionId, frame }
+//   frame = { topic, subscriptionId, sentAt, fromSeq, toSeq, payload }
+//   frame.payload = { kind:'snapshot'|'deltas', rows:{window:[…]} / ops:[…] }
+//
+// 两个曾经踩空的点：① 内容体在 frame.payload（不是 data.payload，也不是 data.frame）；
+// ② `data.kind` 是**投递**类别（'complete'），拿它判 snapshot/deltas 会永远判错。
+// ---------------------------------------------------------------------------
+
+function realConversationFrame(topic, subscriptionId, payload, seq) {
+    return {
+        wireVersion: 1,
+        kind: 'complete',
+        deliveryKind: 'stream',
+        logicalFrameId: 7,
+        logicalFrameOrdinal: 3,
+        topic: topic,
+        subscriptionId: subscriptionId,
+        frame: {
+            topic: topic,
+            subscriptionId: subscriptionId,
+            sentAt: 1,
+            fromSeq: seq,
+            toSeq: seq,
+            payload: payload
+        }
+    };
+}
+
+test('conversation text: the real three-level wire shape is parsed', () => {
+    const {client} = makeClient();
+    client._trackConversationText(realConversationFrame('conversation/sess_real', 'sub-real', {
+        kind: 'snapshot',
+        rows: {
+            window: [
+                {kind: 'userInput', rowId: 1, text: '问题'},
+                {kind: 'assistantText', rowId: 2, text: '真实形状的正文'}
+            ]
+        }
+    }, 11));
+    const got = client.latestConversationText();
+    assert.ok(got, '三层嵌套的快照必须能解出正文');
+    assert.strictEqual(got.text, '真实形状的正文');
+    assert.strictEqual(got.topic, 'conversation/sess_real');
+    assert.strictEqual(got.rowId, 2);
+});
+
+test('conversation text: real-shape deltas append to the tracked row', () => {
+    const {client} = makeClient();
+    client._trackConversationText(realConversationFrame('conversation/sess_d', 'sub-d', {
+        kind: 'snapshot',
+        rows: {window: [{kind: 'assistantText', rowId: 9, text: '开头'}]}
+    }, 1));
+    client._trackConversationText(realConversationFrame('conversation/sess_d', 'sub-d', {
+        kind: 'deltas',
+        ops: [{op: 'row.delta', rowId: 9, path: 'text', append: '，接着写'}]
+    }, 2));
+    assert.strictEqual(client.latestConversationText().text, '开头，接着写');
+});
+
+test('conversation candidates: the live native seed wins over the snapshot', () => {
+    const {client} = makeClient();
+    client.nativeRunningSessions = {'ws-live': ['sess_stale']};
+    client.nativeRunningSessionsProvider = () => ({'ws-live': ['sess_live']});
+    assert.deepStrictEqual(client._conversationCandidates('ws-live'), ['sess_live']);
+    assert.deepStrictEqual(client._conversationCandidates('ws-unknown'), []);
+});
+
+// ---------------------------------------------------------------------------
+// 对话流的看门狗与主动重锚
+//
+// 这一组照抄 `E:\zemote\lib\protocol\conversation.dart:1048-1068 / 943-968` 的契约：
+// 网页端**不做**周期性 resync，所以桌面端一安静页面就停住（前台也一样）；zemote 靠
+// "10s 一跳、静默 20s、且会话确实在跑 → resyncConversationV4{forceSnapshot:true, base}"
+// 主动要快照，才做到连续稳定。这里把那条契约钉住，免得以后又被改回被动等推送。
+// ---------------------------------------------------------------------------
+
+/** 假 bridge：记录 channels.call 的参数，便于断言重锚请求的内容。 */
+function fakeConversationBridge(key) {
+    const calls = [];
+    return {
+        key: key,
+        scope: {workspacePath: 'E:\\fake-' + key, workspaceIdentity: 'fake-' + key},
+        calls: calls,
+        channels: {
+            call: (channel, method, args) => {
+                calls.push({channel: channel, method: method, args: args});
+                return Promise.resolve({});
+            },
+            addEventListener: () => ({dispose() {}})
+        }
+    };
+}
+
+function fakeConversationSub(bridge, overrides) {
+    return Object.assign({
+        key: bridge.key,
+        sessionId: 'sess_1',
+        bridge: bridge,
+        subscriptionId: 'sub-A',
+        logEpoch: null,
+        seq: 0,
+        lastFrameAt: Date.now(),
+        lastTextAt: 0,
+        lastResyncAt: 0,
+        resyncCount: 0,
+        resyncing: false
+    }, overrides || {});
+}
+
+test('conversation frames are filtered by subscriptionId', () => {
+    const {client} = makeClient();
+    const sub = fakeConversationSub(fakeConversationBridge('ws-filter'));
+    // 别的订阅的帧（两条会话同时订阅时会落在同一个事件通道上）必须丢掉。
+    client._acceptConversationFrame(sub, {
+        topic: 'conversation/sess_1', subscriptionId: 'sub-B', payload: {}
+    });
+    assert.strictEqual(client._convFrames || 0, 0, '不是自己订阅的帧不能算');
+    client._acceptConversationFrame(sub, {
+        topic: 'conversation/sess_1', subscriptionId: 'sub-A', payload: {}
+    });
+    assert.strictEqual(client._convFrames, 1, '自己订阅的帧要收下');
+});
+
+test('a sequence gap triggers an immediate conversation resync with its位点', () => {
+    const {client} = makeClient();
+    const bridge = fakeConversationBridge('ws-gap');
+    const sub = fakeConversationSub(bridge, {logEpoch: 'ep-1', seq: 5});
+    client._acceptConversationFrame(sub, {
+        topic: 'conversation/sess_1', subscriptionId: 'sub-A',
+        fromSeq: 9, toSeq: 12, payload: {}
+    });
+    assert.strictEqual(bridge.calls.length, 1, '跳号必须立刻重锚（不等看门狗）');
+    assert.strictEqual(bridge.calls[0].method, 'resyncConversationV4');
+    const args = bridge.calls[0].args[0];
+    assert.strictEqual(args.forceSnapshot, true, '要的是完整快照');
+    assert.deepStrictEqual(args.base, {logEpoch: 'ep-1', seq: 5}, '要带上自己的位点');
+    assert.strictEqual(sub.seq, 12, '位点随后推进到 toSeq');
+});
+
+test('a resync without a baseline sends base: null (never an omitted field)', () => {
+    const {client} = makeClient();
+    const bridge = fakeConversationBridge('ws-base');
+    const sub = fakeConversationSub(bridge, {logEpoch: null});
+    client._resyncConversation(sub, 'test');
+    const args = bridge.calls[0].args[0];
+    // 桌面端的 zod schema 是 `.nullable()` 而不是 `.optional()`：省略会被拒收
+    // （`expected object, received undefined`）——README 记过的真机定案。
+    assert.ok('base' in args, 'base 字段必须存在');
+    assert.strictEqual(args.base, null, '无基线要显式传 null');
+});
+
+test('the conversation watchdog resyncs a quiet but active conversation', () => {
+    const {client} = makeClient();
+    const bridge = fakeConversationBridge('ws-quiet-active');
+    const sub = fakeConversationSub(bridge, {
+        lastFrameAt: Date.now() - 25000,        // 静默 25s > 20s
+        lastTextAt: Date.now() - 1000           // 正文刚还在涨 → 视作在跑
+    });
+    client._convSubs = {sess_1: sub};
+    client._conversationWatchdogTick();
+    assert.strictEqual(bridge.calls.length, 1, '静默且在跑 → 主动要一份快照');
+    assert.strictEqual(sub.resyncCount, 1);
+});
+
+test('the conversation watchdog leaves an idle conversation alone', () => {
+    const {client} = makeClient();
+    const bridge = fakeConversationBridge('ws-idle');
+    // 静默很久，但正文早就停了、会话索引里也没有它 → 不该折腾。
+    const sub = fakeConversationSub(bridge, {
+        lastFrameAt: Date.now() - 60000,
+        lastTextAt: 0
+    });
+    client._convSubs = {sess_1: sub};
+    client._conversationWatchdogTick();
+    assert.strictEqual(bridge.calls.length, 0, '没在跑就别重锚');
+});
+
+test('the conversation watchdog is throttled and circuit-broken', () => {
+    const {client} = makeClient();
+    const bridge = fakeConversationBridge('ws-throttle');
+    const sub = fakeConversationSub(bridge, {
+        lastFrameAt: Date.now() - 25000,
+        lastTextAt: Date.now() - 1000,
+        lastResyncAt: Date.now()            // 刚重锚过 → 节流窗口内
+    });
+    client._convSubs = {sess_1: sub};
+    client._conversationWatchdogTick();
+    assert.strictEqual(bridge.calls.length, 0, '节流窗口内不重复重锚');
+
+    // 熔断：连续多次重锚都没换来帧就停手，等帧自己回来（帧到了会把计数清零）。
+    sub.lastResyncAt = 0;
+    sub.resyncCount = 5;
+    client._conversationWatchdogTick();
+    assert.strictEqual(bridge.calls.length, 0, '到上限就熔断');
+
+    // 并发幂等：正在重锚时不叠加第二次。
+    sub.resyncCount = 0;
+    sub.resyncing = true;
+    client._conversationWatchdogTick();
+    assert.strictEqual(bridge.calls.length, 0, 'resyncing 期间不叠加');
+});
+
+test('conversation candidates: a failing provider falls back, and the cap holds', () => {
+    const {client} = makeClient();
+    // 桥没了（config() 抛了）→ 退回创建时的快照，不能让异常冒出去。
+    client.nativeRunningSessions = {'ws-fb': ['sess_fb']};
+    client.nativeRunningSessionsProvider = () => {
+        throw new Error('bridge gone');
+    };
+    assert.deepStrictEqual(client._conversationCandidates('ws-fb'), ['sess_fb']);
+    // 一次最多订 CONVERSATION_MAX 条：卡片只显示得下少数几张，多订只是白烧桌面端。
+    client.nativeRunningSessionsProvider = () => ({'ws-cap': ['s1', 's2', 's3']});
+    assert.deepStrictEqual(client._conversationCandidates('ws-cap'), ['s1', 's2']);
+});
+
 // --- append to inject.test.js ---------------------------------------------
 

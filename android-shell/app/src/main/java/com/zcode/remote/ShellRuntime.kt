@@ -10,6 +10,7 @@ import com.zcode.remote.core.Diagnostics
 import com.zcode.remote.core.NotifyState
 import com.zcode.remote.core.Prefs
 import com.zcode.remote.core.RelayCreds
+import com.zcode.remote.core.RelayWire
 import com.zcode.remote.core.SurvivalVerdict
 import com.zcode.remote.core.Tier2Probe
 import com.zcode.remote.core.TaskSnapshot
@@ -309,6 +310,30 @@ object ShellRuntime {
                 )
                 applyUpdate(update)
             }
+        }
+    }
+
+    /**
+     * 网页自带对话流送来的正文 → 覆盖该会话的活进展，让流体云 / 常驻通知跟手。
+     *
+     * 与 [pushLivePreview]（原生接管那条路）的三点不同：
+     *   1. **不需要接管**——数据来自页面那条 socket，前台后台都在，也不涉及第二条
+     *      连接，因此不会触发单控制端互斥（用户看到的 KICKED）；
+     *   2. 不要求 `livePolling`，也不清 livePreviews（页面重新供数时以会话索引为准）；
+     *   3. 工作区要用 sessionId 反查——对话流只给 `conversation/sess_…`。
+     */
+    private fun onConversationText(sessionId: String, text: String) {
+        val key = store.runningTaskRefs().firstOrNull { it.second == sessionId }?.first
+        if (key == null) {
+            // 没有在跑的任务要显示这句正文，丢掉即可（任务列表仍走会话索引更新）。
+            return
+        }
+        val head = RelayWire.progressHeadOf(text)
+        if (head.isEmpty()) return
+        val update = store.applyLivePreview(key, sessionId, head)
+        if (update.running.isNotEmpty()) {
+            Diagnostics.log("debug", "页面正文 $key：${head.take(60)}")
+            applyUpdate(update)
         }
     }
 
@@ -615,20 +640,40 @@ object ShellRuntime {
     }
 
     /**
+     * 自动后台接管的**总闸**（2026-09-15 起关闭，Phase 1 落地前勿打开）。
+     *
+     * 关闭依据不是猜测，是从网页 bundle 里读出来的**服务端语义**：
+     *   * relay 强制"同一时间只能保留一个手机控制端"——网页自己的失败文案即证据
+     *     （`index-nOVzQNKW.js` @4713300：badge=设备接管 / reason=session-conflict）；
+     *   * 页面收到 `KICKED` 后进 `kicked` 终态并 `enterTerminalFailure('session-conflict')`
+     *     （同文件 @4703473），**不自动恢复**，用户必须手动重载。
+     *
+     * 于是"第二条 relay 连接"（含原生自己连）必然把页面踢死。而需求是
+     * **后台保活且不占页面连接**——那就只能让那条连接继续是页面自己的那一条：
+     * 连接的**承载**改由原生代理（Phase 1：WebSocket 替身），**协议所有权仍归页面**。
+     *
+     * 诊断指令（tier2_test / tier2_takeover / tier1_silence_test）不受本闸影响，
+     * 仍可手动验证接管语义。Phase 1 落地后连同整个 Tier2 接管路径一起删除。
+     */
+    private const val AUTO_TAKEOVER_ENABLED = false
+
+    /**
      * 退后台后的接管（用户 2026-09-13 的口径："切后台就直接原生接管连接并继续
      * 获取对话详情推送到流体云"）。
      *
-     * 为什么后台一定要接管：桌面端对远端的**推送是稀疏的**——真机逐 10s 统计
-     * 证实，页面拿到快照之后整段只有心跳帧、入站字符数为 0，任务在流式输出时
-     * 也一样；会话索引的 preview 又只在轮次边界变。所以后台想让流体云跟手，
-     * 只能由**壳自己持有连接并主动拉**，而那要求页面的 socket 让位（relay 单
-     * 控制端互斥，KICK 语义已定案）。
-     *
-     * 时点：退后台后 [BACKGROUND_TAKEOVER_DELAY_MS] 再动手——用户瞥一眼别的
-     * 应用就切回来的场景不该被踢（页面被踢的代价是回前台要重载一次）。
-     * 理由行会写清是"渲染器已冻结"还是"后台接管（推流稀疏）"。
+     * ⚠️ 2026-09-15 起**默认关闭**，理由见 [AUTO_TAKEOVER_ENABLED]：接管必 KICK 页面。
+     * 保留这个探测点是给 Phase 1 用——它同时是"渲染器是否已冻结"的判据。
      */
     private fun scheduleBackgroundTakeover() {
+        if (!AUTO_TAKEOVER_ENABLED) {
+            Diagnostics.log(
+                "info",
+                "Tier2: 自动接管已停用（单控制端互斥，接管必 KICK 页面）——保留后台泵与页面连接",
+            )
+            // 只上报一次 liveness（Phase 1 的"渲染器冻结"判据仍需要它），不排接管。
+            requestLivenessReport()
+            return
+        }
         rendererProbeToken += 1
         val token = rendererProbeToken
         requestLivenessReport()
@@ -649,19 +694,21 @@ object ShellRuntime {
     private var rendererProbeToken = 0
 
     /**
-     * Tier2 后台接管触发：应用在后台且**注入层已经不答话**（渲染器冻结/被杀，
-     * 实况窗必然要断）→ 原生直连 relay 接管配对与任务事件。
+     * Tier2 后台接管触发：应用在后台且**注入层已经不答话**（渲染器冻结/被杀）。
      *
-     * KICK 语义已定案为配对互斥：接管会踢掉页面连接，所以前台绝不做这件事；
-     * 回前台由 [onAppForegroundChanged] 交还，页面侧再由 KICKED 自愈重载恢复。
+     * ⚠️ 默认停用（见 [AUTO_TAKEOVER_ENABLED]）：接管会 KICK 页面，而页面进的是
+     * `kicked` **终态、不自动恢复**——拿"页面被踢死"换后台跟手，代价不可接受。
      */
     private fun maybeTakeOverInBackground(livenessAgoMs: Long) {
+        // 本函数由 5s 一跳的 Tier1 看门狗调用，这里必须静默返回（打日志会刷屏）。
+        if (!AUTO_TAKEOVER_ENABLED) return
         if (livenessAgoMs in 0 until TIER2_TAKEOVER_SILENCE_MS) return
         takeOverNow("用户已离开且注入层静默 ${livenessAgoMs / 1000}s（渲染器已冻结）")
     }
 
     /** 执行接管（前置条件已满足，只做最后两道门）。 */
     private fun takeOverNow(reason: String) {
+        if (!AUTO_TAKEOVER_ENABLED) return
         if (externalPickerActive) return
         if (!userIsAway()) return
         if (Tier2Probe.isRunning()) return
@@ -838,6 +885,19 @@ object ShellRuntime {
                         data.optString("level", "info"),
                         "页面: " + parts.joinToString(" ").take(600),
                     )
+                }
+                "convtext" -> {
+                    // 网页自己那条对话流里的"最新一段 AI 正文"——注入层从**页面自带的**
+                    // 订阅里解出来（见 zcode-protocol.js 的 _trackConversationText）。
+                    // 它走的是页面那条 socket，所以前后台都能用，也不涉及第二条连接
+                    // → 不会再触发单控制端互斥（KICKED）。会话索引的 preview 只在
+                    // 轮次边界变，流式进度只能靠这条补上。
+                    val data = root.optJSONObject("data") ?: return
+                    val text = data.optString("text")
+                    if (text.isEmpty()) return
+                    val sessionId = data.optString("topic").substringAfterLast('/')
+                    if (sessionId.isEmpty()) return
+                    onConversationText(sessionId, text)
                 }
                 "pagevitals" -> {
                     // DOM 体征快照（卡死看门狗布防/撤防/放弃时的现场）。

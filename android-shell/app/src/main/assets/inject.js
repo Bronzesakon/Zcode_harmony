@@ -190,28 +190,52 @@
         return;
     }
 
+    /** 读不到原生配置时的兜底——**必须与 Prefs 的真实默认值一致**（现在两者都是"不订阅"）。 */
+    function configDefaults() {
+        return {subscribeAll: false, passiveObserve: true};
+    }
+
     function config() {
         if (!bridge || typeof bridge.config !== 'function') {
-            return {subscribeAll: true};
+            return configDefaults();
         }
         try {
             var raw = bridge.config();
             var parsed = raw ? JSON.parse(raw) : null;
-            return parsed && typeof parsed === 'object' ? parsed : {subscribeAll: true};
+            return parsed && typeof parsed === 'object' ? parsed : configDefaults();
         } catch (e) {
-            return {subscribeAll: true};
+            return configDefaults();
         }
     }
 
     // -----------------------------------------------------------------------
-    // 1. visibility hijack (decision D12)
+    // 1. visibility hijack (decision D12) —— **已停用**（2026-09-15 晚）
     //
     // The page decides whether to keep its relay work running from the Page
     // Visibility API. Spoofing it keeps the page in "foreground" mode while the
     // app is backgrounded. This does NOT stop the browser from throttling
     // timers — only the foreground service and renderer priority do that — but
     // it stops the page from deliberately pausing itself.
+    //
+    // ⚠️ 上面这段是它当初的立论，真机把它两头都否掉了（2026-09-15 晚的证据）：
+    //
+    //   * **它挡不住节流**：Chromium 的定时器节流与冻结看的是**真实**可见性，
+    //     不看这个 JS API。真机 22:08–22:15 的后台 7 分钟里，劫持全程生效，
+    //     而页面自己那条 10 秒心跳只跳了 6 次（被压到约 1 次/分钟）。
+    //   * **它掐掉了页面的自救**：页面自己的传输层有 suspend→recover 逻辑
+    //     （bundle 里监听 `visibilitychange`/`pagehide`/`freeze`），我们把
+    //     window/document 上的这些事件全吞掉、还把 `visibilityState` 谎报成
+    //     visible——于是页面既不知道自己去过后台，也不知道自己回来了。
+    //     真机 22:15:26 的现场就是它的后果：回前台后页面自己重连成功
+    //     （1006 → 1 秒内 open），但重新订阅一直没被 ack，对话详情一直 0 行，
+    //     只有重启应用（全新 bootstrap）才恢复。
+    //
+    // 结论：**不再对页面说假话**。要让页面在后台继续工作，得从 Android 侧解决
+    // "窗口可见性"（PiP / 覆盖窗 / 原生承载），JS 层这个谎是白撒的。
+    // 保留代码是为了"别再退回"——要复原只需把这个常量改成 true。
     // -----------------------------------------------------------------------
+    var SHELL_VISIBILITY_HIJACK = false;
+
     var LIFECYCLE_EVENTS = {
         visibilitychange: 1,
         pagehide: 1,
@@ -220,6 +244,10 @@
     };
 
     function installVisibilityHijack() {
+        if (!SHELL_VISIBILITY_HIJACK) {
+            diag('info', '可见性劫持已停用：页面拿到真实可见性，生命周期事件照常送达');
+            return;
+        }
         var readOnly = function (value) {
             return {get: function () {
                 return value;
@@ -306,6 +334,14 @@
     }
 
     function installWebSocketHook() {
+        // **被动旁观总开关**（`diag_cmd passive_off`，见 Prefs.passiveObserve 的注释）。
+        // 关掉时这里直接返回：不 hook WebSocket ⇒ 不建 socket 索引、不逐帧观测、不建协议
+        // 客户端、不发心跳探针。留下的只有"零侵入三件事"（滚动条 CSS / 状态页面上报 /
+        // 页面日志汇），用来判定"是不是我们对每帧的同步处理拖死了页面"。
+        if (config().passiveObserve === false) {
+            diag('warn', '被动旁观已关闭（诊断开关 active=false）：跳过 WebSocket hook 与全部协议观测');
+            return;
+        }
         if (typeof NativeWebSocket !== 'function') {
             diag('error', 'window.WebSocket 不存在，无法 hook');
             return;
@@ -414,6 +450,9 @@
         diag('warn', '注入晚于页面建线，已从原型层收编现有 socket（零重连）');
     }
 
+    /** 页面开过的 socket 类型（只记 pathname，凭证一律不进日志）。 */
+    var socketPaths = {};
+
     function trackSocket(socket, url) {
         if (socketKnown(socket)) {
             return;
@@ -421,6 +460,20 @@
         if (url) {
             lastRelayUrl = url;
             maybePostRelayCreds();
+            // 诊断（2026-09-15）：页面到底开了**几种** WebSocket。
+            // 起因：relay 那条上只观测到 `controller/*` 与 `sessions-index/*`，
+            // **从来没有 `conversation/*`**，可页面的会话商店明明拿到了 snapshot。
+            // 第一件要问的事就是"对话流是不是走了另一条 socket"——页面里确实还有一条
+            // `/ws/remote-control/window/<token>`（见 docs/05 的 bundle 分析）。
+            try {
+                var path = String(url).split('?')[0].replace(/^[a-zA-Z]+:\/\/[^/]+/, '');
+                socketPaths[path] = (socketPaths[path] || 0) + 1;
+                if (socketPaths[path] === 1) {
+                    diag('info', '页面 socket 类型首次出现：' + path);
+                }
+            } catch (e) {
+                // 诊断失败不影响建线
+            }
         }
         if (knownSockets) {
             knownSockets.add(socket);
@@ -626,6 +679,9 @@
         }
     }
 
+    /** 上一次上报给原生的对话正文（去重：只在变化时发）。 */
+    var lastConvTextSent = '';
+
     /** Periodic one-liner, emitted only when there was traffic to report. */
     function reportPerf() {
         var frames = perf.decodedFrames - perf.windowFrames;
@@ -649,6 +705,31 @@
         var decodeMs = perf.decodeMs - perf.windowDecodeMs;
         var longTaskMs = perf.longTaskMs - perf.windowLongTaskMs;
         var socket = activeSocket;
+        // 对话流的"最新正文"上报（提取逻辑见 zcode-protocol.js 的
+        // _trackConversationText）：这条流走的是**网页自己那条 socket**，
+        // 所以后台跟手不必再让原生另开一条连接（也就不会再 KICK 页面）。
+        var conv = null;
+        var convStats = null;
+        try {
+            if (client && typeof client.latestConversationText === 'function') {
+                conv = client.latestConversationText();
+                if (conv && conv.text && conv.text !== lastConvTextSent) {
+                    lastConvTextSent = conv.text;
+                    post('convtext', {
+                        topic: conv.topic,
+                        text: conv.text,
+                        frames: conv.frames
+                    });
+                }
+            }
+            // 帧计数**独立于**"有没有正文"取：两者混在一起时，"没帧"和"有帧但没解出
+            // 正文"在日志里长得一模一样（2026-09-15 的教训，见 conversationFrameStats）。
+            if (client && typeof client.conversationFrameStats === 'function') {
+                convStats = client.conversationFrameStats();
+            }
+        } catch (e) {
+            // 上报失败绝不影响节拍本身
+        }
         diag('debug', '页面开销 ' + Math.round(elapsed / 1000) + 's：收帧 ' + frames +
             ' 个（' + Math.round(chars / 1024) + 'K 字符，解码合计 ' +
             Math.round(decodeMs) + 'ms，单帧最长 ' + Math.round(perf.decodeMsMax) + 'ms）· ' +
@@ -657,7 +738,11 @@
             '发帧 ' + outFrames + ' 个（' + Math.round(outChars / 1024) + 'K 字符）· ' +
             '链路 ack ' + acks + ' · 探针 ' + probes + ' · paired ' + relayPaired +
             ' socket ' + (socket ? socket.readyState : -1) +
-            ' · 页面心跳 ' + pageBeats);
+            ' · 页面心跳 ' + pageBeats +
+            ' · 对话帧 ' + (convStats ? convStats.frames : 0) +
+            '（topic ' + (convStats ? convStats.topics : 0) + ' 个 · 订阅 ' +
+            (convStats ? convStats.subs : 0) + ' · 重锚 ' + (convStats ? convStats.resyncs : 0) +
+            ' · 正文 ' + (convStats ? convStats.textLen : 0) + ' 字）');
         perf.windowStartedAt = Date.now();
         perf.windowFrames = perf.decodedFrames;
         perf.windowChars = perf.inboundChars;
@@ -738,12 +823,31 @@
 
     function createClient() {
         var cfg = config();
+        // 接线自证：**0 个工作区** = 原生没把运行集给过来（接线问题）；**有工作区但
+        // 0 条会话** = 确实没有在跑的任务（数据问题）。这两件事的处理完全不同。
+        diag('debug', '原生运行集种子：' +
+            Object.keys(cfg.runningSessions || {}).length + ' 个工作区');
         var next = new P.RemoteClient({
             send: injectPayload,
             log: function (message) {
                 diag('debug', message);
             },
             subscribeAll: cfg.subscribeAll !== false,
+            // 原生给的"在跑会话"种子（工作区 → 会话 id）：开桥时要先订哪几条对话用它。
+            // 它**活过页面重载**，而 JS 侧自己攒的清单活不过——详见
+            // zcode-protocol.js 的 _conversationCandidates 与 WebAppBridge.config 的注释。
+            nativeRunningSessions: cfg.runningSessions || {},
+            // 但**光有创建时的快照不够**：`config()` 是同步 JS 接口，而原生 TaskStore 是
+            // 随索引帧长起来的——刚重装/重启后创建 client 时它还是空的（真机 2026-09-15：
+            // 一直报"0 个工作区"）。所以开桥那一刻**再问一次**，这才是真正新鲜的种子。
+            nativeRunningSessionsProvider: function () {
+                try {
+                    var fresh = config();
+                    return fresh && fresh.runningSessions ? fresh.runningSessions : {};
+                } catch (e) {
+                    return {};
+                }
+            },
             sharedState: pageCoverage
         });
         next.gen = ++clientGenSeq;
@@ -942,6 +1046,47 @@
         }
     }
 
+    /**
+     * 发送**顶层控制帧**（`pair_status_query` 这类）。
+     *
+     * 为什么不能复用 [injectPayload]：那个函数把内容包成
+     * `{type:'data', payload:…}`——那是**数据面**（rpc-frame）的形状；而 relay 的
+     * 控制帧必须是**顶层 `type`**（页面自己的客户端就是 `this.send({type:'pair_status_query',
+     * device_sid, client_ts})`，服务端按顶层 type 分发）。
+     *
+     * 真机 2026-09-15 定案：此前心跳探针走的是 injectPayload，于是它一直被服务端当成
+     * 一个解不开的 data 载荷丢掉——**从来没有被 ack 过**。指纹就是后台那两列数字：
+     * `探针 1` 而 `链路 ack 0`。前台看不出来（页面自己的心跳定时器在跑），一旦退后台，
+     * 页面的自链式定时器被 Chromium 节流，没有 ack，页面的 30s ack 看门狗就判死并
+     * `i4t.reconnectAfterStaleWaiting` 关掉 socket——这就是"回后台立刻断线"的根因。
+     */
+    function sendControlFrame(payload) {
+        var socket = activeSocket;
+        if (!socket || socket.readyState !== 1) {
+            socket = null;
+            for (var i = sockets.length - 1; i >= 0; i--) {
+                if (sockets[i].readyState === 1) {
+                    socket = sockets[i];
+                    break;
+                }
+            }
+        }
+        if (!socket || socket.readyState !== 1) {
+            return false;
+        }
+        activeSocket = socket;
+        injecting = true;
+        try {
+            socket.send(JSON.stringify(payload));
+            return true;
+        } catch (e) {
+            diag('warn', '控制帧发送失败: ' + e);
+            return false;
+        } finally {
+            injecting = false;
+        }
+    }
+
     function observeText(text, outbound) {
         if (!text) {
             return;
@@ -1067,6 +1212,19 @@
     var STALE_PROBES = 2;
     /** A foreground return with the link silent this long is treated as dead. */
     var RESUME_DEAD_LINK_MS = 60000;
+    /**
+     * 回前台"死链兜底"：观察窗与限流（逻辑见 healDeadLinkOnResume）。
+     *
+     * ⚠️ **尚未真机验证**（2026-09-15 晚加的）。它要解决的现场是：
+     * 长后台期间页面定时器被节流 → 桌面端判设备离线 → 回前台时页面自己重连成功
+     * （1006 → 1 秒内 open）**但重新订阅收不到 ack**，对话详情一直 `rows: 0`，
+     * 只有重启应用（全新 bootstrap）才恢复。兜底＝对**已死的链路**重载一次页面，
+     * 与用户手动重启等价；健康链路永远不碰（见 SHELL_READ_ONLY 的边界）。
+     */
+    var RESUME_HEAL_GRACE_MS = 5000;
+    var RESUME_HEAL_MIN_GAP_MS = 300000;
+    var lastResumeHealAt = 0;
+    var resumeHealTimer = null;
     /** Ticks closer together than this are dropped so the timer and the pump cannot double up. */
     var MIN_TICK_GAP_MS = 5000;
     /** Cap on automatic reloads after a KICKED, counted across the reload itself. */
@@ -1079,6 +1237,48 @@
     var appForeground = true;
     var backgroundStartedWallMs = 0;
     var lastBackgroundSilenceLoggedAt = 0;
+
+    /**
+     * **只读壳**（2026-09-15 真机定案）。
+     *
+     * 这一层原本有四件"动手"的事，全部被真机日志定罪为**自伤**。定罪证据是
+     * `socket.close() 被调用 … 来自 …` 那行——它点名调用者，抓到的原话：
+     *
+     *   at nudgeReconnect ← at fallbackCheck
+     *       "进对话 5s 铁判准"；20:27:28–20:28:06 一轮 40 秒内拆了 10 次
+     *   at forceReconnect ← at G.__zcodeShellSetAppForeground
+     *       每次回前台、只要入站帧静默 >60s，就先拆了再说（20:53:04）
+     *   at forceReconnect ← at heartbeatTick ← at G.__zcodeShellHeartbeat
+     *       心跳 ack 陈旧（18:24、18:35、19:40、20:56…）
+     *   stallReloadIfAllowed → location.reload()
+     *
+     * 拆掉的每一次都是**页面正用着的那条** relay 连接，页面只能按自己的梯子重建：
+     * 用户看到的就是"发消息转圈""要重连好几次才出来""返回页面是它自己在重连"。
+     *
+     * 对照组（2026-09-15 21:44:27 起 `passive_off`，这四件事全部失去 socket 句柄）：
+     * 页面自己的对话订阅 ack 之后 **5 分钟零生命周期事件**——没有 close/connect、
+     * 没有 unsub/resub、没有 KICKED、没有轻推。页面收发能力本身是完好的。
+     *
+     * 因此定为政策：**壳永不关闭页面的 socket、永不自动重载页面**。观测照旧（只读），
+     * 后台保活只留"补心跳"一件事。要做对照实验时把这里改成 false 即可。
+     */
+    var SHELL_READ_ONLY = true;
+
+    /** 只读壳拒绝动手时的日志节流（后台每 10s 一条会把日志刷没）。 */
+    var lastReadOnlyRefusalAt = 0;
+
+    /**
+     * 记一条"本会在这一刻动页面"的日志。它不只是说明，还是**诊断量**：
+     * 什么时候我们会想拆线，就说明那一刻页面的链路在观测上已经不健康了。
+     */
+    function noteReadOnlyRefusal(action, reason) {
+        var nowMs = Date.now();
+        if (lastReadOnlyRefusalAt && nowMs - lastReadOnlyRefusalAt < 60000) {
+            return;
+        }
+        lastReadOnlyRefusalAt = nowMs;
+        diag('warn', '只读壳：不' + action + '（本会触发的原因：' + reason + '）');
+    }
 
     /**
      * relay 把本端顶掉（KICKED）。
@@ -1102,6 +1302,71 @@
         return parseInt(storeGet(KICKED_HEAL_STORE), 10) || 0;
     }
 
+    /**
+     * 回前台"死链兜底"（2026-09-15 晚加，**尚未真机验证**）。
+     *
+     * 现场（2026-09-15 22:15:26 真机日志）：长后台 7 分钟后回前台，页面自己把
+     * 死了 385s 的 socket 收尸并 1 秒内重连成功（`1006` → `relay socket open (#2)`），
+     * 紧接着 `conversation subscription started`——**但永远没有 acknowledged**，
+     * 页面体征一直 `{"chat":true,"timeline":true,"rows":0}`，对话详情空白；
+     * 重启应用（全新 bootstrap）后 250ms 就 ack 回来、快照 234 行。
+     *
+     * 判据（三条同时成立才动手，全是"页面已经失败"的证据）：
+     *   ① 回前台时链路观测已静默 > RESUME_DEAD_LINK_MS；
+     *   ② 观察窗 RESUME_HEAL_GRACE_MS 内**没有任何入站帧**（页面自己没恢复）；
+     *   ③ 体征显示"在对话视图里但 0 行"（正是"重订阅没 ack"的形状）。
+     * 三条都成立时才重载，且 5 分钟限流一次——与用户手动重启等价，但不用他动手。
+     * 健康链路一条都不碰：只要有帧在进，② 就不成立。
+     */
+    function healDeadLinkOnResume(silenceMs) {
+        if (resumeHealTimer) {
+            clearTimeout(resumeHealTimer);
+        }
+        var framesAtResume = liveness.inboundFrames;
+        var resumedAt = Date.now();
+        resumeHealTimer = setTimeout(function () {
+            resumeHealTimer = null;
+            if (!appForeground) {
+                diag('info', '回前台兜底：观察窗内又退到后台，本轮不判');
+                return;
+            }
+            if (liveness.inboundFrames !== framesAtResume) {
+                diag('info', '回前台兜底：链路已自行恢复（静默 ' +
+                    Math.round(silenceMs / 1000) + 's 后收到 ' +
+                    (liveness.inboundFrames - framesAtResume) + ' 帧），不介入');
+                return;
+            }
+            var v = null;
+            try {
+                v = readVitals();
+            } catch (e) {
+                // 读不到体征就不动手：判据不齐宁可不干预
+            }
+            if (!v || v.chat !== true || v.rows > 0) {
+                diag('warn', '回前台兜底：静默 ' + Math.round(silenceMs / 1000) +
+                    's 且观察窗内零入站帧，但界面不是"对话 0 行"（chat=' +
+                    (v ? v.chat : '?') + ' rows=' + (v ? v.rows : '?') + '），不介入');
+                return;
+            }
+            var gap = Date.now() - lastResumeHealAt;
+            if (gap <= RESUME_HEAL_MIN_GAP_MS) {
+                diag('info', '回前台兜底被限流跳过（距上次重载 ' + Math.round(gap / 1000) +
+                    's < ' + Math.round(RESUME_HEAL_MIN_GAP_MS / 1000) + 's）');
+                return;
+            }
+            lastResumeHealAt = Date.now();
+            diag('warn', '回前台兜底：静默 ' + Math.round(silenceMs / 1000) +
+                's、观察窗 ' + Math.round((Date.now() - resumedAt) / 1000) +
+                's 内零入站帧、对话 0 行 → 重载页面一次（' +
+                Math.round(RESUME_HEAL_MIN_GAP_MS / 60000) + ' 分钟限流）');
+            try {
+                G.location.reload();
+            } catch (e) {
+                diag('warn', '回前台兜底重载失败: ' + e);
+            }
+        }, RESUME_HEAL_GRACE_MS);
+    }
+
     function noteRelayKicked() {
         if (appForeground) {
             diag('warn', '页面连接被顶掉（relay 返回 KICKED，前台）：不自动干预');
@@ -1113,6 +1378,9 @@
     }
 
     function healKickedOnForeground() {
+        // 只读壳里**唯一保留**的页面级干预，理由是它针对的是一条已经死掉的链路：
+        // KICKED 是终态（页面进入"已被其他设备接管"，自己不会回来），重载是唯一
+        // 恢复手段，不存在"打断健康连接"的问题。回前台才做，且跨 reload 记次数封顶。
         if (!kickedAwayAt) {
             return;
         }
@@ -1261,15 +1529,22 @@
         } else {
             staleTicks = 0;
         }
-        // Sent on both branches on purpose: the probe is the recovery path for a
-        // merely-stale link, and the desktop's ack is also what keeps the page's
-        // own ack watchdog from declaring the connection dead.
-        injectPayload({
+        // 顶层控制帧，**不能**走 injectPayload：那个函数包成 {type:'data',payload:…}
+        // 是数据面的形状，而 relay 的控制帧必须顶层 type——见 sendControlFrame 的注释
+        // （真机 2026-09-15：走 injectPayload 的探针从来没被 ack 过，那正是"回后台
+        // 立刻断线"的根因）。
+        //
+        // **只读壳：前台一帧都不发。** 页面自己的 10s 心跳在前台是准的（日志里
+        // `页面心跳` 就是 ~1/10s），我们再插一帧只是往它正用着的那条连接上加噪声，
+        // 而"壳不许碰页面链路"是这版政策的全部意义。只有退到后台、页面的定时器被
+        // Chromium 节流时，才由原生泵补这一帧喂住桌面端的配对状态。
+        if (!appForeground && sendControlFrame({
             type: 'pair_status_query',
             device_sid: deviceSid,
             client_ts: nowMs
-        }, true);
-        linkWindow.probes += 1;
+        })) {
+            linkWindow.probes += 1;
+        }
         return true;
     }
 
@@ -1278,8 +1553,15 @@
      * the page, which is the only party that owns the socket's lifecycle. Rate
      * limited so a dead desktop cannot make us churn. Returns true when the
      * socket was actually closed.
+     *
+     * 只读壳下这里是**空操作**（见 SHELL_READ_ONLY）：只留一行日志说明"本来会
+     * 在哪一刻拆线"，因为这句话本身就是页面链路健康的诊断量。
      */
     function forceReconnect(reason) {
+        if (SHELL_READ_ONLY) {
+            noteReadOnlyRefusal('重建页面 socket', reason);
+            return false;
+        }
         if (Date.now() - lastForcedReconnectAt <= RECONNECT_MIN_GAP_MS) {
             return false;
         }
@@ -1472,7 +1754,16 @@
     };
     /** 进入会话后先给页面 3s 自己恢复；进行中流文本连续 5s 不更新也触发同一恢复梯子。 */
     var FALLBACK_CHECK_MS = 3000;
-    var CONVERSATION_STALE_MS = 5000;
+    /**
+     * "前台对话流多久没新帧算异常"。
+     *
+     * **5s → 60s（2026-09-15 真机定案）**。桌面端的推送本来就稀疏（README「已知问题 B」：
+     * 页面拿到快照后整段只有心跳帧是常态），5 秒静默被判成"卡死"的直接后果是看门狗
+     * **每秒布防、每 4 秒撤防一轮、永不停止**，其中一部分还会走到"轻推"（关 socket）。
+     * 真机实测 15 分钟内：布防 19 次 / 轻推 11 次 / socket close 13 次——用户看到的
+     * "进对话要重连好多次才出来"和"发送按钮一直转圈"都是它。
+     */
+    var CONVERSATION_STALE_MS = 60000;
     var FALLBACK_RELOAD_GAP_MS = 15000;
     var FALLBACK_STORE_AT = 'zcodeShellFastRefreshAt';
 
@@ -1709,6 +2000,14 @@
      * 上限 + 就绪即复位），但**不经过轻推**：见 5b 节头部的决策说明。
      */
     function reloadForMissingConversation(reason) {
+        if (SHELL_READ_ONLY) {
+            // 和"轻推"同源的一条路：进对话没看到内容就重载页面。真机里它同样是
+            // 拿"我们的观测"去否定"页面的事实"——只读壳下只记录，不动页面。
+            stallState.gaveUp = true;
+            diag('warn', '只读壳：不因"' + reason + '"重载页面（只记录，等页面自己恢复）');
+            postPageVitals('giveup');
+            return;
+        }
         var stamp = parseInt(storeGet(FALLBACK_STORE_AT), 10);
         var last = Math.max(stallState.lastReloadAt, isNaN(stamp) ? 0 : stamp);
         var wait = last + FALLBACK_RELOAD_GAP_MS - Date.now();
@@ -1831,6 +2130,17 @@
     var STALL_NUDGE_MS = 3000;
     var STALL_RELOAD_MS = 3000;
     var STALL_RELOAD_CAP = 2;
+    /**
+     * 撤防后多久之内不再重新布防。
+     *
+     * 真机 2026-09-15：20:18–20:50 这一段看门狗布防 **267 次**、撤防 265 次——
+     * 全部是同一对理由在打转（`前台对话流连续 Ns 无新动态` → 3s 后 `判定时已恢复`，
+     * 下一跳再布防）。原因是两条判据看的东西不同：巡检看的是"我们有没有看到对话帧"，
+     * 判定看的是"DOM 健不健康"，而"我们看不到帧、页面却是好的"恰恰是常见状态。
+     * 只读壳下这个看门狗已经不能动手了，它的价值只剩"什么时候我们会想动手"这条
+     * 诊断量，所以给它一个退避，别用 537 行日志把真正的事件淹掉。
+     */
+    var STALL_REARM_COOLDOWN_MS = 60000;
     var STALL_STORE_RELOADS = 'zcodeShellStallReloads';
     /** 布防的页面日志事件：仅梯子已耗尽的终态（retry_scheduled 是页面还在自救，不动）。 */
     var PAGE_LOG_STALL_EVENTS = {
@@ -1853,6 +2163,8 @@
         lastReloadAt: 0,
         skipNudge: false,
         streamStalled: false,
+        /** 上次撤防的时刻（见 STALL_REARM_COOLDOWN_MS）。 */
+        lastCancelAt: 0,
         // 连续刷新计数的内存权威；sessionStorage 是跨 reload 边界的镜像
         // （storage 可能被拒，内存值仍保住单次加载内的上限语义）。
         reloadCount: parseInt((function () {
@@ -2008,6 +2320,15 @@
                     client.lastPageBridgeTrafficAt() : 0;
                 if (trafficAt >= stallState.since) {
                     diag('info', '卡死看门狗：桌面端仍在下发（内容在路上），跳过轻推');
+                } else if (Date.now() - lastForcedReconnectAt <= RECONNECT_MIN_GAP_MS) {
+                    // **这里以前缺了一道门**：`nudgeReconnect` 头顶的注释写着"与
+                    // forceReconnect 共享 180s 限流时钟"，但它只写 `lastForcedReconnectAt`
+                    // 从不读——于是"布防→判定→轻推"可以每 4 秒一轮无限循环，每次都把
+                    // 页面的 socket 拆掉（2026-09-15 真机：11 次轻推）。
+                    // 受限流时不轻推、**也不进刷新判定**：刚干预过就不该再加一刀。
+                    stallCancel('距上次链路干预不足 ' +
+                        Math.round(RECONNECT_MIN_GAP_MS / 1000) + 's，不重复轻推');
+                    return;
                 } else {
                     nudgeReconnect(stallState.armReason || '页面无进展');
                 }
@@ -2020,10 +2341,34 @@
     }
 
     /**
-     * 轻推：关掉共享 socket，恢复归页面。与心跳陈旧路径的 forceReconnect
-     * 共享 180s 限流时钟，两条路不会在同一段链路上反复开刀。
+     * 轻推：关掉共享 socket，恢复归页面。
+     *
+     * ⚠️ **限流必须在这里（唯一收口），不能只放在某个调用方**——2026-09-15 真机教训：
+     * 上一版只在看门狗那条路上加了限流，而"进对话 5s 未出详情"这条**直接调用**它，
+     * 于是形成一个正反馈环：
+     *
+     *     关 socket → 页面重连并重新 subscribeConversationV4（那正是"进对话信标"）
+     *     → 5s 窗口重新武装 → 新连接 5 秒内必然加载不完 → 再关 socket → …
+     *
+     * 实测每 ~4 秒一轮、连续 10 次，用户看到的就是"点进对话要重连好多次才出来"，
+     * 以及"发消息一直转圈"（socket 在发送途中被拆）。**每一次轻推都保证了下一次失败。**
+     *
+     * 与心跳陈旧路径的 [forceReconnect] 共享同一个 180s 时钟——这也是本函数注释里
+     * 一直写着、但此前没有实现的意图：一次干预之后，这条链路上 180 秒内不再开刀。
      */
     function nudgeReconnect(reason) {
+        if (SHELL_READ_ONLY) {
+            // 只读壳：连"轻推"也不做。这条路上最恶性的正反馈（关 socket→页面重连
+            // →5s 窗重新武装→再关）从此不存在，日志里只留一行"本会在何时动手"。
+            noteReadOnlyRefusal('轻推页面 socket', reason);
+            return false;
+        }
+        var gap = Date.now() - lastForcedReconnectAt;
+        if (gap <= RECONNECT_MIN_GAP_MS) {
+            diag('info', '卡死轻推被限流跳过（距上次链路干预 ' + Math.round(gap / 1000) +
+                's < ' + Math.round(RECONNECT_MIN_GAP_MS / 1000) + 's）：' + reason);
+            return false;
+        }
         var socket = activeSocket;
         if (!socket || socket.readyState !== 1) {
             diag('info', '卡死轻推：当前没有活动 socket，等页面自己重建');
@@ -2041,6 +2386,16 @@
     }
 
     function stallReloadIfAllowed() {
+        if (SHELL_READ_ONLY) {
+            // 只读壳：**永不自动重载**。重载会把页面自己的订阅、视图、滚动位置
+            // 全部推倒（用户回来看到的是"它自己在重连/重载"），而它换来的只是
+            // 一次握手——收益远小于代价。看门狗到此为止，只把状态记清楚。
+            stallState.gaveUp = true;
+            stallState.armed = false;
+            diag('warn', '只读壳：不自动重载页面（看门狗停止干预，等页面自己恢复）');
+            postPageVitals('giveup');
+            return;
+        }
         var stamp = parseInt(storeGet(FALLBACK_STORE_AT), 10);
         var last = Math.max(stallState.lastReloadAt, isNaN(stamp) ? 0 : stamp);
         var wait = last + FALLBACK_RELOAD_GAP_MS - Date.now();
@@ -2081,6 +2436,9 @@
         stallState.armed = false;
         stallState.phase = 0;
         stallState.skipNudge = false;
+        // 记住撤防时刻：巡检据此退避（见 STALL_REARM_COOLDOWN_MS），
+        // 否则"布防→3s 判定恢复→立刻再布防"会每 4 秒刷一轮日志。
+        stallState.lastCancelAt = Date.now();
         if (stallState.gaveUp) {
             diag('info', '卡死看门狗解除放弃态: ' + reason);
         }
@@ -2103,7 +2461,8 @@
             if (!at || Date.now() - at < CONVERSATION_STALE_MS) {
                 return;
             }
-            if (!stallState.armed) {
+            if (!stallState.armed &&
+                Date.now() - stallState.lastCancelAt > STALL_REARM_COOLDOWN_MS) {
                 stallArm('前台对话流连续 ' + Math.round((Date.now() - at) / 1000) + 's 无新动态', false);
             }
         } catch (e) {
@@ -2112,6 +2471,11 @@
     }
 
     function startConversationStreamMonitor() {
+        // 同上：被动旁观关掉时，这个 1s 一跳的卡死巡检也一并停掉（它本来就是围着
+        // 逐帧观测与看门狗转的）。
+        if (config().passiveObserve === false) {
+            return;
+        }
         if (G.__zcodeShellConversationMonitor) return;
         G.__zcodeShellConversationMonitor = setInterval(conversationStreamStallTick, 1000);
     }
@@ -2285,6 +2649,18 @@
             if (cmd === 'degrade_test') {
                 return relayDegradeTest();
             }
+            if (cmd === 'deadlink_test') {
+                // 回前台死链兜底的真机测试点：真机没法为了测它去后台待 7 分钟，
+                // 所以把"链路观测静默"这件事直接伪造出来（把 lastInboundAt 拨旧
+                // 120s），再走一次回前台判定。判据：健康链路上应当**不重载**
+                // （观察窗内会有帧进来），死链+对话 0 行时应当重载一次。
+                var before = liveness.lastInboundAt;
+                liveness.lastInboundAt = Date.now() - 120000;
+                diag('warn', '诊断指令：伪造链路静默 120s（原 lastInboundAt=' + before +
+                    '），走一次回前台判定');
+                G.__zcodeShellSetAppForeground(true);
+                return true;
+            }
             diag('warn', '未知诊断指令: ' + cmd);
             return false;
         } catch (e) {
@@ -2327,21 +2703,42 @@
         // one is rebuilt now rather than waiting for the stale branch.
         var silence = liveness.lastInboundAt ? Date.now() - liveness.lastInboundAt : -1;
         if (silence < 0 || silence > RESUME_DEAD_LINK_MS) {
+            if (SHELL_READ_ONLY) {
+                // 这里曾经是"回前台先把静默的 socket 拆了重建"（20:53:04 的现场）。
+                // 代价是每一次回前台都逼页面重连一次；而页面自己有陈旧看门狗
+                // （i4t.reconnectAfterStaleWaiting + 退避梯子），判得比我们准。
+                diag('warn', '回前台：链路观测静默' +
+                    (silence < 0 ? '（本轮从未收到帧）' : ' ' + Math.round(silence / 1000) + 's') +
+                    '，只读壳不拆线；交给 healDeadLinkOnResume 判"页面是否真的没恢复"');
+                healDeadLinkOnResume(silence);
+                reportPageState();
+                return;
+            }
             forceReconnect(silence < 0 ?
                 '回前台且从未收到帧' :
                 '回前台时已静默 ' + Math.round(silence / 1000) + 's');
             reportPageState();
             return;
         }
+        // 只读壳：不写、**也不假装收到过 ack**。原先这里把 lastPairAckAt 拨到现在，
+        // 等于用一个没发生的 ack 去掩盖真实的陈旧——那是自欺，观测层最不该做的事。
+        // 链路活不活，接下来 10s 内页面自己的心跳会给答案。
+        if (SHELL_READ_ONLY) {
+            staleTicks = 0;
+            diag('info', '回前台：链路观测正常（静默 ' + Math.round(silence / 1000) +
+                's），只读壳不介入');
+            reportPageState();
+            return;
+        }
         lastPairAckAt = Date.now();
         staleTicks = 0;
-        injectPayload({
+        // 同上：控制帧必须顶层 type，不能包成 data 载荷（否则永远拿不到 ack）。
+        sendControlFrame({
             type: 'pair_status_query',
             device_sid: deviceSid,
             client_ts: Date.now()
-        }, true);
-        reportPageState();
-    };
+        });
+        reportPageState();    };
 
     /**
      * Re-reports the page's visual state. Called on every return to the
@@ -2365,6 +2762,37 @@
      * displayed at, which shows up as content sitting off-centre relative to
      * the scrollbar.
      */
+    /**
+     * 滚动条到底占了多少宽——"14px 有没有真的还回来"的**唯一硬判据**。
+     *
+     * 根文档量不出来：2026-09-15 真机基线是 `innerWidth == clientWidth == 363`
+     * （dpr 3.5 下的 1272），根滚动条并不占位。占位的是页面自己那个内部滚动容器
+     * （`[data-v4-timeline-scroll]`，class 里还带着 Tailwind 的
+     * `[scrollbar-gutter:stable]`）——README 里"内容盒 1222 / 屏幕 1272"讲的就是它。
+     *
+     * 所以量它的 `offsetWidth - clientWidth`：归零前应为 **14**（正是网页自己的
+     * `::-webkit-scrollbar{width:14px}`），归零后应为 **0**，同时它的宽度应从
+     * 349 回到 363。这三个数字一出来，滚动条这件事就不必再靠截图争论。
+     */
+    function scrollbarReport() {
+        try {
+            var nodes = document.querySelectorAll('[data-v4-timeline-scroll]');
+            if (!nodes || nodes.length === 0) {
+                return ' 时间线=未找到';
+            }
+            var out = '';
+            for (var i = 0; i < nodes.length && i < 2; i += 1) {
+                var el = nodes[i];
+                out += ' 时间线' + i + '=offsetW' + el.offsetWidth +
+                    '/clientW' + el.clientWidth +
+                    '/(滚动条占宽' + (el.offsetWidth - el.clientWidth) + ')';
+            }
+            return out;
+        } catch (e) {
+            return ' 时间线=测量失败';
+        }
+    }
+
     function reportViewport() {
         // Wrapped because it runs from a timer: by the time it fires the
         // document may be going away, and an exception here would escape into
@@ -2379,7 +2807,8 @@
                     ' clientWidth=' + (doc.clientWidth || 0) +
                     ' scrollWidth=' + (doc.scrollWidth || 0) +
                     ' dpr=' + (window.devicePixelRatio || 0) +
-                    ' scale=' + (vv ? Math.round(vv.scale * 100) / 100 : 'n/a')
+                    ' scale=' + (vv ? Math.round(vv.scale * 100) / 100 : 'n/a') +
+                    scrollbarReport()
             });
         } catch (e) {
             // page torn down; nothing to report
@@ -2655,8 +3084,22 @@
     // docs/05 @2259500）。当前 WebView 在条宽归零后会把预留槽一起收掉（2026-09-12
     // 真机确认输入框已回正），这条规则是防页面改版/引擎升级把预留带回来的保险，
     // 今天是 no-op。
-    var SCROLLBAR_CSS = '::-webkit-scrollbar{width:0!important;height:0!important}' +
-        '[data-v4-timeline-scroll]{scrollbar-gutter:auto!important}';
+    // 这一条与网页作者自己的内嵌方案是同一套写法：他们的 bundle 里有个函数
+    // （快照 @1422852，`zcode-coding-plan-hide-scrollbar`）在把页面塞进 WebView
+    // 时注入的正是 `html, body, * { scrollbar-width: none !important; }` +
+    // `html::-webkit-scrollbar, body::-webkit-scrollbar, *::-webkit-scrollbar
+    //  { display: none !important; width: 0 !important; height: 0 !important; }`。
+    // 归零 + gutter 保险，一次写在同一条规则里。
+    //
+    // gutter 那条原来只针对 `[data-v4-timeline-scroll]`（页面把 Tailwind 的
+    // `[scrollbar-gutter:stable]` 挂在主聊天容器上）。现在改成全局：我们既然把
+    // **所有**滚动条都归零了，那么**任何**地方再预留槽位都是错的（设置页的几个
+    // 面板也挂了同一个工具类）。2026-09-15 真机基线：根文档并不占位
+    // （innerWidth == clientWidth == 363 CSS px），占位的是这些内部容器。
+    var SCROLLBAR_CSS =
+        'html,body,*{scrollbar-width:none!important;scrollbar-gutter:auto!important}' +
+        'html::-webkit-scrollbar,body::-webkit-scrollbar,*::-webkit-scrollbar' +
+        '{display:none!important;width:0!important;height:0!important}';
 
     function installScrollbarWidth() {
         try {
@@ -2675,22 +3118,34 @@
         }
     }
 
-    // The page's own thumb numbers, reused so the overlay is indistinguishable
-    // from it: a 14px rail whose thumb is inset 3px per side (border:3px solid
-    // transparent + background-clip:padding-box), rounded, and at least 32px.
-    var BAR_INSET = 3;
-    var BAR_WIDTH = 8;
-    var BAR_MIN = 32;
+    // 网页自己那条滚动条，按它自己的宣言逐字复刻成悬浮版。下面每个数字、每条
+    // 声明都来自页面的样式表（快照 index-BMndL2ru.css @368578）：
+    //
+    //   ::-webkit-scrollbar{width:14px;height:14px}              <- 轨道（rail）
+    //   ::-webkit-scrollbar-track{background:0 0}                <- 轨道透明
+    //   ::-webkit-scrollbar-thumb{background:var(--color-border);
+    //     background-clip:padding-box;border:3px solid #0000;
+    //     border-radius:9999px;min-width:32px;min-height:32px}   <- 滑块
+    //
+    // 并且这几个值在运行时**从页面自己的样式表里读回来**（[readPageBarSpec]），
+    // 所以这个悬浮条不可能与它顶替的那条走样：页面改了滚动条样式，这里自动跟。
+    // 盒模型也是逐字复刻的——轨道里放一个 border-box 的滑块，用页面自己那条
+    //透明边框内缩——因此滑块出现的位置与页面自己那条完全一致，两端各内缩 3px。
+    var BAR_FALLBACK = {rail: 14, inset: 3, radius: '9999px', min: 32};
     var BAR_FADE_MS = 700;
     var BAR_COLOR_FALLBACK = 'rgba(128,128,128,0.5)';
     var BAR_Z = 2147483647;
 
+    var barSpec = null;
     var barEl = null;
+    var barThumb = null;
     var barTarget = null;
     var barRect = null;
     var barFrame = 0;
     var barHideTimer = 0;
     var barLive = false;
+    // 滚动条几何诊断的节流时间戳（滚动期间最多 2s 一条日志）。
+    var barDiagAt = 0;
     // Scrollers the page deliberately keeps bar-less; verdicts are cached per
     // element so the check runs at most once per scroller.
     var barSkipped = typeof WeakSet === 'function' ? new WeakSet() : null;
@@ -2702,10 +3157,82 @@
         return setTimeout(fn, 16);
     }
 
+    /** px 数值；非像素长度（空串、auto、变量）一律当 0，即"这条声明不算数"。 */
+    function pxOf(value) {
+        var n = parseFloat(value);
+        return isFinite(n) && n > 0 ? n : 0;
+    }
+
+    /**
+     * 把页面自己的 ::-webkit-scrollbar / -thumb 规则读一遍（只读一次）。
+     * 快照是 /remote/v4 下的同源样式表，cssRules 可读；读不到的（跨源表）保留
+     * 兜底值。0 宽/0 高的规则（页面自己的 scrollbar-hide、xterm 视口，以及**我们
+     * 自己注入的归零规则**）都因为 pxOf 返回 0 而被跳过，不会污染这份规格。
+     */
+    function readPageBarSpec() {
+        if (barSpec) {
+            return barSpec;
+        }
+        var spec = {
+            rail: BAR_FALLBACK.rail,
+            inset: BAR_FALLBACK.inset,
+            radius: BAR_FALLBACK.radius,
+            min: BAR_FALLBACK.min,
+        };
+        barSpec = spec;
+        try {
+            var sheets = document.styleSheets || [];
+            for (var i = 0; i < sheets.length; i++) {
+                var rules = null;
+                try {
+                    rules = sheets[i].cssRules;
+                } catch (e) {
+                    continue; // 读不了的样式表；用兜底值
+                }
+                if (!rules) {
+                    continue;
+                }
+                for (var j = 0; j < rules.length; j++) {
+                    var rule = rules[j];
+                    var sel = rule.selectorText;
+                    if (!sel || sel.indexOf('::-webkit-scrollbar') < 0) {
+                        continue;
+                    }
+                    var css = rule.style;
+                    if (!css) {
+                        continue;
+                    }
+                    if (sel.indexOf('-thumb') >= 0) {
+                        var bw = pxOf(css.borderTopWidth) || pxOf(css.borderWidth);
+                        if (bw) {
+                            spec.inset = bw;
+                        }
+                        if (css.borderRadius) {
+                            spec.radius = css.borderRadius;
+                        }
+                        var mh = pxOf(css.minHeight);
+                        if (mh) {
+                            spec.min = mh;
+                        }
+                    } else if (sel.indexOf('-track') < 0 && sel.indexOf('-corner') < 0) {
+                        var w = pxOf(css.width);
+                        if (w) {
+                            spec.rail = w;
+                        }
+                    }
+                }
+            }
+        } catch (e) {
+            // 用兜底值；形状仍是页面那条的形状
+        }
+        return spec;
+    }
+
     function barElement() {
         if (barEl) {
             return barEl;
         }
+        var spec = readPageBarSpec();
         var el = document.createElement('div');
         el.setAttribute('data-zcode-shell', 'scrollbar');
         var s = el.style;
@@ -2714,47 +3241,101 @@
         s.position = 'fixed';
         s.left = '0px';
         s.top = '0px';
-        s.width = BAR_WIDTH + 'px';
-        s.borderRadius = '9999px';
+        s.width = spec.rail + 'px';
+        // -track{background:0 0}：页面的轨道是透明的，所以轨道什么都不画，
+        // 屏幕上只有滑块本体。
+        s.background = 'transparent';
         s.opacity = '0';
         s.pointerEvents = 'none';
         s.zIndex = String(BAR_Z);
         s.transition = 'opacity 160ms linear';
         s.willChange = 'transform, opacity';
+
+        // 滑块**宽度直接用 inset 算出来**（rail - 2*inset，即页面那条 14px 轨道里
+        // 可见的 8px 药丸），不走 `border:3px solid transparent` +
+        // `background-clip:padding-box` 那套。
+        //
+        // 为什么弃用那套（虽然它与页面的写法逐字一致）：2026-09-15 真机上它没能生效，
+        // 滑块撑满了整条 14px 轨道——视觉上"粗了一倍"，用户当场指出。14px × dpr 3.5
+        // = 49 物理像素，那确实粗得离谱。几何用常量算出来就没有这个失败模式，而且
+        // 渲染结果与页面那条**逐像素一致**：8 CSS px 可见宽，距右缘、上下各 3px。
+        var thumb = document.createElement('div');
+        var t = thumb.style;
+        t.position = 'absolute';
+        t.left = spec.inset + 'px';
+        t.right = spec.inset + 'px';
+        t.top = '0px';
+        t.boxSizing = 'border-box';
+        t.borderRadius = spec.radius;
         // The page's colour token, read from the scroller at paint time: it is
         // defined on the page's theme wrapper, so it follows light/dark for
         // free and nothing here has to know either value.
-        s.background = BAR_COLOR_FALLBACK;
+        t.background = BAR_COLOR_FALLBACK;
+        el.appendChild(thumb);
+
         (document.body || document.documentElement).appendChild(el);
         barEl = el;
+        barThumb = thumb;
         return el;
+    }
+
+    /**
+     * 滚动条几何诊断：滚动期间最多 2s 一条，把"到底多宽"变成可读数字。
+     *
+     * 这是"滑块粗不粗"唯一不靠肉眼争论的判据：容器占宽应为 0、滑块可见宽应为
+     * 8px（28 物理像素）。若哪天又变粗，这条日志会直接指出是哪一项不对。
+     */
+    function barReportGeometry(scroller, spec) {
+        var now = Date.now();
+        if (now - barDiagAt < 2000) {
+            return;
+        }
+        barDiagAt = now;
+        try {
+            var dpr = window.devicePixelRatio || 1;
+            var visible = Math.max(1, spec.rail - spec.inset * 2);
+            var rect = barThumb.getBoundingClientRect();
+            diag('info', '滚动条几何: 容器占宽=' + (scroller.offsetWidth - scroller.clientWidth) +
+                ' 容器宽=' + scroller.clientWidth +
+                ' 轨道=' + spec.rail + 'px 内缩=' + spec.inset + 'px' +
+                ' 滑块可见宽=' + visible + 'px(' + Math.round(visible * dpr) + '物理)' +
+                ' 实测滑块宽=' + (Math.round(rect.width * 10) / 10) + 'px' +
+                ' 圆角=' + spec.radius + ' 最短=' + spec.min);
+        } catch (e) {
+            // 诊断本身失败不影响任何东西
+        }
     }
 
     function barPaint(scroller) {
         var el = barElement();
+        var spec = barSpec || readPageBarSpec();
         if (!barRect) {
             barRect = scroller.getBoundingClientRect();
             try {
                 var token = G.getComputedStyle(scroller).getPropertyValue('--color-border');
                 if (token) {
-                    el.style.background = token.trim();
+                    barThumb.style.background = token.trim();
                 }
             } catch (e) {
                 // keep the fallback; the bar is still visible and correct
             }
         }
         var overflow = scroller.scrollHeight - scroller.clientHeight;
-        var track = barRect.height - BAR_INSET * 2;
-        if (overflow <= 0 || track <= BAR_MIN) {
+        // 轨道就是滚动容器自己的高（经典滚动条不额外留白）。
+        var rail = barRect.height;
+        if (overflow <= 0 || rail <= spec.min) {
             el.style.opacity = '0';
             return;
         }
-        var size = Math.max(BAR_MIN, Math.round(track * scroller.clientHeight / scroller.scrollHeight));
-        var y = barRect.top + BAR_INSET + (track - size) * (scroller.scrollTop / overflow);
-        var x = barRect.right - BAR_INSET - BAR_WIDTH;
-        el.style.height = size + 'px';
-        el.style.transform = 'translate3d(' + Math.round(x) + 'px,' + Math.round(y) + 'px,0)';
+        var size = Math.max(spec.min, Math.round(rail * scroller.clientHeight / scroller.scrollHeight));
+        var y = (rail - size) * (scroller.scrollTop / overflow);
+        var x = barRect.right - spec.rail;
+        el.style.height = rail + 'px';
+        barThumb.style.height = size + 'px';
+        el.style.transform = 'translate3d(' + Math.round(x) + 'px,' + Math.round(barRect.top) + 'px,0)';
+        barThumb.style.transform = 'translate3d(0,' + Math.round(y) + 'px,0)';
         el.style.opacity = '1';
+        barReportGeometry(scroller, spec);
     }
 
     function barOnFrame() {

@@ -44,9 +44,17 @@
     // rather than growing memory without bound)
     // -----------------------------------------------------------------------
     var MAX_MESSAGE_BYTES = 16 * 1024 * 1024;
-    var MAX_FRAGMENT_BYTES = 512 * 1024;
-    var MAX_FRAGMENTS = 64;
-    var MAX_LOGICAL_FRAGMENTS = 64;
+    // 物理分片上限 512 KiB → 1 MiB、逻辑分片 64 → 1024：与 Kotlin 侧（RelayWire）**对齐**。
+    //
+    // 为什么必须抬：对话流的 snapshot/增量是**大帧**，而 controller/* 与 sessions-index
+    // 的头是小帧。真机 2026-09-15 的入站 topic 直方图只出现
+    // `controller/workspaces` / `controller/tasks-index` / `sessions-index/…`，
+    // **从来没有 `conversation/*`**——直方图在分片重组之后，所以大帧被这道上限丢掉时
+    // 它是看不见的。Kotlin 侧早就因为同一类问题抬过一次（512 KiB→1 MiB、64→1024），
+    // JS 侧一直留着旧值。
+    var MAX_FRAGMENT_BYTES = 1024 * 1024;
+    var MAX_FRAGMENTS = 1024;
+    var MAX_LOGICAL_FRAGMENTS = 1024;
     var MAX_CONTAINER_ITEMS = 100000;
     var MAX_VALUE_BYTES = 16 * 1024 * 1024;
 
@@ -67,6 +75,76 @@
     var METHOD_SUBSCRIBE_SI = 'subscribeSessionsIndexV4';
     var METHOD_UNSUBSCRIBE_SI = 'unsubscribeSessionsIndexV4';
     var METHOD_RESYNC_SI = 'resyncSessionsIndexV4';
+
+    // 对话流（流体云卡片跟手的唯一数据源）。
+    //
+    // **顺序是语义**：`subscribeConversationV4` 必须发在 `subscribeSessionsIndexV4` 之前
+    // ——同一座桥上索引先上去之后，对话订阅永远不回包（真机 20:0x：每 36s 重试、连续
+    // 12 分钟全超时；18:35 成功那次纯属轮询线程抢到了正确顺序）。Kotlin Tier2 侧也是
+    // 同一个结论，所以这里照抄它的做法：握手之后**先订对话，再订索引**。
+    var EVENT_CONVERSATION_FRAME = 'onDynamicConversationFrame';
+    var METHOD_SUBSCRIBE_CONVERSATION = 'subscribeConversationV4';
+    /** 一次最多订几条对话：卡片只显示得下少数几张，多订只是白烧桌面端。 */
+    var CONVERSATION_MAX = 2;
+    /** 单条对话订阅的等待上限。宁可放弃，也**绝不能挡住索引订阅**（否则通知全瞎）。 */
+    var CONVERSATION_SUBSCRIBE_MS = 12000;
+
+    /**
+     * ⛔ **我们是否自己订阅对话流——默认关，别轻易打开。**
+     *
+     * 真机 2026-09-15 定案：**页面自己已经订着用户正在看的那条会话**，我们再订一份就是
+     * 重复订阅（日志里同一个 `sess_46daf1dd-…` 出现两次），并且会对它发
+     * `resyncConversationV4 {forceSnapshot:true}`。后果是**页面的接收流被挤掉**：
+     * 用户现场看到"消息发出去了、桌面端跑了三轮十秒一回复，手机端只有『工作中』+转圈，
+     * 连桌面端点了暂停也不更新"——**而全程在前台**。
+     *
+     * **对照实验**：鸿蒙版是同一个网页的纯壳、没有任何订阅，跟踪完全正常。
+     *
+     * 所以正确形态是**纯旁观**：页面的流照旧，我们从入站帧里读正文
+     * （`_trackConversationText` 已按真实帧结构修好：载荷在 `frame`、`kind` 在顶层）。
+     * 这条同 README「实现要点」13 的不变式：*页面已覆盖的工作区/会话，绝不重复开桥/订阅*。
+     */
+    var CONVERSATION_SUBSCRIBE_ENABLED = false;
+
+    // ---- 对话流的看门狗与主动重锚（照 zemote 抄；六个参数逐条对应）----
+    //
+    // 背景：**网页端不做周期性 resync/forceSnapshot**——订阅一次，靠推送 + 缺口恢复。
+    // 而桌面端的推送是稀疏、且由它自己决定的，所以一轮回复结束后页面就静在那儿不动
+    // （**前台也一样卡**）。zemote 之所以能连续稳定几分钟，靠的就是下面这套"主动要"。
+    // 出处：`E:\zemote\lib\protocol\conversation.dart:1055-1068`（看门狗）与
+    // `:943-968`（重锚请求）。
+    /** 重锚方法名。 */
+    var METHOD_RESYNC_CONVERSATION = 'resyncConversationV4';
+    /** 看门狗周期（zemote 同值：10s）。 */
+    var CONVERSATION_WATCHDOG_MS = 10000;
+    /** 静默多久算异常（zemote 同值：20s）。太短会误伤稀疏推送。 */
+    var CONVERSATION_QUIET_MS = 20000;
+    /** 两次重锚的最小间隔——本机额外加的节流：桌面端可能真的长时间不下发帧。 */
+    var CONVERSATION_RESYNC_MIN_GAP_MS = 20000;
+    /** 连续这么多次重锚都没换来帧就熔断，等帧自己回来再解除（防churn）。 */
+    var CONVERSATION_RESYNC_MAX_STRIKES = 5;
+    /** "正文最近还在涨"就视作该会话在跑（JS 侧没有 conversation store，只能这样近似）。 */
+    var CONVERSATION_ACTIVE_TEXT_MS = 120000;
+    /** 已经不动的 phase：选"订哪几条"时排到最后。 */
+    var TERMINAL_PHASES = {
+        completedSuccess: true,
+        completedInterrupted: true,
+        completedFailed: true,
+        completedError: true,
+        failed: true,
+        cancelled: true,
+        error: true
+    };
+
+    /**
+     * 每个工作区"上一轮见过的会话清单"——**必须跨 RemoteClient 实例存活**。
+     *
+     * 每次 relay 断线重连都会重建 client（`resetClient()`），而"开桥时要先订对话"这一步
+     * 只能拿上一轮的清单（那一刻没有新索引）。挂在实例上就会被重连清空，于是候选永远为空
+     * ——与当年 `pageCoverage` 丢在重连后是同一类错（真机 2026-09-15：v107 装了 55 秒
+     * 一条 `subscribed conversation` 都没有，就是因为这个）。
+     */
+    var sessionsByKeyCache = {};
 
     // Page-RPC tracing budgets (see RemoteClient.prototype._tracePageCall).
     // A page call slower than this is what "opening a task takes forever" looks
@@ -1579,6 +1657,11 @@
                 }], 45000);
             })
             .then(function () {
+                // **顺序是语义**：对话订阅必须在索引订阅之前（见常量区的注释）。
+                // 这一步失败不影响索引——它只是卡片跟手的增强。
+                return self._subscribeConversationsBeforeIndex(bridge);
+            })
+            .then(function () {
                 var args = {};
                 for (var k in bridge.scope) {
                     args[k] = bridge.scope[k];
@@ -1605,6 +1688,13 @@
                         }
                         if (state.applyWireFrame(data)) {
                             self._emitSessions(bridge.key, bridge, state, 'active');
+                            // **真正的钩子在这里**：会话清单是随快照帧异步到达的
+                            // （ack 之后），所以"刚 subscribe 完"那一刻候选还是空的。
+                            // 状态第一次就绪时补订一次对话流，每座桥只补一次。
+                            if (!bridge._convSubscribeTried && state.ready) {
+                                bridge._convSubscribeTried = true;
+                                self._subscribeConversationsBeforeIndex(bridge);
+                            }
                         }
                         if (state.needsResync) {
                             state.needsResync = false;
@@ -1613,6 +1703,13 @@
                     }
                 );
                 self._log('subscribed sessions-index for ' + bridge.key);
+                // 索引到手之后**再试一次**对话订阅：上面那次在开桥时清单还是空的（首次
+                // 连接必然如此，JS 堆刚重建），而连接现在很稳、不一定会有第二次开桥。
+                //
+                // 顺序约束（"索引先上桥之后对话订阅不回包"）是 Kotlin 侧的实测；这里做
+                // 一次低成本实测——成功就拿到流式正文，失败只会留一行
+                // `subscribe conversation failed`，绝不挡住任何东西。
+                self._subscribeConversationsBeforeIndex(bridge);
                 return {
                     key: bridge.key,
                     scope: bridge.scope,
@@ -1660,6 +1757,10 @@
     };
 
     RemoteClient.prototype._emitSessions = function (key, bridge, state, source) {
+        var list = state.list();
+        // 留住这份清单（**模块级**，跨 client 重建存活）：开桥时"对话订阅必须先于
+        // 索引订阅"，而那一刻唯一能用的"在跑会话"就是上一轮拿到的这份。
+        sessionsByKeyCache[key] = list;
         if (!this.onSessions) {
             return;
         }
@@ -1670,8 +1771,324 @@
             workspacePath: scope.workspacePath || '',
             workspaceIdentity: scope.workspaceIdentity || '',
             source: source,
-            sessions: state.list()
+            sessions: list
         });
+    };
+
+    /**
+     * 挑出该工作区"值得订对话流"的会话：在跑的优先，其次最近活动的。
+     *
+     * 注意 `phase` 是**持久态**（轮次边界才变），所以它只能当粗筛；真正的"此刻在跑"
+     * 在 controller 流的 liveStatus 里，JS 侧拿不到。有 `hasBackgroundWork` 的一律
+     * 当作活的——那是页面自己标出来的。
+     */
+    RemoteClient.prototype._conversationCandidates = function (key) {
+        var out = [];
+        var push = function (id) {
+            if (id && out.indexOf(id) < 0 && out.length < CONVERSATION_MAX) {
+                out.push(id);
+            }
+        };
+        // 1) **原生给的种子最优先**：它是权威的"在跑"（原生 TaskStore），而且活过页面
+        //    重载。开桥那一刻本轮的会话清单还没到——快照帧是索引订阅 ack 之后才来的，
+        //    所以只有它一定有东西（真机 2026-09-15：只靠 JS 侧缓存时这里恒为 0）。
+        //    优先**现问**（provider），因为 TaskStore 是随索引帧长起来的，创建 client
+        //    时的快照在刚重装/重启后必然为空。
+        var seedMap = this.nativeRunningSessions || {};
+        if (typeof this.nativeRunningSessionsProvider === 'function') {
+            try {
+                var live = this.nativeRunningSessionsProvider();
+                if (live && typeof live === 'object') {
+                    seedMap = live;
+                }
+            } catch (e) {
+                // 退回创建时的快照
+            }
+        }
+        var seed = seedMap[key] || [];
+        for (var s = 0; s < seed.length; s += 1) {
+            push(seed[s]);
+        }
+        // 2) JS 侧上一轮的索引缓存（模块级、跨 resetClient 存活）兜底。
+        var list = sessionsByKeyCache[key] || [];
+        var live = [];
+        var rest = [];
+        for (var i = 0; i < list.length; i += 1) {
+            var item = list[i];
+            if (!item || !item.sessionId) {
+                continue;
+            }
+            if (item.hasBackgroundWork || !TERMINAL_PHASES[String(item.phase)]) {
+                live.push(item);
+            } else {
+                rest.push(item);
+            }
+        }
+        var byRecency = function (a, b) {
+            return (b.lastActivityAt || 0) - (a.lastActivityAt || 0);
+        };
+        live.sort(byRecency);
+        rest.sort(byRecency);
+        for (var j = 0; j < live.length; j += 1) {
+            push(live[j].sessionId);
+        }
+        for (var k = 0; k < rest.length; k += 1) {
+            push(rest[k].sessionId);
+        }
+        return out;
+    };
+
+    /**
+     * 订该工作区在跑会话的对话流（握手之后、索引订阅之前调用）。
+     *
+     * 失败一律咽掉：它只是"卡片跟手"的增强，**绝不能挡住索引订阅**——索引一断，
+     * 通知就全瞎了。所以每条都带超时，整体再包一层 catch。
+     */
+    RemoteClient.prototype._subscribeConversationsBeforeIndex = function (bridge) {
+        // ⛔ **默认关闭（2026-09-15 真机定案，勿轻易打开）**
+        //
+        // 这一段是"重复订阅"：**页面自己已经订着当前会话**，我们又给同一个 sessionId 开
+        // 了一份（日志里同一个 `sess_46daf1dd-…` 出现两次：一次是页面
+        // `v4 conversation subscription activated`，一次是我们的
+        // `subscribed conversation for sess_46daf1dd-…`），并且从 v122 起还每 20s 对它发
+        // `resyncConversationV4 {forceSnapshot:true}`。
+        //
+        // 后果（用户 2026-09-15 现场报告）：消息发出去了、桌面端跑了三轮十秒一回复，
+        // 手机端**只有"工作中"+转圈、内容全程不更新，连桌面端点了暂停也不更新**——
+        // 页面的接收流被我们的重复订阅挤掉了。
+        // **对照实验最有说服力**：鸿蒙版是同一个网页的纯壳、没有任何订阅，它跟踪完全正常。
+        //
+        // 这恰好违反本项目自己反复得出的不变式：**页面已覆盖的工作区/会话，绝不重复
+        // 开桥/订阅**（README「实现要点」13）。所以这里回到"纯旁观"形态：
+        // 页面的流照旧，我们从入站帧里读正文（`_trackConversationText`，已按真实帧结构修好）。
+        if (!CONVERSATION_SUBSCRIBE_ENABLED) {
+            return Promise.resolve();
+        }
+        var ids = this._conversationCandidates(bridge.key);
+        // 候选数一律记一行：为 0 时这条路径是静默的，而"为什么没订上"正是
+        // 2026-09-15 那轮排查里唯一看不见的东西。
+        this._log('对话流候选 ' + bridge.key + '：' + ids.length + ' 条' +
+            (ids.length ? '（' + ids.join(', ') + '）' : ''));
+        if (ids.length === 0) {
+            return Promise.resolve();
+        }
+        var jobs = [];
+        for (var i = 0; i < ids.length; i += 1) {
+            jobs.push(this._subscribeOneConversation(bridge, ids[i]));
+        }
+        return Promise.all(jobs).catch(function () {});
+    };
+
+    RemoteClient.prototype._subscribeOneConversation = function (bridge, sessionId) {
+        var self = this;
+        var args = {};
+        for (var k in bridge.scope) {
+            args[k] = bridge.scope[k];
+        }
+        args.sessionId = sessionId;
+        return bridge.channels
+            .call(CHANNEL_CONVERSATION, METHOD_SUBSCRIBE_CONVERSATION, [args], CONVERSATION_SUBSCRIBE_MS)
+            .then(function (result) {
+                var ack = result && result.ack ? result.ack : null;
+                var subId = ack && ack.subscriptionId ? ack.subscriptionId : null;
+                if (!subId) {
+                    throw new Error('subscribeConversationV4: no ack.subscriptionId');
+                }
+                if (!self._convSubs) {
+                    self._convSubs = {};
+                }
+                var sub = {
+                    key: bridge.key,
+                    sessionId: sessionId,
+                    bridge: bridge,
+                    subscriptionId: subId,
+                    logEpoch: null,
+                    seq: 0,
+                    lastFrameAt: Date.now(),
+                    lastTextAt: 0,
+                    lastResyncAt: 0,
+                    resyncCount: 0,
+                    resyncing: false
+                };
+                self._convSubs[sessionId] = sub;
+                bridge.channels.addEventListener(
+                    CHANNEL_CONVERSATION,
+                    EVENT_CONVERSATION_FRAME,
+                    bridge.scope,
+                    function (data) {
+                        if (!data || typeof data !== 'object' || !data.topic) {
+                            return;
+                        }
+                        if (String(data.topic).indexOf('conversation/') !== 0) {
+                            return;
+                        }
+                        self._acceptConversationFrame(sub, data);
+                    }
+                );
+                self._startConversationWatchdog();
+                self._log('subscribed conversation for ' + sessionId +
+                    ' (sub ' + subId + ')');
+            })
+            .catch(function (err) {
+                self._log('subscribe conversation failed for ' + sessionId + ': ' + err);
+            });
+    };
+
+    /**
+     * 收一条对话逻辑帧：**先按 subscriptionId 过滤**，再记位点、判缺口、最后提取正文。
+     *
+     * 逐条对应 zemote 的 `SubscriptionBase._acceptLogicalFrame`
+     * （`E:\zemote\lib\protocol\conversation.dart:1048-1053`）：
+     *   * `frame['subscriptionId'] != subId` → 直接丢（两条会话同时订阅时，帧落在同一个
+     *     事件通道上，不按 id 过滤就会串味）；
+     *   * 收到帧就刷新 `_lastFrameAt`（看门狗据此算静默时长）；
+     *   * 缺口交给 state 层判（zemote 是 `applyFrame(frame, onGap: _resync)`）。
+     */
+    RemoteClient.prototype._acceptConversationFrame = function (sub, data) {
+        if (!sub || sub.disposed) {
+            return;
+        }
+        if (data.subscriptionId && String(data.subscriptionId) !== String(sub.subscriptionId)) {
+            return;
+        }
+        sub.lastFrameAt = Date.now();
+        // 位点：真实帧结构里 `frame` 才是载荷（见 _trackConversationText 顶部注释），
+        // 所以 fromSeq/toSeq/logEpoch 依次在 **frame → payload → 顶层** 三处找。
+        var body = data.frame && typeof data.frame === 'object' ? data.frame :
+            (data.payload && typeof data.payload === 'object' ? data.payload : data);
+        var from = typeof data.fromSeq === 'number' ? data.fromSeq :
+            (typeof body.fromSeq === 'number' ? body.fromSeq : null);
+        var to = typeof data.toSeq === 'number' ? data.toSeq :
+            (typeof body.toSeq === 'number' ? body.toSeq : null);
+        if (typeof body.logEpoch === 'string') {
+            sub.logEpoch = body.logEpoch;
+        } else if (typeof data.logEpoch === 'string') {
+            sub.logEpoch = data.logEpoch;
+        }
+        // 缺口：跳号立刻重锚，不等看门狗（zemote 的 onGap 是同一个意思）。
+        if (from !== null && sub.seq > 0 && from > sub.seq + 1) {
+            this._resyncConversation(sub, '缺口 fromSeq=' + from + ' > seq=' + sub.seq);
+        }
+        if (to !== null) {
+            sub.seq = to;
+        }
+        var before = this._convText && this._convText[data.topic] ?
+            this._convText[data.topic].text : '';
+        this._trackConversationText(data);
+        var after = this._convText && this._convText[data.topic] ?
+            this._convText[data.topic].text : '';
+        if (after && after !== before) {
+            sub.lastTextAt = Date.now();
+            sub.resyncCount = 0;   // 重锚真的换来了新正文 → 解除熔断计数
+        }
+    };
+
+    /**
+     * 对话流看门狗：**这是"网页前台也会卡、zemote 却连续稳定"的那条分水岭。**
+     *
+     * zemote 每 10s 一跳，静默 ≥20s 且会话**确实在跑**时，主动发
+     * `resyncConversationV4 {forceSnapshot:true, base:{logEpoch,seq}}` —— 它不是等推送，
+     * 是明着要一份完整快照。网页端没有这套，所以桌面端一安静，页面就停在那儿。
+     *
+     * 与 zemote 的两点**有意差异**（都是本机真机教训）：
+     *   ① 加**节流 + 熔断**：这里没有 zemote 那台 conversation store 能精确判"在跑"，
+     *      而桌面端可能真的长时间不下发——无脑重锚会变成 churn；
+     *   ② "在跑"用两个近似判据（正文最近还在涨 / 会话索引里非终态或有后台工作）。
+     */
+    RemoteClient.prototype._startConversationWatchdog = function () {
+        var self = this;
+        if (this._convWatchdog) {
+            return;
+        }
+        this._convWatchdog = setInterval(function () {
+            try {
+                self._conversationWatchdogTick();
+            } catch (e) {
+                // 看门狗自身绝不影响页面
+            }
+        }, CONVERSATION_WATCHDOG_MS);
+    };
+
+    RemoteClient.prototype._conversationWatchdogTick = function () {
+        if (!this._convSubs) {
+            return;
+        }
+        var now = Date.now();
+        for (var sessionId in this._convSubs) {
+            var sub = this._convSubs[sessionId];
+            if (!sub || sub.disposed) {
+                continue;
+            }
+            if (now - sub.lastFrameAt < CONVERSATION_QUIET_MS) {
+                continue;
+            }
+            if (sub.resyncCount >= CONVERSATION_RESYNC_MAX_STRIKES) {
+                continue;
+            }
+            if (now - sub.lastResyncAt < CONVERSATION_RESYNC_MIN_GAP_MS) {
+                continue;
+            }
+            if (!this._conversationLooksActive(sub)) {
+                continue;
+            }
+            this._resyncConversation(sub,
+                '静默 ' + Math.round((now - sub.lastFrameAt) / 1000) + 's');
+        }
+    };
+
+    /** "这条会话确实在跑吗"——JS 侧没有 conversation store，用两个近似判据。 */
+    RemoteClient.prototype._conversationLooksActive = function (sub) {
+        var now = Date.now();
+        if (sub.lastTextAt && now - sub.lastTextAt < CONVERSATION_ACTIVE_TEXT_MS) {
+            return true;
+        }
+        var list = sessionsByKeyCache[sub.key] || [];
+        for (var i = 0; i < list.length; i += 1) {
+            var session = list[i];
+            if (session && session.sessionId === sub.sessionId) {
+                return session.hasBackgroundWork === true ||
+                    !TERMINAL_PHASES[String(session.phase)];
+            }
+        }
+        return false;
+    };
+
+    /**
+     * 主动重锚：要一份**完整快照**（`forceSnapshot: true`）。
+     *
+     * ⚠️ `base` 是**必填可空**：无基线时要显式传 `null`，省略整个字段会被桌面端的 zod
+     * 拒收（`expected object, received undefined`）——README 记过的真机定案。
+     * 幂等：同一条订阅上并发只跑一次（zemote 的 `_resyncing` 同款）。
+     */
+    RemoteClient.prototype._resyncConversation = function (sub, reason) {
+        var self = this;
+        if (!sub || sub.disposed || sub.resyncing) {
+            return;
+        }
+        sub.resyncing = true;
+        sub.lastResyncAt = Date.now();
+        sub.resyncCount += 1;
+        var args = {};
+        for (var k in sub.bridge.scope) {
+            args[k] = sub.bridge.scope[k];
+        }
+        args.subscriptionId = sub.subscriptionId;
+        args.forceSnapshot = true;
+        args.base = sub.logEpoch ? {
+            logEpoch: sub.logEpoch,
+            seq: sub.seq
+        } : null;
+        this._log('对话重锚 ' + sub.sessionId + '（' + reason + '，第 ' + sub.resyncCount +
+            ' 次，base=' + (sub.logEpoch ? sub.logEpoch + '/' + sub.seq : 'null') + '）');
+        var done = function () {
+            sub.resyncing = false;
+        };
+        sub.bridge.channels
+            .call(CHANNEL_CONVERSATION, METHOD_RESYNC_CONVERSATION, [args], CONVERSATION_SUBSCRIBE_MS)
+            .then(done, function (err) {
+                self._log('对话重锚失败 ' + sub.sessionId + ': ' + err);
+                done();
+            });
     };
 
     // ------------------------------------------------------------------ active
@@ -2111,8 +2528,10 @@
 
     RemoteClient.prototype._observeInboundRpc = function (payload) {
         if (this._bridgesById[payload.bridgeSessionId]) {
+            this._obsOurs = (this._obsOurs || 0) + 1;
             return;
         }
+        this._obsIn = (this._obsIn || 0) + 1;
         // 页面桥的入站流量戳（任何 rpc-frame 都算）：「对话内容是否真的在下发」
         // 的协议层信号——DOM 层看不出内容缺失（标题/输入框都正常），流量看得出。
         // inject.js 的 10s 内容检查用（见 §5b）。
@@ -2136,6 +2555,27 @@
         if (header[0] === RES_EVENT_FIRE && data && typeof data === 'object' &&
             typeof data.topic === 'string' && data.topic.indexOf('conversation/') === 0) {
             this._pageConversationTrafficAt = Date.now();
+            this._trackConversationText(data);
+        }
+        // 入站 topic 直方图：每个新 topic 打一行（最多 8 种）。
+        // 为什么要有它：真机 2026-09-15 出现"对话订阅 8 次全部 ack 成功、对话帧却是 0"，
+        // 而页面自己那条订阅同期**拿到了 snapshot**——所以帧一定在发，问题在"我这条观测
+        // 通路有没有见到它"。这行日志就是回答这个问题的唯一手段（topic 长什么样、
+        // 页面桥的帧到底进没进来）。
+        if (header[0] === RES_EVENT_FIRE && data && typeof data === 'object' &&
+            typeof data.topic === 'string') {
+            if (!this._obsTopics) {
+                this._obsTopics = {};
+            }
+            if (this._obsTopics[data.topic] === undefined) {
+                var kinds = Object.keys(this._obsTopics).length;
+                this._obsTopics[data.topic] = 0;
+                if (kinds < 8) {
+                    this._log('入站 topic 首次出现(' + (kinds + 1) + ')：' + data.topic +
+                        ' payload.kind=' + (data.payload && data.payload.kind ? data.payload.kind : '-'));
+                }
+            }
+            this._obsTopics[data.topic] += 1;
         }
         if (header[0] === RES_PROMISE_SUCCESS || header[0] === RES_PROMISE_ERROR ||
             header[0] === RES_PROMISE_ERROR_OBJ) {
@@ -2163,6 +2603,184 @@
                 scope: entry.scope
             }, entry.state, 'passive');
         }
+    };
+
+    /**
+     * 从**网页自己那条**对话订阅流里取"最新一段 AI 正文"。
+     *
+     * 为什么需要它：会话索引里的 `lastAssistantPreview` **只在轮次边界变**，流式输出
+     * 期间卡片是死的（真机 2026-09-15：帧一直在来，正文却停在某一刻不动）。而网页自己
+     * 对"用户正在看的那条会话"是订阅着的，那些帧就走**同一条 socket**、我们本来就看得见
+     * ——此前只给它打了个流量时间戳（见上）。于是不必开第二条连接、不会触发单控制端
+     * 互斥（KICKED），也能拿到流式正文。
+     *
+     * 帧契约与 Kotlin 侧 `RelayWire` 的解码注释是同一份：
+     *   {topic, subscriptionId, fromSeq, toSeq, payload:{kind:'snapshot'|'deltas'}}
+     *   snapshot → payload.rows.window = [row…]
+     *   deltas   → payload.ops = [{op:'row.appended'|'row.upserted'|'row.delta'|…}]
+     *   row.delta 的字段 = {rowId, path:'text', append}
+     * 行里只认 `kind === 'assistantText'` 的 `text`（与 Kotlin 侧 progressHead 同口径：
+     * 工具调用 / 子代理 / reasoning 一律不上卡片）。
+     *
+     * 每个 topic 只留"最后一段"，不做整台 store——流体云要的就是这一句。
+     */
+    RemoteClient.prototype._trackConversationText = function (data) {
+        if (!this._convText) {
+            this._convText = {};
+        }
+        this._convFrames = (this._convFrames || 0) + 1;
+        // **真实结构（2026-09-15 真机打出来，三层，不要再猜）**：
+        //   data  = { wireVersion, kind:'complete', deliveryKind, logicalFrameId,
+        //             logicalFrameOrdinal, topic, subscriptionId, frame }
+        //   frame = { topic, subscriptionId, sentAt, fromSeq, toSeq, payload }
+        //   frame.payload = { kind:'snapshot'|'deltas', rows:{window:[…]} / ops:[…], logEpoch … }
+        //
+        // 两个曾经踩空的点：① 内容体在 **frame.payload**，不是 data.payload；
+        // ② `data.kind` 是**投递**类别（'complete'），**不是** snapshot/deltas——所以下面
+        // 判分支只看 `rows`/`ops` 是否存在，不再依赖那个字符串。
+        var frame = data.frame && typeof data.frame === 'object' ? data.frame : null;
+        var inner = frame && frame.payload && typeof frame.payload === 'object' ? frame.payload : null;
+        var body = inner ||
+            (data.payload && typeof data.payload === 'object' ? data.payload : null) ||
+            frame || data;
+        if (!this._convShapeSeen) {
+            this._convShapeSeen = {};
+        }
+        if (!this._convShapeSeen[data.topic]) {
+            this._convShapeSeen[data.topic] = true;
+            var dataKeys = '-';
+            var bodyKeys = '-';
+            try {
+                dataKeys = Object.keys(data).join(',');
+            } catch (e) {
+                dataKeys = 'keys-failed';
+            }
+            try {
+                bodyKeys = body && typeof body === 'object' ?
+                    Object.keys(body).join(',') : String(body);
+            } catch (e) {
+                bodyKeys = 'keys-failed';
+            }
+            this._log('对话帧形状 ' + data.topic + '：投递kind=' + data.kind +
+                ' 内容kind=' + (body ? body.kind : '-') +
+                ' data键=[' + dataKeys + '] 内容键=[' + bodyKeys + ']');
+        }
+        if (!body || typeof body !== 'object') {
+            return;
+        }
+        var entry = this._convText[data.topic];
+        if (!entry) {
+            entry = this._convText[data.topic] = {
+                rowId: null,
+                text: ''
+            };
+        }
+        // 窗口与增量两个位置都找一遍（快照在 rows.window，增量在 ops），并且**只看
+        // 结构存在与否来判分支**——`data.kind` 是投递类别（'complete'），拿它判
+        // snapshot/deltas 会永远判错（2026-09-15 就栽在这儿）。
+        var rows = null;
+        if (body.rows && Array.isArray(body.rows.window)) {
+            rows = body.rows.window;
+        } else if (data.rows && Array.isArray(data.rows.window)) {
+            rows = data.rows.window;
+        }
+        var ops = Array.isArray(body.ops) ? body.ops :
+            (Array.isArray(data.ops) ? data.ops : null);
+        var changed = false;
+        if (rows) {
+            for (var i = rows.length - 1; i >= 0; i -= 1) {
+                var row = rows[i];
+                if (row && row.kind === 'assistantText' &&
+                    typeof row.text === 'string' && row.text.trim().length > 0) {
+                    entry.rowId = row.rowId || null;
+                    entry.text = row.text;
+                    changed = true;
+                    break;
+                }
+            }
+        } else if (ops) {
+            for (var j = 0; j < ops.length; j += 1) {
+                var op = ops[j];
+                if (!op || typeof op !== 'object') {
+                    continue;
+                }
+                var full = op.row || op;
+                if ((op.op === 'row.appended' || op.op === 'row.upserted') &&
+                    full && full.kind === 'assistantText' && typeof full.text === 'string') {
+                    entry.rowId = full.rowId || entry.rowId;
+                    entry.text = full.text;
+                    changed = true;
+                } else if (op.op === 'row.delta' && op.path === 'text' &&
+                    typeof op.append === 'string' && op.append.length > 0) {
+                    // 只在 rowId 对得上时拼接；对不上说明错过了这一行的开头，
+                    // 那就等下一次 snapshot / upsert 把整行送回来。
+                    if (!entry.rowId || op.rowId === entry.rowId) {
+                        entry.rowId = op.rowId || entry.rowId;
+                        entry.text += op.append;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if (changed) {
+            this._convTextAt = Date.now();
+            this._convTextTopic = data.topic;
+        }
+    };
+
+    /**
+     * 当前"最新一段 AI 正文"；null 表示还没有正文可报。
+     * 只报最新那个 topic——卡片显示的是用户此刻在看的会话。
+     */
+    RemoteClient.prototype.latestConversationText = function () {
+        var topic = this._convTextTopic;
+        if (!topic || !this._convText || !this._convText[topic]) {
+            return null;
+        }
+        var entry = this._convText[topic];
+        if (!entry.text) {
+            return null;
+        }
+        return {
+            topic: topic,
+            text: entry.text,
+            rowId: entry.rowId,
+            frames: this._convFrames || 0,
+            at: this._convTextAt || 0
+        };
+    };
+
+    /**
+     * 诊断专用：**帧计数与"有没有正文"解耦**。
+     *
+     * 为什么必须分开：`latestConversationText()` 是给"上报正文"用的，没正文就返回 null，
+     * 于是 `页面开销` 那行的 `对话帧` 也跟着变成 0——**"没帧"与"有帧但没解出正文"
+     * 在日志里长得一模一样**。2026-09-15 我为此连查了几轮分片上限与候选时序，
+     * 真相却是帧一直在到（入站直方图里 `conversation/…` 出现过），只是提取器形状不匹配。
+     */
+    RemoteClient.prototype.conversationFrameStats = function () {
+        var topics = this._convShapeSeen ? Object.keys(this._convShapeSeen).length : 0;
+        var textLen = 0;
+        if (this._convTextTopic && this._convText && this._convText[this._convTextTopic]) {
+            textLen = (this._convText[this._convTextTopic].text || '').length;
+        }
+        // 订阅数与重锚数一起报：**只看"帧数"会误判**——没有订阅、或订阅了却不重锚，
+        // 都会表现为"没有帧"，而这两件事的处置完全不同（前者选会话，后者补看门狗）。
+        var subs = 0;
+        var resyncs = 0;
+        if (this._convSubs) {
+            for (var sessionId in this._convSubs) {
+                subs += 1;
+                resyncs += this._convSubs[sessionId].resyncCount || 0;
+            }
+        }
+        return {
+            frames: this._convFrames || 0,
+            topics: topics,
+            textLen: textLen,
+            subs: subs,
+            resyncs: resyncs
+        };
     };
 
     /** Reassembles the page's rpc-frames in a side table (never acks). */

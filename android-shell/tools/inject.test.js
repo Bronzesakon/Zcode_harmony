@@ -518,12 +518,19 @@ test('the close log names the real caller, not the wrapper itself', async () => 
     }
 });
 
-test('the page is told it is visible and its lifecycle listeners are suppressed', () => {
+// 2026-09-15 晚：可见性劫持停用。它挡不住 Chromium 的定时器节流（真机后台 7 分钟里
+// 页面的 10s 心跳只跳了 6 次），却把页面自救用的生命周期事件全吞了——于是页面既不
+// 知道自己去过后台，也不知道自己回来了（回前台后重订阅收不到 ack，对话 0 行，
+// 只有重启应用才恢复）。现在：不再对页面说假话。
+test('可见性劫持已停用：页面拿到真实可见性，生命周期事件照常送达', () => {
     const page = setupPage();
     try {
-        assert.strictEqual(globalThis.document.hidden, false);
-        assert.strictEqual(globalThis.document.visibilityState, 'visible');
-        assert.strictEqual(globalThis.document.hasFocus(), true);
+        assert.ok(!Object.getOwnPropertyDescriptor(globalThis.document, 'hidden'),
+            'document.hidden must not be replaced by a spoofed getter');
+        assert.ok(!Object.getOwnPropertyDescriptor(FakeDocument.prototype, 'visibilityState'),
+            'visibilityState must not be replaced by a spoofed getter');
+        assert.strictEqual(globalThis.document.hasFocus(), false,
+            'hasFocus must keep the page\'s own answer (the fake document says false)');
 
         let fired = 0;
         globalThis.document.addEventListener('visibilitychange', () => fired++);
@@ -538,7 +545,8 @@ test('the page is told it is visible and its lifecycle listeners are suppressed'
         dispatch(globalThis.document, 'visibilitychange');
         dispatch(globalThis.window, 'pagehide');
         dispatch(globalThis.window, 'blur');
-        assert.strictEqual(fired, 0, 'lifecycle events must not reach page listeners');
+        assert.strictEqual(fired, 3,
+            'the page\'s own suspend/recover listeners must receive their events again');
 
         // Ordinary element events still work.
         const input = new FakeElement('input');
@@ -552,14 +560,81 @@ test('the page is told it is visible and its lifecycle listeners are suppressed'
     }
 });
 
-test('assigning document.onvisibilitychange does not crash the page', () => {
+test('不再给 document.onvisibilitychange 装空处理器（页面可以自己挂）', () => {
     const page = setupPage();
     try {
-        globalThis.document.onvisibilitychange = () => {
-            throw new Error('must never run');
+        let called = 0;
+        const handler = () => {
+            called += 1;
         };
-        assert.strictEqual(globalThis.document.onvisibilitychange, null);
+        globalThis.document.onvisibilitychange = handler;
+        assert.strictEqual(globalThis.document.onvisibilitychange, handler,
+            'the page must keep the property it set');
+        assert.strictEqual(called, 0, 'assignment alone must not call it');
     } finally {
+        page.teardown();
+    }
+});
+
+// 回前台"死链兜底"（healDeadLinkOnResume）：只有三条判据同时成立才重载页面。
+// 这是"长后台回来重订阅收不到 ack、对话 0 行、只能重启应用"那个现场的对策。
+test('回前台死链兜底：有帧进来＝页面自己恢复了，一帧都不许重载', async () => {
+    const page = setupPage();
+    const {reloads, restore} = stubReload();
+    try {
+        const socket = new globalThis.WebSocket('wss://relay.example');
+        socket.dispatchEvent({type: 'open'});
+        socket.send(JSON.stringify({type: 'auth_init', role: 'terminal', device_sid: 'sid-1'}));
+        socket.receive({type: 'pair_status_ack', pair_status: 'matched'});
+        await wait(30);
+
+        // 退后台再回前台：此刻 lastInboundAt 还是刚才那帧 → 静默 <60s，兜底根本不启动。
+        globalThis.__zcodeShellSetAppForeground(false);
+        globalThis.__zcodeShellSetAppForeground(true);
+        // 观察窗内页面自己恢复了（来一帧）。
+        socket.receive({type: 'pair_status_ack', pair_status: 'matched'});
+        await wait(120);
+
+        assert.strictEqual(reloads.length, 0, 'a live link must never be reloaded');
+    } finally {
+        restore();
+        page.teardown();
+    }
+});
+
+test('回前台死链兜底：静默＋观察窗零帧＋对话 0 行 → 重载一次', async () => {
+    const page = setupPage();
+    const {reloads, restore} = stubReload();
+    try {
+        // 配对要先成立：回前台判定在"链路未就绪"时会提前返回（那时该由页面自己重连）。
+        const socket = new globalThis.WebSocket('wss://relay.example');
+        socket.dispatchEvent({type: 'open'});
+        socket.send(JSON.stringify({type: 'auth_init', role: 'terminal', device_sid: 'sid-1'}));
+        socket.receive({type: 'pair_status_ack', pair_status: 'matched'});
+        await wait(30);
+
+        // 体征要能读出"在对话视图里但 0 行"：这正是"重订阅没 ack"的形状。
+        const timeline = new FakeElement('div');
+        timeline.setAttribute('data-row-count', '0');
+        page.document.querySelector = (selector) => {
+            if (selector === '[data-mobile-page="chat"]') {
+                return page.document.body;
+            }
+            if (selector === '[data-v4-timeline-scroll]') {
+                return timeline;
+            }
+            return null;
+        };
+
+        // 真机没法为这一条去后台待 7 分钟，所以用诊断指令伪造"观测静默 120s"。
+        assert.strictEqual(globalThis.__zcodeShellDiag('deadlink_test'), true);
+        await wait(5400);
+
+        assert.strictEqual(reloads.length, 1, 'a dead link with an empty conversation must be rebuilt');
+        assert.ok(findPost(page.posts, 'diag', (d) =>
+            d.message.includes('回前台兜底：静默')).length === 1);
+    } finally {
+        restore();
         page.teardown();
     }
 });
@@ -889,7 +964,10 @@ test('the native pump can drive a heartbeat, and the tick is rate limited', asyn
                     return null;
                 }
             })
-            .filter((frame) => frame && frame.payload && frame.payload.type === 'pair_status_query');
+            // 控制帧是**顶层 `type`**（页面自己的客户端就是这么发的——本文件伪造页面
+            // 心跳那行用的也是顶层形状）。这里原先按 `frame.payload.type` 计数，等于
+            // 把壳的封装 bug 钉死在测试里：真机上那种帧从来没被服务端 ack 过。
+            .filter((frame) => frame && frame.type === 'pair_status_query');
         assert.strictEqual(queries.length, 1, 'a pumped tick must put exactly one pair_status_query on the wire');
         assert.strictEqual(globalThis.__zcodeShellHeartbeat(), false, 'a tick inside the gap must be dropped');
 
@@ -906,12 +984,37 @@ test('the native pump can drive a heartbeat, and the tick is rate limited', asyn
     }
 });
 
+// 只读壳的核心承诺：**前台一个字节都不往页面的连接里写**。页面自己的 10s 心跳
+// 在前台是准的（真机日志里 `页面心跳` 就是 ~1/10s），壳再插一帧只是往它正用着的
+// 连接上加噪声；而"壳不碰页面链路"正是这一版政策的全部意义。
+test('只读壳：前台心跳一帧都不写页面 socket', async () => {
+    const page = setupPage();
+    try {
+        const socket = new globalThis.WebSocket('wss://relay.example');
+        socket.dispatchEvent({type: 'open'});
+        socket.send(JSON.stringify({type: 'auth_init', role: 'terminal', device_sid: 'sid-1'}));
+        socket.receive({type: 'pair_status_ack', pair_status: 'matched'});
+        await wait(1700);
+
+        const before = socket.sent.length;
+        // 返回 true ＝ 这一跳被接受（没被 5s 间隔门吃掉），所以"没有新帧"这件事
+        // 只可能是只读门挡下的，而不是限流挡下的。
+        assert.strictEqual(globalThis.__zcodeShellHeartbeat(), true, 'the tick itself is accepted');
+        assert.strictEqual(
+            socket.sent.length, before,
+            'a foreground tick must not write anything into the page socket'
+        );
+    } finally {
+        page.teardown();
+    }
+});
+
 // The resume posture (borrowed from the reference client): the decision is made
 // on the frames that were still arriving, not on the ack clock. Closing the
 // socket is the heaviest thing this layer can do — the page's own recovery is
 // what follows it, and that costs a full re-open of workspaces and tasks — so it
 // must never happen to a link that is demonstrably alive.
-test('a foreground return with frames still arriving leaves the socket alone', async () => {
+test('只读壳：回前台对活的链路连一帧都不写（更不许拆）', async () => {
     const page = setupPage();
     try {
         const socket = new globalThis.WebSocket('wss://relay.example');
@@ -926,16 +1029,12 @@ test('a foreground return with frames still arriving leaves the socket alone', a
         await flush();
 
         assert.strictEqual(socket.readyState, FakeWebSocket.OPEN, 'a live link must not be torn down');
-        const probes = socket.sent.slice(before)
-            .map((raw) => {
-                try {
-                    return JSON.parse(raw);
-                } catch (e) {
-                    return null;
-                }
-            })
-            .filter((frame) => frame && frame.payload && frame.payload.type === 'pair_status_query');
-        assert.strictEqual(probes.length, 1, 'the resume must probe the link once');
+        assert.strictEqual(
+            socket.sent.length, before,
+            'the resume must not write into the live page socket either'
+        );
+        assert.ok(findPost(page.posts, 'diag', (d) =>
+            d.message.includes('只读壳不介入')).length === 1);
     } finally {
         page.teardown();
     }
@@ -1214,7 +1313,7 @@ test('进对话铁判准：页面日志的订阅确认也算就绪', () => {
     }
 });
 
-test('进对话恢复：5s 无详情先最小内推，仍失败才整体刷新', () => {
+test('只读壳：进对话 5s 无详情只记账，不轻推也不刷新', () => {
     const page = setupPage();
     const {reloads, restore} = stubReload();
     try {
@@ -1222,23 +1321,26 @@ test('进对话恢复：5s 无详情先最小内推，仍失败才整体刷新',
         appendComposer(page, '向 ZCode 提问…', false);
         FB().note({name: 'zcode-agent.subscribeConversationV4', args: {sessionId: 'sess_a'}});
         FB().check();
-        assert.strictEqual(reloads.length, 0, 'first deadline should try the minimum nudge');
+        assert.strictEqual(reloads.length, 0, 'the first deadline must not reload anything');
         assert.ok(findPost(page.posts, 'diag', (d) =>
             d.message.includes('先尝试最小内推')).length === 1);
+        // 真机定罪的那条链（轻推←fallbackCheck，40 秒里拆了 10 次）在只读壳下
+        // 只剩这一行日志：说明"我们本来会在这一刻动手"。
         assert.ok(findPost(page.posts, 'diag', (d) =>
-            d.message.includes('卡死轻推')).length === 1);
+            d.message.includes('只读壳：不轻推页面 socket')).length === 1);
         clearTimeout(FB().timer());
         FB().check();
-        assert.strictEqual(reloads.length, 1, 'fallback reload follows a failed nudge');
+        assert.strictEqual(reloads.length, 0, 'a read-only shell never reloads the page');
         assert.ok(findPost(page.posts, 'diag', (d) =>
-            d.message.includes('整体刷新页面')).length === 1);
+            d.message.includes('只读壳：不因')).length === 1);
+        assert.strictEqual(FB().stall().gaveUp, true, 'the deadline stops instead of escalating');
     } finally {
         restore();
         page.teardown();
     }
 });
 
-test('进对话恢复：状态 B 也先内推再保底刷新', () => {
+test('只读壳：状态 B（输入框未就绪）同样只记账不刷新', () => {
     const page = setupPage();
     const {reloads, restore} = stubReload();
     try {
@@ -1246,19 +1348,21 @@ test('进对话恢复：状态 B 也先内推再保底刷新', () => {
         appendComposer(page, null, true);
         FB().note({name: 'zcode-agent.conversationRowsRangeV4', args: {sessionId: 'sess_b'}});
         FB().check();
-        assert.strictEqual(reloads.length, 0, 'state B first tries a minimum nudge');
+        assert.strictEqual(reloads.length, 0, 'state B must not reload either');
         assert.ok(findPost(page.posts, 'diag', (d) =>
             d.message.includes('输入框未就绪')).length === 1);
         clearTimeout(FB().timer());
         FB().check();
-        assert.strictEqual(reloads.length, 1, 'state B falls back to reload after the nudge');
+        assert.strictEqual(reloads.length, 0, 'state B also stays read-only');
+        assert.ok(findPost(page.posts, 'diag', (d) =>
+            d.message.includes('只读壳：不因')).length === 1);
     } finally {
         restore();
         page.teardown();
     }
 });
 
-test('进对话铁判准：15s 间隔内不连刷；到期再刷；2 次到顶放弃；就绪即复位', () => {
+test('只读壳：进对话卡住不会重载，也不会连刷；就绪信号照样复位', () => {
     const page = setupPage();
     const {reloads, restore} = stubReload();
     try {
@@ -1266,35 +1370,21 @@ test('进对话铁判准：15s 间隔内不连刷；到期再刷；2 次到顶�
         appendComposer(page, '向 ZCode 提问…', false);
         FB().note({name: 'zcode-agent.subscribeConversationV4', args: {sessionId: 'sess_1'}});
         FB().check();
-        assert.strictEqual(reloads.length, 0, 'the first deadline nudges without reload');
+        assert.strictEqual(reloads.length, 0, 'the first deadline nudges nothing');
         assert.ok(findPost(page.posts, 'diag', (d) => d.message.includes('先尝试最小内推')).length === 1);
         clearTimeout(FB().timer());
 
-        // 内推后仍卡住：下一次检查才进入整体刷新保底
+        // 第二次判定：旧版在这里进"整体刷新保底"，只读壳到此为止。
         FB().check();
-        assert.strictEqual(reloads.length, 1, 'the failed nudge falls back to reload');
+        assert.strictEqual(reloads.length, 0, 'the read-only shell never escalates to a reload');
 
-        // 刷新后的新页面里信标重来，仍旧卡着：间隔内 → 不刷，只顺延复查
+        // 无论判定多少次，页面都不会被壳重载。
+        FB().stall().lastReloadAt = Date.now() - 16000;
         FB().note({name: 'zcode-agent.conversationRowsRangeV4', args: {sessionId: 'sess_1'}});
         FB().check();
-        assert.strictEqual(reloads.length, 1, 'within the gap there must be no second reload');
-        assert.ok(FB().timer() !== null, 'a deferred re-check must be scheduled');
-        clearTimeout(FB().timer());
+        assert.strictEqual(reloads.length, 0, 'no ladder, no reload — ever');
 
-        // 间隔到期：再判 → 第 2/2 次刷新
-        FB().stall().lastReloadAt = Date.now() - 16000;
-        FB().check();
-        assert.strictEqual(reloads.length, 2, 'after the gap the second fallback reloads');
-
-        // 第三次仍卡着：到顶 → 放弃
-        FB().stall().lastReloadAt = Date.now() - 16000;
-        FB().check();
-        assert.strictEqual(reloads.length, 2, 'the cap stops the reload loop');
-        assert.strictEqual(FB().stall().gaveUp, true, 'the deadline gives up at the cap');
-        assert.ok(findPost(page.posts, 'diag', (d) =>
-            d.message.includes('连续刷新 2 次未恢复')).length === 1);
-
-        // 就绪信号到达 → 复位，可以重新开始
+        // 就绪信号到达 → 复位，状态干净，下一轮照旧能判。
         FB().note({name: 'zcode-agent.subscribeConversationV4', args: {sessionId: 'sess_1'}});
         FB().ready('v4.conversation.store.connect.completed');
         FB().check();

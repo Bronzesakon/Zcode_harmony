@@ -234,6 +234,19 @@ class MainActivity : AppCompatActivity() {
         // not the static call the migration doc's shorthand suggested.
         webView.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false)
 
+        // 滚动条只归注入层管（见 assets/inject.js 第 7 节）：网页自己的
+        // `::-webkit-scrollbar{width:14px}` 决定了布局要留出 14px，而 Chromium 在
+        // 安卓上不画自己的合成器滚动条——官方源码注释写得很直白：
+        // `// Android WebView uses system scrollbars, so make ours invisible.`
+        // （codereview.chromium.org/2620743003）。所以那条"默认样式"的滚动条是
+        // **Android View 画的**，网页 CSS 只能决定它占多宽。
+        //
+        // 注入层负责把宽度归零（布局回正）并自绘一条与网页同款式的悬浮指示条；
+        // 这里再把 View 层那条多余的默认条关掉，否则它会压在指示条旁边一起显示。
+        // 关掉它不影响滚动本身，也不影响页面内其它滚动容器的可用性。
+        webView.isVerticalScrollBarEnabled = false
+        webView.scrollBarStyle = View.SCROLLBARS_INSIDE_OVERLAY
+
         webView.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(
                 view: WebView,
@@ -770,6 +783,26 @@ class MainActivity : AppCompatActivity() {
             "tier2_takeover" -> {
                 // 接管语义验证：配对 → 桥覆盖 → 原生解码会话事件 → 自动交还。
                 ShellRuntime.startTier2TakeoverForTest(90_000L)
+                return
+            }
+            // 被动旁观总开关（二分用）：关掉后注入层只剩"零侵入三件事"——滚动条归零 CSS、
+            // 状态页面上报、页面日志汇；不再 hook WebSocket、不逐帧观测、不发心跳探针。
+            // 两条都会重载页面，好让配置立刻生效。
+            "passive_off", "passive_on" -> {
+                val on = cmd == "passive_on"
+                prefs.passiveObserve = on
+                Diagnostics.log(
+                    "warn",
+                    "诊断：被动旁观已${if (on) "开启" else "关闭"}——" +
+                        if (on) {
+                            // 说清"+ 探针"的边界：只读壳下前台一帧都不发（页面自己的 10s
+                            // 心跳在前台是准的），只有退到后台才由原生泵补帧。
+                            "注入层恢复只读观测（逐帧读、绝不写：不关 socket、不重载；心跳探针仅后台发）"
+                        } else {
+                            "注入层只保留滚动条 + 状态页面上报 + 页面日志汇，重载页面中"
+                        },
+                )
+                binding.webview.reload()
                 return
             }
         }
