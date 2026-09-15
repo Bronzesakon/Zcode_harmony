@@ -1565,4 +1565,107 @@ test('hook 安全：晚注入经原型层收编页面已有 socket（零重连�
     }
 });
 
+// ---------------------------------------------------------------------------
+// 后台原生承载（2026-09-16）：交还兜底与"仅取证"的推动函数
+//
+// 生产逻辑里"谁来接住连接"是原生侧（ShellRuntime.maybeStartNativeCarrier），
+// 注入层只留两件：① 交还后极窄的兜底（页面掉进失败态才重载一次）；
+// ② 取证用的推动（合成 online / 关 socket）——真机已证它救不了后台，别再拿它当方案。
+// ---------------------------------------------------------------------------
+
+/** 给合成事件测试装上最小 Event / dispatchEvent（注入层里 G === globalThis）。 */
+function stubSyntheticEvents() {
+    const dispatched = [];
+    const previousEvent = globalThis.Event;
+    const previousDispatch = globalThis.dispatchEvent;
+    const previousWindowDispatch = globalThis.window && globalThis.window.dispatchEvent;
+    globalThis.Event = function (type) { return {type}; };
+    globalThis.dispatchEvent = (ev) => { dispatched.push(ev && ev.type); return true; };
+    if (globalThis.window) {
+        globalThis.window.dispatchEvent = globalThis.dispatchEvent;
+    }
+    return {
+        dispatched,
+        restore: () => {
+            globalThis.Event = previousEvent;
+            globalThis.dispatchEvent = previousDispatch;
+            if (globalThis.window) {
+                globalThis.window.dispatchEvent = previousWindowDispatch;
+            }
+        }
+    };
+}
+
+test('后台承载：交还兜底——页面已自己开线就什么都不做（不重载）', async () => {
+    const page = setupPage();
+    const {reloads, restore} = stubReload();
+    try {
+        const socket = new globalThis.WebSocket('wss://relay.example');
+        socket.dispatchEvent({type: 'open'});
+        assert.strictEqual(globalThis.__zcodeShellAfterCarrierReturn(50), true);
+        await wait(150);
+        assert.strictEqual(reloads.length, 0, '有一条 OPEN 的 socket 时绝不许重载');
+        assert.strictEqual(
+            findPost(page.posts, 'diag', (d) => d.message.includes('交还后页面已自行恢复')).length,
+            1,
+            '恢复与否必须留一行判据');
+    } finally {
+        restore();
+        page.teardown();
+    }
+});
+
+test('后台承载：交还兜底——零 OPEN socket 且零入站帧 → 重载一次', async () => {
+    const page = setupPage();
+    const {reloads, restore} = stubReload();
+    try {
+        // 不建任何 socket：等价于页面已经 dispose（真机 00:12:57 的形状 socket=-1 paired=false）
+        assert.strictEqual(globalThis.__zcodeShellAfterCarrierReturn(50), true);
+        await wait(150);
+        assert.strictEqual(reloads.length, 1, '失败态自己回不来，兜底必须重载一次');
+        assert.strictEqual(
+            findPost(page.posts, 'diag', (d) => d.message.includes('交还兜底')).length,
+            1);
+    } finally {
+        restore();
+        page.teardown();
+    }
+});
+
+test('后台承载：恢复推动 event 档只派发合成 online，并回报推动前现场', async () => {
+    const page = setupPage();
+    const events = stubSyntheticEvents();
+    try {
+        const socket = new globalThis.WebSocket('wss://relay.example');
+        socket.dispatchEvent({type: 'open'});
+        const before = globalThis.__zcodeShellNudgeRecover('event');
+        assert.deepStrictEqual(events.dispatched, ['online'], '只派发一个 online，不要 pageshow');
+        assert.ok(String(before).indexOf('socket=1') >= 0,
+            '返回值是推动前的链路现场（原生日志与它对齐看时序）');
+        assert.strictEqual(
+            findPost(page.posts, 'diag', (d) => d.message.indexOf('恢复推动 event') === 0).length,
+            1);
+    } finally {
+        events.restore();
+        page.teardown();
+    }
+});
+
+test('后台承载：恢复推动 close 档关掉页面那条 socket（仅取证）', () => {
+    const page = setupPage();
+    try {
+        const socket = new globalThis.WebSocket('wss://relay.example');
+        socket.dispatchEvent({type: 'open'});
+        const before = globalThis.__zcodeShellNudgeRecover('close');
+        assert.ok(String(before).indexOf('socket=1') >= 0, '返回值是关线前的现场');
+        assert.strictEqual(socket.readyState, FakeWebSocket.CLOSED,
+            'close 档必须真的关掉它（生产逻辑不用，仅取证）');
+        assert.strictEqual(
+            findPost(page.posts, 'diag', (d) => d.message.indexOf('恢复推动 close') === 0).length,
+            1);
+    } finally {
+        page.teardown();
+    }
+});
+
 

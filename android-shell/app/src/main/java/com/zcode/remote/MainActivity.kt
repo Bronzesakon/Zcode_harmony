@@ -766,25 +766,10 @@ class MainActivity : AppCompatActivity() {
     private fun runDiagCommand(cmd: String) {
         if (cmd.isEmpty()) return
         Diagnostics.log("info", "诊断指令: $cmd")
-        // Tier2 是原生侧实验，不走注入层。
+        // 原生侧命令（Tier2 实验、后台失速自愈开关）统一走 ShellRuntime.runNativeDiag：
+        // 与 DiagReceiver（adb broadcast → 后台可用）共用同一份实现，避免两处漂移。
+        if (ShellRuntime.runNativeDiag(cmd)) return
         when (cmd) {
-            "tier2_test" -> {
-                ShellRuntime.startTier2Probe(60_000L)
-                return
-            }
-            "tier2_stop" -> {
-                ShellRuntime.stopTier2Probe()
-                return
-            }
-            "tier1_silence_test" -> {
-                ShellRuntime.forceTier1SilenceCheckForTest()
-                return
-            }
-            "tier2_takeover" -> {
-                // 接管语义验证：配对 → 桥覆盖 → 原生解码会话事件 → 自动交还。
-                ShellRuntime.startTier2TakeoverForTest(90_000L)
-                return
-            }
             // 被动旁观总开关（二分用）：关掉后注入层只剩"零侵入三件事"——滚动条归零 CSS、
             // 状态页面上报、页面日志汇；不再 hook WebSocket、不逐帧观测、不发心跳探针。
             // 两条都会重载页面，好让配置立刻生效。

@@ -2633,8 +2633,218 @@
         return dispatched > 0;
     }
 
+    // -----------------------------------------------------------------------
+    // 后台失速自愈：推动页面走**它自己**的恢复路径（2026-09-16 实验件）
+    //
+    // 现场（真机 2026-09-15 23:09–23:33，v129 只读壳，22 分钟不间断采样）：
+    // 退后台约 60s 后入站帧与 `链路 ack` **同时**归零，而页面那条 socket 的
+    // `readyState` 始终 1（OPEN）、`paired` 始终 true —— 客户端视角的**僵尸连接**：
+    // 远端不再回任何东西，也没有任何 close 事件。页面自己在 hidden 时按设计挂起
+    // （`suspend()` = stopHeartbeat + 清看门狗），于是它永远不知道链路已经死了；
+    // 而回前台时页面的 `recoverConnection()` 一拨就回来，证明"重拨"本身就是解药。
+    //
+    // 所以这里**不重载、不替页面持连接**，只推动页面走它自己的恢复路径：
+    //   event : window 上派发合成 `online` —— 页面统一生命周期 observer 的
+    //           `onRecover('online')` → `recoverConnection()` → `reconnectNow()`。
+    //           它只对"确实挂起过"的页面响应（observer 内部标志），后台若页面
+    //           没有挂起，这一条是空操作。
+    //   close : 直接 close 页面那条 socket —— 页面 close 处理器在非挂起态会走它
+    //           自己的 `scheduleReconnect` 梯子（0.5s 起退避）。
+    //   auto  : 先派发 event；2.5s 后若 socket 身份未变且仍 OPEN，再补一次 close。
+    //           默认值：两种页面状态各走一条，且只走一条。
+    //
+    // 这条写操作的两句自问（「实现要点」14 的规矩）：
+    //   ① 页面自己做不到这件事吗？——做不到：它不知道自己已经瞎了（没有入站帧
+    //      就没有任何信号，看门狗又被自己的 suspend 清掉了）。
+    //   ② 怎么知道它已经失败了？——"完全没有任何入站帧"持续 ≥35s，而壳每 10s
+    //      还在发 probe：健康的链路上 probe 一定有 ack（真机健康窗 `链路 ack 1~5/10s`），
+    //      连 ack 都没有就是链路已死，不是"桌面端安静"。
+    // -----------------------------------------------------------------------
+
+    /** 一行链路现场（只读，供日志与判据用）。 */
+    function describeRelay() {
+        var states = [];
+        for (var i = 0; i < sockets.length; i++) {
+            states.push(sockets[i].readyState);
+        }
+        return 'socket=' + (activeSocket ? activeSocket.readyState : -1) +
+            ' sockets=[' + states.join(',') + ']' +
+            ' paired=' + relayPaired +
+            ' inboundAgo=' + (liveness.lastInboundAt ?
+                Math.round((Date.now() - liveness.lastInboundAt) / 1000) + 's' : 'never') +
+            ' ackAgo=' + (lastPairAckAt ?
+                Math.round((Date.now() - lastPairAckAt) / 1000) + 's' : 'never') +
+            ' vis=' + (typeof document !== 'undefined' ? String(document.visibilityState) : '?') +
+            ' fg=' + appForeground;
+    }
+
+    function closeRelaySocketForNudge(reason) {
+        var socket = activeSocket;
+        if (!socket || socket.readyState !== 1) {
+            return false;
+        }
+        try {
+            socket.close(1000, reason);
+            return true;
+        } catch (e) {
+            diag('warn', '恢复推动：close 抛错 ' + e);
+            return false;
+        }
+    }
+
+    /**
+     * 推动页面自行恢复。返回推动前的现场字符串（原生日志与它对齐看时序）。
+     */
+    G.__zcodeShellNudgeRecover = function (mode) {
+        try {
+            var m = mode || 'auto';
+            var before = describeRelay();
+            var socket0 = activeSocket;
+            var acts = [];
+            if (m === 'event' || m === 'auto' || m === 'online' || m === 'pageshow') {
+                var evName = (m === 'pageshow') ? 'pageshow' : 'online';
+                try {
+                    G.dispatchEvent(new G.Event(evName));
+                    acts.push('dispatch:' + evName);
+                } catch (e) {
+                    acts.push('dispatch-failed:' + evName + '(' + e + ')');
+                }
+            }
+            if (m === 'close') {
+                acts.push('close=' + closeRelaySocketForNudge('shell-nudge'));
+            }
+            diag('warn', '恢复推动 ' + m + '：' + acts.join(' + ') + ' · 前 ' + before);
+            if (m === 'auto' && typeof G.setTimeout === 'function') {
+                G.setTimeout(function () {
+                    try {
+                        if (activeSocket === socket0 && socket0 && socket0.readyState === 1) {
+                            diag('warn', '恢复推动：合成事件未生效（socket 未变），改走 close · ' +
+                                describeRelay());
+                            closeRelaySocketForNudge('shell-nudge-fallback');
+                        } else {
+                            diag('info', '恢复推动：socket 已变化（页面自己在重连）· ' +
+                                describeRelay());
+                        }
+                    } catch (e) {
+                        diag('warn', '恢复推动 auto 收尾失败: ' + e);
+                    }
+                }, 2500);
+            }
+            return before;
+        } catch (e) {
+            diag('warn', '恢复推动失败: ' + e);
+            return '';
+        }
+    };
+
+    /**
+     * 网络自检：用一条**全新连接**打 HTTP（默认页面自己 origin）。
+     *
+     * 判据：墙来的时候，若这一条也失败/挂住 ⇒ App 的网络在后台被平台限制了
+     * （那么原生承载同样救不了）；若它成功而 relay 那条是死的 ⇒ 只是那条连接
+     * 坏了，重拨即可（那么"推动页面重拨"就是完整解）。
+     */
+    G.__zcodeShellNetProbe = function (url, tag) {
+        try {
+            var started = Date.now();
+            var target = url || (String(G.location.origin) + '/remote/v4');
+            target = target + (target.indexOf('?') >= 0 ? '&' : '?') + '__zcprobe=' + started;
+            var host = String(target).replace(/^([a-zA-Z]+:\/\/[^/]+).*$/, '$1');
+            diag('warn', '网络自检[' + (tag || '') + '] 发起 ' + host +
+                ' online=' + (typeof navigator !== 'undefined' ? String(navigator.onLine) : '?') +
+                ' vis=' + (typeof document !== 'undefined' ? String(document.visibilityState) : '?'));
+            G.fetch(target, {cache: 'no-store', credentials: 'omit'}).then(function (r) {
+                diag('warn', '网络自检[' + (tag || '') + ']：HTTP ' + r.status + ' 用时 ' +
+                    (Date.now() - started) + 'ms');
+            }).catch(function (e) {
+                diag('warn', '网络自检[' + (tag || '') + ']：失败 用时 ' +
+                    (Date.now() - started) + 'ms · ' + e);
+            });
+            return true;
+        } catch (e) {
+            diag('warn', '网络自检发起失败: ' + e);
+            return false;
+        }
+    };
+
+    /**
+     * 原生承载交还后的兜底（回前台时由原生调用一次）。
+     *
+     * 正常路径：可见性恢复 → 页面自己的 `T('visible')` → `recoverConnection()` →
+     * `reconnectNow()`，页面重拨回来，**不重载**。
+     *
+     * 但页面若已经掉进**失败态**（`i4t.dispose` 之后 `intentionallyClosed=true`、
+     * socket 关掉、`paired=false`），它自己回不来——真机 00:12:57 交还后 37 秒
+     * 仍是 `socket=-1 paired=false`，只有手动重载才回来（同 docs 里 KICKED 终态的
+     * 性质）。所以这里给一个**极窄**的兜底：8s 后若既没有一条 OPEN 的 socket、
+     * 这段窗口里又零入站帧，才重载一次；沿用死链兜底那条 5 分钟限流。
+     */
+    G.__zcodeShellAfterCarrierReturn = function (graceMs) {
+        try {
+            if (appForeground !== true) {
+                diag('info', '交还兜底：此刻不在前台，跳过');
+                return false;
+            }
+            var framesAtStart = liveness.inboundFrames;
+            var waitMs = graceMs && graceMs > 0 ? graceMs : 8000;
+            G.setTimeout(function () {
+                try {
+                    if (appForeground !== true) return;
+                    var open = false;
+                    for (var i = 0; i < sockets.length; i++) {
+                        if (sockets[i].readyState === 1) {
+                            open = true;
+                        }
+                    }
+                    var gotFrames = liveness.inboundFrames !== framesAtStart;
+                    if (open || gotFrames) {
+                        diag('info', '交还后页面已自行恢复（open=' + open + ' 新入站帧=' + gotFrames +
+                            '）· ' + describeRelay());
+                        return;
+                    }
+                    if (lastResumeHealAt && Date.now() - lastResumeHealAt <= RESUME_HEAL_MIN_GAP_MS) {
+                        diag('warn', '交还兜底：页面仍未开线，但距上次兜底重载不足 ' +
+                            Math.round(RESUME_HEAL_MIN_GAP_MS / 60000) + ' 分钟，限流跳过');
+                        return;
+                    }
+                    lastResumeHealAt = Date.now();
+                    diag('warn', '交还兜底：' + Math.round(waitMs / 1000) +
+                        's 后页面既没有 OPEN 的 socket 也没有新入站帧（失败态自己回不来）——重载一次 · ' +
+                        describeRelay());
+                    G.location.reload();
+                } catch (e) {
+                    diag('warn', '交还兜底收尾失败: ' + e);
+                }
+            }, waitMs);
+            return true;
+        } catch (e) {
+            diag('warn', '交还兜底发起失败: ' + e);
+            return false;
+        }
+    };
+
     G.__zcodeShellDiag = function (cmd) {
         try {
+            if (cmd === 'bg_redial') {
+                G.__zcodeShellNudgeRecover('event');
+                return true;
+            }
+            if (cmd.indexOf('bg_redial:') === 0) {
+                G.__zcodeShellNudgeRecover(cmd.substring(10));
+                return true;
+            }
+            if (cmd === 'bg_http') {
+                G.__zcodeShellNetProbe(null, '');
+                return true;
+            }
+            if (cmd.indexOf('bg_http|') === 0) {
+                G.__zcodeShellNetProbe(cmd.substring(8), 'custom');
+                return true;
+            }
+            if (cmd === 'bg_state') {
+                diag('info', '链路现场: ' + describeRelay());
+                return true;
+            }
             if (cmd === 'vitals') {
                 diag('info', '页面体征: ' + JSON.stringify(readVitals()));
                 return true;

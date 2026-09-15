@@ -56,7 +56,7 @@
 
 ## 项目现状（先读这一节）
 
-**一句话**：主体功能已落地，测试全绿（**JS 90 项 + Kotlin 92 项**）；真机当前跑的是**本机出的 `1.0.0-local.129`**（不走 CI、不写预发布），而 `pre` 每次推送仍会把最新 APK **覆写**到滚动预发布 [android-pre](https://github.com/Bronzesakon/Zcode_harmony/releases/tag/android-pre)（固定链接 `…/releases/download/android-pre/zcode-remote.apk`，可直接覆盖安装）——**真机验证已过十五轮**（一加 PLC110 / ColorOS 16 / API 36 / WebView 153–154）。**第十五轮两条已定案**：① 壳不再拆页面连接（「只读壳」，见「实现要点」14）；② 可见性劫持已停用，且**回前台"加载不出来"这一条已被真机证实修好**（页面自己走回 `recoverConnection`）。**仍未解的是"后台约 60 秒墙"**——两轮实测都撞到，且已排除壳干预与劫持两个原因；持续跟手只剩"谁来承载连接"三条路可走（见「未结项」2）。下表按"还剩什么没结论"排：
+**一句话**：主体功能已落地，测试全绿（**JS 94 项 + Kotlin 92 项**）；真机当前跑的是**本机出的 `1.0.0-local.129`**（不走 CI、不写预发布），而 `pre` 每次推送仍会把最新 APK **覆写**到滚动预发布 [android-pre](https://github.com/Bronzesakon/Zcode_harmony/releases/tag/android-pre)（固定链接 `…/releases/download/android-pre/zcode-remote.apk`，可直接覆盖安装）——**真机验证已过十五轮**（一加 PLC110 / ColorOS 16 / API 36 / WebView 153–154）。**第十五轮两条已定案**：① 壳不再拆页面连接（「只读壳」，见「实现要点」14）；② 可见性劫持已停用，且**回前台"加载不出来"这一条已被真机证实修好**（页面自己走回 `recoverConnection`）。**仍未解的是"后台约 60 秒墙"**——两轮实测都撞到，且已排除壳干预与劫持两个原因；**2026-09-16 凌晨已定案根因**：退后台约 60–70s 后 **Chromium 的网络栈整条停止工作**（页面新建 `fetch` 76 秒既不成功也不失败），而**同一刻原生 Java 侧裸 TCP 67ms、HTTPS 200**——所以页面侧任何自救都不可能成功，**只有换承载连接的那一层**。落地形态是「链路判死 → 原生接管 → 回前台交还」，v132/v133 已真机跑通触发与交还（后台上承 139s、心跳 13、ack 14），取证与复现步骤见 **`docs/16-后台60秒墙-根因取证与原生承载.md`**。下表按"还剩什么没结论"排：
 
 | # | 待验证 / 待排查 | 现状 | 怎么看 |
 | --- | --- | --- | --- |
@@ -229,12 +229,12 @@ hook 挂在 `WebSocket.prototype` 上、对补注前已存在的页面连接同�
 
 | job | 内容 | 首次 | 有缓存 |
 | --- | --- | --- | --- |
-| `js` | Node 协议层 + 注入层测试（90 项），不需要 JDK/SDK | ~1 min | ~40 s |
+| `js` | Node 协议层 + 注入层测试（94 项），不需要 JDK/SDK | ~1 min | ~40 s |
 | `build` | 单次 Gradle 调用：release 单元测试（92 项）+ `assembleRelease` + 签名校验 | ~4 min | ~2m 45s |
 | `prerelease` | 仅 `pre` 分支：把最新 APK **覆写**到滚动预发布 Release（固定下载链接） | ~20 s | ~20 s |
 | `release` | 仅 `v*` tag：用 CHANGELOG 段落发正式 Release | ~20 s | ~20 s |
 
-测试构成：JS **90 项**（`tools/protocol.test.js` + `tools/inject.test.js`，含手算黄金字节；其中 6 项钉「对话流 → 卡片正文」的帧契约：snapshot 取最后一段 `assistantText`、`row.delta` 只拼同一行、工具/子代理/reasoning 不覆盖正文、原生种子优先且上限 `CONVERSATION_MAX`；另有 4 项钉**只读壳契约**：前台心跳零写入、回前台零写入、进对话卡住不重载、卡住不连刷）；Kotlin **92 项 / 9 个测试类**（`@Test` 实数：`NotifyStateTest` 30 + `RelayWireTest` 21 + `UploadMimeTest` 8 + `ControllerTasksStateTest` 8 + `PromotionPolicyTest` 7 + `PageBarColorTest` 6 + `SurvivalVerdictTest` 5 + `RelayBridgeTest` 5 + `Tier2ProofTest` 2）。数字以实测为准（`node --test` 报 tests 行；Kotlin 数 `@Test`），**改测试后请同步这一行**。**这些是唯一能在无设备条件下验证的东西**，真机行为一律以设备为准。
+测试构成：JS **94 项**（`tools/protocol.test.js` + `tools/inject.test.js`，含手算黄金字节；其中 6 项钉「对话流 → 卡片正文」的帧契约：snapshot 取最后一段 `assistantText`、`row.delta` 只拼同一行、工具/子代理/reasoning 不覆盖正文、原生种子优先且上限 `CONVERSATION_MAX`；4 项钉**只读壳契约**：前台心跳零写入、回前台零写入、进对话卡住不重载、卡住不连刷；**另 4 项钉后台承载**（2026-09-16 加）：交还兜底「有线/有帧就不重载」与「零 socket 零帧才重载一次」、推动函数 event 档只派发合成 `online`、close 档真关线）；Kotlin **92 项 / 9 个测试类**（`@Test` 实数：`NotifyStateTest` 30 + `RelayWireTest` 21 + `UploadMimeTest` 8 + `ControllerTasksStateTest` 8 + `PromotionPolicyTest` 7 + `PageBarColorTest` 6 + `SurvivalVerdictTest` 5 + `RelayBridgeTest` 5 + `Tier2ProofTest` 2）。数字以实测为准（`node --test` 报 tests 行；Kotlin 数 `@Test`），**改测试后请同步这一行**。**这些是唯一能在无设备条件下验证的东西**，真机行为一律以设备为准。
 
 省时间的几个点：`js` 不与 Android 构建串行；`testReleaseUnitTest` 与 `assembleRelease` 放在**同一次 Gradle 调用**里（共享 `compileReleaseKotlin`，源码只编译一次、Gradle 只启动一次）；`fetch-depth: 1`；`actions/setup-java` 的 `cache: gradle` 会恢复 `~/.gradle`（依赖缓存 + 本地 build cache）；`org.gradle.configuration-cache=true` 且 `problems=warn`，所以配置缓存只可能加速、不会让构建失败。
 
@@ -442,6 +442,7 @@ zcode-remote.apk -> CN=ZCode Remote, OU=Mobile, O=ZCode, L=Unknown, ST=Unknown, 
 12. **滚动条：网页自己那条 14px 经典条是我们隐藏掉的，不要再加第二条。** 引擎层已确认 Android WebView 把 overlay 滚动条整体关掉（`layer_tree_settings.cc:415`，见 issue 40226034，至今 P3/New），唯一把手是 legacy 轨道宽度；而"丑陋滚动条"**是网页自己写的**（`index-BMndL2ru.css` @368578：`*{scrollbar-width:auto}` + `::-webkit-scrollbar{width:14px}` + thumb `var(--color-border)`/`border:3px solid #0000`/`radius:9999px`/`min 32px`）——Chromium **只要自定义 `::-webkit-scrollbar` 就强制经典占位条**，14×dpr3.5 = 49 物理像素，丢宽的是内部 `[data-v4-timeline-scroll]` 容器（**根文档不丢**：真机 `innerWidth==clientWidth==363`）。**现行做法**：照抄网页自己的内嵌模式（bundle 函数 `J0e()` @1422852）把轨道归零——`html,body,*{scrollbar-width:none!important;scrollbar-gutter:auto!important}` + `::-webkit-scrollbar{display:none!important;width:0!important;height:0!important}`——再用自绘 overlay 指示条补回视觉：可见 8px、距右缘内缩 3px、圆角 9999px、最短 32px、颜色读容器上的 `--color-border`、停止 700ms 后淡出、捕获阶段 passive `scroll` 监听（`event.target` 即滚动容器，不依赖选择器）、跳过 `[class*=scrollbar-hide]` / pptx 渲染面 / xterm 视口。⚠️ **滑块宽度必须用常量算**（`rail - 2*inset`）：与网页逐字一致的那套 `border:3px solid transparent` + `background-clip:padding-box` 在真机上不生效，滑块会撑满 14px 轨道、视觉粗一倍。**硬判据**：`滚动条几何: 容器占宽=0 容器宽=363 轨道=14px 内缩=3px 滑块可见宽=8px(28物理) 实测滑块宽=8px 圆角=9999px 最短=32`。**v1 只做指示、不可拖拽，只处理纵向。**
 13. **页面自身的 RPC 要与我们的 bridge 分开看，且「页面覆盖情况」必须活过 relay 重连。** 被动观测也记录页面自己的 promise 调用/回复（`_tracePageCall` / `_tracePageResult` → 日志里的 `页面调用慢`、`页面调用失败`、`页面 RPC 10s`），因为「点进任务不出内容」那个请求是**页面的**，壳的 bridge 永远看不到。硬约束：① 页面已覆盖的工作区**绝不重复开 bridge**，这份认知由 `inject.js` 的 `pageCoverage` 跨 `resetClient()` 存活（第一轮正是它在重连后丢失，导致重复 bridge 与 `rpc-transport-fault` 死循环）；② `_observeInboundRpc` 里 promise 回复按 `(bridgeSessionId, id)` 配对，**不要求先学到工作区**，否则页面 bridge 的回复会被静默丢掉；③ 「页面拥有某工作区」不能只凭一个证据——页面开了 bridge（入站 `workspace-bridge-ready` 且 id 不在 `_requestedBridgeIds` 里）**且**桌面端确实拒掉我们的 bridge，两者同时成立才永久放弃（`_pageOwned`）；④ 同一条 relay 连接内 fault 超过 `_maxReopens`（**现行值 0**，即首次 fault 不再重开）就停止重开，跨连接另设冷却 `FAULT_COOLDOWN_CONNECTIONS=3` / `FAULT_COOLDOWN_MS=10 分钟`（连续 3 条连接都 fault 就冷却 10 分钟，到期自动重试）；⑤ burst 的每一站之前 `awaitPageIdle()`，让路预算整个 burst 共享（8s），故 `主动订阅完成：用时` 可能到 ~19s 是**刻意的**。
 14. **只读壳（`SHELL_READ_ONLY = true`，2026-09-15 定案）：壳永不关闭页面的 socket、永不自动重载页面。** 真机把三种自伤来源抓齐了——`socket.close() 被调用 … 来自 …` 那行会点名调用者：`nudgeReconnect ← fallbackCheck`（"进对话 5s 铁判准"，**40 秒里 10 次**）、`forceReconnect ← G.__zcodeShellSetAppForeground`（**回一次前台拆一次**，20:53:04）、`forceReconnect ← heartbeatTick ← G.__zcodeShellHeartbeat`（18:24 / 18:35 / 19:40 / 20:56）。拆掉的每一次都是**页面正用着的那条** relay 连接，用户看到的"发消息转圈 / 要重连 n 次才出来 / 返回页面是它自己在重连"全是它的下游。对照实验（`diag_cmd passive_off`，这些手段全部失去 socket 句柄）：页面自己的订阅 ack 之后 **5 分钟零生命周期事件**。**壳对页面的写入面只允许五处**：① document-start 的滚动条 CSS；② **退后台之后**每 10s 一帧 `pair_status_query`（前台一帧都不写——页面自己的 10s 心跳在前台是准的，见第 6 条）；③ KICKED 终态时回前台的自愈重载（终态页面自己回不来，只有手动"重新连接"）；④ 通知点击后的定位点击；⑤ **回前台死链兜底重载**（2026-09-15 晚加，**待真机验证**：静默 >60s ＋ 5s 观察窗零入站帧 ＋ 对话 0 行，三条齐了才重载，5 分钟限流；判据是"页面已经失败"，不是"我们怀疑它失败"）。**要新增任何写操作之前，先回答两句："页面自己做不到这件事吗？"以及"我怎么知道它已经失败了？"**
+15. **「后台 60 秒墙」= Chromium 的网络栈在后台死掉，不是 App 没网、不是壳的问题（2026-09-16 凌晨定案，别再重查）。** 判据是同刻三件事：墙内页面**新建** `fetch` 挂住 76s（既不成功也不失败）；同刻**原生 Java** 裸 TCP `ok 67ms`、HTTPS `HTTP 200 276ms`；同刻原生 WebSocket 1 秒内 `★配对成功（matched）`。墙的形状是**僵尸连接**：`socket readyState=1(OPEN)`、`paired true`、壳每 10s 仍在发探针，却连 ack 都没有，且**没有任何 close 事件**；连页面自己 `close()` 都卡在 CLOSING（帧发不出去）。**这一条把"页面侧自救"整类方案全部证伪**（合成 `online` 送到了页面也没用），所以：① **落地形态**是「判死 → 原生接管 → 回前台交还」（「未结项」2 的路线 B 的真正形态，触发条件见 `ShellRuntime.maybeStartNativeCarrier`：入站帧静默 ≥35s，**不是**老的"退后台 5 秒"）；② 反向不变式：**页面链路一旦自己活了（入站帧 <35s），原生立刻交还**，任何时刻只有一侧持连接；③ 判死时页面那条连接早已是僵尸，且它的网络栈是死的 ⇒ **`KICKED` 帧根本送不到页面**，页面不会进终态（这正是老路径 K1 风险的解）；④ **回前台不需要重载**：原生先交还，页面可见性恢复后 Chromium 网络栈复活，页面自己的 `recoverConnection` 会重拨；只有页面**已经掉进失败态**（`i4t.dispose` 之后自己回不来）才由 `__zcodeShellAfterCarrierReturn` 兜底重载一次（交还后 8s、无 OPEN socket、零入站帧，5 分钟限流）；⑤ 诊断判据三件套（**后台可调用**，`am broadcast` 不碰可见性）：`net_probe`（原生网络）、`bg_http`（Chromium 侧新连接）、`bg_state`（链路现场），用法见 `docs/16-…md` §4.3。
 
 ---
 
@@ -585,7 +586,7 @@ M3 基线的做法（2026-09-11 落地）：
 
 ```powershell
 cd android-shell
-node --test tools/inject.test.js tools/protocol.test.js   # 90 项：线格式、分片重组、通道客户端、会话索引、注入层、页面 RPC 取证
+node --test tools/inject.test.js tools/protocol.test.js   # 94 项：线格式、分片重组、通道客户端、会话索引、注入层、页面 RPC 取证
 python tools/check_kotlin_structure.py   # 括号配平 / 包名与目录一致 / 合并残留（约 1 秒）
 python tools/check_resources.py          # 资源引用名是否存在（约 1 秒，补 aapt2 只在 CI 跑的缺口）
 python tools/watch_ci.py                 # 读 CI 状态与失败原因（无需 gh / 无需 token）
@@ -699,26 +700,36 @@ MSYS_NO_PATHCONV=1 "$ADB" devices -l                 # 确认出现设备
 | `docs/05-远程网页-remote-v4-20260911/` | 要**网页侧契约**时读：bundle 快照（`assets/index-nOVzQNKW.js`、`src-DHgFesxz.js`、`logger-BVohFQ23.js`）+ 注入点审计/进对话无内容分析。本轮所有"源码定案"都是从这里读出来的 |
 | `docs/05-…/assets/logger-BVohFQ23.js` | 只想弄清"页面自带日志到底能拿到什么"时读它（1013 字节，PROD 下 console 全短路，唯 `window.zcode.log`） |
 | `docs/15-后台原生承载-独立设计.md` | 要**后台原生承载**这条路时读：由子代理在干净上下文里只读 bundle 独立推导（**禁止读本项目实现**），含协议契约逐条 `文件:行:列` 证据、接管/交还时序、17 条真机实验。⚠️ 其 §2.6 平台结论未经本会话核验（附录 C 自述），读时先看该声明 |
+| **`docs/16-后台60秒墙-根因取证与原生承载.md`** | 要**后台 60 秒墙**的真机取证时读：三次实测的逐窗数据、同刻三证（JS `fetch` 挂住 / 原生 TCP 67ms / 原生配对 1s）、被否定的 7 条假设表、v132/v133 的落地形态与诊断指令、复现步骤。**本轮所有"后台"结论都在这里** |
 
 ### 一句话状态
 
-真机当前跑的是**本机出的 `1.0.0-local.129`**（本地 keystore 同签名，`adb install -r` 覆盖安装，
-**零 CI 消耗**）。`pre` 分支与滚动预发布 `android-pre` 停在 **`764235e`**；本轮工作已作为
-**快照提交 `c8c93e2`**（`fix(android-shell): 止血——壳不再拆页面连接（只读壳）+ 回前台死链兜底`，
-11 文件 +2486/−585），**仅本地、未推送**；`docs/15-…md` 与根目录历史 APK 仍未跟踪。
+真机当前跑的是**本机出的 `1.0.0-local.133`**（本地 keystore 同签名，`adb install -r` 覆盖安装，
+**零 CI 消耗**；v130–v133 都是 2026-09-16 凌晨为"后台 60 秒墙"做的实验件）。`pre` 分支与滚动预发布
+`android-pre` 停在 **`764235e`**；只读壳那轮是本地快照提交 `c8c93e2`、收尾文档 `c5f9407`，
+**均仅本地、未推送**；`docs/15-…md`、`docs/16-…md` 与根目录历史 APK 仍未跟踪。
 
-**第十五轮（2026-09-15 晚）的三条结论**：
-1. 用户报的"发消息一直转圈 / 要重连好几次才连上 / 返回页面是它自己在重连"＝**壳自伤**（壳在拆页面
-   正用着的那条 relay 连接），已按**只读壳**止血（「实现要点」14）。
-2. "回前台加载不出来、重启就秒开"＝**可见性劫持**掐掉了页面的 `suspend/recover`；劫持停用后
-   **v129 真机已证实恢复**（页面回前台自己走 `recoverConnection → reconnectNow`，1.2 s 干净重拨）。
-3. **"后台约 60 秒墙"仍未解**，且已排除壳干预（两轮零干预复现）与可见性劫持（停用后照样 60 s）；
-   补帧也救不回（`探针 1` 无 ack）。持续跟手只剩「未结项」2 的三条路，**等用户拍板**。
+**2026-09-16 凌晨（第十六轮）：后台 60 秒墙定案 → 换承载层。三条结论**：
+1. **根因**：退后台约 60–70s 后 **Chromium 的网络栈整条停止工作**。同刻三证：墙内页面新建
+   `fetch` 挂住 76s（既不成功也不失败）；**原生 Java** 裸 TCP `ok 67ms`、HTTPS `HTTP 200 276ms`；
+   原生 WebSocket 1 秒内 `★配对成功（matched）`。墙的形状是**僵尸连接**（`socket=1(OPEN)`、
+   `paired true`、探针照发、零 ack、无 close 事件；连页面 `close()` 都卡在 CLOSING）。
+   ⇒ **页面侧自救整类方案被证伪**（合成 `online` 送到页面也没用），只有换承载层。
+2. **落地**：`判死（入站帧静默 ≥35s）→ 原生接管（OkHttp，持久模式）→ 回前台交还`。
+   真机已跑通：触发行 `后台原生承载：入站帧静默 36s …` → `★接管配对成功`；
+   后台上承 **139s 里心跳 13 次 / ack 14 次**（那段时间 Chromium 侧全死）；回前台
+   `Tier2: 关闭（回前台交还）` + 无 KICKED。**回前台不需要重载**（页面自己 `recoverConnection`
+   重拨）；只有页面已进失败态才由 v133 的 `__zcodeShellAfterCarrierReturn` 兜底重载一次。
+3. **仍未验收的是"正文真的推到流体云"**：需要桌面端能开桥。本轮桌面端的 host 进程
+   00:04:38 死了（`unregistered host` + `host process exited with code 1`），此后所有
+   `workspace-bridge` 都回 `desktop-disconnected: 未找到桌面窗口 host process，windowId=1`，
+   原生与页面两条路都开不了桥 ⇒ 没有会话订阅 ⇒ 无正文可推。**这不是壳侧问题**；
+   23:21:31 也崩过一次。**先修桌面端再验收**（见「未结项」1）。
 
 **目标（用户拍板，两条，未变）**：
 1. **前台**：对话流跟手——前提是"壳不碰页面链路"，判据见「下一步」第 1 条。
 2. **后台/锁屏**：应用常驻接收并跟踪**各对话流**，推到流体云显示（ColorOS 侧已授权完全后台行为）。
-   **这一条目前达不到**（第 3 条结论），且卡点已经不在壳侧。
+   **承载层已换成原生（第 2 条）**，剩下的是"原生订阅 → 正文 → 流体云"这一跳的端到端验收（第 3 条）。
 
 **上一轮（第十四轮，2026-09-14/15）定案并修掉的四处机制**（历史；机制细节仍然有效，别再重做）：
 
@@ -741,27 +752,39 @@ store 三级优先级：controller > 会话流 > SI 持久态）；controller �
 
 ### 下一步（新会话第一件事）
 
-1. **验只读壳 + 两条新对策（用户真机）**：进对话连续发 4 条以上消息，判据：
-   ① `socket.close() 被调用 … 来自 …` **零条**（这行会点名调用者：若再出现 `nudgeReconnect` /
-   `forceReconnect` / `G.__zcodeShellSetAppForeground`，就是只读门失效）；
-   ② 日志里**没有**壳发起的"自动重载页面"；
-   ③ `页面开销` 每 10 s 一条，且**前台 `探针 0`**（退后台才变 1）；
-   ④ 启动时有 `可见性劫持已停用：页面拿到真实可见性，生命周期事件照常送达`（**v129 已验证存在**）；
-   ⑤ 回前台时**页面自己**打出 `socket.close() 被调用 … 来自 at i4t.reconnectNow ← at i4t.recoverConnection`
-   ＋ `relay socket closed (code=1005 clean=true)` ＋ 1~2 s 内 `relay socket open (#N)`，
-   且此后照旧收帧（**v129 已验证**）。
-2. **后台约 60 秒墙（仍未解；卡点已不在壳侧，等用户拍板走哪条路）**：两轮零干预实测都会在
-   退后台 ~60–70 s 后双向归零（数据见「第十五轮」6）。**不要再花力气在注入层上试"救后台"**——
-   已排除壳干预、可见性劫持、补帧不足三个原因。可选：**A 维持现状**／**B 后台原生承载**
-   （`docs/15-后台原生承载-独立设计.md`，代价是页面被 KICK 终态、回前台需重载）／
-   **C 让窗口后台仍可见**（PiP/覆盖窗，熄屏失效）。
-3. **流体云正文最后一跳**（独立未结项）：`对话帧 N（正文 M 字）` 里"正文"至今**始终 0 字**
+0. **先修桌面端，再做验收（当前唯一的拦路石）**：桌面端的 remote-control host 进程会崩
+   （2026-09-15 23:21:31、2026-09-16 00:04:38 各一次；日志
+   `[task-realtime] unregistered host … windowId=1` +
+   `[spawnHostProcess] host process (local-1) exited with code 1`）——它一死，**所有
+   `workspace-bridge` 都回 `desktop-disconnected: 未找到桌面窗口 host process，windowId=1`**
+   （手机侧同名行 `bridge open failed for <key>: desktop-disconnected: …`），
+   原生与页面两条路都开不了桥，页面 bootstrap 还会因此直接 `i4t.dispose`。
+   处置：在桌面端把「远程控制」**关掉再打开**（或重启桌面应用），看到手机侧重新出现
+   `bridge ready for <key>` 即可继续。**注意：重启桌面应用会连带结束当前这个会话。**
+1. **后台承载的端到端验收（本轮唯一没做完的一条）**：桌面端健康时，让手机进一个**在跑任务**的会话
+   （页面上点进那个任务，或通知点击定位），然后：
+   ① 退后台（`input keyevent KEYCODE_HOME`）→ 第 6~7 窗应出现
+   `后台原生承载：入站帧静默 3Xs（门槛 35s，Chromium 网络栈已死）——原生接管 relay 连接…`
+   与 `Tier2: ★接管配对成功（matched）`；
+   ② 之后 `Tier2: 收帧`/`活进展 <key>：…`/`页面正文 <key>：…` 应持续出现，手机上流体云正文跟着变
+   （判据仍是「同刻核对 `android.text`、`when` 与系统时间」）；
+   ③ 回前台：`Tier2: 关闭（回前台交还）存活=Ns 心跳=n ack=m` +
+   **页面自己** `socket.close() … ← i4t.recoverConnection` + `relay socket open (#N)`，
+   **没有**壳发起的重载，**没有** KICKED；只有页面已进失败态时才允许出现
+   `交还兜底：8s 后页面既没有 OPEN 的 socket 也没有新入站帧…——重载一次`。
+2. **后台长测（过夜）**：亮屏挂后台 2 小时以上，看原生承载的 `存活`/`心跳`/`ack` 是否线性增长、
+   有没有被 ColorOS 掐掉；然后再做**熄屏**工况（本轮到 00:20 为止全部是亮屏 + 主页）。
+3. **流体云正文最后一跳（页面那条路）**：`对话帧 N（正文 M 字）` 里"正文"至今**始终 0 字**
    （v129 的 23:09 窗口仍是 `正文 0 字`，而帧在流：`对话帧 30 → 64`）。要判的是
    "页面自己那条流有没有走进观测通路"（看有没有 `入站 topic 首次出现(N)：conversation/…`）。
-4. **`healDeadLinkOnResume` 仍未验证**：v129 那次回前台静默 0 s，兜底一次都没触发（符合预期）。
-   要验它，用诊断指令 `deadlink_test`（伪造静默 120 s）或真去后台 7 分钟再回。
-5. **子代理方案需人工评审**：`docs/15-…md` 的 §2.6 平台结论未经本会话核验；
-   最该先做的是它列的 **E1 + E14 + E2**（分离"心跳停"与"收包停"、扫 KICKED 的最小间隔）。
+   原生承载上路之后，这一跳改由原生订阅承担（`Tier2Probe.progressSink → pushLivePreview`）。
+4. **只读壳 + 两条对策的复验**（v129 已验过大半）：进对话连发 4 条以上消息，判据仍是
+   ① `socket.close() 被调用 … 来自 …` 只有页面自己那两处（`i4t.dispose` 启动、`i4t.reconnectNow` 回前台）；
+   ② 没有壳发起的自动重载；③ `页面开销` 每 10s 一条且**前台 `探针 0`**；
+   ④ 启动有 `可见性劫持已停用：…`；⑤ 回前台页面自己 1~2s 内重拨并照旧收帧。
+5. **`healDeadLinkOnResume` 仍未验证**：要验它，用诊断指令 `deadlink_test`（伪造静默 120s）或真去后台 7 分钟再回。
+6. **Chromium 侧为什么会在后台死**：只知现象与边界（Java 侧同刻完全正常），没定位到哪一层。
+   要定案得做进程/cgroup 级取证；本轮没手段。**不要再花时间在"注入层救后台"上**（已证伪）。
 
 ### 本轮用真机 + 源码换来的硬事实（别再重新发现）
 
@@ -798,29 +821,26 @@ store 三级优先级：controller > 会话流 > SI 持久态）；controller �
 
 ### 未结项（按优先级，按这个顺序做）
 
-1. **只读壳 + 两条对策的真机验收（第十五轮已做掉大半）**：已证——`socket.close() 被调用` 只剩**页面
-   自己**的两处（`i4t.dispose` 启动时、`i4t.reconnectNow` 回前台），壳不再有任何一处；
-   启动见 `可见性劫持已停用`；回前台页面自己走 `recoverConnection` 并 1.2 s 干净重拨（1005）。
-   **仍未验**：前台 `探针 0`（需在前台待满一个 10 s 窗口）、`healDeadLinkOnResume`。
-2. **后台约 60 秒墙（唯一还没定案的机制问题；卡点已不在壳侧）**：
-   * 第一轮（22:08–22:15，劫持开着，壳零干预）：后台 7 分 21 秒，补帧 44 次，页面心跳 6/44 窗，
-     入站帧前 ~50 s 有、之后全程 0，退后台 **~70 s** 后双向静默。
-   * 第二轮（23:09，v129，劫持停用）：后台第 60 秒后双向同时归零（`收 41/发 39` → `0/0`），
-     `对话帧` 冻在 64，补帧 `探针 1` 照发但 `ack` 归零。
-   * **已排除**：壳干预（两轮）、可见性劫持（第二轮）、补帧不足（全程在发、前期被 ack）。
-   * **仍未定**：远端为什么在 ~60 s 决定停（桌面端判据？页面挂起时是否改了订阅 visibility？）
-     —— 由子代理方案的 **E1/E14** 分离，**别在实验前写原因**。
-   * **三条路等用户拍板**：**A 维持现状**（后台 60 s 后停）／**B 后台原生承载**
-     （`docs/15-后台原生承载-独立设计.md`：能持续，代价是页面被 KICK 终态、回前台需重载页面
-     才能拿回链路——你先前明确不想要，但两轮实测说明它可能是唯一可靠的路）／
-     **C 让窗口后台仍被判可见**（PiP / 覆盖窗，亮屏勉强、熄屏失效、体验侵入）。
+1. **后台承载的端到端验收（唯一没做完的一条；前置是桌面端 host 进程活着）**：
+   机制已验：判死 → 原生接管 → 后台 139s 里心跳 13/ack 14 → 回前台交还、无 KICKED、无重载。
+   **要验的是"正文真的推到流体云"**：需要能开桥（桌面端 host 活着）＋ 一个在跑的任务。
+   步骤与判据见「下一步」0/1。
+2. **后台 60 秒墙已定案（2026-09-16 凌晨，别再当未解问题）**：根因是**Chromium 的网络栈在后台死掉**
+   （墙内页面 `fetch` 挂住 76s，同刻原生裸 TCP 67ms/HTTPS 200），形状是僵尸连接
+   （`socket=1(OPEN)` + `paired true` + 探针照发 + 零 ack + 无 close 事件 + close 卡 CLOSING）。
+   **已排除**：壳干预、可见性劫持、补帧不足、平台掐网络（netpolicy 允许、原生同刻通）、进程冻结。
+   **落地形态**：`判死（入站帧静默 ≥35s）→ 原生接管（持久模式）→ 回前台交还`；
+   反向不变式是"页面链路一活，原生立刻交还"。取证/复现/诊断指令见
+   `docs/16-后台60秒墙-根因取证与原生承载.md`。**仍未定**的是 Chromium 内部哪一层死的（不再追）。
 3. **流体云正文最后一跳**：`对话帧 N（正文 M 字）` 里的"正文"若始终 0 字，要判的是
    "页面自己那条流有没有走进观测通路"（看日志里有没有 `入站 topic 首次出现(N)：conversation/…`），
-   与只读政策无关——只读门只管"不写"，不管"读什么"。
-4. **桌面端拒桥已不在主路径上**：`desktop-disconnected: 未找到桌面窗口 host process，windowId=1` /
-   `DEVICE_OFFLINE` 只在**主动订阅**（设置里的「订阅所有工作区」）时才需要；现行只读壳默认不开桥
-   （`subscribeAll=false`），正文靠"页面自己那条订阅流"读。哪天要回到主动订阅再处理它
-   （判据行：`bridge open failed for <key>: desktop-disconnected: …`）。
+   与只读政策无关——只读门只管"不写"，不管"读什么"。原生承载上路后这一跳改由
+   `Tier2Probe.progressSink → pushLivePreview` 承担。
+4. **桌面端拒桥（`desktop-disconnected` / `DEVICE_OFFLINE`）现在回到主路径上了**：
+   原生承载要靠它开桥，所以 host 进程一死，承载就只剩"连着但没内容"。
+   判据行：`bridge open failed for <key>: desktop-disconnected: 未找到桌面窗口 host process，windowId=1`；
+   桌面端同刻有 `[task-realtime] unregistered host` + `host process … exited with code 1`。
+   处置：桌面端把「远程控制」关掉再打开（见「下一步」0）。
 5. **`onAgentRuntimeRestarted` / `runtimeRestart` 未接**：网页端在 agent 重启时作废全部订阅并重订；
    我们只能等超时后回收，会出现一段无谓空窗。
 6. **watchdog 未对齐网页端**：`FrameAssembler` 无 30 s 超时与淘汰、无 45 s ack 宽限、
@@ -903,7 +923,7 @@ store 三级优先级：controller > 会话流 > SI 持久态）；controller �
 cd android-shell
 python tools/check_kotlin_structure.py     # 一秒：括号配平 / 包名与目录一致 / 合并残留
 python tools/check_resources.py            # 一秒：每个 @type/name 是否都有定义
-node --test tools/inject.test.js tools/protocol.test.js   # 90 项（protocol + inject）
+node --test tools/inject.test.js tools/protocol.test.js   # 94 项（protocol + inject）
 python tools/watch_ci.py                   # 匿名读 CI 状态与编译错误注解（单次读取；失败/取消时退出码非 0）
 bash tools/device_check.sh                 # 真机一键验收（取包→装→清日志→跑→打印全部判据）
 ```
@@ -940,6 +960,10 @@ MSYS_NO_PATHCONV=1 "$ADB" -s "$S" shell "L=/sdcard/Android/data/com.zcode.remote
 第九轮（pre.42–pre.50，27 个提交）：11 条要求全部交付并真机验收（去应用栏 + 状态栏动态取色、
 顶部避让/底部沉浸、MiuiX 设置页、长按快捷方式、通知标题与完成卡片、fault 收敛）。
 2026-09-12 下午：`538f67d` 标题回退自动恢复（**当时** 2s 判定 + 25s 刷新窗；现已换代）。
+第十五轮（2026-09-15）：只读壳止血 + 可见性劫持停用 + 后台 60 秒墙两轮实测。
+第十六轮（2026-09-16 凌晨，v130–v133 全部本机出包直装真机）：**60 秒墙定案为"Chromium 网络栈在后台死掉"**，
+落地"判死 → 原生接管 → 回前台交还"（触发/交还/兜底三处），新增后台可调用的 `DiagReceiver` 诊断通道，
+取证归档进 `docs/16-…md`。**未验收：原生订阅 → 正文 → 流体云的端到端一跳**（前置是桌面端 host 进程活着）。
 **第十轮即本轮（2026-09-12 晚）**：网页代码全面审计（`docs/05/分析-壳端注入点审计-*.md`）后落地四件事——
 ① **页面日志汇**：生产页面的全部生命周期自述只走 `window.zcode?.log`（此前无人接收、静默丢弃），
 inject.js 现供给 sink，原生日志出 `页面: …` 行；
@@ -1236,13 +1260,21 @@ socket"的读法是**错的**，`/ws/remote-control/window/<token>` 只做窗口
   复验前先等 CI 绿、下载覆盖安装（对 `.md5`）。
 - 已装机并真机验过的：R1 铁判准刷新的正向路径、R3 KICKED 自愈、R2a 退后台 5 s 接管与桥覆盖。
 - **未验**：修复后的对话订阅能否稳定回包、流体云是否真的跟手（判据见「下一步」）。
-- **诊断指令全集**（统一 `am start -f 0x20000000 -n com.zcode.remote/.MainActivity -a com.zcode.remote.action.DIAG --es diag_cmd <cmd>`）：
-  `vitals`｜`l1_test`（轻推 socket，只读壳下只记一行日志）｜`kick_test`（第二条 WS 观察 KICK）｜
-  `degrade_test`｜`deadlink_test`（伪造"观测静默 120 s"后走一次回前台死链判定，
-  省掉真去后台待 7 分钟——**只读壳下唯一会自动重载页面的那条路的测试点**）｜
-  `passive_off` / `passive_on`（注入层观测层总开关，两条都会重载页面）｜
-  `tier2_test`（配对+覆盖 60 s）｜`tier2_stop`｜`tier2_takeover`（接管 90 s 自动交还）｜
-  `tier1_silence_test`（强制判死，走静默接管路径）。
+- **诊断指令全集**。**两条通道**：
+  * **后台可调用**（`DiagReceiver`，`android.permission.DUMP` 门禁，**不碰可见性**——测后台现场只能用这条）：
+    `"$ADB" -s $S shell am broadcast -n com.zcode.remote/.DiagReceiver -a com.zcode.remote.action.DIAG --es diag_cmd <cmd>`
+  * 前台/老通道（会把应用拉到前台）：`am start -f 0x20000000 -n com.zcode.remote/.MainActivity -a com.zcode.remote.action.DIAG --es diag_cmd <cmd>`
+  * 指令表：`vitals`｜`l1_test`（轻推 socket，只读壳下只记一行）｜`kick_test`（第二条 WS 观察 KICK）｜
+    `degrade_test`｜`deadlink_test`（伪造"观测静默 120s"后走一次回前台死链判定）｜
+    `passive_off` / `passive_on`（注入层观测层总开关，两条都会重载页面，**只能走前台通道**）｜
+    `tier2_test`（原生配对+覆盖 60s，不动生产状态）｜`tier2_stop`｜`tier2_takeover`（90s 自动交还）｜
+    `tier1_silence_test`｜
+    **第十六轮新增（后台承载）**：`stall_state`（开关/是否已接管/Tier2 在跑/入站帧多久没来）｜
+    `carrier_on` / `carrier_off` / `carrier_now`（开关与手动接管）｜
+    `net_probe`（**原生**裸 TCP+HTTPS，不经 Chromium——墙的定性判据）｜
+    `bg_state`（链路现场：`socket` readyState / `sockets[]` / `paired` / `inboundAgo` / `ackAgo` / `vis` / `fg`）｜
+    `bg_http`、`bg_http|<url>`（**Chromium 侧**新建连接判据，墙内会挂住）｜
+    `bg_redial`、`bg_redial:close`（合成 `online` / 关页面 socket，**仅取证**，生产逻辑不用）。
 - 真机取数命令（本机专属）：`MSYS_NO_PATHCONV=1 "$ADB" -s 3B6F5RE8GCL3LYY7 exec-out cat …/zcode-shell.log > x.log`
   （设备端 grep 中文会碎）；流体云现状用 `python tools/notif_dump.py`（打印 title/text/`when`）。
 
@@ -1252,7 +1284,7 @@ socket"的读法是**错的**，`/ws/remote-control/window/<token>` 只做窗口
   出包命令见「本机开发」；`adb install -r` 直接覆盖安装，**不消耗 CI**。CI 仍然是可选通路
   （`git push origin pre` → js 检查 + `:app:testReleaseUnitTest` + APK → 滚动预发布 `android-pre`）。
   本地出包前务必先跑门禁（下面两条），因为本地编译**同样**只报类型错误、不保证行为正确。
-- **本地能跑的检查**：`node --test tools/inject.test.js tools/protocol.test.js`（90 项）、
+- **本地能跑的检查**：`node --test tools/inject.test.js tools/protocol.test.js`（94 项）、
   `python tools/check_kotlin_structure.py`
   （括号配平 / 包名 / 同文件重名——**不同嵌套类里的同名 fun 也会被点名**，改名即可）、
   `python tools/check_resources.py`；读 CI 用 `python tools/watch_ci.py`（含 `e:` 注解行；

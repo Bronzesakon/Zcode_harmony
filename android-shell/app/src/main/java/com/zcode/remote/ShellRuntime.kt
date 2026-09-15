@@ -196,9 +196,24 @@ object ShellRuntime {
             // 成功；重连后 runtime 已死，由卡死看门狗的僵尸档走刷新恢复。
             if (Tier2Probe.isRunning()) {
                 Tier2Probe.stop("回前台交还")
-                Diagnostics.log("warn", "Tier2: 前台交还完成，页面将由重连+KICKED 自愈恢复")
+                carrierHandedBack = true
+                Diagnostics.log(
+                    "warn",
+                    "后台原生承载：回前台交还完成——页面可见性恢复后 Chromium 网络栈复活，" +
+                        "由页面自己的 recoverConnection 重拨（本壳不重载页面）",
+                )
             }
+            clearCarrierState()
             stopLiveProgressPolling()
+            if (carrierHandedBack) {
+                // 只在这一条路径上安排兜底：8s 后页面若还没开线、也没有新入站帧，
+                // 说明它已经掉进失败态（自己回不来），那时才重载一次（5 分钟限流）。
+                carrierHandedBack = false
+                evaluateJs(
+                    "window.__zcodeShellAfterCarrierReturn && " +
+                        "window.__zcodeShellAfterCarrierReturn(8000);",
+                )
+            }
             stopHeartbeatPump()
             val startedAt = backgroundStartedAt
             val endedAt = SystemClock.elapsedRealtime()
@@ -464,6 +479,9 @@ object ShellRuntime {
                 }
                 // 原生巡检：渲染器冻结时注入层的 liveness 会整段停摆，这里仍能判死并接管。
                 checkTier1Silence()
+                // 页面链路判死 ⇒ 把连接交给原生（Chromium 的网络栈在后台会整体死掉，
+                // 页面侧自救无效；见 `maybeStartNativeCarrier` 的取证）。
+                maybeStartNativeCarrier()
                 mainHandler.postDelayed(this, PUMP_INTERVAL_MS)
             } else {
                 heartbeatPumpRunning = false
@@ -496,6 +514,359 @@ object ShellRuntime {
      */
     fun requestLivenessReport() {
         evaluateJs("window.__zcodeShellReportLiveness && window.__zcodeShellReportLiveness();")
+    }
+
+    // ------------------------------------------------- 后台失速自愈（僵尸连接）
+    //
+    // 现场（真机 2026-09-15 23:09–23:33，v129 只读壳，22 分钟不间断采样）：
+    // 退后台约 60s 后入站帧与 `链路 ack` **同时**归零，而页面那条 socket 的
+    // `readyState` 始终 1（OPEN）、`paired` 始终 true —— 远端不再回任何东西，
+    // 也没有 close 事件，客户端视角就是一条僵尸连接。页面按自己的设计在 hidden
+    // 时挂起（stopHeartbeat + 清看门狗），所以它永远不知道自己已经瞎了；而回前台
+    // 时它自己的 `recoverConnection()` 一拨就恢复，证明"重拨"本身就是解药。
+    //
+    // 于是这里做的事只有一件：**在后台失速时推动页面走它自己的恢复路径**
+    // （注入层的 `__zcodeShellNudgeRecover`：合成 `online` → 页面的生命周期
+    // observer → recoverConnection；不生效才退回"关一次它自己的 socket"）。
+    // 不接管连接、不重载页面、不动页面状态。
+    //
+    // 默认关闭：这是一条**写操作**，按「实现要点」14 的规矩，它必须先回答两句——
+    //   ① 页面自己做不到吗？做不到（它没有入站帧就没有任何失败信号，看门狗又被
+    //      自己的 suspend 清掉了）。
+    //   ② 怎么知道它失败了？壳每 10s 仍在发顶层 `pair_status_query`，健康链路上
+    //      它一定有 ack（真机健康窗 `链路 ack 1~5/10s`）；**连 ack 都没有**就说明
+    //      链路已死，而不是"桌面端安静"。
+    // 真机验收通过后再决定是否转正（`stallguard_on` 是 adb 开关）。
+
+    // ------------------------------------------------- 后台承载（方案 B 落地）
+    //
+    // 真机定案（2026-09-16 00:00–00:05，v131）：
+    //
+    //   退后台约 60–70s 后，**Chromium 的网络栈整体停止工作**，而 App 的网络没事：
+    //     · 页面那条 relay socket 停在 `readyState=1(OPEN)`、`paired=true`，
+    //       双向零帧持续 22 分钟（`收帧 0 / 发帧 0 / 链路 ack 0`，而壳每 10s 仍在
+    //       发顶层 pair_status_query——`探针 1` 却连 ack 都没有）；
+    //     · 同一刻页面里新建的 `fetch` **76 秒既不成功也不失败**（挂住）；
+    //     · 同一刻**原生 Java 侧**：`原生网络自检 裸TCP=ok 67ms · HTTPS=HTTP 200 276ms`；
+    //     · 同一刻原生 WebSocket：1 秒内 `★配对成功（matched）` + 开桥 + 订阅索引。
+    //   结论：**不是平台掐了 App 的网络，是 Chromium 的网络栈在后台死了**。
+    //   于是页面侧任何自救（重拨 / 合成 online / 重载）都不可能成功——这也是此前
+    //   注入层两轮"救后台"全部无效的原因；只有把连接的**承载**换成原生才行。
+    //
+    // 为什么不会 KICK 页面：判据是"入站帧静默 ≥35s"，此刻页面那条连接早已是僵尸
+    // （服务端那侧也失效），而且它的网络栈是死的——**KICKED 帧根本送不到页面**，
+    // 页面不会进终态。回前台时原生先交还（见 [onAppForegroundChanged]），页面自己
+    // 的 `recoverConnection` 在可见性恢复、Chromium 网络栈复活后重拨，
+    // 所以**回前台不需要重载页面**（这条要真机验收）。
+
+    /**
+     * 失速门槛：注入层自述"最早一帧入站是多久以前"超过它，就认定页面那条链路已死。
+     *
+     * 35s = 3 个泵周期 + 余量：健康的后台窗口里每 10s 都有入站帧（数据帧或我们
+     * 探针的 ack），连续三窗一帧都没有，只可能是链路断了。
+     */
+    private const val STALL_SILENCE_MS = 35_000L
+
+    @Volatile
+    private var carrierEnabled = true
+
+    private var carrierStarted = false
+
+    /** 刚刚交还过（前台分支读一次并清掉）：只在这条路径上安排"页面没恢复才重载"的兜底。 */
+    private var carrierHandedBack = false
+    private var nudgeCount = 0
+    private var lastNudgeAt = 0L
+    private var pendingNudgeAt = 0L
+    private var pendingNudgeMark = -1L
+    private var nudgeEscalated = false
+
+    /** 推动之后等多久升级动作（注入层不能用页面定时器收尾：后台被节流到分钟级）。 */
+    private const val NUDGE_ESCALATE_MS = 15_000L
+
+    /** 两次推动之间的最小间隔。 */
+    private const val NUDGE_MIN_GAP_MS = 25_000L
+
+    /** 一个后台窗口内最多推几次（仅手动诊断路径用）。 */
+    private const val NUDGE_MAX_PER_WINDOW = 10
+
+    /** socket 生命周期的指纹：页面真的重拨了，它一定变。 */
+    private fun nudgeMark(): Long {
+        val snapshot = liveness ?: return -1L
+        return snapshot.socketsOpened * 1_000_000L + snapshot.socketsClosed * 1_000L +
+            (snapshot.inboundFrames % 1_000L)
+    }
+
+    /** 开关（adb：`carrier_on` / `carrier_off`）。 */
+    fun setCarrierEnabled(enabled: Boolean) {
+        carrierEnabled = enabled
+        Diagnostics.log("warn", "后台原生承载：${if (enabled) "已开启" else "已关闭"}")
+        if (!enabled && Tier2Probe.isRunning()) {
+            Tier2Probe.stop("后台承载被关闭")
+            stopLiveProgressPolling()
+            carrierStarted = false
+        }
+    }
+
+    /**
+     * 泵每跳调用一次：页面链路判死就把连接交给原生。
+     *
+     * 只判"完全没有任何入站帧"——健康链路上壳的探针一定有 ack（真机健康窗
+     * `链路 ack 1~5/10s`），连 ack 都没有就不是"桌面端安静"，是链路已死。
+     */
+    private fun maybeStartNativeCarrier() {
+        if (!carrierEnabled) return
+        val age = lastInboundAgeMs() ?: return
+        if (age < STALL_SILENCE_MS) {
+            // 页面链路自己活着（或已恢复）⇒ 原生必须让位，绝不能两条连着。
+            if (carrierStarted) {
+                Diagnostics.log(
+                    "warn",
+                    "后台原生承载：页面链路已恢复（最新入站帧 ${age / 1000}s 前），原生交还",
+                )
+                Tier2Probe.stop("页面链路已恢复")
+                stopLiveProgressPolling()
+                carrierStarted = false
+            }
+            return
+        }
+        if (carrierStarted || Tier2Probe.isRunning()) return
+        val creds = relayCreds
+        if (creds == null) {
+            Diagnostics.log("warn", "后台原生承载：等待页面移交 relay 凭证")
+            return
+        }
+        carrierStarted = true
+        Diagnostics.log(
+            "warn",
+            "后台原生承载：入站帧静默 ${age / 1000}s（门槛 ${STALL_SILENCE_MS / 1000}s，" +
+                "Chromium 网络栈已死）——原生接管 relay 连接并订阅在跑会话，推到流体云",
+        )
+        Tier2Probe.start(creds, durationMs = 0L)
+        startLiveProgressPolling()
+    }
+
+    /** 交还时清账（由 [onAppForegroundChanged] 的前台分支调用）。 */
+    private fun clearCarrierState() {
+        carrierStarted = false
+        nudgeCount = 0
+        pendingNudgeAt = 0L
+        pendingNudgeMark = -1L
+        nudgeEscalated = false
+    }
+
+    /**
+     * 手动推动页面重拨（**只保留为 adb 诊断**）。
+     *
+     * 2026-09-16 真机证伪：墙内合成 `online` 事件确实送到了页面（日志
+     * `恢复推动 event：dispatch:online`），但页面**什么也做不了**——它那条 socket
+     * 的 close 都发不出去（`socket 2`=CLOSING 卡死），因为死的是 Chromium 的网络栈。
+     * 所以这条路不再参与生产逻辑，留作取证。
+     */
+    private fun maybeNudgeStalledPage() {
+        if (!carrierEnabled) return
+        if (jsEvaluator == null) return
+        val age = lastInboundAgeMs() ?: return
+        val now = SystemClock.elapsedRealtime()
+        if (pendingNudgeAt > 0L) {
+            val mark = nudgeMark()
+            if (mark != pendingNudgeMark) {
+                Diagnostics.info("后台失速自愈：推动后 socket 已变化（页面在重拨）")
+                pendingNudgeAt = 0L
+                pendingNudgeMark = -1L
+                nudgeEscalated = false
+            } else if (!nudgeEscalated && now - pendingNudgeAt >= NUDGE_ESCALATE_MS) {
+                nudgeEscalated = true
+                Diagnostics.log(
+                    "warn",
+                    "后台失速自愈：合成 online 未生效（${NUDGE_ESCALATE_MS / 1000}s 内 socket 未变），" +
+                        "升级为关掉页面那条 socket",
+                )
+                nudgePageRecovery("stall-escalate", "close")
+            }
+        }
+        if (age < STALL_SILENCE_MS) {
+            if (nudgeCount > 0) {
+                Diagnostics.info(
+                    "后台失速自愈：链路已回来（最新入站帧 ${age / 1000}s 前，共推动 $nudgeCount 次）",
+                )
+                nudgeCount = 0
+                pendingNudgeAt = 0L
+                pendingNudgeMark = -1L
+                nudgeEscalated = false
+            }
+            return
+        }
+        if (nudgeCount >= NUDGE_MAX_PER_WINDOW) return
+        if (now - lastNudgeAt < NUDGE_MIN_GAP_MS) return
+        lastNudgeAt = now
+        nudgeCount += 1
+        Diagnostics.log(
+            "warn",
+            "后台失速自愈 #$nudgeCount：入站帧静默 ${age / 1000}s（仅取证，见 maybeNudgeStalledPage 注释）",
+        )
+        pendingNudgeAt = now
+        pendingNudgeMark = nudgeMark()
+        nudgeEscalated = false
+        nudgePageRecovery("stall-${age / 1000}s", "event")
+    }
+
+    /**
+     * 原生网络自检（**不经 Chromium**）：先裸 TCP 连 relay host 的 443，再发一次 HTTPS GET。
+     *
+     * 为什么要原生再做一遍：墙内的页面 `fetch` 76 秒既不成功也不失败（真机 2026-09-15
+     * 23:54:43→23:55:59），那既可能是"平台把 App 的网络掐了"，也可能是"Chromium 的
+     * 网络栈在后台停了"。裸 TCP 是纯 Java 侧的判据，两者一分就清楚：
+     *   · 裸 TCP 也连不上 ⇒ 包被丢了，App 在后台整体没网（换谁承载连接都救不了）；
+     *   · 裸 TCP 秒连、只有那条 relay 连接死 ⇒ 只是那条连接坏了，重拨即可。
+     */
+    fun nativeNetProbe(tag: String) {
+        val raw = try {
+            prefs.remoteUrl
+        } catch (e: Exception) {
+            null
+        }
+        val host = try {
+            android.net.Uri.parse(raw.orEmpty()).host
+        } catch (e: Exception) {
+            null
+        } ?: "zcode.z.ai"
+        Thread {
+            val tcpStart = SystemClock.elapsedRealtime()
+            val tcp = try {
+                java.net.Socket().use { socket ->
+                    socket.connect(java.net.InetSocketAddress(host, 443), 5000)
+                    "ok ${SystemClock.elapsedRealtime() - tcpStart}ms"
+                }
+            } catch (e: Exception) {
+                "失败 ${SystemClock.elapsedRealtime() - tcpStart}ms ${e.javaClass.simpleName}: ${e.message}"
+            }
+            val httpStart = SystemClock.elapsedRealtime()
+            val http = try {
+                val conn = java.net.URL("https://$host/remote/v4?__zcprobe=${System.currentTimeMillis()}")
+                    .openConnection() as java.net.HttpURLConnection
+                conn.connectTimeout = 8000
+                conn.readTimeout = 8000
+                conn.requestMethod = "GET"
+                conn.setRequestProperty("Cache-Control", "no-store")
+                val code = conn.responseCode
+                conn.disconnect()
+                "HTTP $code ${SystemClock.elapsedRealtime() - httpStart}ms"
+            } catch (e: Exception) {
+                "失败 ${SystemClock.elapsedRealtime() - httpStart}ms ${e.javaClass.simpleName}: ${e.message}"
+            }
+            Diagnostics.log("warn", "原生网络自检[$tag] host=$host 裸TCP=$tcp · HTTPS=$http")
+        }.start()
+    }
+
+    /**
+     * 推动页面走它自己的恢复路径。这是本版唯一的"写页面连接"动作，且只在
+     * 后台失速（已判死）时使用。
+     */
+    fun nudgePageRecovery(reason: String, mode: String = "event") {
+        if (jsEvaluator == null) {
+            Diagnostics.log("warn", "恢复推动跳过（JS 求值通道未就绪）：$reason")
+            return
+        }
+        evaluateJs(
+            "window.__zcodeShellNudgeRecover && window.__zcodeShellNudgeRecover(" +
+                JSONObject.quote(mode) + ");",
+        )
+    }
+
+    /**
+     * 背景可调用的原生命令（adb broadcast 走 [DiagReceiver]，不经 Activity——
+     * `am start` 会把退到后台的应用拉回前台，正好毁掉要测的后台现场）。
+     *
+     * @return true 表示这条命令由原生侧处理完毕，调用方不必再转给注入层。
+     */
+    fun runNativeDiag(cmd: String): Boolean {
+        when (cmd) {
+            // Tier2 原生直连实验（保留原语义）。
+            "tier2_test" -> {
+                startTier2Probe(60_000L)
+                return true
+            }
+            "tier2_stop" -> {
+                stopTier2Probe()
+                return true
+            }
+            "tier1_silence_test" -> {
+                forceTier1SilenceCheckForTest()
+                return true
+            }
+            "tier2_takeover" -> {
+                startTier2TakeoverForTest(90_000L)
+                return true
+            }
+            // 后台原生承载的开关与手动触发。
+            "carrier_on" -> {
+                setCarrierEnabled(true)
+                return true
+            }
+            "carrier_off" -> {
+                setCarrierEnabled(false)
+                return true
+            }
+            "carrier_now" -> {
+                Diagnostics.log("warn", "后台原生承载（adb 手动触发）")
+                val creds = relayCreds
+                if (creds == null) {
+                    Diagnostics.log("warn", "后台原生承载：凭证未就绪")
+                } else {
+                    carrierStarted = true
+                    Tier2Probe.start(creds, durationMs = 0L)
+                    startLiveProgressPolling()
+                }
+                return true
+            }
+            "nudge_now" -> {
+                Diagnostics.log("warn", "恢复推动（adb 手动触发）")
+                nudgePageRecovery("adb", "event")
+                return true
+            }
+            "nudge_close" -> {
+                Diagnostics.log("warn", "恢复推动（adb 手动触发，close 档）")
+                nudgePageRecovery("adb-close", "close")
+                return true
+            }
+            "net_probe" -> {
+                nativeNetProbe("adb")
+                return true
+            }
+            "stall_state" -> {
+                val age = lastInboundAgeMs()
+                Diagnostics.log(
+                    "info",
+                    "后台承载状态：开关=$carrierEnabled 已接管=$carrierStarted " +
+                        "Tier2在跑=${Tier2Probe.isRunning()} " +
+                        "入站帧=${if (age == null) "未知" else "${age / 1000}s 前"}",
+                )
+                return true
+            }
+        }
+        return false
+    }
+
+    /**
+     * 把指令转给注入层（`__zcodeShellDiag`）。注入脚本要等页面 boot 完才就绪，
+     * 所以沿用 MainActivity 的重试口径（最多 40 次 × 600ms）。
+     */
+    fun dispatchJsDiag(cmd: String, attempt: Int = 0) {
+        if (jsEvaluator == null) {
+            Diagnostics.log("warn", "诊断指令无处执行（JS 求值通道未就绪）：$cmd")
+            return
+        }
+        if (!isInjectedReady()) {
+            if (attempt >= 40) {
+                Diagnostics.log("warn", "放弃诊断指令（注入脚本未就绪）：$cmd")
+                return
+            }
+            mainHandler.postDelayed({ dispatchJsDiag(cmd, attempt + 1) }, 600L)
+            return
+        }
+        evaluateJs(
+            "window.__zcodeShellDiag && window.__zcodeShellDiag(" + JSONObject.quote(cmd) + ");",
+        )
     }
 
     /**

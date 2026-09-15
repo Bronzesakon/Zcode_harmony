@@ -88,6 +88,21 @@
                 android:value="维持在后台与用户自有桌面设备的远程控制长连接,以便持续接收任务状态并发送通知" />
         </service>
 
+        <!-- adb 可**后台**调用的诊断入口。存在的理由：诊断指令原本只挂在
+             MainActivity 的 intent 上，而 am start 会把退到后台的应用拉回前台
+             ——可见性一变，要测的后台现场就毁了。广播不碰 Activity 生命周期。
+             只接受 shell(2000)/root(0) 发来的广播（见 DiagReceiver）。
+             用法见 README「诊断指令全集」：am broadcast -n <pkg>/.DiagReceiver
+             -a com.zcode.remote.action.DIAG 再带 diag_cmd 这个 string extra。 -->
+        <receiver
+            android:name=".DiagReceiver"
+            android:exported="true"
+            android:permission="android.permission.DUMP">
+            <intent-filter>
+                <action android:name="com.zcode.remote.action.DIAG" />
+            </intent-filter>
+        </receiver>
+
         <!-- Hands the exported diagnostics file to a share target (settings ->
              分享日志). Nothing else in the app is exposed through it. -->
         <provider
