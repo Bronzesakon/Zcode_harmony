@@ -124,8 +124,6 @@ object ShellRuntime {
     @Volatile
     private var verdictPending = false
 
-    fun livenessSnapshot(): Liveness? = liveness
-
     /** Age of the newest inbound frame, or null if nothing ever arrived. */
     fun lastInboundAgeMs(): Long? {
         val snapshot = liveness ?: return null
@@ -135,7 +133,6 @@ object ShellRuntime {
 
     private fun onLiveness(data: JSONObject) {
         val receivedAt = SystemClock.elapsedRealtime()
-        lastLivenessAt = receivedAt
         val ago = data.optLong("lastInboundAgoMs", -1)
         liveness = Liveness(
             inboundFrames = data.optInt("inboundFrames"),
@@ -149,7 +146,7 @@ object ShellRuntime {
             socketState = data.optInt("socketState", -1),
         )
         // 这里**不再**用注入层自述的链路静默（lastInboundAgoMs）触发接管：
-        // 桌面端安静不等于渲染器死了（见 checkTier1Silence 的说明）。
+        // 桌面端安静不等于渲染器死了；接管只认"页面链路判死"（见 maybeStartNativeCarrier）。
         // A background window just closed and this is the first fresh reading:
         // this is the milestone-4 verdict.
         if (verdictPending && backgroundStartedAt == 0L) {
@@ -232,14 +229,14 @@ object ShellRuntime {
             appIsForeground = false
             evaluateJs("window.__zcodeShellSetAppForeground && window.__zcodeShellSetAppForeground(false);")
             startHeartbeatPump()
-            lastLivenessAt = SystemClock.elapsedRealtime()
             backgroundStartedAt = SystemClock.elapsedRealtime()
             val snapshot = liveness
             backgroundFrameBase = snapshot?.inboundFrames ?: 0
             backgroundAckBase = snapshot?.pairAcks ?: 0
             backgroundTickBase = snapshot?.backgroundTicks ?: 0
-            // 退后台宽限期后原生接管（页面的 socket 让位，壳自己拉对话详情）。
-            scheduleBackgroundTakeover()
+            // 只上报一次 liveness：它是"渲染器是否已冻结"的判据。真正的接管由
+            // pump 里的 maybeStartNativeCarrier 按"页面链路判死"触发（见其注释）。
+            requestLivenessReport()
         }
     }
 
@@ -457,9 +454,6 @@ object ShellRuntime {
     private var appIsForeground = true
 
     @Volatile
-    private var externalPickerActive = false
-
-    @Volatile
     private var heartbeatPumpRunning = false
 
     private var lastAwayState = false
@@ -477,8 +471,6 @@ object ShellRuntime {
                         Diagnostics.log("debug", "后台心跳泵 #$pumpDispatches 次发令")
                     }
                 }
-                // 原生巡检：渲染器冻结时注入层的 liveness 会整段停摆，这里仍能判死并接管。
-                checkTier1Silence()
                 // 页面链路判死 ⇒ 把连接交给原生（Chromium 的网络栈在后台会整体死掉，
                 // 页面侧自救无效；见 `maybeStartNativeCarrier` 的取证）。
                 maybeStartNativeCarrier()
@@ -570,6 +562,9 @@ object ShellRuntime {
     /** 页面刚动过 socket（重拨中）后的静默期：见 [lastSocketMarkForStall]。 */
     private const val CARRIER_REQUIET_AFTER_SOCKET_MS = 20_000L
 
+    /** 多工作区覆盖一次最多开几座桥（与 `Tier2Probe.DEFAULT_MAX_COVERAGE` 对齐）。 */
+    private const val MULTI_WS_COVERAGE_CAP = 3
+
     /**
      * 后台承载总开关。
      *
@@ -602,6 +597,24 @@ object ShellRuntime {
     @Volatile
     private var pageWorkspaceTaskId = ""
 
+    /**
+     * 多工作区覆盖开关（adb：`multi_ws_on` / `multi_ws_off`），**默认关**。
+     *
+     * 打开后承载不再只开页面工作区一座桥，而是 **page 工作区 ∪ 有在跑任务的工作区**
+     * （上限 [MULTI_WS_COVERAGE_CAP]）。为什么默认关：这是 `docs/17` 的下一个方向，
+     * 桌面端能否同时服务多座桥**还没验证过**（旧证据被 host 之死污染），所以先做成开关，
+     * 真机验证通过再谈改默认（`docs/17` §7.5 的原话）。
+     */
+    @Volatile
+    private var multiWorkspaceCoverage = false
+
+    /**
+     * `coverage_ws:<k1>,<k2>` 诊断指令的显式覆盖清单：**优先于开关**，专供 E1 做干净 A/B
+     * （不必真起第二个任务，也不必改开关默认值）。
+     */
+    @Volatile
+    private var coverageOverride: List<String> = emptyList()
+
     private var carrierStarted = false
 
     /** 刚刚交还过（前台分支读一次并清掉）：只在这条路径上安排"页面没恢复才重载"的兜底。 */
@@ -617,20 +630,6 @@ object ShellRuntime {
      */
     private var lastSocketMarkForStall = -1L
     private var lastSocketChangeAt = 0L
-    private var nudgeCount = 0
-    private var lastNudgeAt = 0L
-    private var pendingNudgeAt = 0L
-    private var pendingNudgeMark = -1L
-    private var nudgeEscalated = false
-
-    /** 推动之后等多久升级动作（注入层不能用页面定时器收尾：后台被节流到分钟级）。 */
-    private const val NUDGE_ESCALATE_MS = 15_000L
-
-    /** 两次推动之间的最小间隔。 */
-    private const val NUDGE_MIN_GAP_MS = 25_000L
-
-    /** 一个后台窗口内最多推几次（仅手动诊断路径用）。 */
-    private const val NUDGE_MAX_PER_WINDOW = 10
 
     /** socket 生命周期的指纹：页面真的重拨了，它一定变。 */
     private fun nudgeMark(): Long {
@@ -652,11 +651,23 @@ object ShellRuntime {
     }
 
     /**
-     * 泵每跳调用一次：页面链路判死就把连接交给原生。
+     * 承载这一轮要开哪些工作区的桥（多工作区方向，见 `docs/17`）。
      *
-     * 只判"完全没有任何入站帧"——健康链路上壳的探针一定有 ack（真机健康窗
-     * `链路 ack 1~5/10s`），连 ack 都没有就不是"桌面端安静"，是链路已死。
+     * 优先级：诊断覆盖清单 > 多工作区开关 > 只开页面工作区（返回空，交给 `Tier2Probe` 决定）。
+     * 开关打开时＝ page 工作区 ∪ 有在跑任务的工作区，上限 [MULTI_WS_COVERAGE_CAP]。
      */
+    private fun carrierCoverageTargets(): List<String> {
+        if (coverageOverride.isNotEmpty()) return coverageOverride
+        if (!multiWorkspaceCoverage) return emptyList()
+        val out = LinkedHashSet<String>()
+        if (pageWorkspaceKey.isNotEmpty()) out.add(pageWorkspaceKey)
+        for ((key, _) in store.runningTaskRefs()) {
+            if (out.size >= MULTI_WS_COVERAGE_CAP) break
+            if (key.isNotEmpty()) out.add(key)
+        }
+        return out.take(MULTI_WS_COVERAGE_CAP)
+    }
+
     /**
      * 后台原生承载：把连接交给原生。
      *
@@ -723,6 +734,7 @@ object ShellRuntime {
             durationMs = 0L,
             onlyWorkspace = pageWorkspaceKey,
             onlyTaskId = pageWorkspaceTaskId,
+            coverageWorkspaces = carrierCoverageTargets(),
         )
         startLiveProgressPolling()
     }
@@ -776,66 +788,6 @@ object ShellRuntime {
     private fun clearCarrierState() {
         releaseCarrierWakeLock()
         carrierStarted = false
-        nudgeCount = 0
-        pendingNudgeAt = 0L
-        pendingNudgeMark = -1L
-        nudgeEscalated = false
-    }
-
-    /**
-     * 手动推动页面重拨（**只保留为 adb 诊断**）。
-     *
-     * 2026-09-16 真机证伪：墙内合成 `online` 事件确实送到了页面（日志
-     * `恢复推动 event：dispatch:online`），但页面**什么也做不了**——它那条 socket
-     * 的 close 都发不出去（`socket 2`=CLOSING 卡死），因为死的是 Chromium 的网络栈。
-     * 所以这条路不再参与生产逻辑，留作取证。
-     */
-    private fun maybeNudgeStalledPage() {
-        if (!carrierEnabled) return
-        if (jsEvaluator == null) return
-        val age = lastInboundAgeMs() ?: return
-        val now = SystemClock.elapsedRealtime()
-        if (pendingNudgeAt > 0L) {
-            val mark = nudgeMark()
-            if (mark != pendingNudgeMark) {
-                Diagnostics.info("后台失速自愈：推动后 socket 已变化（页面在重拨）")
-                pendingNudgeAt = 0L
-                pendingNudgeMark = -1L
-                nudgeEscalated = false
-            } else if (!nudgeEscalated && now - pendingNudgeAt >= NUDGE_ESCALATE_MS) {
-                nudgeEscalated = true
-                Diagnostics.log(
-                    "warn",
-                    "后台失速自愈：合成 online 未生效（${NUDGE_ESCALATE_MS / 1000}s 内 socket 未变），" +
-                        "升级为关掉页面那条 socket",
-                )
-                nudgePageRecovery("stall-escalate", "close")
-            }
-        }
-        if (age < STALL_SILENCE_MS) {
-            if (nudgeCount > 0) {
-                Diagnostics.info(
-                    "后台失速自愈：链路已回来（最新入站帧 ${age / 1000}s 前，共推动 $nudgeCount 次）",
-                )
-                nudgeCount = 0
-                pendingNudgeAt = 0L
-                pendingNudgeMark = -1L
-                nudgeEscalated = false
-            }
-            return
-        }
-        if (nudgeCount >= NUDGE_MAX_PER_WINDOW) return
-        if (now - lastNudgeAt < NUDGE_MIN_GAP_MS) return
-        lastNudgeAt = now
-        nudgeCount += 1
-        Diagnostics.log(
-            "warn",
-            "后台失速自愈 #$nudgeCount：入站帧静默 ${age / 1000}s（仅取证，见 maybeNudgeStalledPage 注释）",
-        )
-        pendingNudgeAt = now
-        pendingNudgeMark = nudgeMark()
-        nudgeEscalated = false
-        nudgePageRecovery("stall-${age / 1000}s", "event")
     }
 
     /**
@@ -908,6 +860,22 @@ object ShellRuntime {
      * @return true 表示这条命令由原生侧处理完毕，调用方不必再转给注入层。
      */
     fun runNativeDiag(cmd: String): Boolean {
+        // 带参指令走前缀匹配（下面的 `when` 只做精确匹配）。
+        if (cmd.startsWith("coverage_ws:")) {
+            val list = cmd.substringAfter(':').split(',').map { it.trim() }.filter { it.isNotEmpty() }
+            coverageOverride = list
+            Diagnostics.log(
+                "warn",
+                "多工作区覆盖：诊断覆盖清单已设为 " +
+                    (if (list.isEmpty()) "(空)" else list.joinToString()) + "（${list.size} 座）",
+            )
+            return true
+        }
+        if (cmd == "coverage_ws_clear") {
+            coverageOverride = emptyList()
+            Diagnostics.log("warn", "多工作区覆盖：已清空诊断覆盖清单")
+            return true
+        }
         when (cmd) {
             // Tier2 原生直连实验（保留原语义）。
             "tier2_test" -> {
@@ -916,10 +884,6 @@ object ShellRuntime {
             }
             "tier2_stop" -> {
                 stopTier2Probe()
-                return true
-            }
-            "tier1_silence_test" -> {
-                forceTier1SilenceCheckForTest()
                 return true
             }
             "tier2_takeover" -> {
@@ -935,19 +899,43 @@ object ShellRuntime {
                 setCarrierEnabled(false)
                 return true
             }
+            // 多工作区覆盖（docs/17 的方向）：默认关，验证通过再谈改默认。
+            "multi_ws_on" -> {
+                multiWorkspaceCoverage = true
+                Diagnostics.log(
+                    "warn",
+                    "多工作区覆盖：已开启（page ∪ 在跑任务，上限 $MULTI_WS_COVERAGE_CAP）",
+                )
+                return true
+            }
+            "multi_ws_off" -> {
+                multiWorkspaceCoverage = false
+                Diagnostics.log("warn", "多工作区覆盖：已关闭（只开页面工作区）")
+                return true
+            }
             "carrier_now" -> {
                 Diagnostics.log("warn", "后台原生承载（adb 手动触发）")
                 val creds = relayCreds
                 if (creds == null) {
                     Diagnostics.log("warn", "后台原生承载：凭证未就绪")
                 } else {
+                    val age = lastInboundAgeMs()
+                    val targets = carrierCoverageTargets()
+                    Diagnostics.log(
+                        "warn",
+                        "后台原生承载：手动接管（页面入站帧 " +
+                            (if (age == null) "未知" else "${age / 1000}s 前") + "，" +
+                            (if (targets.isEmpty()) "覆盖=页面工作区" else "覆盖=${targets.joinToString()}") + "）",
+                    )
                     carrierStarted = true
+                    acquireCarrierWakeLock()
                     Tier2Probe.start(
-            creds,
-            durationMs = 0L,
-            onlyWorkspace = pageWorkspaceKey,
-            onlyTaskId = pageWorkspaceTaskId,
-        )
+                        creds,
+                        durationMs = 0L,
+                        onlyWorkspace = pageWorkspaceKey,
+                        onlyTaskId = pageWorkspaceTaskId,
+                        coverageWorkspaces = targets,
+                    )
                     startLiveProgressPolling()
                 }
                 return true
@@ -997,6 +985,7 @@ object ShellRuntime {
                     "info",
                     "后台承载状态：开关=$carrierEnabled 已接管=$carrierStarted " +
                         "Tier2在跑=${Tier2Probe.isRunning()} " +
+                        "多工作区=$multiWorkspaceCoverage 覆盖=${carrierCoverageTargets().joinToString()} " +
                         "入站帧=${if (age == null) "未知" else "${age / 1000}s 前"}",
                 )
                 return true
@@ -1044,37 +1033,6 @@ object ShellRuntime {
     private var relayCreds: RelayCreds? = null
 
     /**
-     * Tier1 静默超过该时长即视为判死，Tier2 原生接管配对与任务事件。
-     * 25s：用户要求"30 秒内必须接管"；正常链路的 liveness/心跳节拍是 10s，
-     * 25s 容得下两次迟到，配合 5s 一跳的看门狗最坏 30s 内动手。
-     */
-    private const val TIER2_TAKEOVER_SILENCE_MS = 25_000L
-
-    /**
-     * 退后台探针的应答窗：退后台那一刻问一次 liveness，4s 内没有回音即认定
-     * 渲染器已经起不来（熄屏被挂起/被冻结）——接管理由行会这么写。接管本身
-     * 与它无关（后台总要接管），这个读数只用来把理由写准。
-     */
-    private const val RENDERER_PROBE_MS = 4_000L
-
-    /**
-     * 退后台到接管的宽限：瞥一眼别的应用就切回来不该付"页面被踢+回前台重载"
-     * 的代价。5s 相对流体云的跟手需求可以忽略。
-     */
-    private const val BACKGROUND_TAKEOVER_DELAY_MS = 5_000L
-
-    /**
-     * 最后一次收到注入层 liveness 报告的墙钟时刻。
-     *
-     * 关键：接管判据不能只看 JS 上报的 lastInboundAgoMs——渲染器被冻结时
-     * 连报告本身都停了（2026-09-13 真机：进程 FGS 存活、渲染器静默 30 分钟，
-     * 注入层零上报，接管因此永远不会触发）。这里用"原生多久没收到任何
-     * liveness"作为主判据，JS 的自述只作补充。
-     */
-    @Volatile
-    private var lastLivenessAt = 0L
-
-    /**
      * 用户是否已经离开（接管的前置条件）：应用在后台，**或屏幕已熄灭**。
      *
      * 屏幕熄灭这一条是 2026-09-13 真机补上的：应用名义上还在前台时原生泵不
@@ -1092,42 +1050,6 @@ object ShellRuntime {
         return !power.isInteractive
     }
 
-    /**
-     * 原生侧巡检 Tier1 静默（常驻看门狗，不依赖注入层上报）。
-     *
-     * 判据只有一条：**原生多久没收到注入层的 liveness**。
-     * 那才是"渲染器瞎了"的证据——liveness 由原生泵每 10s 用 evaluateJavascript
-     * 驱动（见 [pumpRunnable]），渲染器被冻结/杀死时它整段停摆。
-     *
-     * 2026-09-13 真机教训：这里原先取 min(注入层报告静默, 链路入站静默)，于是
-     * "桌面端 25s 没下发任何帧"也会判死并接管。那是**误判**：桌面端安静不等于
-     * 我们瞎了（接管同样拿不到帧），而接管的代价是把页面顶掉（relay 单控制端
-     * 互斥，KICK 语义已定案）。16:05 那次误判把页面踢成 KICKED 终态，页面不会
-     * 自愈，流体云从此断供——链路安静归页面自己的心跳看门狗管，接管只认
-     * "渲染器不答话"。
-     */
-    fun setExternalPickerActive(active: Boolean) {
-        externalPickerActive = active
-        if (active) {
-            rendererProbeToken += 1
-            Diagnostics.log("debug", "系统文件选择器打开，暂停后台接管")
-        } else {
-            Diagnostics.log("debug", "系统文件选择器关闭，恢复后台接管判定")
-        }
-    }
-
-    private fun checkTier1Silence() {
-        if (lastLivenessAt <= 0L) {
-            return
-        }
-        if (externalPickerActive) {
-            Diagnostics.log("debug", "Tier2: 系统文件选择器期间不接管")
-            return
-        }
-        if (!userIsAway()) return
-        maybeTakeOverInBackground(SystemClock.elapsedRealtime() - lastLivenessAt)
-    }
-
     /** Tier1 静默看门狗：每 5s 一跳，前台/后台/熄屏都在岗。 */
     private val tier1Watchdog = object : Runnable {
         override fun run() {
@@ -1136,7 +1058,7 @@ object ShellRuntime {
                 if (away && !lastAwayState) {
                     evaluateJs("window.__zcodeShellSetAppForeground && window.__zcodeShellSetAppForeground(false);")
                     startHeartbeatPump()
-                    if (!externalPickerActive) scheduleBackgroundTakeover()
+                    requestLivenessReport()
                 } else if (!away && lastAwayState) {
                     evaluateJs("window.__zcodeShellSetAppForeground && window.__zcodeShellSetAppForeground(true);")
                     if (Tier2Probe.isRunning()) {
@@ -1150,7 +1072,6 @@ object ShellRuntime {
                     stopHeartbeatPump()
                 }
                 lastAwayState = away
-                checkTier1Silence()
             } catch (e: Exception) {
                 Diagnostics.log("warn", "Tier1 看门狗异常: ${e.message}")
             }
@@ -1158,109 +1079,9 @@ object ShellRuntime {
         }
     }
 
-    /**
-     * 诊断指令 tier1_silence_test：把 liveness 时间戳强制拨旧，验证"渲染器静默
-     * → 原生判死 → Tier2 接管"这条路径（真机无法自然制造渲染器冻结）。
-     */
-    fun forceTier1SilenceCheckForTest() {
-        lastLivenessAt = SystemClock.elapsedRealtime() - (TIER2_TAKEOVER_SILENCE_MS + 5_000L)
-        Diagnostics.log("warn", "Tier1 静默测试：强制判死并立即巡检")
-        checkTier1Silence()
-    }
-
     fun startTier1Watchdog() {
         mainHandler.removeCallbacks(tier1Watchdog)
         mainHandler.postDelayed(tier1Watchdog, 5_000L)
-    }
-
-    /**
-     * 自动后台接管的**总闸**（2026-09-15 起关闭，Phase 1 落地前勿打开）。
-     *
-     * 关闭依据不是猜测，是从网页 bundle 里读出来的**服务端语义**：
-     *   * relay 强制"同一时间只能保留一个手机控制端"——网页自己的失败文案即证据
-     *     （`index-nOVzQNKW.js` @4713300：badge=设备接管 / reason=session-conflict）；
-     *   * 页面收到 `KICKED` 后进 `kicked` 终态并 `enterTerminalFailure('session-conflict')`
-     *     （同文件 @4703473），**不自动恢复**，用户必须手动重载。
-     *
-     * 于是"第二条 relay 连接"（含原生自己连）必然把页面踢死。而需求是
-     * **后台保活且不占页面连接**——那就只能让那条连接继续是页面自己的那一条：
-     * 连接的**承载**改由原生代理（Phase 1：WebSocket 替身），**协议所有权仍归页面**。
-     *
-     * 诊断指令（tier2_test / tier2_takeover / tier1_silence_test）不受本闸影响，
-     * 仍可手动验证接管语义。Phase 1 落地后连同整个 Tier2 接管路径一起删除。
-     */
-    private const val AUTO_TAKEOVER_ENABLED = false
-
-    /**
-     * 退后台后的接管（用户 2026-09-13 的口径："切后台就直接原生接管连接并继续
-     * 获取对话详情推送到流体云"）。
-     *
-     * ⚠️ 2026-09-15 起**默认关闭**，理由见 [AUTO_TAKEOVER_ENABLED]：接管必 KICK 页面。
-     * 保留这个探测点是给 Phase 1 用——它同时是"渲染器是否已冻结"的判据。
-     */
-    private fun scheduleBackgroundTakeover() {
-        if (!AUTO_TAKEOVER_ENABLED) {
-            Diagnostics.log(
-                "info",
-                "Tier2: 自动接管已停用（单控制端互斥，接管必 KICK 页面）——保留后台泵与页面连接",
-            )
-            // 只上报一次 liveness（Phase 1 的"渲染器冻结"判据仍需要它），不排接管。
-            requestLivenessReport()
-            return
-        }
-        rendererProbeToken += 1
-        val token = rendererProbeToken
-        requestLivenessReport()
-        mainHandler.postDelayed({
-            if (token != rendererProbeToken) return@postDelayed
-            if (!userIsAway()) return@postDelayed
-            val since = SystemClock.elapsedRealtime() - lastLivenessAt
-            val why = if (since >= RENDERER_PROBE_MS) {
-                "渲染器已冻结（注入层 ${since / 1000}s 零应答）"
-            } else {
-                "后台接管（页面推流稀疏，改由原生主动拉对话详情）"
-            }
-            takeOverNow(why)
-        }, BACKGROUND_TAKEOVER_DELAY_MS)
-    }
-
-    @Volatile
-    private var rendererProbeToken = 0
-
-    /**
-     * Tier2 后台接管触发：应用在后台且**注入层已经不答话**（渲染器冻结/被杀）。
-     *
-     * ⚠️ 默认停用（见 [AUTO_TAKEOVER_ENABLED]）：接管会 KICK 页面，而页面进的是
-     * `kicked` **终态、不自动恢复**——拿"页面被踢死"换后台跟手，代价不可接受。
-     */
-    private fun maybeTakeOverInBackground(livenessAgoMs: Long) {
-        // 本函数由 5s 一跳的 Tier1 看门狗调用，这里必须静默返回（打日志会刷屏）。
-        if (!AUTO_TAKEOVER_ENABLED) return
-        if (livenessAgoMs in 0 until TIER2_TAKEOVER_SILENCE_MS) return
-        takeOverNow("用户已离开且注入层静默 ${livenessAgoMs / 1000}s（渲染器已冻结）")
-    }
-
-    /** 执行接管（前置条件已满足，只做最后两道门）。 */
-    private fun takeOverNow(reason: String) {
-        if (!AUTO_TAKEOVER_ENABLED) return
-        if (externalPickerActive) return
-        if (!userIsAway()) return
-        if (Tier2Probe.isRunning()) return
-        // The page's paired flag may be stale while its renderer is frozen or
-        // recovering. Native authentication is the authoritative check; it will
-        // only take the relay slot after the server returns matched.
-        val c = relayCreds ?: return
-        Tier2Probe.start(
-            c,
-            durationMs = 0L,
-            onlyWorkspace = pageWorkspaceKey,
-            onlyTaskId = pageWorkspaceTaskId,
-        )
-        Diagnostics.log(
-            "warn",
-            "Tier2: $reason——原生接管配对与任务事件（回前台/亮屏自动交还）",
-        )
-        startLiveProgressPolling()
     }
 
     /** 诊断指令 tier2_test：原生直连探针跑一轮（默认 60s 自动关闭）。 */

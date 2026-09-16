@@ -29,13 +29,6 @@ object Diagnostics {
     private val entries: MutableList<String> = Collections.synchronizedList(ArrayList())
     private val timeFormat = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
 
-    @Volatile
-    private var listener: (() -> Unit)? = null
-
-    fun setListener(callback: (() -> Unit)?) {
-        listener = callback
-    }
-
     fun log(level: String, message: String) {
         val safe = redact(message)
         entries.add("${timeFormat.format(Date())}  ${level.uppercase(Locale.US)}  $safe")
@@ -45,7 +38,6 @@ object Diagnostics {
             }
         }
         ShellLog.append(level, safe)
-        listener?.invoke()
     }
 
     fun info(message: String) = log("info", message)
@@ -55,7 +47,6 @@ object Diagnostics {
     fun clear() {
         synchronized(entries) { entries.clear() }
         ShellLog.clearFile()
-        listener?.invoke()
     }
 
     fun asText(): String = snapshot().joinToString("\n")

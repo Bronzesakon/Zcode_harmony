@@ -23,7 +23,6 @@ object RelayWire {
 
     // ChannelClient request/response type tags.
     const val REQ_PROMISE = 100
-    const val REQ_PROMISE_CANCEL = 101
     const val REQ_EVENT_LISTEN = 102
     const val REQ_EVENT_DISPOSE = 103
     const val RES_INITIALIZE = 200
@@ -459,14 +458,6 @@ object RelayWire {
     }
 
     // ------------------------------------------------------- ChannelClient body
-
-    /** 组装一个 promise 请求 body：`[REQ_PROMISE, id, channel, method] + args`。 */
-    fun requestBody(id: Long, channel: String, method: String, args: List<Any?>): ByteArray =
-        encodeBody(listOf(REQ_PROMISE, id, channel, method), args)
-
-    /** 组装一个事件监听 body：`[REQ_EVENT_LISTEN, id, channel, event] + args`。 */
-    fun listenBody(id: Long, channel: String, event: String, args: List<Any?>): ByteArray =
-        encodeBody(listOf(REQ_EVENT_LISTEN, id, channel, event), args)
 
     /** 解析 ChannelClient body：header 数组 + 可选 args。 */
     class ParsedBody(val header: List<Any?>, val args: Any?)

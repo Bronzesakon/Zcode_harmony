@@ -31,10 +31,4 @@
         <item name="colorSurfaceContainerHighest">@color/miuix_secondary</item>
         <item name="colorOutline">@color/miuix_outline</item>
     </style>
-
-    <!-- Shown while the process starts, before the WebView has anything to
-         paint: the themed background avoids a white/black flash. -->
-    <style name="Theme.ZcodeRemote.Splash" parent="Theme.ZcodeRemote">
-        <item name="android:windowBackground">?android:attr/colorBackground</item>
-    </style>
 </resources>

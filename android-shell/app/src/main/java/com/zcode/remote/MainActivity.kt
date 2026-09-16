@@ -389,7 +389,6 @@ class MainActivity : AppCompatActivity() {
                 }
                 pendingFileCallback?.onReceiveValue(null)
                 pendingFileCallback = filePathCallback
-                ShellRuntime.setExternalPickerActive(true)
                 showUploadSourceDialog(fileChooserParams)
                 return true
             }
@@ -630,21 +629,10 @@ class MainActivity : AppCompatActivity() {
         // sit waiting on that input forever.
         pendingFileCallback?.onReceiveValue(null)
         pendingFileCallback = null
-        ShellRuntime.setExternalPickerActive(false)
         // Drop the evaluator: it closes over this Activity's binding.
         ShellRuntime.setJsEvaluator(null)
         ShellRuntime.setPageStateListener(null)
         super.onDestroy()
-    }
-
-    private fun notifyForegroundState(foreground: Boolean) {
-        if (!::binding.isInitialized) return
-        val script = "window.__zcodeShellSetAppForeground && window.__zcodeShellSetAppForeground($foreground);"
-        try {
-            binding.webview.evaluateJavascript(script, null)
-        } catch (e: Exception) {
-            Diagnostics.log("debug", "前台状态同步失败: ${e.message}")
-        }
     }
 
     /**
@@ -887,7 +875,6 @@ class MainActivity : AppCompatActivity() {
     private fun deliverPickedFiles(uris: List<Uri>) {
         val callback = pendingFileCallback ?: return
         pendingFileCallback = null
-        ShellRuntime.setExternalPickerActive(false)
         Diagnostics.info(
             if (uris.isEmpty()) "文件选择已取消"
             else "已选择 ${uris.size} 个文件，交回网页：${describePickedFiles(uris)}"
@@ -965,7 +952,6 @@ class MainActivity : AppCompatActivity() {
         const val EXTRA_DIAG_CMD = "diag_cmd"
         const val EXTRA_SESSION_ID = "session_id"
         const val EXTRA_TASK_TITLE = "task_title"
-        const val EXTRA_WORKSPACE_KEY = "workspace_key"
 
         private const val BRIDGE_NAME = "ZCodeShell"
         private const val ALLOWED_ROOT = "z.ai"

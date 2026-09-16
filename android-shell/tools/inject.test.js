@@ -8,10 +8,12 @@
  * a minimal EventTarget/Document/Window tree plus a WebSocket that records what
  * was sent, with the shared fake desktop on the other end.
  *
- * Covered: idempotency, the visibility spoof, hook transparency (statics,
- * instanceof, no feedback loop), the full active-subscribe handshake over the
- * socket, passive reading of the page's own stream, the title-matching task
- * locator, and the promise that credentials never reach the diagnostic log.
+ * Covered: idempotency, the read-only contract (the visibility hijack stays
+ * off and the shell writes nothing to the page's socket while in the
+ * foreground), hook transparency (statics, instanceof, no feedback loop), the
+ * full active-subscribe handshake over the socket, passive reading of the
+ * page's own stream, the title-matching task locator, and the promise that
+ * credentials never reach the diagnostic log.
  */
 'use strict';
 

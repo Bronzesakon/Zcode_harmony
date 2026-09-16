@@ -56,6 +56,15 @@ object Tier2Probe {
 
     enum class Phase { IDLE, CONNECTING, AUTHENTICATING, PAIRED, CLOSED }
 
+    /** 一次覆盖最多开几座桥（每座桥 = 桌面端一条常驻会话，别无限开）。 */
+    private const val DEFAULT_MAX_COVERAGE = 3
+
+    /** 同一工作区连续开桥失败几次后进入冷却。 */
+    private const val BRIDGE_FAIL_COOLDOWN_AFTER = 2
+
+    /** 冷却时长：别每轮重连都去撞同一个必失败的桥。 */
+    private const val BRIDGE_FAIL_COOLDOWN_MS = 10 * 60 * 1000L
+
     @Volatile
     private var phase: Phase = Phase.IDLE
 
@@ -78,9 +87,23 @@ object Tier2Probe {
     private var reconnectAttempt = 0
     private var durationTimer: java.util.Timer? = null
 
-    /** 页面正在显示的工作区（只为它开桥）；空串=未知，退回全量覆盖。 */
+    /** 页面正在显示的工作区（view-state 帧用，也是默认的覆盖目标）；空串=未知。 */
     @Volatile
     private var onlyWorkspace: String = ""
+
+    /**
+     * **显式覆盖目标**（多工作区）。非空时只用它，空=退回"只开页面当前工作区"。
+     *
+     * 内容由 [ShellRuntime] 决定（多工作区开关打开时＝page 工作区 ∪ 有在跑任务的工作区，
+     * 上限 [DEFAULT_MAX_COVERAGE]），或由诊断指令 `coverage_ws:<k1>,<k2>` 直接指定（E1 用）。
+     * 显式覆盖**不受失败冷却影响**——实验要能看到失败。
+     */
+    @Volatile
+    private var coverageWorkspaces: List<String> = emptyList()
+
+    /** 开桥失败计数 / 冷却截止（毫秒，`SystemClock` 不可用，这里用墙钟）。 */
+    private val bridgeFailCount = java.util.concurrent.ConcurrentHashMap<String, Int>()
+    private val bridgeCooldownUntil = java.util.concurrent.ConcurrentHashMap<String, Long>()
 
     /** 页面正在显示的任务（view-state 帧里要用；空串=未知）。 */
     @Volatile
@@ -160,14 +183,16 @@ object Tier2Probe {
     /**
      * @param durationMs 探针存活时长；<=0 表示接管模式（持久，直到 [stop]，
      *   且配对成功后启动桥覆盖 + 断线自动重连）。
-     * @param onlyWorkspace 页面**自己**正在显示的工作区键：只为它开桥。空串表示注入层
-     *   还没上报，退回全量覆盖（有让桌面端拆 host 的风险，见 [startCoverage] 的注释）。
+     * @param onlyWorkspace 页面**自己**正在显示的工作区键：view-state 帧用它，也是
+     *   没有 [coverageWorkspaces] 时的唯一覆盖目标。空串表示注入层还没上报。
+     * @param coverageWorkspaces 多工作区覆盖清单（非空时只用它，顺序即开桥顺序）。
      */
     fun start(
         newCreds: RelayCreds,
         durationMs: Long = 60_000L,
         onlyWorkspace: String = "",
         onlyTaskId: String = "",
+        coverageWorkspaces: List<String> = emptyList(),
     ) {
         startInternal(
             newCreds,
@@ -175,6 +200,7 @@ object Tier2Probe {
             takeoverOverride = null,
             onlyWorkspace = onlyWorkspace,
             onlyTaskId = onlyTaskId,
+            coverageWorkspaces = coverageWorkspaces,
         )
     }
 
@@ -198,6 +224,7 @@ object Tier2Probe {
         takeoverOverride: Long?,
         onlyWorkspace: String = "",
         onlyTaskId: String = "",
+        coverageWorkspaces: List<String> = emptyList(),
     ) {
         if (isRunning()) {
             Diagnostics.log("warn", "Tier2: 已在运行（phase=$phase），忽略重复启动")
@@ -206,6 +233,9 @@ object Tier2Probe {
         creds = newCreds
         this.onlyWorkspace = onlyWorkspace
         this.onlyTaskId = onlyTaskId
+        this.coverageWorkspaces = coverageWorkspaces
+        bridgeFailCount.clear()
+        bridgeCooldownUntil.clear()
         persistent = durationMs <= 0
         stopping = false
         reconnectAttempt = 0
@@ -418,6 +448,8 @@ object Tier2Probe {
                     Diagnostics.log("warn", "Tier2: 会话运行态回调失败 ${e.message}")
                 }
             },
+            onBridgeResult = { key, ok -> recordBridgeResult(key, ok) },
+            maxWorkspaces = DEFAULT_MAX_COVERAGE,
         )
         bridgeManager = manager
         Thread {
@@ -438,32 +470,102 @@ object Tier2Probe {
                     val key = workspaceKeyOf(workspace)
                     if (key == null) 0 else runningSessionsProvider?.invoke(key).orEmpty().size
                 }
-                // **只开页面自己在看的那个工作区**（2026-09-16 定案）：页面自己永远只开一个桥
-                // （它当前显示的 workspace，带 taskId），而原生扫全部 7 个工作区时桌面端会在
-                // 4 秒后把 host 收掉（`unregistered host` + `host process exited`，docs/16 §8/§10）。
-                // 有页面工作区就只开它；没有（注入层还没上报）才退回"按在跑任务排序的全量"。
+                // 覆盖目标三档（2026-09-16 第二版：多工作区）：
+                //   ① **显式清单**（多工作区开关打开 / `coverage_ws:` 诊断）——只用它，按给定顺序，
+                //      不受失败冷却影响（实验要能看到失败）；
+                //   ② **页面工作区**（默认）——与页面自己的行为一致，是经过真机验收的生产路径；
+                //   ③ 都没有 ——按"在跑任务数"排序取前 [DEFAULT_MAX_COVERAGE] 个。
+                //      **不再全量**：扫全部工作区曾被认为是桌面端拆 host 的诱因，虽然后来查明真凶是
+                //      controller 流那次 `rpc:listen`（docs/16 §8/§10），但没有理由为此开满 12 座桥。
+                val explicit = coverageWorkspaces
                 val only = onlyWorkspace
-                val targets = if (only.isNotEmpty()) {
-                    val hit = ordered.filter { workspaceKeyOf(it) == only }
-                    if (hit.isNotEmpty()) {
-                        Diagnostics.log("info", "Tier2: 只开页面当前工作区的桥：$only")
-                        hit
-                    } else {
+                val targets = when {
+                    explicit.isNotEmpty() -> {
+                        val wanted = explicit.toSet()
+                        val hit = ordered.filter {
+                            val k = workspaceKeyOf(it)
+                            k != null && k in wanted
+                        }
+                        val live = hit.filterNot { cooledDown(workspaceKeyOf(it)) }
+                        if (live.size < hit.size) {
+                            Diagnostics.log(
+                                "info",
+                                "Tier2: 覆盖清单里 ${hit.size - live.size} 座在冷却中，本轮跳过",
+                            )
+                        }
+                        if (live.isEmpty()) {
+                            Diagnostics.log(
+                                "warn",
+                                "Tier2: 覆盖清单（${explicit.joinToString()}）在桌面端列表里没有可用项，本轮不开桥",
+                            )
+                            emptyList()
+                        } else {
+                            Diagnostics.log(
+                                "info",
+                                "Tier2: 多工作区覆盖 ${live.size} 座：" +
+                                    live.mapNotNull { workspaceKeyOf(it) }.joinToString(),
+                            )
+                            live
+                        }
+                    }
+                    only.isNotEmpty() -> {
+                        val hit = ordered.filter { workspaceKeyOf(it) == only }
+                        if (hit.isNotEmpty()) {
+                            Diagnostics.log("info", "Tier2: 只开页面当前工作区的桥：$only")
+                            hit
+                        } else {
+                            Diagnostics.log(
+                                "warn",
+                                "Tier2: 页面工作区 $only 不在桌面端列表里（${ordered.size} 个），" +
+                                    "退回按在跑任务排序的前 $DEFAULT_MAX_COVERAGE 个",
+                            )
+                            ordered.take(DEFAULT_MAX_COVERAGE)
+                        }
+                    }
+                    else -> {
                         Diagnostics.log(
                             "warn",
-                            "Tier2: 页面工作区 $only 不在桌面端列表里（${ordered.size} 个），退回全量覆盖",
+                            "Tier2: 注入层还没上报页面工作区，按在跑任务排序开前 $DEFAULT_MAX_COVERAGE 个",
                         )
-                        ordered
+                        ordered.take(DEFAULT_MAX_COVERAGE)
                     }
-                } else {
-                    Diagnostics.log("warn", "Tier2: 注入层还没上报页面工作区，退回全量覆盖（有拆 host 风险）")
-                    ordered
                 }
+                if (targets.isEmpty()) return@Thread
                 manager.beginCoverage(targets)
             } catch (e: Exception) {
                 Diagnostics.log("warn", "Tier2: 覆盖启动失败 ${e.message}")
             }
         }.start()
+    }
+
+    /** 该工作区是否在"连续开桥失败"的冷却里（冷却到期自动解除）。 */
+    private fun cooledDown(key: String?): Boolean {
+        if (key == null) return false
+        val until = bridgeCooldownUntil[key] ?: return false
+        if (System.currentTimeMillis() >= until) {
+            bridgeCooldownUntil.remove(key)
+            bridgeFailCount.remove(key)
+            return false
+        }
+        return true
+    }
+
+    /** 桥开启结果：成功清账；连续失败到阈值则冷却，避免每轮重连都撞同一座必失败的桥。 */
+    private fun recordBridgeResult(key: String, ok: Boolean) {
+        if (ok) {
+            bridgeFailCount.remove(key)
+            bridgeCooldownUntil.remove(key)
+            return
+        }
+        val n = (bridgeFailCount[key] ?: 0) + 1
+        bridgeFailCount[key] = n
+        if (n >= BRIDGE_FAIL_COOLDOWN_AFTER) {
+            bridgeCooldownUntil[key] = System.currentTimeMillis() + BRIDGE_FAIL_COOLDOWN_MS
+            Diagnostics.log(
+                "warn",
+                "Tier2: 工作区 $key 连续 $n 次开桥失败，冷却 ${BRIDGE_FAIL_COOLDOWN_MS / 60_000} 分钟",
+            )
+        }
     }
 
     private fun scheduleReconnect() {

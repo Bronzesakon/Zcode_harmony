@@ -552,8 +552,6 @@ class BridgeSession(
     fun conversationSessionIds(): List<String> = convSubscriptions.keys.toList()
 
     /** 桥是否还挂着对话订阅（回收决策用：没挂过就没什么可重锚的）。 */
-    fun hasConversationSubscriptions(): Boolean = convSubscriptions.isNotEmpty()
-
     /** 复制工作区 scope，避免桥回收线程持有可变对象。 */
     fun scopeCopy(): JSONObject = JSONObject(scope.toString())
 
@@ -850,6 +848,8 @@ class BridgeManager(
     private val liveTaskSink: ((List<ControllerTasksState.LiveTask>) -> Unit)? = null,
     /** 会话流运行态回调（工作区键、会话 id、是否在跑）——controller 拿不到时的兜底。 */
     private val turnStateSink: ((String, String, Boolean) -> Unit)? = null,
+    /** 每座桥的开启结果（工作区键、是否成功）：供上层做失败退避（见 Tier2Probe）。 */
+    private val onBridgeResult: ((String, Boolean) -> Unit)? = null,
     private val maxWorkspaces: Int = 12,
 ) {
     private val relayPending = ConcurrentHashMap<String, PendingRelayRequest>()
@@ -891,6 +891,7 @@ class BridgeManager(
                     }
                     openedBridge.runHandshake(runningSessions(openedBridge.workspaceKey))
                     opened += 1
+                    onBridgeResult?.invoke(openedBridge.workspaceKey, true)
                     onLogLine(
                         "bridge ready for ${openedBridge.workspaceKey} (${openedBridge.bridgeSessionId})",
                     )
@@ -905,6 +906,10 @@ class BridgeManager(
                             // 关闭路径不再抛
                         }
                     }
+                    onBridgeResult?.invoke(
+                        workspaceKeyOf(workspace) ?: workspace.optString("workspacePath"),
+                        false,
+                    )
                     onLogLine("bridge open failed for ${workspace.optString("workspacePath")}: ${e.message}")
                 }
                 try {

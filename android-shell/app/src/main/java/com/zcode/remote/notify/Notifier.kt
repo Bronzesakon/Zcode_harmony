@@ -214,7 +214,6 @@ class Notifier(private val context: Context) {
                 // notification to jump to the task" (caught on device
                 // 2026-09-12: `未能在页面上定位任务: 运行中 · …`).
                 putExtra(MainActivity.EXTRA_TASK_TITLE, item.locateTitle)
-                putExtra(MainActivity.EXTRA_WORKSPACE_KEY, item.workspaceKey)
             }
             val pending = PendingIntent.getActivity(
                 context,
@@ -406,7 +405,6 @@ class Notifier(private val context: Context) {
             action = MainActivity.ACTION_LOCATE_TASK
             putExtra(MainActivity.EXTRA_SESSION_ID, sessionId)
             putExtra(MainActivity.EXTRA_TASK_TITLE, title)
-            putExtra(MainActivity.EXTRA_WORKSPACE_KEY, workspaceKey)
         }
         return PendingIntent.getActivity(
             context,

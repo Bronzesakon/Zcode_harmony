@@ -62,9 +62,7 @@ data class NotifyUpdate(
     val running: List<TaskSnapshot>,
     val completed: List<CompletionEvent>,
     val attention: List<AttentionEvent>,
-) {
-    val hasRunning: Boolean get() = running.isNotEmpty()
-}
+)
 
 /**
  * Pure derivation of notification state from sessions-index snapshots.
@@ -172,8 +170,6 @@ class NotifyState {
 
         /** Terminal phases that read better as a failure than a success. */
         val FAILED_PHASES = setOf("failed", "error", "cancelled", "completedInterrupted")
-
-        fun isTerminal(phase: String): Boolean = phase in TERMINAL_PHASES
 
         fun isRunning(phase: String): Boolean = phase in RUNNING_PHASES
 

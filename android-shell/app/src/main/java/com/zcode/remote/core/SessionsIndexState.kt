@@ -66,13 +66,9 @@ private const val MAX_LOGICAL_FRAGMENTS = 1024
 
 class SessionsIndexState {
 
-    var workspaceId: String? = null
-        private set
     var logEpoch: String? = null
         private set
     var seq: Long = 0
-        private set
-    var ready = false
         private set
 
     /** 缺口标记：调用方消费后应清零并发 resyncSessionsIndexV4。 */
@@ -85,16 +81,6 @@ class SessionsIndexState {
     private class LogicalAssembly(val count: Int) {
         val parts = arrayOfNulls<ByteArray>(count)
         var received = 0
-    }
-
-    fun resetState() {
-        workspaceId = null
-        logEpoch = null
-        seq = 0
-        ready = false
-        needsResync = false
-        sessions.clear()
-        fragments.clear()
     }
 
     /** 入口：wire 信封 `{topic, kind:'complete'|'fragment', …}`。 */
@@ -150,11 +136,6 @@ class SessionsIndexState {
         when (payload.optString("kind")) {
             "snapshot" -> {
                 val snapshot = payload.optJSONObject("snapshot") ?: return false
-                workspaceId = if (snapshot.has("workspaceId") && !snapshot.isNull("workspaceId")) {
-                    snapshot.optString("workspaceId")
-                } else {
-                    null
-                }
                 logEpoch = if (snapshot.has("logEpoch") && !snapshot.isNull("logEpoch")) {
                     snapshot.optString("logEpoch")
                 } else {
@@ -199,7 +180,6 @@ class SessionsIndexState {
             }
             else -> return false
         }
-        ready = true
         return true
     }
 

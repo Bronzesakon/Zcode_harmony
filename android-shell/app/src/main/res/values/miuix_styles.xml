@@ -124,15 +124,6 @@
         <item name="android:textSize">14sp</item>
     </style>
 
-    <!-- 行尾的值文本（endActions 里的 body2 + actions 角色） -->
-    <style name="MiuixRowValue" parent="">
-        <item name="android:layout_width">wrap_content</item>
-        <item name="android:layout_height">wrap_content</item>
-        <item name="android:layout_marginEnd">8dp</item>
-        <item name="android:textColor">@color/miuix_on_surface_actions</item>
-        <item name="android:textSize">14sp</item>
-    </style>
-
     <!-- 行尾箭头：10x16dp（ArrowPreference 的 ArrowRight 尺寸）。
          只放框架属性：tint 是库属性，写在 style 里要靠"限定名"解析，容易踩 aapt2 的坑，
          所以着色放在使用处的 app:tint（布局里用库属性是铁定的写法）。 -->

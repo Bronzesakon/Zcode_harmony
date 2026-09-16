@@ -31,7 +31,6 @@ class RelayBridgeTest {
             ),
         )
         assertTrue(state.applyWire(wire))
-        assertTrue(state.ready)
         assertEquals(1L, state.seq)
         val update = state.buildUpdate("/repo/x", JSONObject().put("workspacePath", "/repo/x"), "active")
         assertEquals("/repo/x", update.getString("key"))
@@ -75,7 +74,6 @@ class RelayBridgeTest {
             .put("payload", JSONObject()
                 .put("kind", "snapshot")
                 .put("snapshot", JSONObject()
-                    .put("workspaceId", "ws-a")
                     .put("logEpoch", "epoch-1")
                     .put("sessions", JSONArray().put(sessionJson("s1", "一", "running", 10)))))
         val bytes = logical.toString().toByteArray(Charsets.UTF_8)

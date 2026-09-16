@@ -28,6 +28,7 @@
 
 | 文件 | 内容 |
 | --- | --- |
+| **`docs/18-全仓审计-错误路线残留与清理.md`** | **2026-09-16 全仓审计**：四个子代理并行只读审计 + 本轮落地。已删清单（Kotlin 死代码 / 整文件级死资源 / 注入层自伤代码）、保留但标注的、刻意没做的（需拍板）、多工作区落地与 E1 跑法 |
 | **`docs/17-多工作区多任务订阅-理论推导.md`** | 下一个方向（多工作区/多任务订阅）的理论推导：代码侧能力清单、被推翻的归因、发现链、设计草案、实验 E1–E4 |
 | **`docs/16-后台60秒墙-根因取证与原生承载.md`** | 2026-09-16 这一夜的完整取证与验收：墙的根因、原生承载落地、真凶（controller 流）、端到端、熄屏、一小时长测 |
 | `docs/15-后台原生承载-独立设计.md` | 备份方案：子代理只读 bundle 推导的**协议契约**（逐条 `文件:行:列` 证据）；⚠️ §4 的"必须补 window 控制面"已被推翻 |
@@ -730,7 +731,8 @@ MSYS_NO_PATHCONV=1 "$ADB" devices -l                 # 确认出现设备
 | README 正文「已知问题 A–D」 | 要机制级细节时读：A（ColorOS 悬浮窗弹窗）、B（会话加载慢，含"A/B 证明不在壳侧"）、C（流体云出卡）、D1/D1-b/D2（标题回退与长后台卡住） |
 | `docs/05-远程网页-remote-v4-20260911/` | 要**网页侧契约**时读：bundle 快照（`assets/index-nOVzQNKW.js`、`src-DHgFesxz.js`、`logger-BVohFQ23.js`）+ 注入点审计/进对话无内容分析。本轮所有"源码定案"都是从这里读出来的 |
 | `docs/05-…/assets/logger-BVohFQ23.js` | 只想弄清"页面自带日志到底能拿到什么"时读它（1013 字节，PROD 下 console 全短路，唯 `window.zcode.log`） |
-| **`docs/17-多工作区多任务订阅-理论推导.md`** | **要接"多工作区/多任务"这件事时先读它**：代码侧能力清单（带 `文件:行`）、一行过滤的来历与被推翻的归因、桌面端未知与被污染的历史证据、发现链、设计草案、风险、实验 E1–E4 与判据。**新会话的第一件事就在这里** |
+| **`docs/18-全仓审计-错误路线残留与清理.md`** | **要动这个仓库的代码前先读它**：四个开关（`AUTO_TAKEOVER_ENABLED` / `SHELL_VISIBILITY_HIJACK` / `SHELL_READ_ONLY` / `controllerStreamEnabled`）各封死了什么、哪些已删、哪些刻意保留、哪些还要你拍板。**"别再重做一遍已删的东西"看这份** |
+| **`docs/17-多工作区多任务订阅-理论推导.md`** | **要接"多工作区/多任务"这件事时先读它**：代码侧能力清单（带 `文件:行`）、一行过滤的来历与被推翻的归因、桌面端未知与被污染的历史证据、发现链、设计草案、风险、实验 E1–E4 与判据 |
 | **`docs/16-后台60秒墙-根因取证与原生承载.md`** | 要**后台 60 秒墙 / 原生承载**的真机取证时读：三次实测的逐窗数据、同刻三证（JS `fetch` 挂住 / 原生 TCP 67ms / 原生配对 1s）、被否定的 7 条假设表、v132–v145 的落地形态与诊断指令、复现步骤、§8–§12（真凶＝controller 流、端到端验收、熄屏、一小时长测） |
 | `docs/15-后台原生承载-独立设计.md` | 要**协议契约**时读（子代理在干净上下文里只读 bundle 推导，逐条 `文件:行:列` 证据）。⚠️ **两处已被推翻**：§2.6 的平台结论本会话未核验（附录 C 自述）；**§4"原生必须补 window 控制面"是错的**——真凶是 controller 流那次 `rpc:listen`（`docs/16` §8/§10） |
 | `docs/_archive-superseded/` | **不要读**（除非考古）：`native-side-audit` / `标题迟加载调研` / `晨间报告-2026-09-12` 三份已被 README 与 `docs/16` 取代或推翻，挪进归档只为避免新会话先读到过期结论 |
@@ -796,13 +798,17 @@ store 三级优先级：controller > 会话流 > SI 持久态）；controller �
 
 ### 下一步（新会话第一件事）
 
-0. **多工作区 / 多任务对话订阅（本轮收尾时定的下一个方向，只做了理论推导）**：先读
-   **`docs/17-多工作区多任务订阅-理论推导.md`**。一句话：**代码侧已经具备**（原生桥本来就是
-   多桥并发、`maxWorkspaces=12`；正文与卡片按 `(workspaceKey, sessionId)` 键；外壳轮询本来就
-   遍历全部在跑任务），**只差 `Tier2Probe.startCoverage()` 里那层"只开页面当前工作区"的保守过滤**
-   ——而它建立在一条**已被推翻的归因**上（controller 流那次 `rpc:listen`，见「实现要点」16）。
-   **第一步＝E1**：用诊断指令干净地开 3 座桥（page 工作区 + 另外 2 个），判据
-   ① 每座各自 `bridge ready for <key>` 或明确的 `workspace-bridge-error: <reason+error>`；
+0. **多工作区 / 多任务对话订阅（代码已落地，等真机 E1）**：先读 **`docs/17`**（理论推导）与
+   **`docs/18` §3**（本轮落地）。2026-09-16 下午已把 `Tier2Probe.startCoverage()` 那层"只开页面
+   当前工作区"的保守过滤改成**三档**（显式清单 / 页面工作区 / `take(3)` 有界退回），并加了
+   **失败退避**（连续 2 次失败冷却 10 分钟）、**独立开关**（adb：`multi_ws_on` / `multi_ws_off`，
+   默认关）与 **`coverage_ws:<k1>,<k2>` 诊断清单**。**下一步＝跑 E1**（不需要用户配合，但设备得先连回来）：
+   ```bash
+   bc "coverage_ws:<key1>,<key2>"   # 设 3 座（page 工作区 + 2 个别的）
+   bc stall_state                   # 确认日志里的"覆盖=…"
+   bc carrier_now                   # 手动接管，会去开这几座桥
+   ```
+   判据 ① 每座各自 `bridge ready for <key>` 或 `bridge open failed for <path>: <reason>`；
    ② 桌面端 `unregistered host` / `uncaughtException` 计数**不增长**（2026-09-16 基线 7 / 14）；
    ③ 桌面端日志出现 `workspaceKeyCount: ≥2`。
    **E2 需要用户配合**：在**另一个工作区**起一个任务（页面仍停在 A），看承载能否订到 B 的会话并出正文。
@@ -990,6 +996,13 @@ MSYS_NO_PATHCONV=1 "$ADB" -s "$S" shell "L=/sdcard/Android/data/com.zcode.remote
 | 注入层失效了没（滚动条/取色回退） | `注入未在 document-start 生效，由加载期补注` 行 = 抓到失效现场（补注已兜住） |
 
 **更新记录**：2026-09-11 建立本区；同日第二至七轮见 git 历史。
+**2026-09-16 下午（清理轮）**：四个子代理并行只读审计 + 落地第一轮清理——删掉四个"恒关"开关
+封死的死代码（老自动接管链 `AUTO_TAKEOVER_ENABLED`、nudge 失速自愈、可见性劫持实现、注入层四处
+"自伤"函数体）、整文件级死资源（`values/colors.xml`、`values/styles.xml`、9 个零引用 miuix 色、
+`MiuixRowValue`、`Theme.ZcodeRemote.Splash`）、`EXTRA_WORKSPACE_KEY` 等零读方字段；同时把
+**多工作区覆盖**按 `docs/17` §7 落地（三档目标 + 失败退避 + `coverage_ws:` / `multi_ws_*` 诊断，
+见 `docs/18` §3）。**净 −361 行**；审计报告 `docs/18`。门禁全绿（结构 / 资源 / JS 94 / Kotlin 92），
+本机出包 `1.0.0-local.146`。⚠️ 本轮**未上真机**（设备当时 adb 不可达），E1 待设备连回后跑。
 第八轮（pre.34–pre.39）：后台存活测满 29 分 26 秒判定保活成立、修掉会骗人的 close 归因、后台三把尺子。
 第九轮（pre.42–pre.50，27 个提交）：11 条要求全部交付并真机验收（去应用栏 + 状态栏动态取色、
 顶部避让/底部沉浸、MiuiX 设置页、长按快捷方式、通知标题与完成卡片、fault 收敛）。
@@ -1324,9 +1337,10 @@ socket"的读法是**错的**，`/ws/remote-control/window/<token>` 只做窗口
     `degrade_test`｜`deadlink_test`（伪造"观测静默 120s"后走一次回前台死链判定）｜
     `passive_off` / `passive_on`（注入层观测层总开关，两条都会重载页面，**只能走前台通道**）｜
     `tier2_test`（原生配对+覆盖 60s，不动生产状态）｜`tier2_stop`｜`tier2_takeover`（90s 自动交还）｜
-    `tier1_silence_test`｜
-    **第十六轮新增（后台承载）**：`stall_state`（开关/是否已接管/Tier2 在跑/入站帧多久没来）｜
+    **第十六轮新增（后台承载）**：`stall_state`（开关/是否已接管/Tier2 在跑/多工作区/覆盖清单/入站帧多久没来）｜
     `carrier_on` / `carrier_off` / `carrier_now`（开关与手动接管）｜
+    **多工作区（2026-09-16 下午新增，见 `docs/18` §3）**：`coverage_ws:<k1>,<k2>`（设显式覆盖清单，E1 用）｜
+    `coverage_ws_clear`｜`multi_ws_on` / `multi_ws_off`（多工作区开关，默认关）｜
     `net_probe`（**原生**裸 TCP+HTTPS，不经 Chromium——墙的定性判据）｜
     `bg_state`（链路现场：`socket` readyState / `sockets[]` / `paired` / `inboundAgo` / `ackAgo` / `vis` / `fg`）｜
     `bg_http`、`bg_http|<url>`（**Chromium 侧**新建连接判据，墙内会挂住）｜

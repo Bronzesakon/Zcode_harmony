@@ -232,63 +232,12 @@
     //
     // 结论：**不再对页面说假话**。要让页面在后台继续工作，得从 Android 侧解决
     // "窗口可见性"（PiP / 覆盖窗 / 原生承载），JS 层这个谎是白撒的。
-    // 保留代码是为了"别再退回"——要复原只需把这个常量改成 true。
+    // 2026-09-16 审计：历史实现（谎报 visible + 吞掉 lifecycle 事件）已删除——
+    // 它只会让页面既不知道自己去过后台、也不知道自己回来了，回前台的订阅永远
+    // 拿不到 ack。这里只保留一行日志：它本身就是"壳没有在骗页面"的诊断量。
     // -----------------------------------------------------------------------
-    var SHELL_VISIBILITY_HIJACK = false;
-
-    var LIFECYCLE_EVENTS = {
-        visibilitychange: 1,
-        pagehide: 1,
-        freeze: 1,
-        blur: 1
-    };
-
     function installVisibilityHijack() {
-        if (!SHELL_VISIBILITY_HIJACK) {
-            diag('info', '可见性劫持已停用：页面拿到真实可见性，生命周期事件照常送达');
-            return;
-        }
-        var readOnly = function (value) {
-            return {get: function () {
-                return value;
-            }, configurable: true};
-        };
-        var noopHandler = {
-            get: function () {
-                return null;
-            },
-            set: function () {},
-            configurable: true
-        };
-        try {
-            Object.defineProperty(Document.prototype, 'hidden', readOnly(false));
-            Object.defineProperty(Document.prototype, 'visibilityState', readOnly('visible'));
-            // Some engines expose these as own properties of the instance.
-            Object.defineProperty(document, 'hidden', readOnly(false));
-            Object.defineProperty(document, 'visibilityState', readOnly('visible'));
-            Object.defineProperty(Document.prototype, 'onvisibilitychange', noopHandler);
-            if (typeof Window !== 'undefined' && Window.prototype) {
-                Object.defineProperty(Window.prototype, 'onpagehide', noopHandler);
-                Object.defineProperty(Window.prototype, 'onblur', noopHandler);
-            }
-            if (Document.prototype.hasFocus) {
-                Document.prototype.hasFocus = function () {
-                    return true;
-                };
-            }
-        } catch (e) {
-            diag('warn', '可见性属性劫持部分失败: ' + e);
-        }
-
-        var originalAdd = EventTarget.prototype.addEventListener;
-        EventTarget.prototype.addEventListener = function (type, listener, options) {
-            // Only window/document lifecycle signals are suppressed; element
-            // level events (input, scroll, blur on a field) are untouched.
-            if (LIFECYCLE_EVENTS[type] === 1 && (this === document || this === window)) {
-                return;
-            }
-            return originalAdd.call(this, type, listener, options);
-        };
+        diag('info', '可见性劫持已停用：页面拿到真实可见性，生命周期事件照常送达');
     }
 
     // -----------------------------------------------------------------------
@@ -1574,35 +1523,14 @@
     }
 
     /**
-     * Rebuilds the relay socket by closing it: the recovery itself belongs to
-     * the page, which is the only party that owns the socket's lifecycle. Rate
-     * limited so a dead desktop cannot make us churn. Returns true when the
-     * socket was actually closed.
-     *
-     * 只读壳下这里是**空操作**（见 SHELL_READ_ONLY）：只留一行日志说明"本来会
-     * 在哪一刻拆线"，因为这句话本身就是页面链路健康的诊断量。
+     * 只读壳契约（见 SHELL_READ_ONLY）：**永不执行**。只留一行日志说明"本来会在
+     * 哪一刻拆线"，因为这句话本身就是页面链路健康的诊断量。
+     * 2026-09-16 审计：历史实现（关掉页面 socket 逼它自己重连）已删除——真机定罪
+     * 它是自伤（40 秒里拆了 10 次，用户看到的就是"转圈 / 要重连好几次"）。
      */
     function forceReconnect(reason) {
-        if (SHELL_READ_ONLY) {
-            noteReadOnlyRefusal('重建页面 socket', reason);
-            return false;
-        }
-        if (Date.now() - lastForcedReconnectAt <= RECONNECT_MIN_GAP_MS) {
-            return false;
-        }
-        var socket = activeSocket;
-        if (!socket || socket.readyState !== 1) {
-            return false;
-        }
-        lastForcedReconnectAt = Date.now();
-        staleTicks = 0;
-        diag('warn', '强制重建 relay 连接以恢复（' + reason + '）');
-        try {
-            socket.close();
-        } catch (e) {
-            // ignore
-        }
-        return true;
+        noteReadOnlyRefusal('重建页面 socket', reason);
+        return false;
     }
 
     /**
@@ -2025,43 +1953,12 @@
      * 上限 + 就绪即复位），但**不经过轻推**：见 5b 节头部的决策说明。
      */
     function reloadForMissingConversation(reason) {
-        if (SHELL_READ_ONLY) {
-            // 和"轻推"同源的一条路：进对话没看到内容就重载页面。真机里它同样是
-            // 拿"我们的观测"去否定"页面的事实"——只读壳下只记录，不动页面。
-            stallState.gaveUp = true;
-            diag('warn', '只读壳：不因"' + reason + '"重载页面（只记录，等页面自己恢复）');
-            postPageVitals('giveup');
-            return;
-        }
-        var stamp = parseInt(storeGet(FALLBACK_STORE_AT), 10);
-        var last = Math.max(stallState.lastReloadAt, isNaN(stamp) ? 0 : stamp);
-        var wait = last + FALLBACK_RELOAD_GAP_MS - Date.now();
-        if (wait > 0) {
-            diag('info', reason + '：处于刷新间隔内，' + Math.round(wait / 1000) + 's 后再判');
-            if (fallbackTimer) {
-                clearTimeout(fallbackTimer);
-            }
-            fallbackTimer = setTimeout(fallbackCheck, wait);
-            return;
-        }
-        if (stallState.reloadCount >= STALL_RELOAD_CAP) {
-            stallState.gaveUp = true;
-            diag('error', reason + '：连续刷新 ' + stallState.reloadCount +
-                ' 次未恢复，停止自动刷新（任何就绪信号到达后自动复位）');
-            postPageVitals('giveup');
-            return;
-        }
-        stallState.reloadCount += 1;
-        storeSet(STALL_STORE_RELOADS, String(stallState.reloadCount));
-        stallState.lastReloadAt = Date.now();
-        storeSet(FALLBACK_STORE_AT, String(stallState.lastReloadAt));
-        diag('warn', reason + '：第 ' + stallState.reloadCount + '/' + STALL_RELOAD_CAP +
-            ' 次刷新页面');
-        try {
-            G.location.reload();
-        } catch (e) {
-            diag('warn', '自动刷新失败: ' + e);
-        }
+        // 和"轻推"同源的一条路：进对话没看到内容就重载页面。真机里它同样是拿
+        // "我们的观测"去否定"页面的事实"——只读壳下只记录，不动页面。
+        // 2026-09-16 审计：历史实现（两级刷新 + sessionStorage 限流 + 连续上限）已删除。
+        stallState.gaveUp = true;
+        diag('warn', '只读壳：不因"' + reason + '"重载页面（只记录，等页面自己恢复）');
+        postPageVitals('giveup');
     }
 
     /** Upload-named page RPCs get explicit lines: that is the file-send chain. */
@@ -2382,74 +2279,22 @@
      * 一直写着、但此前没有实现的意图：一次干预之后，这条链路上 180 秒内不再开刀。
      */
     function nudgeReconnect(reason) {
-        if (SHELL_READ_ONLY) {
-            // 只读壳：连"轻推"也不做。这条路上最恶性的正反馈（关 socket→页面重连
-            // →5s 窗重新武装→再关）从此不存在，日志里只留一行"本会在何时动手"。
-            noteReadOnlyRefusal('轻推页面 socket', reason);
-            return false;
-        }
-        var gap = Date.now() - lastForcedReconnectAt;
-        if (gap <= RECONNECT_MIN_GAP_MS) {
-            diag('info', '卡死轻推被限流跳过（距上次链路干预 ' + Math.round(gap / 1000) +
-                's < ' + Math.round(RECONNECT_MIN_GAP_MS / 1000) + 's）：' + reason);
-            return false;
-        }
-        var socket = activeSocket;
-        if (!socket || socket.readyState !== 1) {
-            diag('info', '卡死轻推：当前没有活动 socket，等页面自己重建');
-            return false;
-        }
-        lastForcedReconnectAt = Date.now();
-        diag('warn', '卡死轻推：关闭 relay socket 触发页面自愈（' + reason + '）');
-        try {
-            socket.close();
-        } catch (e) {
-            diag('warn', '卡死轻推关闭失败: ' + e);
-            return false;
-        }
-        return true;
+        // 只读壳：连"轻推"也不做。这条路上最恶性的正反馈（关 socket→页面重连
+        // →5s 窗重新武装→再关）从此不存在，日志里只留一行"本会在何时动手"。
+        // 2026-09-16 审计：历史实现（关掉页面 socket 逼它重连）已删除。
+        noteReadOnlyRefusal('轻推页面 socket', reason);
+        return false;
     }
 
     function stallReloadIfAllowed() {
-        if (SHELL_READ_ONLY) {
-            // 只读壳：**永不自动重载**。重载会把页面自己的订阅、视图、滚动位置
-            // 全部推倒（用户回来看到的是"它自己在重连/重载"），而它换来的只是
-            // 一次握手——收益远小于代价。看门狗到此为止，只把状态记清楚。
-            stallState.gaveUp = true;
-            stallState.armed = false;
-            diag('warn', '只读壳：不自动重载页面（看门狗停止干预，等页面自己恢复）');
-            postPageVitals('giveup');
-            return;
-        }
-        var stamp = parseInt(storeGet(FALLBACK_STORE_AT), 10);
-        var last = Math.max(stallState.lastReloadAt, isNaN(stamp) ? 0 : stamp);
-        var wait = last + FALLBACK_RELOAD_GAP_MS - Date.now();
-        if (wait > 0) {
-            diag('info', '卡死看门狗：处于刷新间隔内，' + Math.round(wait / 1000) + 's 后复查');
-            stallState.timer = setTimeout(stallFire, wait);
-            return;
-        }
-        var count = stallState.reloadCount;
-        if (count >= STALL_RELOAD_CAP) {
-            stallState.gaveUp = true;
-            stallState.armed = false;
-            diag('error', '卡死看门狗：连续刷新 ' + count + ' 次未恢复，停止自动干预' +
-                '（恢复信号到达后自动复位）');
-            postPageVitals('giveup');
-            return;
-        }
-        count += 1;
-        stallState.reloadCount = count;
-        storeSet(STALL_STORE_RELOADS, String(count));
-        stallState.lastReloadAt = Date.now();
-        storeSet(FALLBACK_STORE_AT, String(stallState.lastReloadAt));
-        diag('warn', '卡死看门狗：轻推后仍无内容，第 ' + count + '/' + STALL_RELOAD_CAP +
-            ' 次刷新页面');
-        try {
-            G.location.reload();
-        } catch (e) {
-            diag('warn', '自动刷新失败: ' + e);
-        }
+        // 只读壳：**永不自动重载**。重载会把页面自己的订阅、视图、滚动位置全部推倒
+        // （用户回来看到的是"它自己在重连/重载"），而它换来的只是一次握手——收益远
+        // 小于代价。看门狗到此为止，只把状态记清楚。
+        // 2026-09-16 审计：历史实现（刷新间隔 + 连续上限 + location.reload）已删除。
+        stallState.gaveUp = true;
+        stallState.armed = false;
+        diag('warn', '只读壳：不自动重载页面（看门狗停止干预，等页面自己恢复）');
+        postPageVitals('giveup');
     }
 
     function stallCancel(reason) {
