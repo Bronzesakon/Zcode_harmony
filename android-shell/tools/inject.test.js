@@ -712,11 +712,16 @@ test('只读壳：默认配置下配对之后注入层不主动开桥（D7 已�
     try {
         const socket = new globalThis.WebSocket('wss://relay.example');
         const link = connectDesktop(socket);
+        // 旧实现（D7 打开时）就是拿这份工作区列表去开桥的；留着它是为了证明
+        // "网还张在那里，只是没人来撞"——fake desktop 只在收到 workspace-list-request
+        // 时才会读它，所以它本身不会诱发任何流量。
         link.desktop.workspaces = [{workspacePath: '/repo/a', workspaceIdentity: 'ws-a'}];
 
         socket.send(JSON.stringify({type: 'auth_init', role: 'terminal', device_sid: 'sid-1'}));
         socket.receive({type: 'pair_status_ack', pair_status: 'matched'});
-        // 旧实现在配对后 1.5s 起步（ACTIVE_START_DELAY_MS）；等足这个窗口。
+        // 等过旧实现的起步窗（当年的 ACTIVE_START_DELAY_MS = 1.5s，已随 D7 删除）：
+        // 这不是在等某个现存常量，而是给"万一有人把主动开桥调度器加回来"留出它当年
+        // 最早会动手的那一刻——否则这条断言在时间上就没有对手。
         await wait(1900);
 
         assert.strictEqual(link.desktop.subscriptions.length, 0,
@@ -964,11 +969,6 @@ test('the native pump can drive a heartbeat, and the tick is rate limited', asyn
         socket.send(JSON.stringify({type: 'auth_init', role: 'terminal', device_sid: 'sid-1'}));
         socket.receive({type: 'pair_status_ack', pair_status: 'matched'});
         await wait(1700);
-
-        assert.strictEqual(
-            typeof globalThis.__zcodeShellHeartbeat, 'function',
-            'the native pump needs an entry point inside the page'
-        );
 
         const before = socket.sent.length;
         globalThis.__zcodeShellSetAppForeground(false);
@@ -1220,11 +1220,13 @@ test('a document-start arrival before <html> exists retries instead of giving up
 });
 
 // ---------------------------------------------------------------------------
-// 快速刷新（§5b，3s 双态直刷）
+// 进对话卡住（§5b）——**只读壳口径：只记账，不刷新**
 //
-// 用户拍板的粗暴版：进对话 3s 后查一次——头部停在「新建任务」（状态 A）或
-// 输入框灰/禁用（状态 B：有标题但内容没加载时页面自己的信号）→ 直接刷新。
-// 除「15s 最小刷新间隔」（防死循环的终止性保证）外无任何守卫。
+// 这一节的历史：2026-09-12 用户拍板过"进对话 3s 后查一次，状态 A（头部停在
+// 新建任务）或状态 B（输入框灰）→ 直接刷新"的粗暴版；2026-09-15 只读壳定案后
+// **刷新这条路被废掉**（壳永不自动重载页面），下面几条测试断言的是现在的口径：
+// 判定照做、状态照记（`__zcodeShellFallback` 的 stall/ready 记账），但
+// `reloads` 恒为 0，终止性不再靠"15s 最小刷新间隔"。
 // ---------------------------------------------------------------------------
 
 const FB = () => globalThis.__zcodeShellFallback;

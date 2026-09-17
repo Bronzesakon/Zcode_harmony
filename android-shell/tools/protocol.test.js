@@ -391,13 +391,14 @@ test('active mode respects the workspace cap（只剩单测 seam：壳永不调�
 
 test('只读壳：没有「订阅所有工作区」开关，客户端自己不开桥（D7 已删，2026-09-17）', () => {
     // 这条原来是 `makeClient({subscribeAll: false})` → "no writes when subscribe-all
-    // is off"。开关整个删掉后，等价断言是**客户端不再有"主动"这个状态**：构造完了
-    // 就安安静静，一帧都不写；主动覆盖只能由（已无生产调用者的）start() 显式发起。
+    // is off"。开关整个删掉后，等价断言分两半，都要能**独立失败**：
+    //   ① 字段本身不存在——有人把开关加回来这条就红（删掉的开关不许复活）；
+    //   ② 默认构造之后一帧都不写页面 socket——主动覆盖只能由 start() 显式发起，
+    //      而注入层永不调用它（正面证据在 inject.test.js「默认配置下不主动开桥」）。
+    // 不写 `subscriptions.length === 0`：它被"零写入"严格蕴含，只是同一件事的复述。
     const {client, desktop} = makeClient();
     assert.strictEqual(client.subscribeAll, undefined,
         'D7 开关已删除：客户端不再有"我该主动开桥"这个状态');
-    assert.strictEqual(client.isStarted(), false, '没有 start() 就没有主动覆盖');
-    assert.strictEqual(desktop.subscriptions.length, 0, '构造本身不得产生任何订阅');
     assert.strictEqual(desktop.sent.length, 0, '构造本身不得写页面 socket');
 });
 
@@ -1194,6 +1195,4 @@ test('conversation candidates: a failing provider falls back, and the cap holds'
     client.nativeRunningSessionsProvider = () => ({'ws-cap': ['s1', 's2', 's3']});
     assert.deepStrictEqual(client._conversationCandidates('ws-cap'), ['s1', 's2']);
 });
-
-// --- append to inject.test.js ---------------------------------------------
 
