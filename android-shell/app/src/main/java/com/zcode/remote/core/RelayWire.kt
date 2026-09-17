@@ -625,8 +625,6 @@ object RelayWire {
         fun logEpoch(): String? = currentLogEpoch
         fun seq(): Long = currentSeq
 
-        val size: Int get() = rows.length()
-
         fun applySnapshot(snapshot: JSONObject?, logEpoch: String? = null, seq: Long? = null) {
             val window = snapshot?.optJSONObject("rows")?.optJSONArray("window")
             rows = window ?: JSONArray()

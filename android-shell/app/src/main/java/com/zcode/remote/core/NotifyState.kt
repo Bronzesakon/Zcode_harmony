@@ -171,8 +171,6 @@ class NotifyState {
         /** Terminal phases that read better as a failure than a success. */
         val FAILED_PHASES = setOf("failed", "error", "cancelled", "completedInterrupted")
 
-        fun isRunning(phase: String): Boolean = phase in RUNNING_PHASES
-
         /**
          * The notification title: `状态 · 任务名`.
          *

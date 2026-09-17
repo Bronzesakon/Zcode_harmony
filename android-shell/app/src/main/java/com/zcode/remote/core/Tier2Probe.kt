@@ -169,8 +169,6 @@ object Tier2Probe {
             .build()
     }
 
-    val currentPhase: Phase get() = phase
-
     /** 探针是否持有（或正在建立）连接——接管触发与前台交还都看它。 */
     fun isRunning(): Boolean = phase != Phase.IDLE && phase != Phase.CLOSED
 
