@@ -6,6 +6,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import com.zcode.remote.core.CarrierHandback
 import com.zcode.remote.core.Diagnostics
 import com.zcode.remote.core.NotifyState
 import com.zcode.remote.core.Prefs
@@ -672,6 +673,23 @@ object ShellRuntime {
 
     private var carrierStarted = false
 
+    /**
+     * 本次承载是**提前接管**起来的（接管那一刻页面链路本来是活的）。
+     *
+     * 为什么必须记住它：反向不变式「页面链路一旦自己活了，原生立刻交还」是用
+     * `lastInboundAgeMs` 判"活了"的——这在**判死**路径上成立（那时页面已静默 35s，
+     * 之后再来帧一定是它自己回来了），但对**提前接管**不成立：桌面端在配对成功时会给
+     * 页面发一帧 `KICKED`，页面随即 `dispose` 掉 socket（真机 2026-09-17 22:48:51.7：
+     * `socket.close() … X2t.dispose ← at Object.onFailure`），而**这一帧本身**就刷新了
+     * `lastInboundAt`。于是 10s 后 `age=16s < 35s` ⇒ 壳把连接交还给一个**已经进终态**的
+     * 页面、同一次调用里又立刻接管回来（22:49:01 现场：多一次解配对/重配对 + 桥拆建，
+     * 只因 20s socket 守卫凑巧挡住才没连续抖）。判定见 [CarrierHandback]。
+     */
+    private var carrierStartedEarly = false
+
+    /** 上面那条"暂不交还"的日志每次承载只写一行（每拍一行会把日志淹掉）。 */
+    private var handbackDeferredLogged = false
+
     /** 刚刚交还过（前台分支读一次并清掉）：只在这条路径上安排"页面没恢复才重载"的兜底。 */
     private var carrierHandedBack = false
 
@@ -705,6 +723,9 @@ object ShellRuntime {
         return snapshot.socketsOpened * 1_000_000L + snapshot.socketsClosed.toLong()
     }
 
+    /** 会话帧年龄的日志写法（三处共用：候选、提前接管、暂不交还）。−1 = 从未见过。 */
+    private fun convAgoText(agoMs: Long): String = if (agoMs < 0) "从未" else "${agoMs / 1000}s 前"
+
     /** 开关（adb：`carrier_on` / `carrier_off`）。 */
     fun setCarrierEnabled(enabled: Boolean) {
         carrierEnabled = enabled
@@ -714,6 +735,11 @@ object ShellRuntime {
             stopLiveProgressPolling()
             releaseCarrierWakeLock()
             carrierStarted = false
+        }
+        if (!enabled) {
+            // 关掉就走"没有承载"的状态，别把上一次的来路与去抖标志留给下一次。
+            carrierStartedEarly = false
+            handbackDeferredLogged = false
         }
     }
 
@@ -787,8 +813,31 @@ object ShellRuntime {
         }
 
         if (age < STALL_SILENCE_MS) {
+            // Tier2 可能已经自己停了（配对失败 / 桌面端拒桥 / 桌面端离线），而标志留在 true：
+            // 那会让下面"提前接管暂不交还"的分支把一个并不存在的承载一直当成在跑，于是永远不重试。
+            // 先把标志与实际对齐——对齐之后 age 仍 <35s，会照常重新走判据/接管。
+            if (carrierStarted && !Tier2Probe.isRunning()) {
+                carrierStarted = false
+                carrierStartedEarly = false
+                handbackDeferredLogged = false
+            }
             // 页面链路自己活着（或已恢复）⇒ 原生必须让位，绝不能两条连着。
-            if (carrierStarted) {
+            // **例外**：这一次承载是【提前接管】起来的，而页面还没回到"在跟会话"——见 [CarrierHandback]。
+            // 提前接管后桌面端会给页面发 KICKED、页面自己 dispose 掉 socket，而**那一帧本身**就把
+            // age 拉回 <35s；照旧判"已恢复"就会把连接交还给一个已经进终态的页面（真机 22:49:01）。
+            val page = liveness
+            val pageIsServing = page != null && CarrierHandback.pageIsServing(
+                socketState = page.socketState,
+                paired = page.paired,
+                convFrameAgoMs = page.convFrameAgoMs,
+                convSilenceMs = EARLY_TAKEOVER_CONV_SILENCE_MS,
+            )
+            val handBack = CarrierHandback.shouldHandBack(
+                pageLinkAlive = true,
+                startedEarly = carrierStartedEarly,
+                pageIsServing = pageIsServing,
+            )
+            if (carrierStarted && handBack) {
                 Diagnostics.log(
                     "warn",
                     "后台原生承载：页面链路已恢复（最新入站帧 ${age / 1000}s 前），原生交还",
@@ -797,6 +846,20 @@ object ShellRuntime {
                 stopLiveProgressPolling()
                 releaseCarrierWakeLock()
                 carrierStarted = false
+                carrierStartedEarly = false
+                handbackDeferredLogged = false
+            } else if (carrierStarted) {
+                if (!handbackDeferredLogged) {
+                    handbackDeferredLogged = true
+                    Diagnostics.log(
+                        "info",
+                        "后台原生承载：提前接管暂不交还（页面最近 " +
+                            "${convAgoText(page?.convFrameAgoMs ?: -1L)}收到会话帧 · " +
+                            "socket=${page?.socketState ?: -1} paired=${page?.paired ?: false}）" +
+                            "——age<${STALL_SILENCE_MS / 1000}s 只说明收到过帧，不说明页面在跟会话",
+                    )
+                }
+                return
             }
             // **提前接管**（2026-09-17 用户拍板，真机现场：停在**工作区概览页**退后台）：
             // 页面链路活着 ≠ 有人在喂卡片。概览页**没有任何会话订阅** ⇒ 谁都不拉正文，
@@ -818,8 +881,7 @@ object ShellRuntime {
                 earlyTakeoverSince = now
                 Diagnostics.log(
                     "info",
-                    "后台原生承载：候选提前接管（页面最近 " +
-                        (if (convAgo < 0) "从未" else "${convAgo / 1000}s 前") +
+                    "后台原生承载：候选提前接管（页面最近 " + convAgoText(convAgo) +
                         " 收到会话帧 · ${runningRefs.size} 个在跑任务），" +
                         "观察 ${EARLY_TAKEOVER_DEBOUNCE_MS / 1000}s 后动手",
                 )
@@ -828,8 +890,7 @@ object ShellRuntime {
             if (now - earlyTakeoverSince < EARLY_TAKEOVER_DEBOUNCE_MS) return
             Diagnostics.log(
                 "warn",
-                "后台原生承载：**提前接管**——页面活着但最近 " +
-                    (if (convAgo < 0) "从未" else "${convAgo / 1000}s 前") +
+                "后台原生承载：**提前接管**——页面活着但最近 " + convAgoText(convAgo) +
                     " 收到会话帧（没人喂卡片），且有 ${runningRefs.size} 个在跑任务；" +
                     "页面连接会被顶掉，回前台由兜底重载恢复",
             )
@@ -843,6 +904,10 @@ object ShellRuntime {
             return
         }
         carrierStarted = true
+        // 走到这里只有两条来路：页面判死（age ≥ 门槛）或**提前接管**（页面活着、只是没人喂卡片）。
+        // 来路决定交还判据能有多宽，见 [carrierStartedEarly] 与 [CarrierHandback]。
+        carrierStartedEarly = age < STALL_SILENCE_MS
+        handbackDeferredLogged = false
         if (age >= STALL_SILENCE_MS) {
             Diagnostics.log(
                 "warn",
@@ -911,6 +976,8 @@ object ShellRuntime {
     private fun clearCarrierState() {
         releaseCarrierWakeLock()
         carrierStarted = false
+        carrierStartedEarly = false
+        handbackDeferredLogged = false
     }
 
     /**
