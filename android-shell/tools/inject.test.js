@@ -257,7 +257,10 @@ function setupPage(options) {
     const document = new FakeDocument();
     const window = new FakeWindow();
     const posts = [];
-    const configValue = {subscribeAll: !options || options.subscribeAll !== false};
+    // 原生 config() 的真实形状：`passiveObserve` + `runningSessions`。
+    // 2026-09-17：D7「订阅所有工作区」（`subscribeAll`）删除后这里不再有这个字段，
+    // 所以每个测试跑的都是**只读壳**的默认配置——注入层不许再主动开桥。
+    const configValue = {passiveObserve: true};
 
     install('EventTarget', FakeEventTarget);
     install('Document', FakeDocument);
@@ -405,7 +408,6 @@ function setupPage(options) {
         delete globalThis.__zcodeShellInstalled;
         delete globalThis.__zcodeShellLocateTask;
         delete globalThis.__zcodeShellSetAppForeground;
-        delete globalThis.__zcodeShellSetSubscribeAll;
         delete globalThis.__zcodeShellHeartbeat;
         delete globalThis.__zcodeShellReportPageState;
         delete globalThis.__zcodeShellPageStateHooked;
@@ -662,18 +664,35 @@ test('credentials never reach the diagnostic log', async () => {
 });
 
 test('our own injected frames are not re-observed as page traffic', async () => {
+    // 这条测试原来用"壳自己发的 workspace-list-request"当"我们自己的帧"——
+    // 那是 D7 主动开桥链的第一步，2026-09-17 已删。现在壳唯一会写页面 socket 的
+    // 帧是后台补心跳的探针（前台一帧都不写，见"只读壳：前台心跳一帧都不写页面 socket"），
+    // 所以改用它：探针发出去之后不许再有任何连带写入——一旦观察层把"我们自己的帧"
+    // 当成页面流量回灌，客户端就会自激（这正是当年那条 feedback loop 的形状）。
     const page = setupPage();
     try {
         const socket = new globalThis.WebSocket('wss://relay.example');
+        socket.dispatchEvent({type: 'open'});
+        socket.send(JSON.stringify({type: 'auth_init', role: 'terminal', device_sid: 'sid-1'}));
         socket.receive({type: 'pair_status_ack', pair_status: 'matched'});
         await wait(1700);
-        const countRequests = () =>
-            socket.sent.filter((text) => text.includes('workspace-list-request')).length;
-        assert.strictEqual(countRequests(), 1, 'exactly one workspace list request');
-        // A feedback loop (our own send observed as page traffic) would keep
-        // the client re-triggering itself; the count must stay put.
+
+        const before = socket.sent.length;
+        globalThis.__zcodeShellSetAppForeground(false);
+        assert.strictEqual(globalThis.__zcodeShellHeartbeat(), true, '后台补心跳要真的发出这一帧');
         await wait(250);
-        assert.strictEqual(countRequests(), 1);
+        const ours = socket.sent.slice(before)
+            .map((raw) => {
+                try {
+                    return JSON.parse(raw);
+                } catch (e) {
+                    return null;
+                }
+            })
+            .filter((frame) => frame && frame.type === 'pair_status_query');
+        assert.strictEqual(ours.length, 1, 'exactly one probe frame of our own');
+        assert.strictEqual(socket.sent.length, before + 1,
+            'no feedback loop: our own frame must not make the shell write again');
     } finally {
         page.teardown();
     }
@@ -683,7 +702,12 @@ test('our own injected frames are not re-observed as page traffic', async () => 
 // end-to-end through the page socket
 // ---------------------------------------------------------------------------
 
-test('active subscription works end to end through the page socket', async () => {
+test('只读壳：默认配置下配对之后注入层不主动开桥（D7 已删，2026-09-17）', async () => {
+    // 这条测试原来是 "active subscription works end to end through the page socket"：
+    // 它钉住的是 D7「订阅所有工作区」打开时壳会**在页面那条 socket 上**给每个工作区
+    // 开桥 + 订索引。那条链已在 2026-09-17 删除（与页面自己的订阅争用 → 页面卡
+    // "工作中"+转圈），等价断言因此反过来：**默认配置也必须和"关"完全一样**——
+    // 配对之后零协议写入、零订阅，只跟随页面（跟随的正面证据见下一条 passive 测试）。
     const page = setupPage();
     try {
         const socket = new globalThis.WebSocket('wss://relay.example');
@@ -692,26 +716,17 @@ test('active subscription works end to end through the page socket', async () =>
 
         socket.send(JSON.stringify({type: 'auth_init', role: 'terminal', device_sid: 'sid-1'}));
         socket.receive({type: 'pair_status_ack', pair_status: 'matched'});
+        // 旧实现在配对后 1.5s 起步（ACTIVE_START_DELAY_MS）；等足这个窗口。
         await wait(1900);
 
-        assert.ok(link.sentLog.some((text) => text.includes('workspace-list-request')),
-            'the client should ask for the workspace list once paired');
-        assert.strictEqual(link.desktop.subscriptions.length, 1,
-            'the workspace should be subscribed');
-
-        link.desktop.pushSessionsWire('ws-a', snapshotWire([
-            {sessionId: 's1', title: '重构登录模块', phase: 'running', lastActivityAt: 1,
-                lastAssistantPreview: '已修改 auth_service'}
-        ]));
-        await wait(60);
-
-        const updates = findPost(page.posts, 'sessions');
-        assert.strictEqual(updates.length, 1, 'one sessions update should reach the bridge');
-        assert.strictEqual(updates[0].data.key, 'ws-a');
-        assert.strictEqual(updates[0].data.source, 'active');
-        assert.strictEqual(updates[0].data.sessions[0].title, '重构登录模块');
-        assert.strictEqual(updates[0].data.sessions[0].phase, 'running');
-        assert.ok(link.desktop.acked.length > 0, 'the desktop must be acked');
+        assert.strictEqual(link.desktop.subscriptions.length, 0,
+            '壳永不给自己开桥：默认配置与旧「订阅所有工作区＝关」必须完全一样');
+        assert.strictEqual(
+            link.sentLog.filter((text) => text.includes('workspace-list-request')).length, 0,
+            '配对之后不得再有 workspace-list-request（主动开桥链的第一步）');
+        assert.strictEqual(
+            link.sentLog.filter((text) => text.includes('workspace-bridge-open')).length, 0,
+            '不得有任何开桥请求');
         link.stop();
     } finally {
         page.teardown();
@@ -719,7 +734,7 @@ test('active subscription works end to end through the page socket', async () =>
 });
 
 test('passive mode follows the page stream without writing anything itself', async () => {
-    const page = setupPage({subscribeAll: false});
+    const page = setupPage();
     try {
         const socket = new globalThis.WebSocket('wss://relay.example');
         const link = connectDesktop(socket);
@@ -757,7 +772,7 @@ test('passive mode follows the page stream without writing anything itself', asy
         assert.strictEqual(updates[0].data.sessions[0].title, '页面里的任务');
         assert.strictEqual(
             link.sentLog.filter((text) => text.includes('workspace-list-request')).length, 0,
-            'subscribe-all off must mean zero protocol writes');
+            '只读壳必须零协议写入（D7 删除后这也包括默认配置）');
         link.stop();
     } finally {
         page.teardown();

@@ -25,22 +25,16 @@ class Prefs(context: Context) {
         }
 
     /**
-     * D7: 主动订阅所有工作区（壳自己在页面的 socket 上开 bridge）。
+     * D7「订阅所有工作区」开关**已删除**（2026-09-17）。
      *
-     * ⚠️ **默认已改为关（2026-09-15 真机 A/B 定案）。**
+     * 它让注入层在**页面自己那条 socket** 上给每个工作区开桥 + 订索引，2026-09-15 真机
+     * A/B 定罪：与页面自己的订阅争用 → 页面卡"工作中"+转圈、内容全程不来。那既是纯重复，
+     * 也违反只读壳契约（前台一帧都不写页面 socket）。功能由 Tier2（原生自开 socket）+
+     * 发现链承载，所以整条（pref / 设置页 / bridge 字段 / 注入层主动开桥）一起删掉。
      *
-     * 开着的时候壳会在**页面那条 socket** 上给 6–7 个工作区各开一座 bridge + 索引订阅，
-     * 而**页面自己早就订着它们**（日志里的 `sessions-index/E:\Mimo` 就是页面订的）——既是
-     * 纯重复（违反 README「实现要点」13 的不变式），又因为开桥在启动瞬发里抢先而必然发生。
-     * 后果：用户点进对话后**页面只剩"工作中"+转圈、内容全程不来、连桌面端点暂停也不更新**。
-     *
-     * 用户实测（关掉本开关）：第 63→67 次、以及锁屏解锁全程第 72→75 次回复，**都顺利推进**。
-     *
-     * 开关留着：桌面端哪天解决了同一 socket 上的争用，可以再打开换回"全工作区通知"。
+     * 旧键 `subscribe_all_workspaces` 不再读写：留一条已死的 SharedPreferences 对壳无害，
+     * 删除它在真机上反而是"多一次写"。**永远不要**把这条链接回来。
      */
-    var subscribeAllWorkspaces: Boolean
-        get() = prefs.getBoolean(KEY_SUBSCRIBE_ALL, false)
-        set(value) = prefs.edit().putBoolean(KEY_SUBSCRIBE_ALL, value).apply()
 
     /** Enables WebView remote debugging in release builds (troubleshooting). */
     var webViewDebugging: Boolean
@@ -78,7 +72,6 @@ class Prefs(context: Context) {
     companion object {
         private const val NAME = "zcode_remote"
         private const val KEY_REMOTE_URL = "remote_url"
-        private const val KEY_SUBSCRIBE_ALL = "subscribe_all_workspaces"
         private const val KEY_WEBVIEW_DEBUG = "webview_debugging"
         private const val KEY_PASSIVE_OBSERVE = "passive_observe"
         private const val KEY_NOTIF_ASKED = "notification_permission_requested"

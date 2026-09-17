@@ -380,18 +380,25 @@ test('active mode opens one bridge per workspace and streams sessions', async ()
     assert.strictEqual(byKey.get('ws-b').sessions[0].phase, 'prewarming');
 });
 
-test('active mode respects the workspace cap and the subscribe-all switch', async () => {
+test('active mode respects the workspace cap（只剩单测 seam：壳永不调用 start）', async () => {
     const capped = makeClient({maxWorkspaces: 1});
     capped.desktop.workspaces = [
         {workspacePath: '/a'}, {workspacePath: '/b'}, {workspacePath: '/c'}
     ];
     await capped.client.start();
     assert.strictEqual(capped.desktop.subscriptions.length, 1);
+});
 
-    const off = makeClient({subscribeAll: false});
-    off.desktop.workspaces = [{workspacePath: '/a'}];
-    await off.client.start();
-    assert.strictEqual(off.desktop.subscriptions.length, 0, 'no writes when subscribe-all is off');
+test('只读壳：没有「订阅所有工作区」开关，客户端自己不开桥（D7 已删，2026-09-17）', () => {
+    // 这条原来是 `makeClient({subscribeAll: false})` → "no writes when subscribe-all
+    // is off"。开关整个删掉后，等价断言是**客户端不再有"主动"这个状态**：构造完了
+    // 就安安静静，一帧都不写；主动覆盖只能由（已无生产调用者的）start() 显式发起。
+    const {client, desktop} = makeClient();
+    assert.strictEqual(client.subscribeAll, undefined,
+        'D7 开关已删除：客户端不再有"我该主动开桥"这个状态');
+    assert.strictEqual(client.isStarted(), false, '没有 start() 就没有主动覆盖');
+    assert.strictEqual(desktop.subscriptions.length, 0, '构造本身不得产生任何订阅');
+    assert.strictEqual(desktop.sent.length, 0, '构造本身不得写页面 socket');
 });
 
 test('a failing workspace does not abort the others', async () => {

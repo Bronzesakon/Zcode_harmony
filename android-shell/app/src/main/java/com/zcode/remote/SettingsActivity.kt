@@ -20,7 +20,6 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import androidx.core.view.WindowInsetsControllerCompat
-import com.google.android.material.materialswitch.MaterialSwitch
 import com.zcode.remote.core.Diagnostics
 import com.zcode.remote.core.RemoteUrl
 import com.zcode.remote.core.ShellLog
@@ -90,20 +89,6 @@ class SettingsActivity : AppCompatActivity() {
 
         binding.rowBattery.setOnClickListener { requestBatteryExemption() }
 
-        val switch: MaterialSwitch = binding.switchSubscribeAll
-        switch.isChecked = ShellRuntime.prefs().subscribeAllWorkspaces
-        switch.setOnCheckedChangeListener { _, checked ->
-            ShellRuntime.prefs().subscribeAllWorkspaces = checked
-            Diagnostics.info(if (checked) "已开启订阅所有工作区" else "已关闭订阅所有工作区")
-            updateSubscribeAllState()
-            // Apply live so the user does not need to reload the page.
-            evaluate(
-                "window.__zcodeShellSetSubscribeAll && window.__zcodeShellSetSubscribeAll($checked);"
-            )
-        }
-        // MiuiX toggles from anywhere on the row, not just the switch itself.
-        binding.rowSubscribeAll.setOnClickListener { switch.toggle() }
-
         binding.rowDiagnostics.setOnClickListener { showDiagnostics() }
         binding.rowShareLog.setOnClickListener { shareLog() }
         binding.rowClearDiagnostics.setOnClickListener {
@@ -118,7 +103,6 @@ class SettingsActivity : AppCompatActivity() {
         super.onResume()
         updatePermissionState()
         updateBatteryState()
-        updateSubscribeAllState()
         // Fresh counters matter most right after returning from the background.
         evaluate("window.__zcodeShellReportLiveness && window.__zcodeShellReportLiveness();")
         startRefreshLoop()
@@ -161,13 +145,6 @@ class SettingsActivity : AppCompatActivity() {
         val exempt = power?.isIgnoringBatteryOptimizations(packageName) == true
         binding.batteryState.text = getString(
             if (exempt) R.string.settings_battery_exempt else R.string.settings_battery_not_exempt
-        )
-    }
-
-    private fun updateSubscribeAllState() {
-        binding.subscribeAllState.text = getString(
-            if (ShellRuntime.prefs().subscribeAllWorkspaces) R.string.settings_subscribe_all_on
-            else R.string.settings_subscribe_all_off
         )
     }
 

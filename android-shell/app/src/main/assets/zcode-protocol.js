@@ -1064,7 +1064,9 @@
      *   log             function(message)
      *   idBase          number (default 0x100000)
      *   maxWorkspaces   number (default 12)
-     *   subscribeAll    boolean — false keeps the client in passive-only mode
+     *
+     * 这里**没有**"订阅所有工作区"开关：D7 于 2026-09-17 删除（见 `start()` 上的注释）。
+     * 客户端恒为被动旁观——只解析页面的流量，不写页面那条 socket。
      *
      * Events (assign callbacks):
      *   onSessions(update)   {key, title, workspacePath, workspaceIdentity,
@@ -1086,7 +1088,9 @@
         this._log = options.log || function () {};
         this._idBase = options.idBase || 0x100000;
         this._maxWorkspaces = options.maxWorkspaces || 12;
-        this.subscribeAll = options.subscribeAll !== false;
+        // ⚠️ 这里**曾经**是 `this.subscribeAll = options.subscribeAll !== false;`——
+        // D7「订阅所有工作区」的开关位，2026-09-17 删除。构造参数里再给 subscribeAll
+        // 也没有任何效果，客户端不接受"我该主动开桥"这个状态了。
 
         this.onSessions = null;
         this.onStatus = null;
@@ -1319,7 +1323,6 @@
             passive += 1;
         }
         var status = {
-            active: this.subscribeAll,
             bridges: bridges,
             passive: passive,
             reason: reason || ''
@@ -2092,6 +2095,21 @@
     };
 
     // ------------------------------------------------------------------ active
+    //
+    // ⚠️ **这一段没有生产调用者**（2026-09-17 起）。
+    //
+    // 它是 D7「订阅所有工作区」的 Tier1 实现：在**页面自己那条 socket** 上开桥 +
+    // 订索引。2026-09-15 真机 A/B 定罪（与页面自己的订阅争用 → 页面卡"工作中"+
+    // 转圈），2026-09-17 用户拍板删开关；注入层那一侧的调度器（`maybeStartActive`）
+    // 与 `__zcodeShellSetSubscribeAll` 已一并删除，所以 `start()`/`retryStart()`
+    // 在真机上**永远不会被调用**——注入层恒被动，只读壳契约不允许它再被接回去。
+    //
+    // 为什么代码没跟着删：它是唯一端到端跑通过 bridge 握手（hello → initialize →
+    // 对话订阅 → 索引订阅 → listen）的实现，`tools/protocol.test.js` 的 active 组
+    // 用它当 seam 钉住线格式。删除它属于"需要真机回归"的一类（连同下面被
+    // `CONVERSATION_SUBSCRIBE_ENABLED = false` 封死的对话自订阅流），留给下一轮；
+    // 在那之前：**只准从 Node 单测调用，不准从 inject.js 调用**。
+    // -------------------------------------------------------------------------
 
     RemoteClient.prototype._scheduleReopen = function (key, attempt) {
         var self = this;
@@ -2113,7 +2131,7 @@
         var delay = Math.min(30000, 2000 * Math.pow(2, attempt - 1));
         this._log('reopening ' + key + ' in ' + delay + 'ms (attempt ' + attempt + ')');
         setTimeout(function () {
-            if (!self.subscribeAll || self._passive[key] || self._pageOwned[key] ||
+            if (self._passive[key] || self._pageOwned[key] ||
                 self._inCooldown(key)) {
                 return;
             }
@@ -2135,6 +2153,9 @@
     /**
      * Starts (or refreshes) active coverage: one bridge + one sessions-index
      * subscription per workspace the page is not already covering.
+     *
+     * ⚠️ **注入层永不调用它**（只读壳契约；D7 于 2026-09-17 删除，见本节头注释）。
+     * 只有 `tools/protocol.test.js` 的 active 组会调用它。
      */
     RemoteClient.prototype.start = function () {
         var self = this;
@@ -2142,10 +2163,6 @@
             return Promise.resolve();
         }
         this._started = true;
-        if (!this.subscribeAll) {
-            this._emitStatus('passive only (subscribe-all off)');
-            return Promise.resolve();
-        }
         var startedAt = Date.now();
         return this.listWorkspaces().then(function (list) {
             var targets = [];
@@ -2219,11 +2236,8 @@
         });
     };
 
-    /** Re-runs active coverage after a failed or empty first attempt. */
+    /** Re-runs active coverage after a failed or empty first attempt. 无生产调用者（见本节头）。 */
     RemoteClient.prototype.retryStart = function () {
-        if (!this.subscribeAll) {
-            return Promise.resolve();
-        }
         this._started = false;
         return this.start();
     };
@@ -2846,7 +2860,7 @@
     };
 
     RemoteClient.prototype.dispose = function () {
-        this.subscribeAll = false;
+        // （曾经这里还有 `this.subscribeAll = false;`——D7 开关本身已删。）
         for (var key in this._bridges) {
             this._bridges[key].closed = true;
         }

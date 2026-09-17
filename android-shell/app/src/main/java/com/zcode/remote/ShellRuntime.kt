@@ -76,7 +76,9 @@ object ShellRuntime {
 
     private var serviceRunning = false
     private var injectedReady = false
-    private var reportedActive = false
+
+    /** 上一行上报过的注入层订阅状态摘要（去重；见 [onStatus]）。 */
+    private var lastInjectStatusLine = ""
 
     // ---------------------------------------------------------- liveness probe
     //
@@ -1356,7 +1358,7 @@ object ShellRuntime {
                     injectedReady = true
                     Diagnostics.log(
                         "info",
-                        "注入脚本已就绪 (subscribeAll=${data.optBoolean("subscribeAll", true)})",
+                        "注入脚本已就绪 (href=${data.optString("href").ifEmpty { "?" }})",
                     )
                 }
                 else -> Unit
@@ -1434,16 +1436,19 @@ object ShellRuntime {
 
     private fun onStatus(data: JSONObject?) {
         if (data == null) return
-        val active = data.optBoolean("active", false)
+        // 2026-09-17：`active` 字段随 D7「订阅所有工作区」开关一起删除——注入层现在
+        // **恒被动**（只读壳契约），这个字段只会永远是 false，留着就是误导。去重因此
+        // 改成对整行摘要做，让"变化"进 info 档、重复的 reason 仍留在 debug 档。
         val bridges = data.optInt("bridges", 0)
         val passive = data.optInt("passive", 0)
         val reason = data.optString("reason")
-        val summary = "订阅状态 active=$active bridges=$bridges passive=$passive"
-        if (active != reportedActive) {
-            reportedActive = active
-            Diagnostics.info(if (reason.isEmpty()) summary else "$summary ($reason)")
+        val line = "订阅状态 bridges=$bridges passive=$passive" +
+            (if (reason.isEmpty()) "" else " ($reason)")
+        if (line != lastInjectStatusLine) {
+            lastInjectStatusLine = line
+            Diagnostics.info(line)
         } else if (reason.isNotEmpty()) {
-            Diagnostics.log("debug", "$summary ($reason)")
+            Diagnostics.log("debug", line)
         }
     }
 
@@ -1591,7 +1596,7 @@ object ShellRuntime {
     /** Called when the page (re)loads: the injected layer starts from scratch. */
     fun onPageStarted() {
         injectedReady = false
-        reportedActive = false
+        lastInjectStatusLine = ""
     }
 
     /** Called when a fresh page has finished loading and re-subscribed. */

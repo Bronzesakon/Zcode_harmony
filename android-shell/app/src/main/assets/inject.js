@@ -190,9 +190,15 @@
         return;
     }
 
-    /** 读不到原生配置时的兜底——**必须与 Prefs 的真实默认值一致**（现在两者都是"不订阅"）。 */
+    /**
+     * 读不到原生配置时的兜底——**必须与 Prefs 的真实默认值一致**。
+     *
+     * 2026-09-17：D7「订阅所有工作区」删除后这里不再有 `subscribeAll`——注入层**恒被动**
+     * （只读壳契约，见 SHELL_READ_ONLY）。兜底里如果残留一个"开订阅"的字段，就等于给
+     * 只读契约留了个后门（2026-09-15 就是这么踩的）。
+     */
     function configDefaults() {
-        return {subscribeAll: false, passiveObserve: true};
+        return {passiveObserve: true};
     }
 
     function config() {
@@ -748,8 +754,6 @@
     // -----------------------------------------------------------------------
     var client = null;
     var relayPaired = false;
-    var startScheduled = false;
-    var startAttempts = 0;
 
     /**
      * What the page already streams is a fact about the PAGE, not about one
@@ -787,7 +791,6 @@
             log: function (message) {
                 diag('debug', message);
             },
-            subscribeAll: cfg.subscribeAll !== false,
             // 原生给的"在跑会话"种子（工作区 → 会话 id）：开桥时要先订哪几条对话用它。
             // 它**活过页面重载**，而 JS 侧自己攒的清单活不过——详见
             // zcode-protocol.js 的 _conversationCandidates 与 WebAppBridge.config 的注释。
@@ -832,16 +835,10 @@
                 's：' + info.name + '（桌面端从未回答）');
         };
         next.suppressPageRpcMirror = pagelogSeen;
+        // 只上报，不做任何"没起来就重试"的动作：注入层**没有**主动开桥这回事了
+        // （2026-09-17 删 D7；原实现在这里对 status.active 为假重试 retryStart）。
         next.onStatus = function (status) {
             post('status', status);
-            if (!status.active && next.subscribeAll && startAttempts < 3) {
-                // The desktop may not have been ready for our workspace list
-                // yet; retry a couple of times before settling for passive.
-                startAttempts += 1;
-                setTimeout(function () {
-                    next.retryStart();
-                }, 20000);
-            }
         };
         return next;
     }
@@ -884,77 +881,20 @@
             client = null;
             diag('warn', 'relay 断开，重建协议客户端（页面覆盖情况保留）');
         }
-        startScheduled = false;
     }
 
     // -----------------------------------------------------------------------
-    // 3b. when to open our own bridges
+    // 3b.（已删除）"什么时候开我们自己的桥"
     //
-    // Not the moment pairing completes. The page is usually still loading its
-    // first conversation then, and one bridge costs four RPCs per workspace
-    // (hello, initialize, subscribe, listen) on the *same* relay socket: on
-    // device, seven workspaces took ~10 s of solid handshaking, all of it queued
-    // in front of whatever the user was opening. So the subscription waits for
-    // the page's own traffic to go quiet, with a hard cap so a busy page can
-    // never postpone notifications indefinitely.
+    // 2026-09-17（D7 删除）：这里原本是"主动开桥"的调度器（`maybeStartActive`：
+    // 配对后等页面安静 800ms、最多推迟 12s，然后 `client.start()` 给**每个**工作区
+    // 在页面那条 socket 上开桥 + 订索引）。它是 D7「订阅所有工作区」的 Tier1 实现，
+    // 2026-09-15 真机 A/B 定罪：与页面自己的订阅争用 → 页面卡"工作中"+转圈。
+    // 一并删掉的还有 `ACTIVE_START_*` 四个常量、`startScheduled`/`startAttempts`。
+    //
+    // **只读壳契约**（见 SHELL_READ_ONLY）：注入层永不主动开桥；多工作区覆盖由
+    // Tier2（原生自开 socket，`RelayBridge`）+ 发现链承载。别把这段调度器加回来。
     // -----------------------------------------------------------------------
-
-    /** First opportunity to start (the previous fixed delay). */
-    var ACTIVE_START_DELAY_MS = 1500;
-    /** Our bridges only start once the socket has been quiet this long. */
-    var ACTIVE_START_QUIET_MS = 800;
-    /** Re-check interval while the page is still busy. */
-    var ACTIVE_START_RETRY_MS = 1000;
-    /** Upper bound on the deferral, however busy the page is. */
-    var ACTIVE_START_MAX_DEFER_MS = 12000;
-
-    function maybeStartActive() {
-        if (!relayPaired || startScheduled || !client) {
-            return;
-        }
-        if (client.isStarted && client.isStarted()) {
-            // The desktop answers every heartbeat with a pair ack, and each ack
-            // re-enters here. start() is a no-op after the first call, so logging
-            // again would claim a restart that never happened — 125 of those
-            // buried the real (re)subscribe lines in the first field log.
-            return;
-        }
-        startScheduled = true;
-        var deadline = Date.now() + ACTIVE_START_MAX_DEFER_MS;
-        var deferredLogs = 0;
-
-        var attempt = function () {
-            if (!relayPaired || !client || !client.subscribeAll) {
-                startScheduled = false;
-                return;
-            }
-            var quietFor = liveness.lastInboundAt ?
-                Date.now() - liveness.lastInboundAt : Number.MAX_VALUE;
-            var inFlight = (client.inFlightPageRpcs && client.inFlightPageRpcs()) || 0;
-            // Two conditions, not one. "The page stopped receiving frames" was
-            // not enough: opening a task leaves a request in flight for seconds,
-            // and the handshake burst then queues on the same relay socket right
-            // in front of it. Now the burst also waits until the page has no
-            // request outstanding. The 12s cap still bounds the wait, so a page
-            // that always has something pending cannot postpone this forever.
-            if (Date.now() < deadline && (quietFor < ACTIVE_START_QUIET_MS || inFlight > 0)) {
-                if (deferredLogs < 3) {
-                    deferredLogs += 1;
-                    diag('debug', '推迟主动订阅：收帧于 ' +
-                        (quietFor === Number.MAX_VALUE ? '∞' : Math.round(quietFor)) +
-                        'ms 前，在飞页面请求 ' + inFlight + ' 个');
-                }
-                setTimeout(attempt, ACTIVE_START_RETRY_MS);
-                return;
-            }
-            startScheduled = false;
-            diag('debug', 'active subscribe start（页面已空闲 ' +
-                (quietFor === Number.MAX_VALUE ? '∞' : Math.round(quietFor)) + 'ms）');
-            client.start().catch(function () {});
-        };
-
-        setTimeout(attempt, ACTIVE_START_DELAY_MS);
-    }
 
     /**
      * Sends a business payload on the socket the page has open.
@@ -1079,8 +1019,9 @@
                 if (kickedHealCount() > 0) {
                     storeSet(KICKED_HEAL_STORE, '0');
                 }
+                // 只建客户端 + 跟随页面：**不**在这里安排任何主动开桥
+                // （2026-09-17 删 D7；原实现是 `maybeStartActive()`）。
                 ensureClient();
-                maybeStartActive();
             } else {
                 resetClient();
             }
@@ -3141,19 +3082,6 @@
         }
     }
 
-    /** Lets the native side flip the subscribe-all switch without a reload. */
-    G.__zcodeShellSetSubscribeAll = function (enabled) {
-        if (!client) {
-            return;
-        }
-        client.subscribeAll = enabled !== false;
-        if (client.subscribeAll) {
-            client.retryStart();
-        } else {
-            client.dispose();
-        }
-    };
-
     /**
      * Asks the injected layer to report its liveness counters immediately.
      * Used by the native side when the app returns to the foreground, so the
@@ -3779,7 +3707,8 @@
     }
     startConversationStreamMonitor();
     installLongTaskObserver();
-    post('ready', {href: location.href, subscribeAll: config().subscribeAll !== false});
+    // 只报 href：`subscribeAll` 随 D7 一起删除（2026-09-17），别再往这帧里加"能力开关"。
+    post('ready', {href: location.href});
     reportLiveness();
     // After the first layout pass, and again whenever the viewport changes.
     setTimeout(reportViewport, 1200);

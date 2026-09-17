@@ -200,35 +200,6 @@
             <LinearLayout style="@style/MiuixCard">
 
                 <LinearLayout
-                    android:id="@+id/rowSubscribeAll"
-                    style="@style/MiuixRow">
-
-                    <LinearLayout
-                        android:layout_width="0dp"
-                        android:layout_height="wrap_content"
-                        android:layout_weight="1"
-                        android:orientation="vertical">
-
-                        <TextView
-                            style="@style/MiuixRowTitle"
-                            android:text="@string/settings_subscribe_all" />
-
-                        <TextView
-                            android:id="@+id/subscribeAllState"
-                            style="@style/MiuixRowSummary" />
-                    </LinearLayout>
-
-                    <com.google.android.material.materialswitch.MaterialSwitch
-                        android:id="@+id/switchSubscribeAll"
-                        android:layout_width="wrap_content"
-                        android:layout_height="wrap_content"
-                        android:layout_marginStart="12dp"
-                        android:contentDescription="@string/settings_subscribe_all" />
-                </LinearLayout>
-
-                <View style="@style/MiuixDivider" />
-
-                <LinearLayout
                     android:id="@+id/rowDiagnostics"
                     style="@style/MiuixRow">
 
