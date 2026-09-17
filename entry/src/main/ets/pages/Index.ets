@@ -28,13 +28,20 @@ const TAG = 'ZCodeIndex';
 
 /**
  * 状态栏两套固定表面色（双端一致，色值取自远程页静态资源解析，2026-09-10 资源嗅探 + 真机像素双验证）。
- * 运行时零取色：网页侧只回推状态名（'boot' | 'main'），原生查本表直接换色：
+ * 运行时零取色：网页侧回推状态名，原生查本表直接换色：
  * - Boot 面：网页 bootstrap BROWSER_THEME_COLORS / --color-background，
  *   覆盖 开屏空白、Boot 加载壳、KICKED/接管提示等状态页（页顶同为 bg-background）；
- * - Main 面：--color-background-win-alt，即控制页外壳区底色
- *   （平板状态栏正下方即此色，真机像素实测一致）；
- * - 手机 Main 变体：--color-header（#FFFFFF / #202020）。手机窄屏布局在状态栏正下方
- *   是白色标题栏（其下才是外壳区），故手机进入主页面后用 Header 色对齐顶栏。
+ * - Main/Surface 面：--color-background-win-alt，即控制页外壳区底色
+ *   （宽屏状态栏正下方即此色，真机像素实测一致）；
+ * - Main/Header 面：--color-header（#FFFFFF / #202020）。网页以窄屏布局渲染（手机端外壳）时
+ *   状态栏正下方是标题栏而非外壳区，需用 Header 色对齐。
+ *
+ * 宽/窄屏不按设备形态分叉，而按网页自身的布局判据分叉：网页 workspace-shell 用
+ * matchMedia('(max-width: 767px)') 决定是否渲染手机端外壳（2026-09-11 快照资源解析确认），
+ * 该查询随窗口宽度（旋转 / 分屏 / 折叠）变化，故注入脚本按同一查询判态并监听其 change 事件。
+ * 原 deviceInfo.deviceType 分叉在平板竖屏下失效：平板 CSS 宽 1840/2.4 ≈ 766.7px 恰好落在
+ * 767px 断点内，一转竖屏网页即进入手机端布局，原生却仍按平板表给外壳色，
+ * 表现为状态栏与正下方标题栏明显色差（2026-09-11 真机截图取证）。
  */
 const BAR_SURFACE_LIGHT = '#FFECECEE';
 const BAR_SURFACE_DARK = '#FF2B2B2B';
@@ -47,15 +54,19 @@ const BAR_BOOT_DARK = '#FF161616';
  * 网页状态观察脚本（经 JavaScriptProxy 回推状态名，取代任何运行时取色）
  *
  * 色值在开发期已由静态资源解析确定（HTML 内联 BROWSER_THEME_COLORS + CSS token），
- * 运行时唯一要做的是判断网页处于哪个状态，因此本脚本只做 DOM 存在性检查：
+ * 运行时唯一要做的是判断网页处于哪个状态，因此本脚本只做存在性检查与同源媒体查询：
  * - '.zcode-boot-loading'：网页预渲染的 Boot 加载壳元素（React 挂载后移除）；
- * - '.bg-background-win-alt'：控制页主视图根节点（SPA 路由/状态页切换时挂载或卸载）。
- * main = 主视图在且 Boot 壳已卸载；其余（Boot 壳、KICKED/接管等状态页）一律 'boot'。
- * KICKED 页替换主视图 → 自动落回 boot，与"状态页页顶 = Boot 色"的资源解析结论一致。
+ * - '.bg-background-win-alt'：控制页主视图根节点（SPA 路由/状态页切换时挂载或卸载）；
+ * - matchMedia('(max-width: 767px)')：网页自己用来决定「是否渲染手机端外壳」的查询，
+ *   窄屏渲染时状态栏正下方是标题栏（bg-header），宽屏直接是外壳区（win-alt）。
+ * 于是回推三种状态名：'boot'（Boot 壳、KICKED/接管等状态页一律归此，与"状态页页顶 =
+ * Boot 色"的资源解析结论一致）、'main-surface'（控制页主视图 + 宽屏）、
+ * 'main-header'（控制页主视图 + 窄屏）。
  *
- * 事件驱动：MutationObserver 监听 DOM 结构与 class 变化，rAF 合帧后状态有变才回推
- * 状态名（非色值），空闲零开销。安装幂等：__zcodePageStateHooked 置位后重复安装为
- * 空操作；document 尚未就绪时返回 'retry' 且不置位，留待 FCP / onPageEnd 重试。
+ * 事件驱动：MutationObserver 监听 DOM 结构与 class 变化，matchMedia change 监听
+ * 旋转 / 分屏 / 折叠跨过断点，二者都经 rAF 合帧后状态有变才回推状态名（非色值），
+ * 空闲零开销。安装幂等：__zcodePageStateHooked 置位后重复安装为空操作；
+ * document 尚未就绪时返回 'retry' 且不置位，留待 FCP / onPageEnd 重试。
  */
 const STATUS_BAR_OBSERVER_JS: string = `
 (function () {
@@ -63,12 +74,25 @@ const STATUS_BAR_OBSERVER_JS: string = `
   if (!document.documentElement) { return 'retry'; }
   window.__zcodePageStateHooked = true;
 
-  // 状态判定：纯 DOM 存在性检查（getElementsByClassName 零样式读取）
+  // 宽窄屏判据与网页同源：workspace-shell 用这条查询决定是否渲染手机端外壳
+  var NARROW_QUERY = '(max-width: 767px)';
+
+  function isNarrow() {
+    try {
+      return !!(window.matchMedia && window.matchMedia(NARROW_QUERY).matches);
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // 状态判定：纯 DOM 存在性检查（getElementsByClassName 零样式读取）+ 同源媒体查询
   function computeState() {
     try {
       var main = document.getElementsByClassName('bg-background-win-alt');
       var boot = document.getElementsByClassName('zcode-boot-loading');
-      return (main.length > 0 && boot.length === 0) ? 'main' : 'boot';
+      if (boot.length > 0 || main.length === 0) { return 'boot'; }
+      // 窄屏：状态栏正下方是网页标题栏（bg-header）；宽屏：直接是外壳区（win-alt）
+      return isNarrow() ? 'main-header' : 'main-surface';
     } catch (e) {
       return '';
     }
@@ -99,6 +123,16 @@ const STATUS_BAR_OBSERVER_JS: string = `
       setTimeout(push, 0);
     }
   }
+
+  // 旋转 / 分屏 / 折叠跨过断点：布局变了但 DOM class 可能没变，靠这条查询的 change 事件补判
+  try {
+    var mq = window.matchMedia(NARROW_QUERY);
+    if (mq) {
+      var onNarrowChange = function () { schedule(); };
+      if (mq.addEventListener) { mq.addEventListener('change', onNarrowChange); }
+      else if (mq.addListener) { mq.addListener(onNarrowChange); }
+    }
+  } catch (e) {}
 
   try {
     var mo = new MutationObserver(schedule);
@@ -153,11 +187,14 @@ struct Index {
   // 状态栏占位底色：初始取开屏壳底色资源（四端限定目录已统一为 Boot 色），
   // 之后由「网页状态 → 固定表面色」查表驱动，只会在两套固定色之间切换
   @State statusBarColor: ResourceColor = $r('app.color.status_bar_bg');
-  // 设备形态：仅用于返回手势策略（onBackPress 平板全吞）；状态栏配色已双端统一，不再按设备分叉
+  // 设备形态：仅用于返回手势策略（onBackPress 平板全吞）；状态栏配色按网页布局判据分叉，与此无关
   private readonly isPhone: boolean = deviceInfo.deviceType === deviceInfo.DeviceTypes.TYPE_PHONE;
   // 网页当前状态（网页侧 DOM 标记判定后回推）：true = 控制页主视图，false = Boot 壳/状态页/未回推。
   // 与深浅色模式无关：模式切换时保留原值直接重映射
   private webPageOnMain: boolean = false;
+  // 主视图的顶面是否为窄屏标题栏（仅 webPageOnMain 时有意义）：
+  // true → 状态栏正下方是 bg-header（窄屏/手机端外壳），false → 外壳区 win-alt
+  private webTopHeader: boolean = false;
   // 网页底色回推桥（javaScriptProxy 注入为 window.zcodeStatusBar）
   private barBridge: StatusBarColorBridge = new StatusBarColorBridge();
   // 上传方式选择模态框（相册 + 文件两项）
@@ -255,8 +292,10 @@ struct Index {
   /**
    * 决定状态栏占位 Row 当前应使用的颜色（双端统一，仅两套固定色，运行时零取色）：
    * - 原生页（扫码引导 / 加载失败）与页面自身背景一致（webBgColor = Boot 色）；
-   * - 控制页：网页回推 main（主视图在挂）→ Main 固定色；
+   * - 控制页：网页回推 main-*（主视图在挂）→ 按顶面查表：窄屏布局状态栏正下方是
+   *   网页标题栏（bg-header）用 Header 色，宽屏直接是外壳区（win-alt）用 Surface 色；
    *   回推 boot（Boot 壳 / KICKED 等状态页）或未回推 → Boot 色（webBgColor）。
+   *   宽窄屏由网页侧按同源媒体查询判态回推，旋转 / 分屏后自动跟随，原生不猜断点。
    */
   // 错误页出现/消失时同步状态栏底色（错误页为原生背景，需与 webBgColor 一致）
   onErrorStateChange(): void {
@@ -269,8 +308,7 @@ struct Index {
       return;
     }
     if (this.webPageOnMain) {
-      // 主页面：平板状态栏正下方是外壳区（win-alt），手机是白色标题栏（header），按设备查表
-      this.statusBarColor = this.isPhone
+      this.statusBarColor = this.webTopHeader
         ? this.themeColor(BAR_HEADER_DARK, BAR_HEADER_LIGHT)
         : this.themeColor(BAR_SURFACE_DARK, BAR_SURFACE_LIGHT);
       return;
@@ -283,11 +321,13 @@ struct Index {
     if (!this.hasConnection || this.isError) {
       return;
     }
-    const onMain: boolean = state === 'main';
-    if (onMain === this.webPageOnMain) {
+    const onMain: boolean = state === 'main-header' || state === 'main-surface';
+    const onHeader: boolean = state === 'main-header';
+    if (onMain === this.webPageOnMain && onHeader === this.webTopHeader) {
       return;
     }
     this.webPageOnMain = onMain;
+    this.webTopHeader = onHeader;
     this.syncStatusBarColor();
   }
 
@@ -856,8 +896,9 @@ struct Index {
   // 热切换到新扫码结果（覆盖式单连接）
   private loadControlPage(target: string): void {
     try {
-      // 新页面从 Boot 状态起步：先回 Boot 色，待观察脚本回推 main 后再切 Main 色
+      // 新页面从 Boot 状态起步：先回 Boot 色，待观察脚本回推 main-* 后再切 Main 色
       this.webPageOnMain = false;
+      this.webTopHeader = false;
       this.syncStatusBarColor();
       this.controller.loadUrl(target);
       this.isError = false;
