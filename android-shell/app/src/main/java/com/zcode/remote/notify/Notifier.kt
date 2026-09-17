@@ -192,6 +192,12 @@ class Notifier(private val context: Context) {
         // promoted: Android refuses to promote a summary, and it would duplicate
         // what the per-task cards already say.
         val promoted = PromotionPolicy.choose(update.running)
+        if (promoted != lastPromotedIds) {
+            lastPromotedIds = promoted
+            val cards = promoted.joinToString(" ") { "#" + it }
+            val runningIds = update.running.joinToString(" ") { "#" + it.id }
+            Diagnostics.info("提升集合变化: [$cards]（运行 ${update.running.size} 个：$runningIds）")
+        }
         if (update.running.isNotEmpty() && lastPromotedCount != promoted.size) {
             lastPromotedCount = promoted.size
             val platform = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
@@ -420,6 +426,13 @@ class Notifier(private val context: Context) {
      * preview delta.
      */
     private var lastPromotedCount = -1
+
+    /**
+     * 上一次的提升集合（诊断用，2026-09-16）：真机报"流体云卡片消失又重建"，
+     * 而通知本身没有被撤回——那只能是**提升集合变化**导致这张卡这一拍没被提升
+     * （ColorOS 会因此收回卡片，下一拍再提升就"重建"）。这行日志是唯一能看见它的地方。
+     */
+    private var lastPromotedIds: Set<Int> = emptySet()
 
     /**
      * The last path segment of a workspace key — "default", "Mimo", … Used as the

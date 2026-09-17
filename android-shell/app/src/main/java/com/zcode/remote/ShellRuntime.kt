@@ -255,11 +255,18 @@ object ShellRuntime {
     // 前台时段不做：那时连接在页面手里（单控制端互斥），订不了也拉不了。
     private const val LIVE_PROGRESS_POLL_MS = 12_000L
 
-    /** 每这么多拍重挂一次（12s × 2 ≈ 24s）。真机实测桌面端推完首屏快照后就不再推，
-     *  所以刷新率完全由这个周期决定；pre.96 实测 48s 一拍时卡片肉眼可见地"半分钟
-     *  不动"，24s 与"对话轮之间几秒一条正文"的节奏更接近，成本只是每 24s 一次
-     *  resync（正常时它只是轻量应答，不再像旧版那样必然超时触发重开）。 */
-    private const val LIVE_REANCHOR_EVERY_POLLS = 2
+    /**
+     * 每这么多拍轮换一次（12s × 1 = **12s**，2026-09-17 用户拍板调快）。
+     *
+     * 这个值决定**卡片更新节奏**，不是交接耗时：桌面端同一时刻只服务一座桥，所以
+     * "每 N 秒轮换一次" ⇒ 每座桥被服务 N 秒、静默 N 秒 ⇒ 单卡的更新间隔 ≈ 2N。
+     *
+     * - `2`（24s 轮换）：单卡间隔 ~24–40s，每 24s 一次握手（151 已验收：0 失败、卡片零抽动）；
+     * - `1`（12s 轮换，**现行**）：单卡间隔 ~12–20s，更接近"对话轮之间几秒一条正文"的观感；
+     *   代价是回收/重订频率翻倍（每 12s 一次）。
+     * - 更早的 `4`（48s）实测"卡片肉眼可见地半分钟不动"，已否决。
+     */
+    private const val LIVE_REANCHOR_EVERY_POLLS = 1
 
     @Volatile
     private var livePolling = false
@@ -380,12 +387,18 @@ object ShellRuntime {
             mainHandler.post {
                 if (epoch != liveEpoch || !userIsAway() || !livePolling) return@post
                 val update = store.applyConversationRunState(key, sessionId, running)
-                if (update.running.isNotEmpty() || update.removedIds.isNotEmpty()) {
-                    Diagnostics.log(
-                        "debug",
-                        "会话运行态：${if (running) "在跑" else "结束"} · $sessionId",
-                    )
-                }
+                // **只有真的变了才发布。** `applyConversationRunState` 在相位没变时返回的是
+                // 四个列表全空的 Update（TaskStore 用"全空"表示"什么都没变"），无条件交给
+                // applyUpdate 就会被当成"当前运行集为空"发布出去：已发布的运行集被抹成 0 →
+                // 流体云卡片被系统收回 → 下一拍再提升就是"重建"。真机 2026-09-16 19:43 起
+                // 每 ~24s 一次且与桥回收同拍，因为**新桥的第一帧必然重报一次 turnState，
+                // 而相位并没有变**。另两条路（pushLivePreview / onConversationText）
+                // 本来就是这么防的——这里漏了。
+                if (update.running.isEmpty() && update.removedIds.isEmpty()) return@post
+                Diagnostics.log(
+                    "debug",
+                    "会话运行态：${if (running) "在跑" else "结束"} · $sessionId",
+                )
                 applyUpdate(update)
             }
         }
@@ -1422,6 +1435,11 @@ object ShellRuntime {
         // list in a way the user is actively watching for — publish those at
         // once and let only the chatter be throttled.
         val urgent = update.completed.isNotEmpty() || update.attention.isNotEmpty()
+        // **空更新（"无变化"）绝不能发布**：TaskStore 用"四个列表全空"表示什么都没变，
+        // 而 [enqueueOngoing] 把 `running` 当作**当前运行集**——一个空列表会把已发布的
+        // 运行集抹成 0（流体云卡片随之被系统收回，下一拍再提升即"重建"）。
+        // 真正的"运行集变空"一定带 removedIds（见 TaskStore.buildUpdate），不会被这条挡住。
+        if (!urgent && update.running.isEmpty() && update.removedIds.isEmpty()) return
         enqueueOngoing(update, throttled = !urgent)
     }
 
@@ -1460,6 +1478,13 @@ object ShellRuntime {
             pendingRemovedIds.clear()
             lastPublishAt = System.currentTimeMillis()
             running to removed
+        }
+        if (snapshot.second.isNotEmpty()) {
+            val after = snapshot.first.joinToString(" ") { "#" + it.id }
+            Diagnostics.info(
+                "卡片撤回 id=${snapshot.second.joinToString(" ")}" +
+                    "（撤回后运行集 ${snapshot.first.size} 个：$after）",
+            )
         }
         notifier.syncRunningTasks(
             TaskStore.Update(

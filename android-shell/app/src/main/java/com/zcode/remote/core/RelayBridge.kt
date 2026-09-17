@@ -312,6 +312,16 @@ class BridgeSession(
     private val convTails = ConcurrentHashMap<String, RelayWire.ConversationTail>()
     private val convLastText = ConcurrentHashMap<String, String>()
     private val convFramesBySession = ConcurrentHashMap<String, Int>()
+
+    /**
+     * 每个会话最后一次收到对话帧的时刻（毫秒）。
+     *
+     * 用途只有一个：重锚失败时给出"这座桥被晾了多久"的现场量（[sinceLastConvFrameMs]）。
+     * 2026-09-16 真机定案——resync **一次**超时**不等于**订阅坏死，而是**桌面端同一时刻
+     * 只服务一座桥**（服务权归最近一次订阅成功的那座）：未被服务的那座既没有帧、
+     * 也不被应答，只能靠"回收重订"把服务权抢回来。
+     */
+    private val convLastFrameAtMs = ConcurrentHashMap<String, Long>()
     private val pendingConversationFrames = ConcurrentHashMap<String, MutableList<JSONObject>>()
     private val convResyncing = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
     private val reanchorRunning = java.util.concurrent.atomic.AtomicBoolean(false)
@@ -528,6 +538,8 @@ class BridgeSession(
             convTails[sessionId] = RelayWire.ConversationTail()
             convLastText.remove(sessionId)
             convFramesBySession.remove(sessionId)
+            // 新订阅从"现在"起算饿死：否则刚订上就被判成饿死（尤其回收后立刻重锚那一拍）。
+            convLastFrameAtMs[sessionId] = System.currentTimeMillis()
             pendingConversationFrames.remove(subId)?.forEach { onConversationWire(it) }
             onLogLine(
                 "subscribed conversation for $sessionId (${ack.optString("mode")}, " +
@@ -555,64 +567,77 @@ class BridgeSession(
     /** 复制工作区 scope，避免桥回收线程持有可变对象。 */
     fun scopeCopy(): JSONObject = JSONObject(scope.toString())
 
-    /** 周期性重挂：保留对话订阅，在同一 subscription 上强制请求新 snapshot。 */
-    fun reanchorConversations(onFailure: () -> Unit = {}) {
-        if (closed || !reanchorRunning.compareAndSet(false, true)) return
+    /**
+     * 周期性重挂：保留对话订阅，在同一 subscription 上强制请求新 snapshot。
+     *
+     * **阻塞式、不自己起线程**（2026-09-16 改动，与 [BridgeManager.reanchorProgress] 配套）：
+     * 多座桥的重锚必须**串行**——真机实测两座桥同毫秒各发一条 resync 时，对端每轮只应答
+     * 一个，另一个正好 8.0s 超时，超时再升级成整桥回收，于是每 24s 拆一座桥（输家交替，
+     * 10 分钟 25 次）。返回 null = 本轮全部成功；否则是失败原因，由调用方决定要不要回收。
+     */
+    fun reanchorConversationsBlocking(): String? {
+        if (closed || !reanchorRunning.compareAndSet(false, true)) return null
         val entries = convSubscriptions.entries.toList()
         if (entries.isEmpty()) {
             reanchorRunning.set(false)
-            return
+            return null
         }
-        Thread {
-            try {
-                for ((session, subId) in entries) {
-                    if (closed || !convResyncing.add(session)) continue
-                    try {
-                        val beforeFrames = convFramesBySession[session] ?: 0
-                        val base = JSONObject(scope.toString())
-                            .put("subscriptionId", subId)
-                            .put("forceSnapshot", true)
-                        // 与 SI resync 同理：base 必填可空，无基线时显式 null。
-                        val tail = convTails[session]
-                        base.put(
-                            "base",
-                            if (tail != null && !tail.logEpoch().isNullOrEmpty()) {
-                                JSONObject().put("logEpoch", tail.logEpoch()).put("seq", tail.seq())
-                            } else {
-                                JSONObject.NULL
-                            },
-                        )
-                        channels.callBlocking(
-                            RelayWire.CHANNEL_CONVERSATION,
-                            RelayWire.METHOD_RESYNC_CONV,
-                            listOf<Any?>(base),
-                            8_000,
-                        )
-                        // 判据是**这个会话**收到新帧，不是全局计数——别的会话的
-                        // 帧不能证明这条订阅还活着。
-                        val deadline = System.currentTimeMillis() + 3_000L
-                        while (!closed && (convFramesBySession[session] ?: 0) == beforeFrames &&
-                            System.currentTimeMillis() < deadline
-                        ) {
-                            Thread.sleep(50L)
-                        }
-                        if (closed || (convFramesBySession[session] ?: 0) == beforeFrames) {
-                            throw RelayWire.WireException("resync returned without a conversation frame")
-                        }
-                        onLogLine("reanchor conversation for $session (force snapshot)")
-                    } catch (e: Exception) {
-                        onLogLine("conversation resync failed for $session: ${e.message}")
-                        onFailure()
-                        return@Thread
-                    } finally {
-                        convResyncing.remove(session)
+        try {
+            for ((session, subId) in entries) {
+                if (closed || !convResyncing.add(session)) continue
+                try {
+                    val beforeFrames = convFramesBySession[session] ?: 0
+                    val base = JSONObject(scope.toString())
+                        .put("subscriptionId", subId)
+                        .put("forceSnapshot", true)
+                    // 与 SI resync 同理：base 必填可空，无基线时显式 null。
+                    val tail = convTails[session]
+                    base.put(
+                        "base",
+                        if (tail != null && !tail.logEpoch().isNullOrEmpty()) {
+                            JSONObject().put("logEpoch", tail.logEpoch()).put("seq", tail.seq())
+                        } else {
+                            JSONObject.NULL
+                        },
+                    )
+                    channels.callBlocking(
+                        RelayWire.CHANNEL_CONVERSATION,
+                        RelayWire.METHOD_RESYNC_CONV,
+                        listOf<Any?>(base),
+                        8_000,
+                    )
+                    // 判据是**这个会话**收到新帧，不是全局计数——别的会话的
+                    // 帧不能证明这条订阅还活着。
+                    val deadline = System.currentTimeMillis() + 3_000L
+                    while (!closed && (convFramesBySession[session] ?: 0) == beforeFrames &&
+                        System.currentTimeMillis() < deadline
+                    ) {
+                        Thread.sleep(50L)
                     }
+                    if (closed || (convFramesBySession[session] ?: 0) == beforeFrames) {
+                        throw RelayWire.WireException("resync returned without a conversation frame")
+                    }
+                    onLogLine("reanchor conversation for $session (force snapshot)")
+                } catch (e: Exception) {
+                    return "conversation resync failed for $session: ${e.message}"
+                } finally {
+                    convResyncing.remove(session)
                 }
-            } finally {
-                reanchorRunning.set(false)
             }
-        }.start()
+            return null
+        } finally {
+            reanchorRunning.set(false)
+        }
     }
+
+    /**
+     * 最近一次收到任一对话帧距今多少毫秒（没有任何订阅时为 null）。
+     *
+     * 只用于重锚失败时的现场量——真机证明桌面端**同一时刻只服务一座桥**
+     * （服务权归最近订阅成功者），所以"这座桥多久没收到帧"就是它被晾着的证据。
+     */
+    fun sinceLastConvFrameMs(nowMs: Long = System.currentTimeMillis()): Long? =
+        convLastFrameAtMs.values.maxOrNull()?.let { nowMs - it }
 
     /** 会话流推出的运行态（变化才上报）：sessionId → 归一 phase。 */
     private val convRunState = ConcurrentHashMap<String, String>()
@@ -660,6 +685,7 @@ class BridgeSession(
             return
         }
         convFramesBySession[id] = (convFramesBySession[id] ?: 0) + 1
+        convLastFrameAtMs[id] = System.currentTimeMillis()
         val tail = convTails.getOrPut(id) { RelayWire.ConversationTail() }
         val payload = frame.optJSONObject("payload") ?: return
         val frameLogEpoch = frame.optString("logEpoch").takeIf { it.isNotEmpty() }
@@ -774,6 +800,7 @@ class BridgeSession(
         pendingConversationFrames.clear()
         convResyncing.clear()
         convFramesBySession.clear()
+        convLastFrameAtMs.clear()
         if (convListenerId >= 0) {
             try {
                 channels.removeListener(
@@ -836,6 +863,21 @@ class BridgeSession(
  * 逐工作区 open+subscribe（失败跳过不拖垮其它）→ 会话更新回调。
  * Tier2 接管模式下页面已死，无需页面覆盖判断。
  */
+
+/** 桥与桥之间的重锚间隔：给对端留出"一次只处理一个 resync"的余量。 */
+private const val REANCHOR_GAP_MS = 500L
+
+/** 刚回收过的桥正在重新握手（约 5s），等它落地再做下一座。 */
+private const val REANCHOR_AFTER_RECYCLE_MS = 3_000L
+
+/**
+ * 主动轮换的门槛：某座桥超过这么久没有新帧，才算"被对端晾着"，才去回收它换服务权。
+ *
+ * N=2 实测：被服务的那座每 6–17s 一段、失去服务的那座静默 17–21s，所以 15s 能把两者分开；
+ * 设这道门槛是为了**桌面端哪天开始并行服务多座桥时不乱拆**（那样两边都 <15s，就只做 resync）。
+ */
+private const val ROTATE_MIN_STARVE_MS = 15_000L
+
 class BridgeManager(
     private val sendPayloadOut: (JSONObject) -> Unit,
     private val onSessionsUpdate: (JSONObject) -> Unit,
@@ -858,6 +900,9 @@ class BridgeManager(
     private val idToKey = ConcurrentHashMap<String, String>()
     private var bridgeGeneration = 0L
     private val recycleInFlight = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    /** 重锚轮的整体互斥：一次只跑一轮（串行，见 [reanchorProgress]）。 */
+    private val reanchorInFlight = java.util.concurrent.atomic.AtomicBoolean(false)
 
     /** [disposeEverything] 后为 true：回收线程不得再开新桥（manager 已无人消费）。 */
     @Volatile
@@ -931,26 +976,74 @@ class BridgeManager(
     }
 
     /**
-     * 周期重挂（见 [BridgeSession.reanchorConversations]）。两级：
-     * 先 resyncConversationV4(forceSnapshot)；该订阅 8s 内没出新对话帧就认为
-     * 这座桥被 sessions-index 钉死了（真机 09-13 20:0x 的形态：索引订阅后
-     * 对话订阅永远不回包）——整桥回收，按「对话先于索引」重新握手 + 恢复原批
-     * 会话订阅。回收在独立线程跑，`recycleInFlight` 防并发重入。
+     * 周期重锚。**主动轮换 + 失败即回收**（N=2 优化版，2026-09-17）。
+     *
+     * 真机定案的两条事实（`docs/18` §3.3）：① 桌面端**同一时刻只服务一座桥**
+     * （服务权归"最近一次订阅成功"的那座）；② 所以"回收重订"是唯一的换服务手段。
+     *
+     * 旧写法是"给每座桥都发 resync，谁超时谁被回收"——没被服务的那座**必然**白等
+     * 8 秒 RPC 超时 + 3 秒重建等待，一轮 14–17s，静默窗（17–21s）就是这么来的。现在：
+     *
+     *   ① 其余桥（N=2 时＝当前被服务的那座）：发 resync 要一份新快照（保底拉取）；
+     *   ② **最饿的那座**（最近收帧距今最久）：**不等超时**，直接回收换服务权。
+     *
+     * 于是静默窗 ≈ 一次重建（~5s），周期仍由 [LIVE_REANCHOR_EVERY_POLLS]（12s×2）决定。
+     * 判据行：`reanchor rotate for <key>：最近收帧 Ns 前 ⇒ 主动回收换服务权`。
+     *
+     * N≥3 的形态与代价见 `docs/17` §11（远期规划，未实施）——那里"每轮只轮换一座"
+     * 正好就是这条实现天然给出的行为；**但 N 的上限仍是 3**（[Tier2Probe.DEFAULT_MAX_COVERAGE]）。
      */
     fun reanchorProgress() {
-        for (bridge in bridges.values) {
-            val key = bridge.workspaceKey
-            val sessions = bridge.conversationSessionIds()
-            val scope = bridge.scopeCopy()
+        if (disposed || !reanchorInFlight.compareAndSet(false, true)) return
+        Thread {
             try {
-                bridge.reanchorConversations(onFailure = {
-                    recycleBridge(key, scope, sessions)
-                })
+                val live = bridges.values.toList().filter { it.conversationSessionIds().isNotEmpty() }
+                if (live.isEmpty()) return@Thread
+                val starved = live.maxByOrNull { convSilenceMs(it) }
+                // ① 其余桥：拉一份新快照（当前被服务的那座会秒回）。
+                for (bridge in live) {
+                    if (bridge === starved) continue
+                    val key = bridge.workspaceKey
+                    val err = bridge.reanchorConversationsBlocking()
+                    if (err != null) {
+                        val silent = convSilenceText(convSilenceMs(bridge))
+                        onLogLine("reanchor failed for $key：$err；最近收帧 $silent ⇒ 整桥回收")
+                        recycleBridge(key, bridge.scopeCopy(), bridge.conversationSessionIds())
+                        Thread.sleep(REANCHOR_AFTER_RECYCLE_MS)
+                    } else {
+                        Thread.sleep(REANCHOR_GAP_MS)
+                    }
+                }
+                // ② 最饿的那座：主动换服务权（只在它真的挨饿时才动，见 ROTATE_MIN_STARVE_MS）。
+                if (starved != null) {
+                    val age = convSilenceMs(starved)
+                    if (age > ROTATE_MIN_STARVE_MS) {
+                        onLogLine(
+                            "reanchor rotate for ${starved.workspaceKey}：" +
+                                "最近收帧 ${convSilenceText(age)} ⇒ 主动回收换服务权",
+                        )
+                        recycleBridge(
+                            starved.workspaceKey,
+                            starved.scopeCopy(),
+                            starved.conversationSessionIds(),
+                        )
+                        Thread.sleep(REANCHOR_AFTER_RECYCLE_MS)
+                    }
+                }
             } catch (e: Exception) {
-                onLogLine("reanchor conversation failed for $key: ${e.message}")
+                onLogLine("reanchor round failed: ${e.message}")
+            } finally {
+                reanchorInFlight.set(false)
             }
-        }
+        }.start()
     }
+
+    /** 距最近一次对话帧的毫秒数；从没收到过按"最久"算（挑轮换目标用）。 */
+    private fun convSilenceMs(bridge: BridgeSession): Long =
+        bridge.sinceLastConvFrameMs() ?: Long.MAX_VALUE
+
+    private fun convSilenceText(ms: Long): String =
+        if (ms == Long.MAX_VALUE) "无帧" else "${ms / 1000}s 前"
 
     /**
      * 二级回收：同一工作区整桥重建。先取快照（旧桥可能并发关闭中，取不到就
