@@ -1350,6 +1350,20 @@
 
     function reportLiveness() {
         var socket = activeSocket;
+        // "页面最近还有没有在收 conversation 帧"（2026-09-17）：承载的**提前接管**判据。
+        // 概览页（没进任何任务）永远收不到；进了任务哪怕 agent 静默也有快照/轮次帧。
+        // −1 = 本客户端生命周期内一帧都没见过 ⇒ 页面没在跟任何会话。
+        var convAgo = -1;
+        try {
+            if (client && typeof client.conversationFrameStats === 'function') {
+                var cs = client.conversationFrameStats();
+                if (cs && typeof cs.lastFrameAgoMs === 'number') {
+                    convAgo = cs.lastFrameAgoMs;
+                }
+            }
+        } catch (e) {
+            convAgo = -1;   // 取不到就退回"没见过"，宁可早接管也不冻卡片
+        }
         post('liveness', {
             inboundFrames: liveness.inboundFrames,
             pairAcks: liveness.pairAcks,
@@ -1360,6 +1374,7 @@
             backgroundFirstTickDelayMs: liveness.backgroundFirstTickDelayMs,
             lastInboundAgoMs: liveness.lastInboundAt ?
                 Date.now() - liveness.lastInboundAt : -1,
+            convFrameAgoMs: convAgo,
             paired: relayPaired,
             socketState: socket ? socket.readyState : -1,
             deviceSidKnown: deviceSid !== null,

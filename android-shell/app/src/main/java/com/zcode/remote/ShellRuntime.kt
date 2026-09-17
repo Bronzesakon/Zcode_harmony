@@ -112,6 +112,18 @@ object ShellRuntime {
         val lastInboundAtElapsed: Long,
         val paired: Boolean,
         val socketState: Int,
+        /**
+         * 页面**最近一次收到会话帧**（topic 前缀 `conversation/`）距今多少毫秒
+         * （−1 = 本客户端生命周期内一帧都没见过）。
+         *
+         * 这是"**页面还在不在跟某个会话**"的唯一现成判据：概览页（没进任何任务）永远收不到，
+         * 而进了任务哪怕 agent 静默，首屏快照/轮次帧也会到。承载的**提前接管**用它
+         * （见 [maybeStartNativeCarrier]）：页面后台 + 有在跑任务 + 这个值大 ⇒ 卡片没人喂。
+         *
+         * 注意实现里**不要**在这段注释里写那个 topic 前缀的通配写法：Kotlin 的块注释可嵌套，
+         * 一个斜杠加星号会把后面的注释一起吃掉（161 编译失败过一次）。
+         */
+        val convFrameAgoMs: Long = -1,
     )
 
     @Volatile
@@ -146,6 +158,7 @@ object ShellRuntime {
             lastInboundAtElapsed = if (ago >= 0) receivedAt - ago else 0,
             paired = data.optBoolean("paired"),
             socketState = data.optInt("socketState", -1),
+            convFrameAgoMs = data.optLong("convFrameAgoMs", -1),
         )
         // 这里**不再**用注入层自述的链路静默（lastInboundAgoMs）触发接管：
         // 桌面端安静不等于渲染器死了；接管只认"页面链路判死"（见 maybeStartNativeCarrier）。
@@ -191,6 +204,8 @@ object ShellRuntime {
         appIsForeground = foreground
         if (foreground) {
             appIsForeground = true
+            // 回前台清掉"提前接管候选"：下一次退后台重新从头观察（避免拿上一轮的计时直接动手）。
+            earlyTakeoverSince = 0L
             evaluateJs("window.__zcodeShellSetAppForeground && window.__zcodeShellSetAppForeground(true);")
             // 成功；重连后 runtime 已死，由卡死看门狗的僵尸档走刷新恢复。
             if (Tier2Probe.isRunning()) {
@@ -578,6 +593,21 @@ object ShellRuntime {
     private const val CARRIER_REQUIET_AFTER_SOCKET_MS = 20_000L
 
     /**
+     * **提前接管**的两个参数（2026-09-17）。
+     *
+     * 页面链路活着也可能"没人喂卡片"——真机现场：停在**工作区概览页**退后台，页面自己
+     * 一个会话订阅都没有，卡片只能显示会话索引的轮次级文案，要等到 ~100s 后链路判死才由
+     * 原生接上。于是加一条更早的触发：后台 + 有在跑任务 + [页面最近没有 conversation 帧]。
+     *
+     * - [EARLY_TAKEOVER_CONV_SILENCE_MS]：多久没收到会话帧（topic 前缀 `conversation/`）就算"没人看"。
+     *   30s 是"agent 一轮思考/工具调用的典型静默"与"概览页永远没有帧"之间的折中。
+     * - [EARLY_TAKEOVER_DEBOUNCE_MS]：条件连续成立这么久才动手，避开"用户正在切页面"的瞬态。
+     */
+    private const val EARLY_TAKEOVER_CONV_SILENCE_MS = 30_000L
+
+    private const val EARLY_TAKEOVER_DEBOUNCE_MS = 10_000L
+
+    /**
      * 多工作区覆盖一次最多开几座桥。
      *
      * **单源**（2026-09-17）：直接引用 `Tier2Probe.DEFAULT_MAX_COVERAGE`——两处各写一个 5
@@ -656,11 +686,23 @@ object ShellRuntime {
     private var lastSocketMarkForStall = -1L
     private var lastSocketChangeAt = 0L
 
-    /** socket 生命周期的指纹：页面真的重拨了，它一定变。 */
+    /** 提前接管候选的首次观察时刻（0 = 当前不是候选）：见 [EARLY_TAKEOVER_DEBOUNCE_MS]。 */
+    private var earlyTakeoverSince = 0L
+
+    /**
+     * **socket 生命周期**的指纹：页面真的重拨了，它一定变。
+     *
+     * ⚠️ **不要再把入站帧计数混进来**（2026-09-17 真机抓到的：它把"提前接管"整个挡死）。
+     * 旧写法是 `socketsOpened*1e6 + socketsClosed*1e3 + (inboundFrames % 1000)`，而
+     * `inboundFrames % 1000` **每收到一帧就变** ⇒ 只要页面还在收帧，[lastSocketChangeAt]
+     * 每拍都被刷新 ⇒ `sinceSocketChange < CARRIER_REQUIET_AFTER_SOCKET_MS` 恒成立 ⇒
+     * `maybeStartNativeCarrier` 每次都在第一道守卫 return。判死路径看不出来（那时本来就没帧、
+     * 这一项恒定），但**提前接管发生在页面活着、帧一直在流的时候**，于是永远走不到判据。
+     * 这道守卫的本名与注释都是"页面刚开过新 socket（重拨中）"，所以只该看 socket 计数。
+     */
     private fun nudgeMark(): Long {
         val snapshot = liveness ?: return -1L
-        return snapshot.socketsOpened * 1_000_000L + snapshot.socketsClosed * 1_000L +
-            (snapshot.inboundFrames % 1_000L)
+        return snapshot.socketsOpened * 1_000_000L + snapshot.socketsClosed.toLong()
     }
 
     /** 开关（adb：`carrier_on` / `carrier_off`）。 */
@@ -756,7 +798,43 @@ object ShellRuntime {
                 releaseCarrierWakeLock()
                 carrierStarted = false
             }
-            return
+            // **提前接管**（2026-09-17 用户拍板，真机现场：停在**工作区概览页**退后台）：
+            // 页面链路活着 ≠ 有人在喂卡片。概览页**没有任何会话订阅** ⇒ 谁都不拉正文，
+            // 卡片只能显示会话索引的轮次级文案、看起来"冻住"，一直要等到 ~100s 后的
+            // 链路判死才由原生接上（用户实测的"后台卡片不更新"就是它）。
+            // 判据只用现成的两件事：① 有在跑任务（否则接管也没内容可推）；
+            // ② 页面**最近没有收到任何 conversation 帧**（`convFrameAgoMs`：概览页永远没有；
+            //    进了任务哪怕 agent 静默也有首屏快照/轮次帧 ⇒ 不误判成"没人看"）。
+            // 连拍两拍（≈10s）才动手，避开"用户正在切页面"的瞬态。
+            // 代价：页面那条连接会被顶掉、进 KICKED 终态 ⇒ 回前台由兜底重载修（既有路径）。
+            val runningRefs = store.runningTaskRefs()
+            val convAgo = liveness?.convFrameAgoMs ?: -1L
+            val nobodyWatching = convAgo < 0 || convAgo > EARLY_TAKEOVER_CONV_SILENCE_MS
+            if (runningRefs.isEmpty() || !nobodyWatching) {
+                earlyTakeoverSince = 0L
+                return
+            }
+            if (earlyTakeoverSince == 0L) {
+                earlyTakeoverSince = now
+                Diagnostics.log(
+                    "info",
+                    "后台原生承载：候选提前接管（页面最近 " +
+                        (if (convAgo < 0) "从未" else "${convAgo / 1000}s 前") +
+                        " 收到会话帧 · ${runningRefs.size} 个在跑任务），" +
+                        "观察 ${EARLY_TAKEOVER_DEBOUNCE_MS / 1000}s 后动手",
+                )
+                return
+            }
+            if (now - earlyTakeoverSince < EARLY_TAKEOVER_DEBOUNCE_MS) return
+            Diagnostics.log(
+                "warn",
+                "后台原生承载：**提前接管**——页面活着但最近 " +
+                    (if (convAgo < 0) "从未" else "${convAgo / 1000}s 前") +
+                    " 收到会话帧（没人喂卡片），且有 ${runningRefs.size} 个在跑任务；" +
+                    "页面连接会被顶掉，回前台由兜底重载恢复",
+            )
+        } else {
+            earlyTakeoverSince = 0L
         }
         if (carrierStarted || Tier2Probe.isRunning()) return
         val creds = relayCreds
@@ -765,11 +843,13 @@ object ShellRuntime {
             return
         }
         carrierStarted = true
-        Diagnostics.log(
-            "warn",
-            "后台原生承载：入站帧静默 ${age / 1000}s（门槛 ${STALL_SILENCE_MS / 1000}s，" +
-                "Chromium 网络栈已死）——原生接管 relay 连接并订阅在跑会话，推到流体云",
-        )
+        if (age >= STALL_SILENCE_MS) {
+            Diagnostics.log(
+                "warn",
+                "后台原生承载：入站帧静默 ${age / 1000}s（门槛 ${STALL_SILENCE_MS / 1000}s，" +
+                    "Chromium 网络栈已死）——原生接管 relay 连接并订阅在跑会话，推到流体云",
+            )
+        }
         acquireCarrierWakeLock()
         Tier2Probe.start(
             creds,

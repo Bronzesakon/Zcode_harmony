@@ -1104,6 +1104,22 @@ test('conversation frames are filtered by subscriptionId', () => {
     assert.strictEqual(client._convFrames, 1, '自己订阅的帧要收下');
 });
 
+test('conversationFrameStats 报出"最后一帧距今多久"（承载提前接管的判据）', () => {
+    const {client} = makeClient();
+    // 一帧都没见过 ⇒ −1（原生据此判"页面没在跟任何会话"）。
+    assert.strictEqual(
+        client.conversationFrameStats().lastFrameAgoMs,
+        -1,
+        '没见过会话帧时必须报 -1，不能报 0（0 会被误读成"刚刚还在收"）',
+    );
+    const sub = fakeConversationSub(fakeConversationBridge('ws-ago'));
+    client._acceptConversationFrame(sub, {
+        topic: 'conversation/sess_1', subscriptionId: 'sub-A', payload: {}
+    });
+    const ago = client.conversationFrameStats().lastFrameAgoMs;
+    assert.ok(typeof ago === 'number' && ago >= 0 && ago < 5_000, `刚收到的帧年龄应接近 0，实际 ${ago}`);
+});
+
 test('a sequence gap triggers an immediate conversation resync with its位点', () => {
     const {client} = makeClient();
     const bridge = fakeConversationBridge('ws-gap');

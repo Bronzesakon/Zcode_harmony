@@ -2625,6 +2625,10 @@
             this._convText = {};
         }
         this._convFrames = (this._convFrames || 0) + 1;
+        // 最后一帧的时刻（2026-09-17）：原生据此判"页面还在不在跟某个会话"——
+        // 概览页（没进任何任务）永远收不到 conversation/* 帧，而进了任务哪怕 agent 静默，
+        // 首屏快照/轮次帧也会到。承载用它做"提前接管"的判据（见 ShellRuntime）。
+        this._convLastFrameAt = Date.now();
         // **真实结构（2026-09-15 真机打出来，三层，不要再猜）**：
         //   data  = { wireVersion, kind:'complete', deliveryKind, logicalFrameId,
         //             logicalFrameOrdinal, topic, subscriptionId, frame }
@@ -2775,7 +2779,10 @@
             topics: topics,
             textLen: textLen,
             subs: subs,
-            resyncs: resyncs
+            resyncs: resyncs,
+            // −1 = 本客户端生命周期内一帧 conversation/* 都没见过（⇒ 页面没在跟任何会话）。
+            // 原生"提前接管"的判据就是这个（见 inject.js 的 reportLiveness 与 ShellRuntime）。
+            lastFrameAgoMs: this._convLastFrameAt ? Date.now() - this._convLastFrameAt : -1
         };
     };
 
