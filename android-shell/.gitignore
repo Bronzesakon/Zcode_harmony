@@ -1,6 +1,7 @@
 # Gradle / Android build outputs
 build/
 .gradle/
+.kotlin/
 local.properties
 
 # 真机验证的闭环会把滚动预发布包下到仓库根（见 README「取 APK」与「真机调试」），
