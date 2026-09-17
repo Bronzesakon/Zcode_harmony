@@ -818,15 +818,6 @@
         this._fragments = {};
     }
 
-    SessionsIndexState.prototype.reset = function () {
-        this.workspaceId = null;
-        this.logEpoch = null;
-        this.seq = 0;
-        this.sessions = {};
-        this.ready = false;
-        this._fragments = {};
-    };
-
     /** Accepts the wire envelope {topic, kind:'complete'|'fragment', ...}. */
     SessionsIndexState.prototype.applyWireFrame = function (wire) {
         if (!wire || typeof wire !== 'object') {
@@ -1049,10 +1040,6 @@
             return false;
         }
         return this.assembler.acceptPayload(payload);
-    };
-
-    Bridge.prototype.clientHello = function () {
-        return this._clientHello || DEFAULT_CLIENT_HELLO;
     };
 
     // -----------------------------------------------------------------------
@@ -2101,8 +2088,9 @@
     // 它是 D7「订阅所有工作区」的 Tier1 实现：在**页面自己那条 socket** 上开桥 +
     // 订索引。2026-09-15 真机 A/B 定罪（与页面自己的订阅争用 → 页面卡"工作中"+
     // 转圈），2026-09-17 用户拍板删开关；注入层那一侧的调度器（`maybeStartActive`）
-    // 与 `__zcodeShellSetSubscribeAll` 已一并删除，所以 `start()`/`retryStart()`
-    // 在真机上**永远不会被调用**——注入层恒被动，只读壳契约不允许它再被接回去。
+    // 与 `__zcodeShellSetSubscribeAll` 已一并删除，所以 `start()` 在真机上**永远不会
+    // 被调用**——注入层恒被动，只读壳契约不允许它再被接回去。（同族的 `retryStart`
+    // 因为彻底零调用，2026-09-17 的死代码清扫里已经删掉。）
     //
     // 为什么代码没跟着删：它是唯一端到端跑通过 bridge 握手（hello → initialize →
     // 对话订阅 → 索引订阅 → listen）的实现，`tools/protocol.test.js` 的 active 组
@@ -2234,12 +2222,6 @@
             self._log('active subscribe failed: ' + err);
             self._emitStatus('active failed: ' + err);
         });
-    };
-
-    /** Re-runs active coverage after a failed or empty first attempt. 无生产调用者（见本节头）。 */
-    RemoteClient.prototype.retryStart = function () {
-        this._started = false;
-        return this.start();
     };
 
     RemoteClient.prototype._openAndSubscribe = function (workspace) {
@@ -2844,19 +2826,6 @@
         delete assemblies[messageSeq];
         var joined = concatBytes(assembly.parts);
         return joined.length === messageBytes ? joined : null;
-    };
-
-    RemoteClient.prototype.takeObservedCounts = function () {
-        var counts = { passive: 0, active: 0 };
-        for (var p in this._passive) {
-            counts.passive += 1;
-        }
-        for (var a in this._bridges) {
-            if (!this._bridges[a].closed) {
-                counts.active += 1;
-            }
-        }
-        return counts;
     };
 
     RemoteClient.prototype.dispose = function () {

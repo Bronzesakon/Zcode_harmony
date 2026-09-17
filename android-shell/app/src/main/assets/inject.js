@@ -836,7 +836,8 @@
         };
         next.suppressPageRpcMirror = pagelogSeen;
         // 只上报，不做任何"没起来就重试"的动作：注入层**没有**主动开桥这回事了
-        // （2026-09-17 删 D7；原实现在这里对 status.active 为假重试 retryStart）。
+        // （2026-09-17 删 D7；原实现在这里对 status.active 为假重试客户端的 retryStart，
+        // 那个方法本身也已随死代码清扫删除）。
         next.onStatus = function (status) {
             post('status', status);
         };
