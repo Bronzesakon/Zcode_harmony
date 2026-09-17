@@ -575,8 +575,14 @@ object ShellRuntime {
     /** 页面刚动过 socket（重拨中）后的静默期：见 [lastSocketMarkForStall]。 */
     private const val CARRIER_REQUIET_AFTER_SOCKET_MS = 20_000L
 
-    /** 多工作区覆盖一次最多开几座桥（与 `Tier2Probe.DEFAULT_MAX_COVERAGE` 对齐）。 */
-    private const val MULTI_WS_COVERAGE_CAP = 3
+    /**
+     * 多工作区覆盖一次最多开几座桥（与 `Tier2Probe.DEFAULT_MAX_COVERAGE` 对齐）。
+     *
+     * **成本取舍，不是平台限制**：每座桥 = 桌面端一条常驻会话 + 每轮一次回收握手；
+     * 轮换已与 N 无关（`RelayBridge.reanchorProgress` 每轮恒 ~5s），所以抬高它不会让轮询互相冲突。
+     * 3 → **5**（2026-09-17）为鸿蒙侧 5 并发实验；**产品真实天花板是 2**（ColorOS 只提升 2 张流体云卡）。
+     */
+    private const val MULTI_WS_COVERAGE_CAP = 5
 
     /**
      * 后台承载总开关。

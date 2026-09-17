@@ -488,18 +488,31 @@ zcode-remote.apk -> CN=ZCode Remote, OU=Mobile, O=ZCode, L=Unknown, ST=Unknown, 
     `ShellRuntime.turnStateSink`（空更新 `return@post`）与 `applyUpdate`（兜底）。
     诊断判据：`提升集合变化: [#a #b]（运行 N 个：…）`——**任务在跑期间不应出现 `[]（运行 0 个）`**；
     `卡片撤回 id=…（撤回后运行集 N 个）` 只在任务真正结束时出现。
-20. **多工作区只按 2 座做（产品上限），且 `multi_ws_on` 是内存开关。** ColorOS 只并发 2 张流体云卡
-    （`PromotionPolicy.MAX_PROMOTED=2`），所以目标就是 2 座桥；做法是**主动轮换**（`reanchor rotate for
-    <key>：最近收帧 Ns 前 ⇒ 主动回收换服务权`）——桌面端同一时刻只服务一座，服务权归"最近订阅成功"者，
-    所以"回收重订"是唯一的换服务手段。**轮换节奏由两个常量共同决定**：
-    `LIVE_REANCHOR_EVERY_POLLS × LIVE_PROGRESS_POLL_MS`（现行 1 × 12s = **12s**）是**拍长**，
-    `RelayBridge.ROTATE_MIN_STARVE_MS`（现行 **8s**）是"饿够了才轮换"的门槛——**门槛必须小于拍长**，
-    否则拍长被门槛吃掉（152 实测：拍长 12s + 门槛 15s ⇒ 实际仍是 24s，rotate 间隔一格不差）。
-    它决定的是**卡片更新节奏而不是交接耗时**：每 N 秒轮换 ⇒ 每座桥被服务 N 秒、静默 N 秒 ⇒ 单卡间隔 ≈ 2N
-    （12s ⇒ 10–23s；24s ⇒ 24–41s，代价减半）。3 座以上的形态与代价见 **`docs/17` §11**（远期规划，未实施）。⚠️ `multi_ws_on` / `coverage_ws:` / `carrier_on` 都是**内存态**：**进程重启即丢**，
-    每轮真机测试前用 `stall_state` 确认 `多工作区=true 覆盖=…` 再开测（09-17 因此白跑过两轮）。
-    ⚠️ **两个任务要落在不同工作区**，否则只有一个页面工作区、只开 1 座桥，看不到轮换
-    （**158 起这条已由发现链解决：不必再逐个打开工作区**，见第 21 条）。
+20. **多工作区：桥数上限是"成本取舍"（现行 5），轮换与 N 无关；产品天花板是 2 张卡。**
+    - **上限 5**（`Tier2Probe.DEFAULT_MAX_COVERAGE` 与 `ShellRuntime.MULTI_WS_COVERAGE_CAP`
+      **必须同步改**；引擎侧 `RelayBridge.BridgeManager.maxWorkspaces` 的构造默认值是 12，
+      是这两处把 5 传了进去）。**这不是平台/协议限制**——每座桥 = 桌面端一条常驻会话 + 每轮一次
+      回收握手，所以它是成本取舍；协议与桌面端侧没有明文上限，**真机实测过的最大并发是 2 座（158）**。
+      **产品真实天花板仍是 2**：ColorOS 只并发提升 **2 张**流体云卡（`PromotionPolicy.MAX_PROMOTED`），
+      第 3 个及以后的任务只在常驻通知里（`running_tasks` 渠道）。
+    - **轮换与 N 无关**（`RelayBridge.reanchorProgress`，2026-09-17）：每轮**只对"被服务的那座"
+      （最近有帧的）发一次 resync**、**只轮换"最饿的一座"**，其余这一轮什么都不做——它们的 resync
+      发出去必然白等 8s 超时（对端同一时刻只应答一座），还会升级成整桥回收。因此
+      **一轮恒 ~5s、握手频率恒 1 次/12s，与 N 无关**；抬高上限**不会**让轮询互相冲突。
+      单桥（N=1）时照常 resync 它、不做轮换。
+    - **代价落在"每张卡的刷新节奏"**：每轮 12s、N 座桥轮流 ⇒ 单卡刷新间隔 ≈ **N × 12s**
+      （N=2 → ~24s；N=3 → ~36s；**N=5 → ~60s**），窗内仍是连跳几段。拍长由
+      `LIVE_REANCHOR_EVERY_POLLS × LIVE_PROGRESS_POLL_MS` 定（现行 1 × 12s），门槛
+      `RelayBridge.ROTATE_MIN_STARVE_MS`（现行 8s）**必须小于拍长**，否则拍长被门槛吃掉
+      （152 实测：拍长 12s + 门槛 15s ⇒ 实际仍是 24s，rotate 间隔一格不差）。
+    - **5 并发实验委托在鸿蒙侧做**（用户 2026-09-17 拍板）：本仓库只做**理论验证**（编译 + 门禁 +
+      上限 5 的接线），**Android 侧未做 N≥3 真机验证**。若哪天要在本仓库验：起 3–5 个在跑任务
+      （发现链会自动给出这些工作区，不必手动开清单），判据＝**每座桥都拿到过服务窗** /
+      各桥最大静默 ≈ (N−1)×12s / `重锚失败 0` / 桌面端 `unregistered host`·`uncaughtException`
+      不增长（2026-09-16 基线 7 / 14）。
+    - `docs/17` §11 里"上限 3、N=3 会丢拍"的分析**已被本节取代**（保留作推导过程）。
+    - ⚠️ `multi_ws_on` / `coverage_ws:` / `carrier_on` 都是**内存态**：**进程重启即丢**，
+      每轮真机测试前用 `stall_state` 确认 `多工作区=true 覆盖=…` 再开测（09-17 因此白跑过两轮）。
 21. **定向接管（发现链）：承载自己读"哪些工作区在跑"，不再要求你先打开每个工作区。** 数据来自
     **我们已经在收的两条响应**——`bootstrap-response.result.tasks`（schema 必填，真机 24–25 KB）与
     `workspace-list-response.result.tasks`（`.optional()`，真机也带，两条各 82 个任务）——

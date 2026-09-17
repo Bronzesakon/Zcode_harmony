@@ -1118,11 +1118,21 @@ class BridgeManager(
      *   ① 其余桥（N=2 时＝当前被服务的那座）：发 resync 要一份新快照（保底拉取）；
      *   ② **最饿的那座**（最近收帧距今最久）：**不等超时**，直接回收换服务权。
      *
-     * 于是静默窗 ≈ 一次重建（~5s），周期仍由 [LIVE_REANCHOR_EVERY_POLLS]（12s×2）决定。
+     * 于是静默窗 ≈ 一次重建（~5s），周期仍由 [LIVE_REANCHOR_EVERY_POLLS]（12s）决定。
      * 判据行：`reanchor rotate for <key>：最近收帧 Ns 前 ⇒ 主动回收换服务权`。
      *
-     * N≥3 的形态与代价见 `docs/17` §11（远期规划，未实施）——那里"每轮只轮换一座"
-     * 正好就是这条实现天然给出的行为；**但 N 的上限仍是 3**（[Tier2Probe.DEFAULT_MAX_COVERAGE]）。
+     * **一轮的耗时与 N 无关（2026-09-17 定案）**：只对**被服务的那座**（最近有帧的）发 resync，
+     * 其余一律不发——它们发出去**必然**白等 8s RPC 超时（对端同一时刻只应答一座），
+     * 而且超时还会升级成整桥回收。每轮只轮换**最饿的一座**，所以：
+     *
+     * ```
+     * N=1：只有一座 → 照常 resync 它（没有轮换可做）
+     * N=2：resync 被服务那座 + 轮换最饿那座            ≈ 5s
+     * N=5：同上，中间那三座这一轮什么都不做            ≈ 5s   ← 与 N=2 同量级
+     * ```
+     *
+     * 每座桥因此按顺序轮流拿到服务窗（N 座 → 每座服务 1 轮、静默 N-1 轮）。
+     * 桥数上限见 [Tier2Probe.DEFAULT_MAX_COVERAGE]（现行 5，成本取舍；产品上限是 2 张提升卡）。
      */
     fun reanchorProgress() {
         if (disposed || !reanchorInFlight.compareAndSet(false, true)) return
@@ -1130,28 +1140,29 @@ class BridgeManager(
             try {
                 val live = bridges.values.toList().filter { it.conversationSessionIds().isNotEmpty() }
                 if (live.isEmpty()) return@Thread
+                // 谁被服务（最近有帧）／谁最饿（最久没帧）——两个极值，各自一个用途。
+                val served = live.minByOrNull { convSilenceMs(it) }
                 val starved = live.maxByOrNull { convSilenceMs(it) }
-                // ① 其余桥：拉一份新快照（当前被服务的那座会秒回）。
-                for (bridge in live) {
-                    if (bridge === starved) continue
-                    val key = bridge.workspaceKey
-                    val err = bridge.reanchorConversationsBlocking()
+                // ① 只有"被服务的那座"值得发 resync（单桥时它就是 served）。
+                if (served != null && (served !== starved || live.size == 1)) {
+                    val key = served.workspaceKey
+                    val err = served.reanchorConversationsBlocking()
                     if (err != null) {
-                        val silent = convSilenceText(convSilenceMs(bridge))
+                        val silent = convSilenceText(convSilenceMs(served))
                         onLogLine("reanchor failed for $key：$err；最近收帧 $silent ⇒ 整桥回收")
-                        recycleBridge(key, bridge.scopeCopy(), bridge.conversationSessionIds())
+                        recycleBridge(key, served.scopeCopy(), served.conversationSessionIds())
                         Thread.sleep(REANCHOR_AFTER_RECYCLE_MS)
                     } else {
                         Thread.sleep(REANCHOR_GAP_MS)
                     }
                 }
-                // ② 最饿的那座：主动换服务权（只在它真的挨饿时才动，见 ROTATE_MIN_STARVE_MS）。
-                if (starved != null) {
+                // ② 每轮只轮换**最饿的一座**（N≥2 才有意义；只在它真的挨饿时才动）。
+                if (live.size >= 2 && starved != null) {
                     val age = convSilenceMs(starved)
                     if (age > ROTATE_MIN_STARVE_MS) {
                         onLogLine(
                             "reanchor rotate for ${starved.workspaceKey}：" +
-                                "最近收帧 ${convSilenceText(age)} ⇒ 主动回收换服务权",
+                                "最近收帧 ${convSilenceText(age)} ⇒ 主动回收换服务权（N=${live.size}）",
                         )
                         recycleBridge(
                             starved.workspaceKey,

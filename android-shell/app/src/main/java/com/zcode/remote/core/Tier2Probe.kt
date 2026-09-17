@@ -56,8 +56,22 @@ object Tier2Probe {
 
     enum class Phase { IDLE, CONNECTING, AUTHENTICATING, PAIRED, CLOSED }
 
-    /** 一次覆盖最多开几座桥（每座桥 = 桌面端一条常驻会话，别无限开）。 */
-    private const val DEFAULT_MAX_COVERAGE = 3
+    /**
+     * 一次覆盖最多开几座桥。
+     *
+     * **这是成本取舍，不是平台/协议限制**（2026-09-17 定案并固化）：
+     *  - 每座桥 = 桌面端**一条常驻会话**，且每轮轮换要**回收 + 重新握手 + 重订**一次；
+     *  - 所以这个数直接乘上"每轮一次的握手成本"；
+     *  - **轮换本身已经与 N 无关**（[com.zcode.remote.core.BridgeManager.reanchorProgress] 每轮
+     *    只对"被服务的那座"发 resync、只轮换最饿的一座，一轮恒 ~5s），因此抬高这个数**不会**
+     *    让轮换互相冲突——它只决定"最多同时照顾几个工作区"。
+     *
+     * 3 → **5**（2026-09-17）：为了在鸿蒙侧做 **5 并发**可行性实验（用户拍板，只做理论验证）。
+     * **产品的真实天花板是 2**：ColorOS 只并发提升 **2 张**流体云卡
+     * （`PromotionPolicy.MAX_PROMOTED`），第 3 个及以后的任务只在常驻通知里。
+     * 协议与桌面端侧**没有**明文上限；真机实测过的最大并发是 2 座（158）。
+     */
+    private const val DEFAULT_MAX_COVERAGE = 5
 
     /** 同一工作区连续开桥失败几次后进入冷却。 */
     private const val BRIDGE_FAIL_COOLDOWN_AFTER = 2
