@@ -110,7 +110,10 @@ object Tier2Probe {
      *
      * 内容由 [ShellRuntime] 决定（多工作区开关打开时＝page 工作区 ∪ 有在跑任务的工作区，
      * 上限 [DEFAULT_MAX_COVERAGE]），或由诊断指令 `coverage_ws:<k1>,<k2>` 直接指定（E1 用）。
-     * 显式覆盖**不受失败冷却影响**——实验要能看到失败。
+     *
+     * **失败冷却**：只有 `coverage_ws:` 诊断清单（[coverageIsDiagnostic]）豁免——实验要能
+     * 看到失败本身；生产路径（多工作区开关 + 发现链）**照旧受冷却**，否则每轮重连都会去撞
+     * 同一座必失败的桥。2026-09-17 之前这段注释说的是"显式覆盖都不受冷却"，与代码不符。
      */
     @Volatile
     private var coverageWorkspaces: List<String> = emptyList()
@@ -226,8 +229,9 @@ object Tier2Probe {
      * @param onlyWorkspace 页面**自己**正在显示的工作区键：view-state 帧用它，也是
      *   没有 [coverageWorkspaces] 时的唯一覆盖目标。空串表示注入层还没上报。
      * @param coverageWorkspaces 多工作区覆盖清单（非空时只用它，顺序即开桥顺序）。
-     * @param coverageIsDiagnostic `coverage_ws:` 给的清单＝只用它（E1 实验语义）；
-     *   false（承载生产路径）时会在**配对拿到 bootstrap 响应之后**并入"发现链"给出的活动工作区。
+     * @param coverageIsDiagnostic `coverage_ws:` 给的清单＝只用它（E1 实验语义），
+     *   并且**豁免开桥失败冷却**（实验要能看到失败本身）；false（承载生产路径）时会在
+     *   **配对拿到 bootstrap 响应之后**并入"发现链"给出的活动工作区，且照旧受冷却。
      */
     fun start(
         newCreds: RelayCreds,
@@ -517,8 +521,9 @@ object Tier2Probe {
                     if (key == null) 0 else runningSessionsProvider?.invoke(key).orEmpty().size
                 }
                 // 覆盖目标三档（2026-09-16 第二版：多工作区）：
-                //   ① **显式清单**（多工作区开关打开 / `coverage_ws:` 诊断）——只用它，按给定顺序，
-                //      不受失败冷却影响（实验要能看到失败）；
+                //   ① **显式清单**（多工作区开关打开 / `coverage_ws:` 诊断）——只用它，按给定顺序；
+                //      `coverage_ws:` 诊断清单**不受失败冷却影响**（实验要能看到失败），
+                //      生产路径照旧受冷却（见下面 `live` 的取法）；
                 //   ② **页面工作区**（默认）——与页面自己的行为一致，是经过真机验收的生产路径；
                 //   ③ 都没有 ——按"在跑任务数"排序取前 [DEFAULT_MAX_COVERAGE] 个。
                 //      **不再全量**：扫全部工作区曾被认为是桌面端拆 host 的诱因，虽然后来查明真凶是
@@ -540,21 +545,52 @@ object Tier2Probe {
                         "Tier2: 发现链给出 ${discovered.size} 个有活动任务的工作区：${discovered.joinToString()}",
                     )
                 }
-                val explicit = (coverageWorkspaces + discovered).distinct()
+                // **截断要在进"覆盖清单"这一档之前做**（2026-09-17，鸿蒙侧审计 4 号）：
+                // 清单 = 显式清单 + 发现链，条数可以超过 [DEFAULT_MAX_COVERAGE]，而
+                // `beginCoverage` 只会开前 maxWorkspaces 座——不截断就会打出"多工作区覆盖 7 座"
+                // 而实际只开 5 座的假账（日志与现场对不上，是最贵的一类误导）。
+                // 取法：**显式清单/发现链优先**（保持它们给出的顺序），条数不够时才轮到
+                // ③ 的"其余按在跑任务数排序"（`ordered` 已经按在跑任务数降序）。
+                val wanted = (coverageWorkspaces + discovered).distinct()
+                val explicit = wanted.take(DEFAULT_MAX_COVERAGE)
+                if (explicit.size < wanted.size) {
+                    Diagnostics.log(
+                        "info",
+                        "Tier2: 覆盖清单 ${wanted.size} 座超过上限 $DEFAULT_MAX_COVERAGE" +
+                            "（显式清单/发现链优先、其余按在跑任务数排序），取前 $DEFAULT_MAX_COVERAGE：" +
+                            explicit.joinToString(),
+                    )
+                }
                 val only = onlyWorkspace
                 val targets = when {
                     explicit.isNotEmpty() -> {
-                        val wanted = explicit.toSet()
+                        val wantedKeys = explicit.toSet()
                         val hit = ordered.filter {
                             val k = workspaceKeyOf(it)
-                            k != null && k in wanted
+                            k != null && k in wantedKeys
                         }
-                        val live = hit.filterNot { cooledDown(workspaceKeyOf(it)) }
-                        if (live.size < hit.size) {
-                            Diagnostics.log(
-                                "info",
-                                "Tier2: 覆盖清单里 ${hit.size - live.size} 座在冷却中，本轮跳过",
-                            )
+                        // 冷却的适用范围**按来源分**（2026-09-17 与注释对齐）：
+                        //   * `coverage_ws:` 诊断清单 → **豁免**：E1 实验的目的就是"看到失败"，
+                        //     上一轮失败把它冷却掉，实验就再也看不到同一座桥的失败现场了；
+                        //   * 生产路径（多工作区开关 + 发现链）→ **照旧受冷却**：同一座桥连续
+                        //     失败还每轮去撞，就是用户看到的"正在尝试重连"churn。
+                        val cooledCount = hit.count { cooledDown(workspaceKeyOf(it)) }
+                        val live = if (coverageIsDiagnostic) {
+                            if (cooledCount > 0) {
+                                Diagnostics.log(
+                                    "info",
+                                    "Tier2: 诊断覆盖清单豁免失败冷却——其中 $cooledCount 座在冷却中，本轮照开",
+                                )
+                            }
+                            hit
+                        } else {
+                            if (cooledCount > 0) {
+                                Diagnostics.log(
+                                    "info",
+                                    "Tier2: 覆盖清单里 $cooledCount 座在冷却中，本轮跳过",
+                                )
+                            }
+                            hit.filterNot { cooledDown(workspaceKeyOf(it)) }
                         }
                         if (live.isEmpty()) {
                             Diagnostics.log(
@@ -565,7 +601,7 @@ object Tier2Probe {
                         } else {
                             Diagnostics.log(
                                 "info",
-                                "Tier2: 多工作区覆盖 ${live.size} 座：" +
+                                "Tier2: 多工作区覆盖 ${live.size} 座（上限 $DEFAULT_MAX_COVERAGE）：" +
                                     live.mapNotNull { workspaceKeyOf(it) }.joinToString(),
                             )
                             live
