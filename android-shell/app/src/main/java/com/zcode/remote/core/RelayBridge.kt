@@ -963,7 +963,13 @@ internal object RelayTaskDigest {
             val status = statusOf(task).ifEmpty { "?" }
             if (status in ACTIVE) active += 1
             counts[status] = (counts[status] ?: 0) + 1
-            if (shown.size < 8) shown.add("$status@${keyOf(task) ?: "?"}")
+            if (shown.size < 8) {
+                // label 只在**这里**当显示名兜底：它是诊断形状探针唯一的可读线索，
+                // 但**不是**工作区键（见 [keyOf]）。
+                val display = keyOf(task)
+                    ?: task.optString("workspaceLabel").ifEmpty { "?" }
+                shown.add("$status@$display")
+            }
         }
         val hist = counts.entries.joinToString("/") { "${it.key}×${it.value}" }
         return "承载发现[$source]：${tasks.length()} 个任务 · 有活动 $active · $hist · ${shown.joinToString(" | ")}"
@@ -987,9 +993,12 @@ internal object RelayTaskDigest {
             val nested = addr.optString("workspacePath")
             if (nested.isNotEmpty()) return nested
         }
-        // `workspaceLabel` 只是显示名（页面也不拿它当键），兜底用。
-        val label = task.optString("workspaceLabel")
-        return label.ifEmpty { null }
+        // **不拿 `workspaceLabel` 兜底**（2026-09-17，鸿蒙侧审计 5 号）：它只是显示名，
+        // 页面与桌面端**都不认它当键**，拿它当工作区键会污染覆盖清单 `wanted`——清单里
+        // 多一个永远匹配不上的项，日志就成了"清单 3 座、实际 0 座"。解析不出 identity/path
+        // 就返回 null，调用方自己跳过（`activeWorkspaces` 的 `?: continue`）。
+        // 诊断摘要仍会显示 label（[describe] 里单独取），因为"形状探针要看得出没解析出来"。
+        return null
     }
 
     /**
@@ -1174,6 +1183,13 @@ class BridgeManager(
                 val live = bridges.values.toList().filter { it.conversationSessionIds().isNotEmpty() }
                 if (live.isEmpty()) return@Thread
                 // 谁被服务（最近有帧）／谁最饿（最久没帧）——两个极值，各自一个用途。
+                //
+                // **全平局是首轮的正常形态，不必处理**：所有桥都还没收到过帧时
+                // `convSilenceMs()` 全是 `Long.MAX_VALUE`，minBy/maxBy 都取**哈希序的第一条**。
+                // 那一拍选谁都一样——它们都还没被服务过，先给谁都是从零建立服务权；
+                // 而且平局只存在于第一拍（之后每条会话都有自己的 `convLastFrameAtMs`）。
+                // **不要**为此引入"排序状态"（记住上一轮选了谁）：多一份状态就多一处
+                // 与回收/重建赛跑的地方，收益是零。
                 val served = live.minByOrNull { convSilenceMs(it) }
                 val starved = live.maxByOrNull { convSilenceMs(it) }
                 // ① 只有"被服务的那座"值得发 resync（单桥时它就是 served）。

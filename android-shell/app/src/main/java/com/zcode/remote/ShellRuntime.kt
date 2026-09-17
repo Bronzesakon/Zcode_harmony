@@ -578,13 +578,17 @@ object ShellRuntime {
     private const val CARRIER_REQUIET_AFTER_SOCKET_MS = 20_000L
 
     /**
-     * 多工作区覆盖一次最多开几座桥（与 `Tier2Probe.DEFAULT_MAX_COVERAGE` 对齐）。
+     * 多工作区覆盖一次最多开几座桥。
+     *
+     * **单源**（2026-09-17）：直接引用 `Tier2Probe.DEFAULT_MAX_COVERAGE`——两处各写一个 5
+     * 曾经过：改了 Tier2 忘了改这里，"日志说 5 座、实际开 3 座"。现在编译器兜底。
      *
      * **成本取舍，不是平台限制**：每座桥 = 桌面端一条常驻会话 + 每轮一次回收握手；
-     * 轮换已与 N 无关（`RelayBridge.reanchorProgress` 每轮恒 ~5s），所以抬高它不会让轮询互相冲突。
-     * 3 → **5**（2026-09-17）为鸿蒙侧 5 并发实验；**产品真实天花板是 2**（ColorOS 只提升 2 张流体云卡）。
+     * 轮换已与 N、M 都无关（`RelayBridge.reanchorProgress` 每轮 ≤6s + ~3s），所以抬高它
+     * 不会让轮询互相冲突。3 → **5**（2026-09-17）为鸿蒙侧 5 并发实验；**产品真实天花板是 2**
+     * （ColorOS 只提升 2 张流体云卡）。
      */
-    private const val MULTI_WS_COVERAGE_CAP = 5
+    private const val MULTI_WS_COVERAGE_CAP = Tier2Probe.DEFAULT_MAX_COVERAGE
 
     /**
      * 后台承载总开关。
@@ -687,23 +691,20 @@ object ShellRuntime {
         if (!multiWorkspaceCoverage) return emptyList()
         val out = LinkedHashSet<String>()
         if (pageWorkspaceKey.isNotEmpty()) out.add(pageWorkspaceKey)
-        val discovered = Tier2Probe.discoveredCoverage()
-        for (key in discovered) {
-            if (out.size >= MULTI_WS_COVERAGE_CAP) break
-            if (key.isNotEmpty()) out.add(key)
-        }
+        // **这里不读发现链**（2026-09-17 删掉那行 `Tier2Probe.discoveredCoverage()`）：
+        // 本函数在**承载启动前**算，而发现链的数据（bootstrap/workspace-list 的 tasks）
+        // 要配对之后才有——那一刻它必然是空表，留着只会让后人误以为"发现链已经并进来了"。
+        // 真正的并入点在 `Tier2Probe.startCoverage()`（日志行 `Tier2: 发现链给出 …`），
+        // 而且它只在本函数返回非空（多工作区开关打开）时才并入。
         for ((key, _) in store.runningTaskRefs()) {
             if (out.size >= MULTI_WS_COVERAGE_CAP) break
             if (key.isNotEmpty()) out.add(key)
         }
         if (out.isNotEmpty()) {
-            // 注意：这一行在**承载启动前**算，所以"发现链"此刻必然是 0——发现链的数据
-            // （bootstrap/workspace-list 的 tasks）要配对之后才有，真正的并入点在
-            // `Tier2Probe.startCoverage()`（日志行 `发现链给出 …`）。
             Diagnostics.log(
                 "info",
                 "承载覆盖目标（启动前）：${out.size} 座（page=${pageWorkspaceKey.ifEmpty { "未知" }} · " +
-                    "store 在跑 ${store.runningTaskRefs().size} 个；发现链见配对后那行）",
+                    "store 在跑 ${store.runningTaskRefs().size} 个；发现链由配对后的 Tier2 并入）",
             )
         }
         return out.take(MULTI_WS_COVERAGE_CAP)
