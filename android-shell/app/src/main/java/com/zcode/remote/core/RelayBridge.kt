@@ -1153,7 +1153,7 @@ class BridgeManager(
      *   ② **最饿的那座**（最近收帧距今最久）：**不等超时**，直接回收换服务权。
      *
      * 于是静默窗 ≈ 一次重建（~5s），周期仍由 [LIVE_REANCHOR_EVERY_POLLS]（12s）决定。
-     * 判据行：`reanchor rotate for <key>：最近收帧 Ns 前 ⇒ 主动回收换服务权（桥 N 座 · 该桥 M 个会话）`。
+     * 判据行：`reanchor rotate for <key>：最近收帧 Ns 前 ⇒ 主动回收换服务权（桥 N 座 · 被服务那座 S 个会话 · 本座 M 个会话）`。
      *
      * **一轮的耗时与 N（桥数）和 M（会话数）都无关（2026-09-17 两轮定案）**：
      *  - 只对**被服务的那座**（最近有帧的）发 resync，其余一律不发——它们发出去**必然**
@@ -1217,10 +1217,14 @@ class BridgeManager(
                 if (live.size >= 2 && starved != null) {
                     val age = convSilenceMs(starved)
                     if (age > ROTATE_MIN_STARVE_MS) {
+                        // 会话数两边都打：**被服务那座的会话数**决定这一轮的 resync 成本
+                        // （一轮只拉它最饿的一条，超时 4s + 等帧 2s），**被回收那座的会话数**
+                        // 决定回收后要重订几条。2026-09-17 鸿蒙侧审计点名要看前者。
                         onLogLine(
                             "reanchor rotate for ${starved.workspaceKey}：" +
                                 "最近收帧 ${convSilenceText(age)} ⇒ 主动回收换服务权" +
-                                "（桥 ${live.size} 座 · 该桥 " +
+                                "（桥 ${live.size} 座 · 被服务那座 " +
+                                "${served?.conversationSessionIds()?.size ?: 0} 个会话 · 本座 " +
                                 "${starved.conversationSessionIds().size} 个会话）",
                         )
                         recycleBridge(

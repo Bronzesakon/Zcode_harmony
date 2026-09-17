@@ -56,7 +56,7 @@
 
 ## 项目现状（先读这一节）
 
-**一句话**：主体功能已落地，测试全绿（**JS 94 项 + Kotlin 92 项**）；真机当前跑的是**本机出的 `1.0.0-local.145`**（不走 CI、不写预发布），而 `pre` 每次推送仍会把最新 APK **覆写**到滚动预发布 [android-pre](https://github.com/Bronzesakon/Zcode_harmony/releases/tag/android-pre)（固定链接 `…/releases/download/android-pre/zcode-remote.apk`，可直接覆盖安装）——**真机验证已过十六轮**（一加 PLC110 / ColorOS 16 / API 36 / WebView 153–154）。**第十五轮两条已定案**：① 壳不再拆页面连接（「只读壳」，见「实现要点」14）；② 可见性劫持已停用，且**回前台"加载不出来"这一条已被真机证实修好**（页面自己走回 `recoverConnection`）。**"后台约 60 秒墙"已在第十六轮（2026-09-16 这一夜）定案并解决**：退后台约 60–70s 后 **Chromium 的网络栈整条停止工作**（页面新建 `fetch` 76 秒既不成功也不失败），而**同一刻原生 Java 侧裸 TCP 67ms、HTTPS 200**——所以页面侧任何自救都不可能成功，**只有换承载连接的那一层**；落地形态是「链路判死 → 原生接管 → 回前台交还」，**端到端已验收**（后台/熄屏都在跟手、回前台不需要重载、一小时长测 30 拍全绿），取证见「已知问题」与 `docs/18`。**多工作区/多任务订阅已收口**：E1 真机跑通＝桌面端**能同时开多座桥、但同一时刻只服务一座**（服务权归"最近订阅成功"者），于是做法定为**主动轮换**，**按 2 座优化**（ColorOS 只并发 2 张实况窗）；桥数上限已抬到 **5**（成本取舍，产品上限仍是 2 张卡），且**承载能自己从 `bootstrap-response.tasks` 发现"哪些工作区在跑"**（定向接管）。落地与取证见 `docs/18` §3.1–§3.8。下表按"还剩什么没结论"排：
+**一句话**：主体功能已落地，测试全绿（**JS 95 项 + Kotlin 92 项**）；真机当前跑的是**本机出的 `1.0.0-local.145`**（不走 CI、不写预发布），而 `pre` 每次推送仍会把最新 APK **覆写**到滚动预发布 [android-pre](https://github.com/Bronzesakon/Zcode_harmony/releases/tag/android-pre)（固定链接 `…/releases/download/android-pre/zcode-remote.apk`，可直接覆盖安装）——**真机验证已过十六轮**（一加 PLC110 / ColorOS 16 / API 36 / WebView 153–154）。**第十五轮两条已定案**：① 壳不再拆页面连接（「只读壳」，见「实现要点」14）；② 可见性劫持已停用，且**回前台"加载不出来"这一条已被真机证实修好**（页面自己走回 `recoverConnection`）。**"后台约 60 秒墙"已在第十六轮（2026-09-16 这一夜）定案并解决**：退后台约 60–70s 后 **Chromium 的网络栈整条停止工作**（页面新建 `fetch` 76 秒既不成功也不失败），而**同一刻原生 Java 侧裸 TCP 67ms、HTTPS 200**——所以页面侧任何自救都不可能成功，**只有换承载连接的那一层**；落地形态是「链路判死 → 原生接管 → 回前台交还」，**端到端已验收**（后台/熄屏都在跟手、回前台不需要重载、一小时长测 30 拍全绿），取证见「已知问题」与 `docs/18`。**多工作区/多任务订阅已收口**：E1 真机跑通＝桌面端**能同时开多座桥、但同一时刻只服务一座**（服务权归"最近订阅成功"者），于是做法定为**主动轮换**，**按 2 座优化**（ColorOS 只并发 2 张实况窗）；桥数上限已抬到 **5**（成本取舍，产品上限仍是 2 张卡），且**承载能自己从 `bootstrap-response.tasks` 发现"哪些工作区在跑"**（定向接管）。落地与取证见 `docs/18` §3.1–§3.8。下表按"还剩什么没结论"排：
 
 | # | 待验证 / 待排查 | 现状 | 怎么看 |
 | --- | --- | --- | --- |
@@ -230,12 +230,12 @@ hook 挂在 `WebSocket.prototype` 上、对补注前已存在的页面连接同�
 
 | job | 内容 | 首次 | 有缓存 |
 | --- | --- | --- | --- |
-| `js` | Node 协议层 + 注入层测试（94 项），不需要 JDK/SDK | ~1 min | ~40 s |
+| `js` | Node 协议层 + 注入层测试（95 项），不需要 JDK/SDK | ~1 min | ~40 s |
 | `build` | 单次 Gradle 调用：release 单元测试（92 项）+ `assembleRelease` + 签名校验 | ~4 min | ~2m 45s |
 | `prerelease` | 仅 `pre` 分支：把最新 APK **覆写**到滚动预发布 Release（固定下载链接） | ~20 s | ~20 s |
 | `release` | 仅 `v*` tag：用 CHANGELOG 段落发正式 Release | ~20 s | ~20 s |
 
-测试构成：JS **94 项**（`tools/protocol.test.js` + `tools/inject.test.js`，含手算黄金字节；其中 6 项钉「对话流 → 卡片正文」的帧契约：snapshot 取最后一段 `assistantText`、`row.delta` 只拼同一行、工具/子代理/reasoning 不覆盖正文、原生种子优先且上限 `CONVERSATION_MAX`；4 项钉**只读壳契约**：前台心跳零写入、回前台零写入、进对话卡住不重载、卡住不连刷；**另 4 项钉后台承载**（2026-09-16 加）：交还兜底「有线/有帧就不重载」与「零 socket 零帧才重载一次」、推动函数 event 档只派发合成 `online`、close 档真关线）；Kotlin **92 项 / 9 个测试类**（`@Test` 实数：`NotifyStateTest` 30 + `RelayWireTest` 21 + `UploadMimeTest` 8 + `ControllerTasksStateTest` 8 + `PromotionPolicyTest` 7 + `PageBarColorTest` 6 + `SurvivalVerdictTest` 5 + `RelayBridgeTest` 5 + `Tier2ProofTest` 2）。数字以实测为准（`node --test` 报 tests 行；Kotlin 数 `@Test`），**改测试后请同步这一行**。**这些是唯一能在无设备条件下验证的东西**，真机行为一律以设备为准。
+测试构成：JS **95 项**（`tools/protocol.test.js` + `tools/inject.test.js`，含手算黄金字节；其中 6 项钉「对话流 → 卡片正文」的帧契约：snapshot 取最后一段 `assistantText`、`row.delta` 只拼同一行、工具/子代理/reasoning 不覆盖正文、原生种子优先且上限 `CONVERSATION_MAX`；5 项钉**只读壳契约**（含 2026-09-17 新增的"默认配置零写入"）：前台心跳零写入、回前台零写入、进对话卡住不重载、卡住不连刷、默认即被动不主动开桥；**另 4 项钉后台承载**（2026-09-16 加）：交还兜底「有线/有帧就不重载」与「零 socket 零帧才重载一次」、推动函数 event 档只派发合成 `online`、close 档真关线）；Kotlin **92 项 / 9 个测试类**（`@Test` 实数：`NotifyStateTest` 30 + `RelayWireTest` 21 + `UploadMimeTest` 8 + `ControllerTasksStateTest` 8 + `PromotionPolicyTest` 7 + `PageBarColorTest` 6 + `SurvivalVerdictTest` 5 + `RelayBridgeTest` 5 + `Tier2ProofTest` 2）。数字以实测为准（`node --test` 报 tests 行；Kotlin 数 `@Test`），**改测试后请同步这一行**。**这些是唯一能在无设备条件下验证的东西**，真机行为一律以设备为准。
 
 省时间的几个点：`js` 不与 Android 构建串行；`testReleaseUnitTest` 与 `assembleRelease` 放在**同一次 Gradle 调用**里（共享 `compileReleaseKotlin`，源码只编译一次、Gradle 只启动一次）；`fetch-depth: 1`；`actions/setup-java` 的 `cache: gradle` 会恢复 `~/.gradle`（依赖缓存 + 本地 build cache）；`org.gradle.configuration-cache=true` 且 `problems=warn`，所以配置缓存只可能加速、不会让构建失败。
 
@@ -670,7 +670,7 @@ M3 基线的做法（2026-09-11 落地）：
 
 ```powershell
 cd android-shell
-node --test tools/inject.test.js tools/protocol.test.js   # 94 项：线格式、分片重组、通道客户端、会话索引、注入层、页面 RPC 取证
+node --test tools/inject.test.js tools/protocol.test.js   # 95 项：线格式、分片重组、通道客户端、会话索引、注入层、页面 RPC 取证
 python tools/check_kotlin_structure.py   # 括号配平 / 包名与目录一致 / 合并残留（约 1 秒）
 python tools/check_resources.py          # 资源引用名是否存在（约 1 秒，补 aapt2 只在 CI 跑的缺口）
 python tools/watch_ci.py                 # 读 CI 状态与失败原因（无需 gh / 无需 token）
@@ -1024,7 +1024,7 @@ store 三级优先级：controller > 会话流 > SI 持久态）；controller �
 cd android-shell
 python tools/check_kotlin_structure.py     # 一秒：括号配平 / 包名与目录一致 / 合并残留
 python tools/check_resources.py            # 一秒：每个 @type/name 是否都有定义
-node --test tools/inject.test.js tools/protocol.test.js   # 94 项（protocol + inject）
+node --test tools/inject.test.js tools/protocol.test.js   # 95 项（protocol + inject）
 python tools/watch_ci.py                   # 匿名读 CI 状态与编译错误注解（单次读取；失败/取消时退出码非 0）
 bash tools/device_check.sh                 # 真机一键验收（取包→装→清日志→跑→打印全部判据）
 ```
@@ -1073,6 +1073,16 @@ MSYS_NO_PATHCONV=1 "$ADB" -s "$S" shell "L=/sdcard/Android/data/com.zcode.remote
 - **第十六轮（2026-09-16 夜）**：**60 秒墙定案**＝Chromium 网络栈在后台整条停摆（墙内页面 `fetch` 挂 76s，
   同刻原生裸 TCP 67ms / HTTPS 200）⇒ **页面侧自救整类方案证伪**；落地「判死 → 原生接管 → 回前台交还」，
   端到端 + 熄屏 8 分钟 + **一小时长测 30 拍全绿**。
+- **2026-09-17（清理轮）**：**删除 D7「订阅所有工作区」开关**（前后端 + 注入层一整条：`Prefs` 的键、
+  设置页开关与文案、`WebAppBridge` 配置、`inject.js` 的 `__zcodeShellSetSubscribeAll` 与 `subscribeAll` 布线、
+  `zcode-protocol.js` 的 active burst 路径；相应单测改写成"**永远被动**"的等价断言）。
+  按**鸿蒙侧交接审计**修掉 6 处：① 重锚一轮只拉**该桥最饿的一个会话** + 超时 `8s→4s`、等帧 `3s→2s`
+  ⇒ 成本与桥数、**每桥会话数**都解耦（旧写法某工作区跑 3 个任务时最坏 33s ≫ 12s 拍）；
+  ② 失败路径 `return@Thread`，守"**一轮最多一次握手**"不变式（旧写法一轮会连回收两座 ≈14s）；
+  ③ `coverage_ws:` 诊断清单**豁免失败冷却**（与注释对齐，否则 E1 会静默打不通）；
+  ④ 覆盖清单 `.take(上限)`，日志不再虚报座数；⑤ 上限改**单源常量**（`ShellRuntime` 直接引用
+  `Tier2Probe.DEFAULT_MAX_COVERAGE`，编译器兜底"两处必须同步"）；⑥ `keyOf` 去掉 `workspaceLabel` 兜底、
+  删掉 `carrierCoverageTargets()` 里的死调用。README 同步精简（1486 → ~1130 行）、删掉过时的阶段性报告。
 - **2026-09-17**：多工作区收口——E1 真机跑通（能开多桥，**同一时刻只服务一座**，服务权归"最近订阅成功"者）；
   两次修法往返（① 串行保留、② "三轮才回收"**已回退**）；**修掉"流体云卡片消失重建"**（空更新被当成
   "运行集为空"发布）；**轮换节奏 12s**（门槛必须小于拍长）；**定向接管 / 发现链**（承载自己读
@@ -1116,7 +1126,7 @@ MSYS_NO_PATHCONV=1 "$ADB" -s "$S" shell "L=/sdcard/Android/data/com.zcode.remote
   出包命令见「本机开发」；`adb install -r` 直接覆盖安装，**不消耗 CI**。CI 仍然是可选通路
   （`git push origin pre` → js 检查 + `:app:testReleaseUnitTest` + APK → 滚动预发布 `android-pre`）。
   本地出包前务必先跑门禁（下面两条），因为本地编译**同样**只报类型错误、不保证行为正确。
-- **本地能跑的检查**：`node --test tools/inject.test.js tools/protocol.test.js`（94 项）、
+- **本地能跑的检查**：`node --test tools/inject.test.js tools/protocol.test.js`（95 项）、
   `python tools/check_kotlin_structure.py`
   （括号配平 / 包名 / 同文件重名——**不同嵌套类里的同名 fun 也会被点名**，改名即可）、
   `python tools/check_resources.py`；读 CI 用 `python tools/watch_ci.py`（含 `e:` 注解行；
