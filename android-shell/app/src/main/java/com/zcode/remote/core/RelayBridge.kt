@@ -1162,6 +1162,10 @@ class BridgeManager(
      *
      * 每座桥因此按顺序轮流拿到服务窗（N 座 → 每座服务 1 轮、静默 N-1 轮）。
      * 桥数上限见 [Tier2Probe.DEFAULT_MAX_COVERAGE]（现行 5，成本取舍；产品上限是 2 张提升卡）。
+     *
+     * ⚠️ **不变式：一轮最多一次握手**（2026-09-17）。被服务那座 resync 失败时这一轮**立刻
+     * 结束**——只回收那一座，不再顺手回收最饿的那座：旧写法一轮 ≈14s > 12s 拍长（超拍＝
+     * 静默丢拍），而且两座桥**同时离线**（两张流体云卡一起消失再重建）。见 ① 处的注释。
      */
     fun reanchorProgress() {
         if (disposed || !reanchorInFlight.compareAndSet(false, true)) return
@@ -1181,9 +1185,17 @@ class BridgeManager(
                         onLogLine("reanchor failed for $key：$err；最近收帧 $silent ⇒ 整桥回收")
                         recycleBridge(key, served.scopeCopy(), served.conversationSessionIds())
                         Thread.sleep(REANCHOR_AFTER_RECYCLE_MS)
-                    } else {
-                        Thread.sleep(REANCHOR_GAP_MS)
+                        // ⚠️ **一轮最多一次握手**（不变式，2026-09-17 定死）。
+                        //
+                        // 失败已经说明对端不在服务我们；这一轮就到此为止，**不许**接着走
+                        // ② 去回收最饿的那座。旧写法会连着回收两座：两轮 sleep 3s + 两次
+                        // 回收握手 ⇒ 一轮 ≈14s > 12s 拍长（超拍的 CAS 是静默丢拍，等于
+                        // 下一拍白丢），而且**两座桥同时离线**——用户看到的是"两张卡一起
+                        // 消失再重建"。`finally` 照常释放 reanchorInFlight，下一拍再收拾
+                        // 最饿的那座（它已经等了一整拍，不差这一拍）。
+                        return@Thread
                     }
+                    Thread.sleep(REANCHOR_GAP_MS)
                 }
                 // ② 每轮只轮换**最饿的一座**（N≥2 才有意义；只在它真的挨饿时才动）。
                 if (live.size >= 2 && starved != null) {
