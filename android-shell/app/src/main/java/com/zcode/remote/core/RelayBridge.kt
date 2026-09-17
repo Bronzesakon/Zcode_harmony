@@ -873,10 +873,14 @@ private const val REANCHOR_AFTER_RECYCLE_MS = 3_000L
 /**
  * 主动轮换的门槛：某座桥超过这么久没有新帧，才算"被对端晾着"，才去回收它换服务权。
  *
- * N=2 实测：被服务的那座每 6–17s 一段、失去服务的那座静默 17–21s，所以 15s 能把两者分开；
- * 设这道门槛是为了**桌面端哪天开始并行服务多座桥时不乱拆**（那样两边都 <15s，就只做 resync）。
+ * ⚠️ **必须小于轮换拍长**（`ShellRuntime.LIVE_PROGRESS_POLL_MS × LIVE_REANCHOR_EVERY_POLLS`），
+ * 否则拍长会被门槛吃掉：2026-09-17 实测，拍长改到 12s 而门槛还是 15s 时，每拍算下来那座桥
+ * 只静默了 12s < 15s ⇒ **每两拍才轮换一次，实际节奏仍是 24s**（日志里 rotate 间隔一格不差是 24s）。
+ * 现行 8s < 12s 拍长，所以每拍都轮换。
+ *
+ * 设这道门槛的本意：**桌面端哪天开始并行服务多座桥时不乱拆**（那样两边都 <8s 有新帧，只做 resync）。
  */
-private const val ROTATE_MIN_STARVE_MS = 15_000L
+private const val ROTATE_MIN_STARVE_MS = 8_000L
 
 class BridgeManager(
     private val sendPayloadOut: (JSONObject) -> Unit,
