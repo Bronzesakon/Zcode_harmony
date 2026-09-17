@@ -882,6 +882,125 @@ private const val REANCHOR_AFTER_RECYCLE_MS = 3_000L
  */
 private const val ROTATE_MIN_STARVE_MS = 8_000L
 
+/**
+ * 任务摘要（**工作区活动态发现链**，2026-09-17）。
+ *
+ * 用途：让承载知道"**哪些工作区确实有在跑任务**"，从而只给这些工作区开桥（定向接管），
+ * 不必再依赖"用户先把每个工作区在手机上打开一遍"。
+ *
+ * 数据源（前两条真机每次都在收，此前只记了大小没解析）：
+ *  1. `bootstrap-response.result.tasks` —— schema 里 **必填**，真机 24–25 KB；
+ *  2. `workspace-list-response.result.tasks` —— schema 里 `optional`，有没有看真机；
+ *  3. （未接）页面自己订的 `controller/tasks-index` 帧 —— 纯被动解析，见 `docs/18` §3.7。
+ * ⛔ **绝不订阅** `window-controller.onDynamicControllerFrame`：那是 `listen`，真机上把桌面端
+ * host 打崩过（`[rpc:listen] … FAIL`）。本文件只读**已经在流的**响应，零新增订阅。
+ *
+ * 字段形状（子代理 2026-09-17 审计网页 bundle 得出）：
+ * `{address:{workspacePath, workspaceIdentity?, taskId?}, meta:{title, workspacePath, …},
+ *   liveStatus:'idle'|'running'|'waiting'|'completed'|'error', activity?}`
+ * 工作区键算法与页面一致：`workspaceIdentity?.trim() || workspacePath`。
+ */
+internal object RelayTaskDigest {
+    /** 判据：网页链 A 把 `displayStatus` 映射成 `idle|running|completed|error`，
+     *  只有 `running` 是"在跑"；`waiting`/`prewarming` 容错留着（真机暂未见）。 */
+    private val ACTIVE = setOf("running", "waiting", "prewarming")
+
+    /** 有活动任务的工作区键（去重、保持出现顺序）。 */
+    fun activeWorkspaces(result: Any?): List<String> {
+        val tasks = tasksOf(result) ?: return emptyList()
+        val out = LinkedHashSet<String>()
+        for (i in 0 until tasks.length()) {
+            val task = tasks.optJSONObject(i) ?: continue
+            if (statusOf(task) !in ACTIVE) continue
+            val key = keyOf(task) ?: continue
+            out.add(key)
+        }
+        return out.toList()
+    }
+
+    /**
+     * 运行态字段：**真机报文用 `displayStatus`**（156 形状探针实测，扁平字段）；
+     * `liveStatus` 是 `controller/tasks-index` 的 `Lue` 形状，留作兼容。
+     * 取值枚举（网页链 A）：`idle | running | completed | error`。
+     */
+    fun statusOf(task: JSONObject): String =
+        task.optString("displayStatus").ifEmpty { task.optString("liveStatus") }
+
+    /** 一行摘要：**只含状态与工作区键**，不含任何凭证或正文。 */
+    fun describe(result: Any?, source: String): String {
+        val tasks = tasksOf(result) ?: return "承载发现[$source]：响应里没有 tasks"
+        if (tasks.length() == 0) return "承载发现[$source]：tasks 为空"
+        val counts = LinkedHashMap<String, Int>()
+        val shown = ArrayList<String>()
+        var active = 0
+        for (i in 0 until tasks.length()) {
+            val task = tasks.optJSONObject(i) ?: continue
+            val status = statusOf(task).ifEmpty { "?" }
+            if (status in ACTIVE) active += 1
+            counts[status] = (counts[status] ?: 0) + 1
+            if (shown.size < 8) shown.add("$status@${keyOf(task) ?: "?"}")
+        }
+        val hist = counts.entries.joinToString("/") { "${it.key}×${it.value}" }
+        return "承载发现[$source]：${tasks.length()} 个任务 · 有活动 $active · $hist · ${shown.joinToString(" | ")}"
+    }
+
+    fun keyOf(task: JSONObject): String? {
+        // **与页面逐字同规则**：`workspaceIdentity?.trim() || workspacePath`
+        // （页面 `GD`/`Co`，src-DHgFesxz.js:44:3789；页面自己也是拿这个 key 去比
+        // `bridge.workspaceKey`，见 index:897:338878）。远程工作区必须用 identity，
+        // 缺失 identity 才是本地工作区 —— **顺序不能反**（156 我写反过一次）。
+        val identity = task.optString("workspaceIdentity").trim()
+        if (identity.isNotEmpty()) return identity
+        val path = task.optString("workspacePath")
+        if (path.isNotEmpty()) return path
+        // 兼容 `controller/tasks-index` 的 `Lue` 形状（`address`/`meta` 嵌套，`liveStatus`）：
+        // 将来若改用那条源（被动解析），这里不用再改。
+        val addr = task.optJSONObject("address") ?: task.optJSONObject("meta")
+        if (addr != null) {
+            val nestedIdentity = addr.optString("workspaceIdentity").trim()
+            if (nestedIdentity.isNotEmpty()) return nestedIdentity
+            val nested = addr.optString("workspacePath")
+            if (nested.isNotEmpty()) return nested
+        }
+        // `workspaceLabel` 只是显示名（页面也不拿它当键），兜底用。
+        val label = task.optString("workspaceLabel")
+        return label.ifEmpty { null }
+    }
+
+    /**
+     * **形状探针**：只落**键名**（外加名字里带 status/phase/state 的字段值），不落任何标题/路径正文。
+     *
+     * 用途：把 [activeWorkspaces] 的字段名对准真实报文。2026-09-17 真机实测：
+     * `bootstrap-response.result.tasks` 与 `workspace-list-response.result.tasks` **都带 82 个任务**，
+     * 但 bundle 审计推出的字段名（`liveStatus` / `address.workspacePath` / `meta.workspacePath`）
+     * **一个都没命中**（摘要全是 `?`）——bootstrap 的 `tasks` 元素类型与 controller 的 `Lue` 不是同一个。
+     */
+    fun shapeOf(result: Any?): String {
+        val tasks = tasksOf(result) ?: return "承载发现形状：result 里没有 tasks"
+        if (tasks.length() == 0) return "承载发现形状：tasks 为空"
+        val first = tasks.optJSONObject(0) ?: return "承载发现形状：tasks[0] 不是对象"
+        fun keys(o: JSONObject?): String =
+            o?.keys()?.asSequence()?.joinToString(",") ?: "-"
+        val sb = StringBuilder("承载发现形状：tasks[0]=[${keys(first)}]")
+        for (name in listOf("address", "meta", "activity", "workspace", "task", "status", "payload")) {
+            first.optJSONObject(name)?.let { sb.append(" · $name=[${keys(it)}]") }
+        }
+        val statusLike = first.keys().asSequence()
+            .filter {
+                it.contains("status", true) || it.contains("phase", true) || it.contains("state", true)
+            }
+            .joinToString(",") { "$it=${first.optString(it)}" }
+        sb.append(" · 状态类字段: ${statusLike.ifEmpty { "-" }}")
+        return sb.toString()
+    }
+
+    private fun tasksOf(result: Any?): org.json.JSONArray? = when (result) {
+        is org.json.JSONArray -> result
+        is JSONObject -> result.optJSONArray("tasks")
+        else -> null
+    }
+}
+
 class BridgeManager(
     private val sendPayloadOut: (JSONObject) -> Unit,
     private val onSessionsUpdate: (JSONObject) -> Unit,
@@ -907,6 +1026,14 @@ class BridgeManager(
 
     /** 重锚轮的整体互斥：一次只跑一轮（串行，见 [reanchorProgress]）。 */
     private val reanchorInFlight = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /**
+     * 发现链落点：`workspace-list-response.result.tasks` 里"有活动任务"的工作区键。
+     * 供 [Tier2Probe.discoveredCoverage] 与 `ShellRuntime.carrierCoverageTargets()` 做定向覆盖。
+     */
+    @Volatile
+    var discoveredActiveWorkspaces: List<String> = emptyList()
+        private set
 
     /** [disposeEverything] 后为 true：回收线程不得再开新桥（manager 已无人消费）。 */
     @Volatile
@@ -1238,6 +1365,10 @@ class BridgeManager(
         val reply = awaitRelayReply(requestId, timeoutMs)
             ?: throw RelayWire.WireException("workspace-list-request timed out")
         val result = reply.opt("result")
+        // 定向接管的发现链之一：这条响应的 `tasks` 在 schema 里是可选的，有就白拿一份活动态。
+        onLogLine(RelayTaskDigest.describe(result, "workspace-list"))
+        onLogLine(RelayTaskDigest.shapeOf(result))
+        discoveredActiveWorkspaces = RelayTaskDigest.activeWorkspaces(result)
         val list = when (result) {
             is org.json.JSONArray -> result
             is JSONObject -> result.optJSONArray("workspaces")

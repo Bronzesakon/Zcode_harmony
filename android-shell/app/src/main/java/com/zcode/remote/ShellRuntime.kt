@@ -667,16 +667,36 @@ object ShellRuntime {
      * 承载这一轮要开哪些工作区的桥（多工作区方向，见 `docs/17`）。
      *
      * 优先级：诊断覆盖清单 > 多工作区开关 > 只开页面工作区（返回空，交给 `Tier2Probe` 决定）。
-     * 开关打开时＝ page 工作区 ∪ 有在跑任务的工作区，上限 [MULTI_WS_COVERAGE_CAP]。
+     * 开关打开时＝ page 工作区 ∪ **发现链**"有活动任务的工作区" ∪ store 里在跑任务的工作区，
+     * 上限 [MULTI_WS_COVERAGE_CAP]。
+     *
+     * **发现链**（2026-09-17 加，见 `docs/18` §3.7）＝从**已经在收的**两处响应解析出来的活动工作区
+     * （`bootstrap-response.result.tasks` 必填 / `workspace-list-response.result.tasks` 可选）。
+     * 有了它，不再要求用户先把每个工作区在手机上打开一遍——壳自己就知道谁在跑。
      */
     private fun carrierCoverageTargets(): List<String> {
         if (coverageOverride.isNotEmpty()) return coverageOverride
         if (!multiWorkspaceCoverage) return emptyList()
         val out = LinkedHashSet<String>()
         if (pageWorkspaceKey.isNotEmpty()) out.add(pageWorkspaceKey)
+        val discovered = Tier2Probe.discoveredCoverage()
+        for (key in discovered) {
+            if (out.size >= MULTI_WS_COVERAGE_CAP) break
+            if (key.isNotEmpty()) out.add(key)
+        }
         for ((key, _) in store.runningTaskRefs()) {
             if (out.size >= MULTI_WS_COVERAGE_CAP) break
             if (key.isNotEmpty()) out.add(key)
+        }
+        if (out.isNotEmpty()) {
+            // 注意：这一行在**承载启动前**算，所以"发现链"此刻必然是 0——发现链的数据
+            // （bootstrap/workspace-list 的 tasks）要配对之后才有，真正的并入点在
+            // `Tier2Probe.startCoverage()`（日志行 `发现链给出 …`）。
+            Diagnostics.log(
+                "info",
+                "承载覆盖目标（启动前）：${out.size} 座（page=${pageWorkspaceKey.ifEmpty { "未知" }} · " +
+                    "store 在跑 ${store.runningTaskRefs().size} 个；发现链见配对后那行）",
+            )
         }
         return out.take(MULTI_WS_COVERAGE_CAP)
     }
@@ -748,6 +768,7 @@ object ShellRuntime {
             onlyWorkspace = pageWorkspaceKey,
             onlyTaskId = pageWorkspaceTaskId,
             coverageWorkspaces = carrierCoverageTargets(),
+            coverageIsDiagnostic = coverageOverride.isNotEmpty(),
         )
         startLiveProgressPolling()
     }
@@ -948,6 +969,7 @@ object ShellRuntime {
                         onlyWorkspace = pageWorkspaceKey,
                         onlyTaskId = pageWorkspaceTaskId,
                         coverageWorkspaces = targets,
+                        coverageIsDiagnostic = coverageOverride.isNotEmpty(),
                     )
                     startLiveProgressPolling()
                 }

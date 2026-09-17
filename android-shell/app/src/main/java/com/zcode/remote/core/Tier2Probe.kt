@@ -105,6 +105,32 @@ object Tier2Probe {
     private val bridgeFailCount = java.util.concurrent.ConcurrentHashMap<String, Int>()
     private val bridgeCooldownUntil = java.util.concurrent.ConcurrentHashMap<String, Long>()
 
+    /**
+     * 发现链落点：`bootstrap-response.result.tasks` 里"有活动任务"的工作区键。
+     * 与 [BridgeManager.discoveredActiveWorkspaces]（workspace-list 那条）一起供
+     * [discoveredCoverage] 使用——**这两条都是我们在收的响应，零新增订阅**。
+     */
+    @Volatile
+    private var bootstrapActiveWorkspaces: List<String> = emptyList()
+
+    /** `coverage_ws:` 诊断清单＝只用它（E1 语义），不并入发现链。 */
+    @Volatile
+    private var coverageIsDiagnostic = false
+
+    /**
+     * 定向接管的覆盖来源：从**已经在收的响应**里解析出来的"有活动任务的工作区"。
+     *
+     * 它解决的是老缺口——壳只认识"页面打开过的工作区"（`pageWorkspaceKey` 来自页面上报），
+     * 所以多工作区覆盖以前要求用户先把每个工作区在手机上打开一遍。现在承载一动就能自己知道。
+     * 顺序：bootstrap（必填源）优先，其次 workspace-list（可选源）。
+     */
+    fun discoveredCoverage(): List<String> {
+        val out = LinkedHashSet<String>()
+        out.addAll(bootstrapActiveWorkspaces)
+        out.addAll(bridgeManager?.discoveredActiveWorkspaces.orEmpty())
+        return out.toList()
+    }
+
     /** 页面正在显示的任务（view-state 帧里要用；空串=未知）。 */
     @Volatile
     private var onlyTaskId: String = ""
@@ -186,6 +212,8 @@ object Tier2Probe {
      * @param onlyWorkspace 页面**自己**正在显示的工作区键：view-state 帧用它，也是
      *   没有 [coverageWorkspaces] 时的唯一覆盖目标。空串表示注入层还没上报。
      * @param coverageWorkspaces 多工作区覆盖清单（非空时只用它，顺序即开桥顺序）。
+     * @param coverageIsDiagnostic `coverage_ws:` 给的清单＝只用它（E1 实验语义）；
+     *   false（承载生产路径）时会在**配对拿到 bootstrap 响应之后**并入"发现链"给出的活动工作区。
      */
     fun start(
         newCreds: RelayCreds,
@@ -193,6 +221,7 @@ object Tier2Probe {
         onlyWorkspace: String = "",
         onlyTaskId: String = "",
         coverageWorkspaces: List<String> = emptyList(),
+        coverageIsDiagnostic: Boolean = false,
     ) {
         startInternal(
             newCreds,
@@ -201,6 +230,7 @@ object Tier2Probe {
             onlyWorkspace = onlyWorkspace,
             onlyTaskId = onlyTaskId,
             coverageWorkspaces = coverageWorkspaces,
+            coverageIsDiagnostic = coverageIsDiagnostic,
         )
     }
 
@@ -225,6 +255,7 @@ object Tier2Probe {
         onlyWorkspace: String = "",
         onlyTaskId: String = "",
         coverageWorkspaces: List<String> = emptyList(),
+        coverageIsDiagnostic: Boolean = false,
     ) {
         if (isRunning()) {
             Diagnostics.log("warn", "Tier2: 已在运行（phase=$phase），忽略重复启动")
@@ -234,6 +265,7 @@ object Tier2Probe {
         this.onlyWorkspace = onlyWorkspace
         this.onlyTaskId = onlyTaskId
         this.coverageWorkspaces = coverageWorkspaces
+        this.coverageIsDiagnostic = coverageIsDiagnostic
         bridgeFailCount.clear()
         bridgeCooldownUntil.clear()
         persistent = durationMs <= 0
@@ -477,7 +509,24 @@ object Tier2Probe {
                 //   ③ 都没有 ——按"在跑任务数"排序取前 [DEFAULT_MAX_COVERAGE] 个。
                 //      **不再全量**：扫全部工作区曾被认为是桌面端拆 host 的诱因，虽然后来查明真凶是
                 //      controller 流那次 `rpc:listen`（docs/16 §8/§10），但没有理由为此开满 12 座桥。
-                val explicit = coverageWorkspaces
+                // **发现链要在这一刻读**（不是承载启动前）：数据来自配对之后的
+                // `bootstrap-response.result.tasks`，承载启动时它还没到（154 实测踩到：
+                // 清单在 `maybeStartNativeCarrier` 里算，日志显示"发现链 0 个"）。
+                // 只在多工作区开关打开时并入（开关关＝只开页面工作区，语义不变）；
+                // `coverage_ws:` 诊断清单不并入（E1 要的是"只用它"）。
+                val discovered =
+                    if (coverageIsDiagnostic || coverageWorkspaces.isEmpty()) {
+                        emptyList()
+                    } else {
+                        discoveredCoverage()
+                    }
+                if (discovered.isNotEmpty()) {
+                    Diagnostics.log(
+                        "info",
+                        "Tier2: 发现链给出 ${discovered.size} 个有活动任务的工作区：${discovered.joinToString()}",
+                    )
+                }
+                val explicit = (coverageWorkspaces + discovered).distinct()
                 val only = onlyWorkspace
                 val targets = when {
                     explicit.isNotEmpty() -> {
@@ -654,11 +703,19 @@ object Tier2Probe {
                     val payload = frame.optJSONObject("payload") ?: return
                     val kind = payload.optString("zcode_type")
                     if (kind.startsWith("bootstrap")) {
-                        // 只记大小与类型：bootstrap 响应可能带凭证，内容绝不落日志。
+                        // 只记大小与类型：bootstrap 响应可能带凭证，**原文绝不落日志**。
                         Diagnostics.log(
                             "info",
                             "Tier2: 收到 $kind（${text.length} 字符）",
                         )
+                        if (kind == "bootstrap-response") {
+                            // 定向接管的发现链（主源）：这条响应里 `result.tasks` 是 schema **必填**，
+                            // 每次 24–25 KB，之前只记了大小没解析。摘要只落"状态 + 工作区键"。
+                            val result = payload.optJSONObject("result")
+                            Diagnostics.log("info", RelayTaskDigest.describe(result, "bootstrap"))
+                            Diagnostics.log("info", RelayTaskDigest.shapeOf(result))
+                            bootstrapActiveWorkspaces = RelayTaskDigest.activeWorkspaces(result)
+                        }
                     }
                     bridgeManager?.acceptRelayPayload(payload)
                 }

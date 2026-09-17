@@ -498,7 +498,24 @@ zcode-remote.apk -> CN=ZCode Remote, OU=Mobile, O=ZCode, L=Unknown, ST=Unknown, 
     它决定的是**卡片更新节奏而不是交接耗时**：每 N 秒轮换 ⇒ 每座桥被服务 N 秒、静默 N 秒 ⇒ 单卡间隔 ≈ 2N
     （12s ⇒ 10–23s；24s ⇒ 24–41s，代价减半）。3 座以上的形态与代价见 **`docs/17` §11**（远期规划，未实施）。⚠️ `multi_ws_on` / `coverage_ws:` / `carrier_on` 都是**内存态**：**进程重启即丢**，
     每轮真机测试前用 `stall_state` 确认 `多工作区=true 覆盖=…` 再开测（09-17 因此白跑过两轮）。
-    ⚠️ **两个任务要落在不同工作区**，否则只有一个页面工作区、只开 1 座桥，看不到轮换。
+    ⚠️ **两个任务要落在不同工作区**，否则只有一个页面工作区、只开 1 座桥，看不到轮换
+    （**158 起这条已由发现链解决：不必再逐个打开工作区**，见第 21 条）。
+21. **定向接管（发现链）：承载自己读"哪些工作区在跑"，不再要求你先打开每个工作区。** 数据来自
+    **我们已经在收的两条响应**——`bootstrap-response.result.tasks`（schema 必填，真机 24–25 KB）与
+    `workspace-list-response.result.tasks`（`.optional()`，真机也带，两条各 82 个任务）——
+    `RelayBridge.RelayTaskDigest` 解析后经 `Tier2Probe.discoveredCoverage()` 并入 `startCoverage()`。
+    **四个必须记住的点**：① **并入点在配对之后**（数据那时才有），别像 154 那样在
+    `maybeStartNativeCarrier` 里算（日志会写 `发现链 0 个`）；② 报文是**扁平**的 `Ng` 形状
+    （`displayStatus` 四值 `idle|running|completed|error` + 扁平 `workspacePath`/`workspaceIdentity`），
+    **不是** `controller/tasks-index` 的嵌套 `Lue`（`liveStatus` 五值 / `address` / `meta`）——
+    我先按 `Lue` 写，真机摘要**全是 `?`**；③ 工作区键与页面**逐字同规则**
+    `workspaceIdentity?.trim() || workspacePath`（**顺序不能反**，远程工作区必须用 identity）；
+    ④ 形状对不上时用**只落键名的形状探针**（`承载发现形状：tasks[0]=[…] · 状态类字段: displayStatus=running`）
+    当场定位。⛔ 仍然**不许**发任何 `listen`（`on*`/`onDynamic*`）：真机把桌面端 host 打崩过
+    （而且当年那次是 **channel 打错**：`onDynamicControllerFrame` 属于 `window-controller`，我们发的是 `zcode-agent`）。
+    没做的三条：`Ng.remoteSessionId`（可省掉等 SI 才知道 sessionId）、`window-controller.listTaskList`
+    （**call，安全**，带 `title` 与 `activity.lastActivityAt`，可做周期刷新）、被动解析页面自己的
+    `controller/tasks-index` 帧（零写入）。取证与逐条证据见 `docs/18` §3.7。
 
 ## 任务通知（这是壳存在的理由）
 
@@ -761,12 +778,13 @@ MSYS_NO_PATHCONV=1 "$ADB" devices -l                 # 确认出现设备
 
 ### 一句话状态
 
-真机当前跑的是**本机出的 `1.0.0-local.153`**（本地 keystore 同签名，`adb install -r` 覆盖安装，
-**零 CI 消耗**）。146→153 全是 2026-09-16/17 为多工作区与"流体云消失重建"做的实验件
+真机当前跑的是**本机出的 `1.0.0-local.158`**（本地 keystore 同签名，`adb install -r` 覆盖安装，
+**零 CI 消耗**）。146→158 全是 2026-09-16/17 为多工作区与"流体云消失重建"做的实验件
 （146 清理+多工作区落地、147 三轮才回收【已回退】、148 失败即回收、149/150 空更新守卫与诊断、
-151 主动轮换、152 轮换拍 24s→12s、153 门槛 15s→8s）。**12s 轮换已真机验收（153，两工作区）**：
-rotate 每 **12s** 一次两桥交替、`重锚失败 0`、交接 ~5s、`卡片撤回 0`、`提升集合变化` 仅启动 2 条、
-采样器零"消失"、单卡更新间隔 **10–23s**（24s 拍时 24–41s）。`pre` 分支与滚动预发布 `android-pre`
+151 主动轮换、152/153 轮换节奏 12s（含"门槛必须小于拍长"那道坑）、154→158 定向接管的发现链）。
+**158 真机验收通过**：12s 两桥交替跟手、两张卡同时 PROMOTED 且正文各自推进、`重锚失败 0`、
+`卡片撤回 0`、`提升集合变化` 仅启动 2 条；**且页面只显示过 A 的情况下承载自己发现了 B 并开桥**
+（`承载发现[bootstrap]：82 个任务 · 有活动 2` → `发现链给出 2 个` → `多工作区覆盖 2 座`）。`pre` 分支与滚动预发布 `android-pre`
 停在 **`764235e`**；本轮提交见 git log（`0e124bc` 之后是 `34303f1` 与 153 这一笔），**均未推送**；
 `docs/15·16·17·18-…md` 与根目录历史 APK 仍未跟踪（`android-shell/docs/` 整目录在 `.gitignore` 里）。
 
@@ -838,17 +856,17 @@ store 三级优先级：controller > 会话流 > SI 持久态）；controller �
 
 ### 下一步（新会话第一件事）
 
-0. **多工作区按 2 座优化：已收口并真机验收（151→153）**。读 **`docs/18` §3.1–§3.6**（E1 证据、两次修法
-   往返、空更新 bug、N=2 主动轮换、12s 节奏与"门槛必须小于拍长"这个坑）与 **`docs/17` §11**（3+ 远期规划）。
-   **下一步的第一件事＝补掉"发现链缺口"**：壳目前**只认识页面打开过的工作区**（`passive: following
-   sessions-index of <page key>`），所以多工作区覆盖要靠用户先把每个工作区在手机上打开一遍。真机日志
-   已经证明**页面自己在订 `controller/workspaces` 与 `controller/tasks-index`**（`入站 topic 首次出现(1)(2)`），
-   帧从同一条 `/ws` 流过我们的钩子——**被动解析它**（不新建订阅，避免 `rpc:listen` 把桌面端 host 搞崩）
-   或找一个**一次性 `call`**（`workspace-list-request` 的 `result.workspaces` 已在手、`bootstrap-request`
-   应答约 24–25 KB 只记了大小），就能只给"确实有在跑任务的工作区"开桥＝**定向接管**。
-   2026-09-17 已派子代理只读审计网页 bundle 求证这条链（结论待回填）。
-   **若要抬到 3 座**（远期，见 `docs/17` §11.4）：`bc "coverage_ws:<k1>,<k2>,<k3>"` + `bc carrier_now`，
-   判据＝每桥重锚成功率 / 各桥最大静默 / 有无桥长时间零成功 / 桌面端计数不增长（基线 7 / 14）。
+0. **多工作区 + 定向接管：已收口并真机验收（151→158）**。读 **`docs/18` §3.1–§3.7**（E1 证据、两次修法
+   往返、空更新 bug、N=2 主动轮换、12s 节奏与"门槛必须小于拍长"、发现链与两个形状坑）与
+   **`docs/17` §11**（3+ 远期规划）。**发现链已解决"必须先在手机上打开每个工作区"这个摩擦**：
+   承载配对后从 `bootstrap-response.result.tasks`（必填）与 `workspace-list-response.result.tasks`
+   读出"哪些工作区在跑"，只给这些开桥。
+   **可选的下一步（都没做）**：① 用 `Ng.remoteSessionId` 省掉"等 SI 才知道 sessionId"；
+   ② `window-controller.listTaskList`（**call，安全**）做周期性刷新，可拿到 `title` 与
+   `activity.lastActivityAt`；③ 被动解析页面自己的 `controller/tasks-index` 帧（零写入的第三条源）；
+   ④ 抬到 3 座（`docs/17` §11.4 的实验与判据）。
+   ⚠️ **每轮开测前先补开关**（内存态，进程重启即丢）：`bc multi_ws_on` + `bc coverage_ws_clear`，
+   再用 `bc stall_state` 确认 `多工作区=true`：
 1. **后台承载的其余收尾**（主体已验收，见「一句话状态」第 4/5 条）：
    `carrierEnabled=true`、**不要再动 controller 流**（打开必崩桌面端）、
    配对后补三帧、只开页面工作区的桥（**146 已放宽为三档，但 `multi_ws_*` 默认仍关**）。
@@ -1055,6 +1073,19 @@ ColorOS 收回卡片 → 0.9s 后重建。**每次桥回收必现**（新桥第�
 **顺带记两个坑**：① `multi_ws_on` 是**内存开关，进程重启即丢**（每轮开测前补发 + `stall_state` 确认）；
 ② **两个任务必须落在不同工作区、且每个工作区都要在页面上打开过**——壳只认识页面打开过的工作区
 （发现链缺口，见「下一步」0）。
+**2026-09-17（第二轮：定向接管/发现链）**：⑥ **承载不再要求"先在手机上逐个打开工作区"**。
+子代理只读审计网页 bundle 定案：手机端那条可见的活动态走 Flow A 的 `workspace-list-request`；
+`bootstrap-response.result.tasks` **必填**（我们每次在收、只记了大小）、`workspace-list-response.result.tasks`
+真机也带；任何 `listen`（`on*`/`onDynamic*`）禁用，而且**当年崩桌面端那次是 channel 打错**
+（`onDynamicControllerFrame` 属于 `window-controller`，我们发的是 `zcode-agent`）。
+落地＝`RelayBridge.RelayTaskDigest` 解析两处已收响应 → `Tier2Probe.discoveredCoverage()` →
+`startCoverage()` 的覆盖目标（**并入点必须在配对之后**；154 曾在启动前算，日志写 `发现链 0 个`）。
+**两个形状坑**：报文是扁平 `Ng`（`displayStatus` 四值 + 扁平 `workspacePath`/`workspaceIdentity`），
+不是 `controller/tasks-index` 的嵌套 `Lue`（`liveStatus` 五值 / `address` / `meta`）——我先按 `Lue` 写，
+真机摘要全是 `?`，靠**只落键名的形状探针**当场定案；工作区键与页面逐字同规则
+`workspaceIdentity?.trim() || workspacePath`（顺序不能反）。**158 真机验收通过**：页面只显示过 A，
+承载自己发现 2 个工作区在跑 → 开 2 座桥 → 12s 交替跟手、两张卡同时 PROMOTED、`重锚失败 0`、
+`卡片撤回 0`。取证见 `docs/18` §3.7。
 **2026-09-16 傍晚（接手会话·文档一致性轮）**：只读核对两份权威文档 + 代码，回答"「订阅所有工作区」是不是
 多工作区并行监听流体云的必要条件"——**不是**：必要的是"每工作区一条桥"（`RelayBridge.kt:929`），
 而 D7 只是它的一种**走页面 socket 的 Tier1 实现**（已定罪有害、默认关）；现行实现是原生承载那条路
