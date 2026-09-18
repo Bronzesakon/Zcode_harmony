@@ -1174,7 +1174,7 @@ if ($obj.result -and $obj.result.result) {
 | remote-v4 网页端与安卓平台事实的两份审计 | `E:\Zcode_harmony\docs\10-remote-v4-网页扩展面与可观测面穷尽盘点.md`、`E:\Zcode_harmony\docs\11-remote-v4-平台事实.md` | ✅ 已迁入（复制），但**父 `docs/` 整个目录被 gitignore** ⇒ 仍需手动拷贝 |
 | 本轮清理的**结论 + 决策台帐 + 禁区 + 配方**；真机回归判据与两个自查缺陷；未完成的调研任务书；CDP 助手 | `E:\Zcode_harmony\docs\12-安卓壳死代码清理-结论与决策档.md`、`13-安卓壳真机回归与两个自查缺陷.md`、`14-待办-remote-v4-bootstrap载荷穷举调研.md`、`docs\tools\cdp.ps1` | ✅ 已迁入（12 为**合并重写**，其余正文未删改）；**全在 gitignore 目录里 ⇒ 必须手动拷贝**。`14` 是**未完成**的调研（`bootstrap-response` 约 28 KB 载荷里还有哪些字段没被解析），**保留待做** |
 | 鸿蒙移植的逐项对照与后台行为 | `E:\Zcode_harmony\docs\09-…`、`06-…`、`07-…`、`08-…`、`01`–`05`（实况窗五篇） | 同上：**本地文件、必须手动拷贝**（本文第 5 小节已把要点抄进来了，细节仍需原篇） |
-| `.dsh-audit/`（本轮全部工作产物）：13 份分区原始审计报告（逐成员调用方分类表）、6 份功能域详情、逐符号活/死判定清单（`BATCH4-INVENTORY-4b.md` / `-4c-phaseB.md`，742 行）、50 KB 执行流水、9 份批次任务书、阶段守则（死代码分类体系、证据标准、跨语言核查清单、功能名词典） | `E:\Zcode_harmony\.dsh-audit\`（**被 gitignore**，已列入收工清理范围） | **清理后"查某个具体 `file:line` 证据的原始出处"将不可得**——主要结论与关键行号已进 `docs/12` 与本节。**临时任务书 `14` 依赖的东西不在这里** |
+| `.dsh-audit/`（本轮全部工作产物）：13 份分区原始审计报告（逐成员调用方分类表）、6 份功能域详情、逐符号活/死判定清单（`BATCH4-INVENTORY-4b.md` / `-4c-phaseB.md`，742 行）、50 KB 执行流水、9 份批次任务书、阶段守则（死代码分类体系、证据标准、跨语言核查清单、功能名词典） | `E:\Zcode_harmony\.dsh-audit\`（**被 gitignore**，**本轮保留、未删**——是否清掉交由后续新对话决定） | **现在仍可查某个具体 `file:line` 证据的原始出处**；主要结论与关键行号也已进 `docs/12` 与本节。其中 13 份分区报告与 6 份功能域详情**已另迁一份**到 `docs/android-shell/`（逐字校验过），所以即便将来清掉该目录，那两层仍在 |
 | 两处真机回归的完整日志 | 设备 `/sdcard/Android/data/com.zcode.remote/files/logs/`（另有 `.1` 轮转） | 仍在设备上；⚠️ **512 KB 轮转**，要留就得先导出 |
 | 签名材料（丢了就无法给老版本做覆盖安装） | `android-shell/scratch/*.p12` / `keystore-password.txt` / `keystore-base64.txt` | 见本文「签名密钥」一节与「交接清单」——**务必备份** |
 | 厂商文档快照 | `android-shell/docs/`（124 MB）、`android-shell/ColorOS_docs/`（87 MB） | 手动拷贝，清单见本文开头「参考库与离线资料索引」 |
