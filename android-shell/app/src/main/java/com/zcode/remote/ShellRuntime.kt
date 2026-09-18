@@ -11,6 +11,7 @@ import com.zcode.remote.core.CompletionEvent
 import com.zcode.remote.core.Diagnostics
 import com.zcode.remote.core.NotifyState
 import com.zcode.remote.core.Prefs
+import com.zcode.remote.core.PreviewSettle
 import com.zcode.remote.core.RelayCreds
 import com.zcode.remote.core.RelayWire
 import com.zcode.remote.core.SurvivalVerdict
@@ -343,18 +344,45 @@ object ShellRuntime {
         }
     }
 
-    private fun pushLivePreview(key: String, sessionId: String, text: String) {
-        val epoch = liveEpoch
-        mainHandler.post {
-            if (epoch != liveEpoch || !userIsAway() || !livePolling) return@post
+    /**
+     * 正文推送的**静默窗**（2026-09-18 真机 bug）：agent 的正文是**分块**到达的，
+     * 现场是 `活进展 …：第五百三十`（半截词）先上了卡片、46ms 后才补成
+     * `第五百三十四次回复，时间09:56:36`；而通知更新本身有 900ms 节流
+     * （[ONGOING_THROTTLE_MS]），于是那半截词在卡片上停了将近一秒——用户看到的就是
+     * "顿号之后停一下才出来"。所以推送前先等这份文本安静 [PreviewSettle.SETTLE_MS]，
+     * 连续流式输出时最多拖 [PreviewSettle.MAX_WAIT_MS]（卡片仍然跟手）。
+     */
+    private val previewPending = HashMap<String, Runnable>()
+    private val previewPublishedAt = HashMap<String, Long>()
+
+    private fun schedulePreview(
+        key: String,
+        sessionId: String,
+        text: String,
+        tag: String,
+        allowed: () -> Boolean,
+    ) {
+        val id = "$key|$sessionId"
+        previewPending.remove(id)?.let { mainHandler.removeCallbacks(it) }
+        val runnable = Runnable {
+            previewPending.remove(id)
+            if (!allowed()) return@Runnable
+            previewPublishedAt[id] = SystemClock.elapsedRealtime()
             val update = store.applyLivePreview(key, sessionId, text)
             if (update.running.isNotEmpty()) {
-                Diagnostics.log(
-                    "debug",
-                    "活进展 $key：${text.replace('\n', ' ').take(60)}",
-                )
+                Diagnostics.log("debug", "$tag $key：${text.replace('\n', ' ').take(60)}")
                 applyUpdate(update)
             }
+        }
+        previewPending[id] = runnable
+        val now = SystemClock.elapsedRealtime()
+        mainHandler.postDelayed(runnable, PreviewSettle.delayFor(previewPublishedAt[id] ?: 0L, now))
+    }
+
+    private fun pushLivePreview(key: String, sessionId: String, text: String) {
+        val epoch = liveEpoch
+        schedulePreview(key, sessionId, text, "活进展") {
+            epoch == liveEpoch && userIsAway() && livePolling
         }
     }
 
@@ -375,11 +403,8 @@ object ShellRuntime {
         }
         val head = RelayWire.progressHeadOf(text)
         if (head.isEmpty()) return
-        val update = store.applyLivePreview(key, sessionId, head)
-        if (update.running.isNotEmpty()) {
-            Diagnostics.log("debug", "页面正文 $key：${head.take(60)}")
-            applyUpdate(update)
-        }
+        // 同一条静默窗：分块到达的正文不该有半截词先上卡片。
+        schedulePreview(key, sessionId, head, "页面正文") { true }
     }
 
     private fun startLiveProgressPolling() {
@@ -443,6 +468,10 @@ object ShellRuntime {
         Tier2Probe.turnStateSink = null
         Tier2Probe.runningSessionsProvider = null
         mainHandler.removeCallbacks(liveProgressPoller)
+        // 静默窗里挂着的待推正文一并丢掉：交还之后它们不该再落到卡片上。
+        for (pending in previewPending.values) mainHandler.removeCallbacks(pending)
+        previewPending.clear()
+        previewPublishedAt.clear()
         store.clearLivePreviews()
     }
 

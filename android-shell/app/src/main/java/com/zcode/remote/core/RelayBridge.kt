@@ -1084,9 +1084,14 @@ class BridgeManager(
 
     private class PendingRelayRequest(val latch: CountDownLatch, @Volatile var reply: JSONObject? = null)
 
+    /** 当前已开桥（已覆盖）的工作区键——覆盖刷新用它算"还缺哪几座"。 */
+    fun coveredKeys(): Set<String> = bridges.keys.toSet()
+
+    /** 还能再开几座桥：别让定时补桥把总数顶过 [maxWorkspaces]。 */
+    fun remainingCoverageSlots(): Int = (maxWorkspaces - bridges.size).coerceAtLeast(0)
+
     /** 开始覆盖（跑在专属线程）；[workspaces] 为 desktop 的 workspace 对象列表。 */
-    fun beginCoverage(workspaces: List<JSONObject>) {
-        Thread {
+    fun beginCoverage(workspaces: List<JSONObject>) {        Thread {
             var opened = 0
             for (workspace in workspaces) {
                 if (Thread.currentThread().isInterrupted) return@Thread

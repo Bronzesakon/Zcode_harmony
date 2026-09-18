@@ -83,6 +83,12 @@ object Tier2Probe {
     /** 冷却时长：别每轮重连都去撞同一个必失败的桥。 */
     private const val BRIDGE_FAIL_COOLDOWN_MS = 10 * 60 * 1000L
 
+    /**
+     * 覆盖刷新的周期（[startCoverageRefresh]）：60s 够快（新任务最多一分钟就被覆盖），
+     * 又远慢于 12s 的轮换拍，不会和轮换抢握手。
+     */
+    private const val COVERAGE_REFRESH_MS = 60_000L
+
     @Volatile
     private var phase: Phase = Phase.IDLE
 
@@ -155,6 +161,11 @@ object Tier2Probe {
     /** 页面正在显示的任务（view-state 帧里要用；空串=未知）。 */
     @Volatile
     private var onlyTaskId: String = ""
+
+    /**
+     * 覆盖刷新定时器（见 [startCoverageRefresh]）：承载期间定期补开"新出现的活动工作区"的桥。
+     */
+    private var coverageTimer: java.util.Timer? = null
 
     private var heartbeatTimer: java.util.Timer? = null
     private var reconnectTimer: java.util.Timer? = null
@@ -351,6 +362,7 @@ object Tier2Probe {
         phase = Phase.CLOSED
         durationTimer?.cancel()
         durationTimer = null
+        stopCoverageRefresh()
         heartbeatTimer?.cancel()
         heartbeatTimer = null
         reconnectTimer?.cancel()
@@ -633,10 +645,93 @@ object Tier2Probe {
                 }
                 if (targets.isEmpty()) return@Thread
                 manager.beginCoverage(targets)
+                startCoverageRefresh(manager)
             } catch (e: Exception) {
                 Diagnostics.log("warn", "Tier2: 覆盖启动失败 ${e.message}")
             }
         }.start()
+    }
+
+    /**
+     * 覆盖刷新（2026-09-18 加）：承载期间每 [COVERAGE_REFRESH_MS] 重问一次工作区列表，
+     * 把**新出现的"有活动任务的工作区"**补进覆盖。
+     *
+     * 为什么需要它：页面被顶掉之后，第三条源（页面自己的 controller 流）就停了
+     * （`docs/18` §3.11 B），而发现链只在**配对那一刻**跑一次（`bootstrap-response` +
+     * `workspace-list-response`）。于是承载期间你在**没被覆盖的工作区**里新起任务，
+     * 壳是不知道的——卡片不会出现，直到下一次接管重来一遍。真机把这个边界诊断出来之后
+     * 用户拍板补上（`docs/18` §3.11 F 第 1 条）。
+     *
+     * 三条纪律：① 只**补**不拆（覆盖一旦建立就交给轮换去管），② 受**失败冷却**约束
+     * （同一座桥连续被拒就别每 60s 再撞一次），③ 受**总上限**约束
+     * （[BridgeManager.remainingCoverageSlots]，别让定时刷新把桥数顶过 5）。
+     */
+    private fun startCoverageRefresh(manager: BridgeManager) {
+        stopCoverageRefresh()
+        val timer = java.util.Timer("tier2-coverage-refresh", true)
+        coverageTimer = timer
+        timer.schedule(
+            object : java.util.TimerTask() {
+                override fun run() {
+                    if (stopping || phase == Phase.CLOSED || bridgeManager !== manager) return
+                    try {
+                        val workspaces = manager.listWorkspacesBlocking()
+                        if (stopping || phase == Phase.CLOSED || bridgeManager !== manager) return
+                        val covered = manager.coveredKeys()
+                        val discovered = manager.discoveredActiveWorkspaces
+                        val missing = discovered
+                            .filter { it.isNotEmpty() && it !in covered && !cooledDown(it) }
+                        // 每拍一行 debug：这条机制在"没有缺口"时是完全静默的，
+                        // 而"它到底有没有在跑"必须能从日志里回答（60s 一行，不吵）。
+                        Diagnostics.log(
+                            "debug",
+                            "Tier2: 覆盖刷新：已覆盖 ${covered.size} 座 · 发现链 ${discovered.size} 座 · " +
+                                "待补 ${missing.size} 座",
+                        )
+                        if (missing.isEmpty()) return
+                        val slots = manager.remainingCoverageSlots()
+                        if (slots <= 0) {
+                            Diagnostics.log(
+                                "debug",
+                                "Tier2: 覆盖刷新——${missing.size} 座有活动任务的工作区没被覆盖，" +
+                                    "但桥数已到上限 $DEFAULT_MAX_COVERAGE",
+                            )
+                            return
+                        }
+                        val byKey = HashMap<String, JSONObject>()
+                        for (workspace in workspaces) {
+                            val key = workspaceKeyOf(workspace) ?: continue
+                            byKey[key] = workspace
+                        }
+                        val targets = missing.mapNotNull { byKey[it] }.take(slots)
+                        if (targets.isEmpty()) {
+                            Diagnostics.log(
+                                "info",
+                                "Tier2: 覆盖刷新——发现 ${missing.size} 座有活动任务的工作区" +
+                                    "（${missing.joinToString()}），但桌面端列表里没有可用项",
+                            )
+                            return
+                        }
+                        Diagnostics.log(
+                            "info",
+                            "Tier2: 覆盖刷新——新发现 ${targets.size} 座有活动任务的工作区，" +
+                                "补开桥（已覆盖 ${covered.size} 座 · 上限 $DEFAULT_MAX_COVERAGE）：" +
+                                targets.mapNotNull { workspaceKeyOf(it) }.joinToString(),
+                        )
+                        manager.beginCoverage(targets)
+                    } catch (e: Exception) {
+                        Diagnostics.log("debug", "Tier2: 覆盖刷新失败 ${e.message}")
+                    }
+                }
+            },
+            COVERAGE_REFRESH_MS,
+            COVERAGE_REFRESH_MS,
+        )
+    }
+
+    private fun stopCoverageRefresh() {
+        coverageTimer?.cancel()
+        coverageTimer = null
     }
 
     /** 该工作区是否在"连续开桥失败"的冷却里（冷却到期自动解除）。 */
