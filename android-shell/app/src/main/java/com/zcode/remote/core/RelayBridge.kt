@@ -1084,18 +1084,36 @@ class BridgeManager(
 
     private class PendingRelayRequest(val latch: CountDownLatch, @Volatile var reply: JSONObject? = null)
 
-    /** 当前已开桥（已覆盖）的工作区键——覆盖刷新用它算"还缺哪几座"。 */
-    fun coveredKeys(): Set<String> = bridges.keys.toSet()
+    /**
+     * 当前**在册**的工作区键：已开桥的 ∪ **正在回收重开**的（[recycleInFlight]）。
+     *
+     * 后者在 `bridges` 里会短暂缺席（回收是"先摘除、关旧、再开新"），但它马上就会回来。
+     * 覆盖刷新绝不能把这个窗口当成缺口——真机 2026-09-18 10:11:05 正是这样：
+     * 轮换 10:11:03 回收 E:\Zcode_harmony，刷新 10:11:05 看到"已覆盖 1 座 · 待补 1 座"，
+     * 于是给同一工作区**又开了一座桥**（紧接着 10:11:18 那座桥 resync 失败）。
+     */
+    fun coveredKeys(): Set<String> = bridges.keys + recycleInFlight
 
-    /** 还能再开几座桥：别让定时补桥把总数顶过 [maxWorkspaces]。 */
-    fun remainingCoverageSlots(): Int = (maxWorkspaces - bridges.size).coerceAtLeast(0)
+    /** 还能再开几座桥：别让定时补桥把总数顶过 [maxWorkspaces]（回收中的也算占位）。 */
+    fun remainingCoverageSlots(): Int =
+        (maxWorkspaces - (bridges.keys + recycleInFlight).size).coerceAtLeast(0)
 
     /** 开始覆盖（跑在专属线程）；[workspaces] 为 desktop 的 workspace 对象列表。 */
-    fun beginCoverage(workspaces: List<JSONObject>) {        Thread {
+    fun beginCoverage(workspaces: List<JSONObject>) {
+        Thread {
             var opened = 0
             for (workspace in workspaces) {
                 if (Thread.currentThread().isInterrupted) return@Thread
                 if (opened >= maxWorkspaces) break
+                // **一个工作区一座桥**：已经有桥（或正在回收重开）就跳过——回收路径自己
+                // 会把它的桥建回来，这里再开一座就是重复连接（真机 10:11 的现场）。
+                val existingKey = workspaceKeyOf(workspace)
+                if (existingKey == null ||
+                    bridges.containsKey(existingKey) ||
+                    recycleInFlight.contains(existingKey)
+                ) {
+                    continue
+                }
                 var bridge: BridgeSession? = null
                 try {
                     // 用非空局部量：闭包里捕获可空 var 会让智能转换失效（K2 直接报错）。
