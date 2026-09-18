@@ -270,6 +270,37 @@ class ControllerTasksStateTest {
         assertEquals(0, store.runningTaskRefs().size)
     }
 
+    @Test
+    fun `the conversation stream keeps the reason the index gave for stopping`() {
+        // 真机 2026-09-18：用户在桌面端点"中断"，卡片却宣布「已完成」。
+        // 会话流只说"停了"（它一律映射成 completedSuccess），所以"停止"这一拍必须保留
+        // SI 给出的终态相位（completedInterrupted / error），否则中断会被降级成完成。
+        val store = TaskStore()
+        store.applyWorkspace(
+            key = "/repo/a", title = "a", path = "/repo/a", identity = "", source = "active",
+            tasks = listOf(snap("sess_a", "running")),
+            nowMs = 1_000L,
+        )
+        store.applyConversationRunState("/repo/a", "sess_a", true, nowMs = 2_000L)
+        // SI 报"用户中断"，随后会话流报"停了"。
+        store.applyWorkspace(
+            key = "/repo/a", title = "a", path = "/repo/a", identity = "", source = "active",
+            tasks = listOf(snap("sess_a", "completedInterrupted")),
+            nowMs = 3_000L,
+        )
+        store.applyConversationRunState("/repo/a", "sess_a", false, nowMs = 4_000L)
+
+        val done = store.flushDueCompletions(4_000L + NotifyState.COMPLETION_HOLD_MS)
+        assertEquals(1, done.completed.size)
+        assertEquals(
+            "中断不能被会话流降级成 completedSuccess",
+            "completedInterrupted",
+            done.completed[0].task.phase,
+        )
+        assertTrue("可听记录也要按「已结束」而不是「完成」措辞", done.completed[0].failed)
+        assertEquals(TaskStatus.INTERRUPTED, NotifyState.finishedStatusOf(done.completed[0].task.phase))
+    }
+
     private fun snap(sessionId: String, phase: String) = TaskSnapshot(
         sessionId = sessionId,
         title = "任务一",

@@ -5,11 +5,12 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * Tests for the promoted-notification (流体云) slot allocation.
+ * Tests for the fluid-cloud (Live Updates) slot allocation.
  *
- * The rule that matters is priority: a task waiting on the user must win a slot
- * over a merely-running one, because that is the case the fluid cloud is
- * genuinely for. Everything else is recency.
+ * 2026-09-18 起**没有"总共几张"的上限**：在跑的任务有几个就提升几个。这里曾经是 2，
+ * 依据"ColorOS 只并发提升 2 张流体云卡"——被用户现场推翻（三个任务同时跑时手机三张卡同时
+ * 显示、`dumpsys notification` 里三条 `PROMOTED_ONGOING`，而当时我们只请求了 2 个）。
+ * 界限只加在"留到用户清掉"的完成卡上。
  */
 class PromotionPolicyTest {
 
@@ -46,21 +47,10 @@ class PromotionPolicyTest {
     }
 
     @Test
-    fun `the most recently active running task gets the slot`() {
-        val chosen = PromotionPolicy.choose(
-            listOf(running(1, false, 10), running(2, false, 30), running(3, false, 20)),
-            max = 1,
-        )
-        assertEquals(setOf(2), chosen)
-    }
-
-    @Test
-    fun `a task waiting for the user outranks a fresher running one`() {
-        val chosen = PromotionPolicy.choose(
-            listOf(running(1, false, 999), running(2, true, 1)),
-            max = 1,
-        )
-        assertEquals(setOf(2), chosen)
+    fun `every running task gets a card, however many there are`() {
+        // 用户 2026-09-18 的现场：三个任务同时在跑，就该有三张卡。
+        val many = (1..6).map { running(it, false, it.toLong()) }
+        assertEquals(setOf(1, 2, 3, 4, 5, 6), PromotionPolicy.choose(many))
     }
 
     @Test
@@ -72,36 +62,23 @@ class PromotionPolicyTest {
                 running(3, true, 50),
                 running(4, false, 90),
             ),
-            max = 3,
         )
-        assertEquals(listOf(3, 2, 1), chosen.toList())
+        assertEquals(listOf(3, 2, 1, 4), chosen.toList())
     }
 
     @Test
-    fun `the cap is respected and never zero-length when tasks exist`() {
-        val many = (1..6).map { running(it, false, it.toLong()) }
-        assertEquals(PromotionPolicy.MAX_PROMOTED, PromotionPolicy.choose(many).size)
-        assertEquals(setOf(6, 5), PromotionPolicy.choose(many))
-    }
-
-    @Test
-    fun `a non-positive cap promotes nothing rather than everything`() {
-        val tasks = listOf(running(1, true, 1))
-        assertTrue(PromotionPolicy.choose(tasks, max = 0).isEmpty())
-        assertTrue(PromotionPolicy.choose(tasks, max = -3).isEmpty())
-    }
-
-    @Test
-    fun `asking for more slots than tasks returns all of them`() {
-        val tasks = listOf(running(1, false, 1), running(2, false, 2))
-        assertEquals(setOf(1, 2), PromotionPolicy.choose(tasks, max = 10))
+    fun `a task waiting for the user comes first`() {
+        val chosen = PromotionPolicy.choose(
+            listOf(running(1, false, 999), running(2, true, 1)),
+        )
+        assertEquals(listOf(2, 1), chosen.toList())
     }
 
     // ------------------------------------------------------------- finished cards
 
     @Test
-    fun `a finished card may hold a slot when nothing else needs it`() {
-        // 2026-09-17：任务结束后那张卡原地变「已完成」并留着（用户拍板），所以它也要抢位。
+    fun `a finished card keeps a card when nothing else needs the slot`() {
+        // 2026-09-17：任务结束后那张卡原地变「已完成」并留着（用户拍板），所以它也要占位。
         val chosen = PromotionPolicy.choose(
             running = emptyList(),
             finished = listOf(PromotionPolicy.Finished(7, completedAt = 100)),
@@ -110,35 +87,42 @@ class PromotionPolicyTest {
     }
 
     @Test
-    fun `a finished card never keeps a running task off the strip`() {
+    fun `finished cards never displace a running task`() {
         val chosen = PromotionPolicy.choose(
-            running = listOf(running(1, false, 5)),
-            finished = listOf(PromotionPolicy.Finished(7, completedAt = 999)),
-            max = 1,
+            running = listOf(running(1, false, 5), running(2, false, 6)),
+            finished = (11..15).map { PromotionPolicy.Finished(it, completedAt = it.toLong()) },
         )
-        assertEquals("在跑的任务优先，哪怕完成卡更新", setOf(1), chosen)
+        assertTrue("在跑的任务一个都不能被顶掉", chosen.containsAll(listOf(1, 2)))
+        // 在跑的按最近活动降序（id 2 的活动时间更近），之后才是最新的完成卡。
+        assertEquals(listOf(2, 1, 15, 14, 13), chosen.toList())
     }
 
     @Test
-    fun `finished cards fill the leftover slots, newest first`() {
+    fun `only the newest finished cards are kept`() {
         val chosen = PromotionPolicy.choose(
-            running = listOf(running(1, false, 5)),
+            running = emptyList(),
             finished = listOf(
                 PromotionPolicy.Finished(7, completedAt = 100),
-                PromotionPolicy.Finished(8, completedAt = 300),
-                PromotionPolicy.Finished(9, completedAt = 200),
+                PromotionPolicy.Finished(8, completedAt = 500),
+                PromotionPolicy.Finished(9, completedAt = 300),
+                PromotionPolicy.Finished(10, completedAt = 200),
+                PromotionPolicy.Finished(11, completedAt = 400),
             ),
         )
-        assertEquals(listOf(1, 8), chosen.toList())
+        assertEquals(
+            "只留最新 ${PromotionPolicy.MAX_FINISHED_PROMOTED} 张（别的降级成可滑除通知，不消失）",
+            listOf(8, 11, 9),
+            chosen.toList(),
+        )
     }
 
     @Test
-    fun `a user-waiting card still wins over everything`() {
+    fun `a zero finished cap promotes no finished card`() {
         val chosen = PromotionPolicy.choose(
-            running = listOf(running(1, false, 9_999), running(2, true, 1)),
-            finished = listOf(PromotionPolicy.Finished(7, completedAt = 9_999)),
-            max = 2,
+            running = listOf(running(1, false, 1)),
+            finished = listOf(PromotionPolicy.Finished(7, completedAt = 999)),
+            maxFinished = 0,
         )
-        assertEquals(listOf(2, 1), chosen.toList())
+        assertEquals(setOf(1), chosen)
     }
 }

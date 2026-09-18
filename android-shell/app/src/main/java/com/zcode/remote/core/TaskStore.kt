@@ -313,7 +313,9 @@ class TaskStore {
         val siAt = siPhasesAt[id] ?: -1L
         // SI 的相位在 base（persistedTasks）里，所以"返回 null"就是"用 SI"。
         if (liveAt < 0L && convAt < 0L) return null
-        if (siAt >= liveAt && siAt >= convAt) return null
+        // **SI 只在严格更新时说了算**：同一毫秒内两条源都报到（单测里极常见，真机也可能）
+        // 时让位给更具体的活跃源——覆盖层存在的理由正是"SI 的相位是持久态"。
+        if (siAt > liveAt && siAt > convAt) return null
         return if (liveAt >= convAt) live else conv
     }
 
@@ -328,7 +330,18 @@ class TaskStore {
         nowMs: Long = System.currentTimeMillis(),
     ): Update {
         val id = LivePreviewKey(workspaceKey, sessionId)
-        val phase = if (running) "running" else "completedSuccess"
+        // 会话流只说"停了"，**不说"怎么停的"**：`turnHeader.state` 的结束既可能是正常完成，
+        // 也可能是用户中断 / 失败。所以"停止"这一拍要**保留 SI 已经给出的终态相位**
+        // （`completedInterrupted` / `error`…），否则中断会被写成「已完成」——
+        // 真机 2026-09-18 用户当场指出：他点的"中断"，卡片却宣布"已完成"。
+        val phase = if (running) {
+            "running"
+        } else {
+            val siPhase = persistedTasks[workspaceKey]
+                ?.firstOrNull { it.sessionId == sessionId }
+                ?.phase
+            if (siPhase != null && siPhase in NotifyState.TERMINAL_PHASES) siPhase else "completedSuccess"
+        }
         // 时刻先盖：**相位没变也是一次"这条源还在说话"的报到**。少了这一句，一条仍在
         // 流动的会话流会被一份后来到达、但内容更旧的持久态报告盖掉。
         conversationPhasesAt[id] = nowMs

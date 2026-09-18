@@ -54,6 +54,8 @@ class Notifier(private val context: Context) {
         val locateTitle: String,
         val title: String,
         val body: String,
+        /** 收尾状态词（已完成／已中断／已失败）——标题与芯片文案都用它。 */
+        val status: TaskStatus,
         val completedAt: Long,
         /** 是否正占着提升位（决定 ongoing：被提升的平台要求必须是 ongoing）。 */
         val promoted: Boolean = false,
@@ -210,16 +212,21 @@ class Notifier(private val context: Context) {
         //    （"只刷新现存卡片，不重建"，2026-09-17 拍板）。
         for (event in update.completed) {
             val id = NotifyState.notificationIdFor(event.workspaceKey, event.task.sessionId)
+            // 收尾状态词按**终态相位**分辨：正常完成 / 用户中断 / 失败（2026-09-18）。
+            // 曾经一律写「已完成」——用户在桌面端点"中断"，卡片却宣布"已完成"。
+            val status = NotifyState.finishedStatusOf(event.task.phase)
             finishedCards[id] = FinishedCard(
                 workspaceKey = event.workspaceKey,
                 sessionId = event.task.sessionId,
                 locateTitle = event.task.displayTitle,
-                title = NotifyState.formatTitle(TaskStatus.COMPLETED.label, event.task.displayTitle),
+                title = NotifyState.formatTitle(status.label, event.task.displayTitle),
                 body = NotifyState.formatBody(event.finalPreview, workspaceNameOf(event.workspaceKey)),
+                status = status,
                 completedAt = now,
             )
             Diagnostics.info(
-                "完成卡原地改状态 id=$id（${event.task.displayTitle}）——不撤卡、不换 id",
+                "完成卡原地改状态 id=$id（${status.label} · ${event.task.displayTitle} · " +
+                    "相位 ${event.task.phase}）——不撤卡、不换 id",
             )
         }
         val cancelled = ArrayList<Int>()
@@ -399,7 +406,7 @@ class Notifier(private val context: Context) {
             .setSilent(true)
             .addAction(0, context.getString(R.string.card_dismiss), dismissIntent(id))
             .addExtras(finishedCardExtras())
-        if (card.promoted) LiveUpdate.requestPromotion(builder, TaskStatus.COMPLETED.label)
+        if (card.promoted) LiveUpdate.requestPromotion(builder, card.status.label)
         try {
             manager.notify(id, builder.build())
         } catch (e: SecurityException) {

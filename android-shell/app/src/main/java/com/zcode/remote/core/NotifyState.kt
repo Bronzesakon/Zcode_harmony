@@ -26,16 +26,24 @@ data class TaskSnapshot(
  * The status words the shell can show.
  *
  * [RUNNING] / [WAITING] are the two a *live* task is allowed to carry (D9 — a
- * third live state was considered and rejected). [COMPLETED] is not a third live
- * state: it is the state the **same** card moves to once the task has been stopped
- * for [NotifyState.COMPLETION_HOLD_MS] (D15 as revised on 2026-09-17 — it used to
- * be a second, separate card id, which is what made the card blink). [statusOf]
- * never returns it, which is what keeps the D9 rule intact.
+ * third live state was considered and rejected). The other three are **finished**
+ * states, used only by the card that is kept after a task stops: [COMPLETED],
+ * [INTERRUPTED] (the user stopped it) and [FAILED]. [statusOf] never returns any of
+ * them, which is what keeps the D9 rule intact.
+ *
+ * 2026-09-18：这三个词之前是**一个**「已完成」——用户点了"中断"，卡片却宣布"已完成"。
+ * 现在按终态相位分辨（[finishedStatusOf]）。
  */
 enum class TaskStatus(val label: String) {
     RUNNING("运行中"),
     WAITING("等待确认"),
     COMPLETED("已完成"),
+
+    /** 用户主动中断／取消（`completedInterrupted` / `cancelled`）。 */
+    INTERRUPTED("已中断"),
+
+    /** 失败（`failed` / `error`）。 */
+    FAILED("已失败"),
 }
 
 /**
@@ -248,6 +256,19 @@ class NotifyState {
 
         /** Terminal phases that read better as a failure than a success. */
         val FAILED_PHASES = setOf("failed", "error", "cancelled", "completedInterrupted")
+
+        /**
+         * 终态相位 → 卡片上的收尾状态词（2026-09-18）。
+         *
+         * 为什么需要：完成卡曾经**一律**写「已完成」——用户在桌面端点"中断"，卡片却宣布
+         * "已完成"（用户当场指出）。三种收尾要分清：正常完成 / **用户中断** / 失败。
+         * 未知终态按"已完成"处理（宁可说完成，也不无端指控失败）。
+         */
+        fun finishedStatusOf(phase: String): TaskStatus = when (phase) {
+            "completedInterrupted", "cancelled" -> TaskStatus.INTERRUPTED
+            "failed", "error" -> TaskStatus.FAILED
+            else -> TaskStatus.COMPLETED
+        }
 
         /**
          * The notification title: `状态 · 任务名`.

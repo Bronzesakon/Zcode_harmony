@@ -216,6 +216,10 @@ object ShellRuntime {
             appIsForeground = true
             // 回前台清掉"提前接管候选"：下一次退后台重新从头观察（避免拿上一轮的计时直接动手）。
             earlyTakeoverSince = 0L
+            // socket 指纹基线也清掉：下一次退后台的第一拍**重新采基线**，不许把"页面在前台
+            // 期间开的 socket"当成"刚刚在重拨"（那会白等 20s，见 maybeStartNativeCarrier）。
+            lastSocketMarkForStall = -1L
+            lastSocketChangeAt = 0L
             evaluateJs("window.__zcodeShellSetAppForeground && window.__zcodeShellSetAppForeground(true);")
             // 成功；重连后 runtime 已死，由卡死看门狗的僵尸档走刷新恢复。
             if (Tier2Probe.isRunning()) {
@@ -515,6 +519,13 @@ object ShellRuntime {
      */
     private const val PUMP_INTERVAL_MS = 10_000L
 
+    /**
+     * 退后台之后的**首拍**延迟（2026-09-18）。它只做两件事：给 socket 指纹采基线、
+     * 判断要不要提前接管。等满一个整拍只会让卡片的正文晚 10s 出现（用户："后台冒出来的
+     * 流体云都得等 20s 体感"）。3s 足够让可见性切换稳定下来，又比 10s 快得多。
+     */
+    private const val PUMP_FIRST_TICK_MS = 3_000L
+
     /** Every Nth dispatch is logged; the first one always is. */
     private const val PUMP_LOG_EVERY = 20
 
@@ -553,10 +564,12 @@ object ShellRuntime {
         heartbeatPumpRunning = true
         mainHandler.removeCallbacks(pumpRunnable)
         pumpDispatches = 0
-        mainHandler.postDelayed(pumpRunnable, PUMP_INTERVAL_MS)
+        // **第一拍早一点**（2026-09-18）：退后台之后要不要接管，用户最直观的感受就是
+        // "卡片多久才有正文"。等满一个 10s 拍纯属浪费（第一拍本来就是采基线 + 判候选）。
+        mainHandler.postDelayed(pumpRunnable, PUMP_FIRST_TICK_MS)
         Diagnostics.log(
             "debug",
-            "后台心跳泵已启动（每 ${PUMP_INTERVAL_MS / 1000}s 驱动一次注入层心跳）",
+            "后台心跳泵已启动（首拍 ${PUMP_FIRST_TICK_MS / 1000}s，之后每 ${PUMP_INTERVAL_MS / 1000}s）",
         )
     }
 
@@ -837,10 +850,16 @@ object ShellRuntime {
         // 因为新 socket 还没收到第一帧），承载于是误判"链路已死"并接管——**把刚恢复的页面 KICK 了**
         // （日志：`页面连接被顶掉（relay 返回 KICKED，应用在后台）`）。
         // 判据：socket 生命周期计数在静默期内变过 ⇒ 页面在自救，等它；要求"最近 20s 没动过 socket"。
+        //
+        // ⚠️ **第一次观测只是基线**（2026-09-18 用户报"后台冒出卡片要等 20s 体感"）：
+        // 页面在**前台**期间开的那些 socket，在下一次退后台的第一拍才会被我们第一次看到；
+        // 旧写法把它当成"刚动过 socket"⇒ 白等 20s。真机实测：09:27:58 HOME → 09:28:28 才出候选
+        // （20s 守卫 + 10s 首拍），而页面那一刻根本没在重拨。所以 -1（未知）时只记基线、不开窗；
+        // 回前台时把基线清掉，下一次退后台重新采一次。
         val socketMark = nudgeMark()
         if (socketMark != lastSocketMarkForStall) {
+            if (lastSocketMarkForStall != -1L) lastSocketChangeAt = now
             lastSocketMarkForStall = socketMark
-            lastSocketChangeAt = now
         }
         val sinceSocketChange = now - lastSocketChangeAt
         if (sinceSocketChange < CARRIER_REQUIET_AFTER_SOCKET_MS) {
@@ -918,17 +937,22 @@ object ShellRuntime {
                 earlyTakeoverSince = 0L
                 return
             }
-            if (earlyTakeoverSince == 0L) {
-                earlyTakeoverSince = now
-                Diagnostics.log(
-                    "info",
-                    "后台原生承载：候选提前接管（页面最近 " + convAgoText(convAgo) +
-                        " 收到会话帧 · ${runningRefs.size} 个在跑任务），" +
-                        "观察 ${EARLY_TAKEOVER_DEBOUNCE_MS / 1000}s 后动手",
-                )
-                return
+            // **从来没收到过会话帧（−1）＝ 这个页面生命周期内压根没在看任何任务**：
+            // 观察窗是为了避开"用户正在切页面"的瞬态，而"从没看过"不存在这种瞬态，
+            // 白等 10s 只会让卡片多空 10s（用户 2026-09-18 的"体感 20s"里有这 10s）。
+            if (convAgo >= 0) {
+                if (earlyTakeoverSince == 0L) {
+                    earlyTakeoverSince = now
+                    Diagnostics.log(
+                        "info",
+                        "后台原生承载：候选提前接管（页面最近 " + convAgoText(convAgo) +
+                            " 收到会话帧 · ${runningRefs.size} 个在跑任务），" +
+                            "观察 ${EARLY_TAKEOVER_DEBOUNCE_MS / 1000}s 后动手",
+                    )
+                    return
+                }
+                if (now - earlyTakeoverSince < EARLY_TAKEOVER_DEBOUNCE_MS) return
             }
-            if (now - earlyTakeoverSince < EARLY_TAKEOVER_DEBOUNCE_MS) return
             Diagnostics.log(
                 "warn",
                 "后台原生承载：**提前接管**——页面活着但最近 " + convAgoText(convAgo) +

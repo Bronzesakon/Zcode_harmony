@@ -193,8 +193,26 @@ class NotifyStateTest {
         assertEquals("ws-2", update.completed[0].workspaceKey)
     }
 
-    // ---------------------------------------------------------------- attention
+    @Test
+    fun `the finished card's status word follows the terminal phase`() {
+        // 2026-09-18 用户现场：在桌面端点"中断"，卡片却宣布「已完成」。三种收尾必须分清。
+        assertEquals(TaskStatus.COMPLETED, NotifyState.finishedStatusOf("completedSuccess"))
+        assertEquals(TaskStatus.COMPLETED, NotifyState.finishedStatusOf("completed"))
+        assertEquals(TaskStatus.INTERRUPTED, NotifyState.finishedStatusOf("completedInterrupted"))
+        assertEquals(TaskStatus.INTERRUPTED, NotifyState.finishedStatusOf("cancelled"))
+        assertEquals(TaskStatus.FAILED, NotifyState.finishedStatusOf("failed"))
+        assertEquals(TaskStatus.FAILED, NotifyState.finishedStatusOf("error"))
+        // 每个终态都得有词，而且**绝不能**复用"运行中/等待确认"这两个 live 词（D9）。
+        for (phase in NotifyState.TERMINAL_PHASES) {
+            val status = NotifyState.finishedStatusOf(phase)
+            assertNotEquals(TaskStatus.RUNNING, status)
+            assertNotEquals(TaskStatus.WAITING, status)
+        }
+        // 未知相位按"已完成"兜底（宁可说完成，也不无端指控失败）。
+        assertEquals(TaskStatus.COMPLETED, NotifyState.finishedStatusOf("someFutureTerminalPhase"))
+    }
 
+    // ---------------------------------------------------------------- attention
     @Test
     fun `a pending interaction is announced once`() {
         val state = NotifyState()
