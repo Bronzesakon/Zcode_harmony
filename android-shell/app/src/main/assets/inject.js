@@ -788,21 +788,20 @@
             log: function (message) {
                 diag('debug', message);
             },
-            // 原生给的"在跑会话"种子（工作区 → 会话 id）：开桥时要先订哪几条对话用它。
-            // 它**活过页面重载**，而 JS 侧自己攒的清单活不过——详见
-            // zcode-protocol.js 的 _conversationCandidates 与 WebAppBridge.config 的注释。
-            nativeRunningSessions: cfg.runningSessions || {},
-            // 但**光有创建时的快照不够**：`config()` 是同步 JS 接口，而原生 TaskStore 是
-            // 随索引帧长起来的——刚重装/重启后创建 client 时它还是空的（真机 2026-09-15：
-            // 一直报"0 个工作区"）。所以开桥那一刻**再问一次**，这才是真正新鲜的种子。
-            nativeRunningSessionsProvider: function () {
-                try {
-                    var fresh = config();
-                    return fresh && fresh.runningSessions ? fresh.runningSessions : {};
-                } catch (e) {
-                    return {};
-                }
-            },
+            // 4c-B 后删（2026-09-18）：这里原来还有两个客户机选项——`nativeRunningSessions`
+            // 与 `nativeRunningSessionsProvider`（把"原生给的**在跑会话**种子"交给协议层，
+            // 供开桥时先订哪几条对话）。**它们唯一的消费者是"对话自订阅簇"，而那一簇已随桥路由
+            // 子系统一起删除**（`zcode-protocol.js` 里 `runningSessions` **零命中**：那层只逐个读
+            // `options.send` / `options.log` / `options.maxWorkspaces` …，没有泛化转存）
+            // ⟹ 两个选项成了**只写不读的孤儿**，故删除。
+            //
+            // ⚠️ **删的只是这两个"选项"，不是那条接线自证**：上面那行
+            // `原生运行集种子：N 个工作区` 读的是 `cfg.runningSessions`（原生
+            // `WebAppBridge.config()` 的播种载荷），**与这两个选项无关**，所以它照旧工作。
+            // 那才是"**空数组也要给**"（2026-09-15 教训：否则"0 个在跑的任务"与"接线断了"
+            // 无法区分）要保的东西。
+            // ⚠️ 原生侧那条"**原生→原生**"的 `runningSessionsProvider` 链是**另一股数据流**
+            // （承重：对话订阅必须抢在索引订阅之前 + "有在跑任务的工作区排最前"），也不受影响。
             sharedState: pageCoverage
         });
         next.gen = ++clientGenSeq;
