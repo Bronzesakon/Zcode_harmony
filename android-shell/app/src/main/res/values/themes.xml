@@ -1,16 +1,34 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- DayNight so the WebView's own dark styling and the system chrome agree. -->
-    <style name="Theme.ZcodeRemote" parent="Theme.Material3.DayNight.NoActionBar">
-        <item name="colorPrimary">@color/brand_primary</item>
-        <item name="android:windowBackground">@color/brand_background</item>
-        <item name="android:statusBarColor">@color/brand_background</item>
-        <item name="android:navigationBarColor">@color/brand_background</item>
-    </style>
+    <!-- Material 3 DayNight, unmodified on purpose.
 
-    <!-- Shown while the process starts, before the WebView has anything to
-         paint: a flat background avoids a white/black flash. -->
-    <style name="Theme.ZcodeRemote.Splash" parent="Theme.ZcodeRemote">
-        <item name="android:windowBackground">@color/brand_background</item>
+         No colour roles are overridden here any more: the Material 3 baseline
+         scheme is a complete, contrast-checked light/dark pair, and overriding a
+         single role (as this file used to, with a fixed brand blue) breaks the
+         pair — a light-tone primary is unreadable on a dark-tone surface. On
+         Android 12+ the whole scheme is replaced at runtime by the system's
+         dynamic palette anyway (ZcodeRemoteApp calls DynamicColors), so anything
+         pinned here would only affect older devices, inconsistently.
+
+         statusBarColor / navigationBarColor are absent by design: edge-to-edge
+         (enforced from targetSdk 35) ignores them, and the insets are handled in
+         core/WindowInsets.kt. -->
+    <style name="Theme.ZcodeRemote" parent="Theme.Material3.DayNight.NoActionBar" />
+
+    <!-- 设置页专用：把 Material 控件真正取色的那几个 M3 角色换成 MiuiX 的值。
+
+         `MaterialSwitch` 取的是 colorPrimary / colorOnPrimary /
+         colorSurfaceContainerHighest / colorOutline 这些**角色**，而不是页面里那些显式的
+         @color/miuix_*。不覆盖的话同一页会出现两套蓝：页面是 MiuiX 的 #3482FF，开关却是
+         Android 12+ 从壁纸派生的动态色。覆盖角色比逐个控件染色稳——该 Activity 里任何 M3
+         控件（含以后新增的）都会自动跟着走。
+
+         **光写这里不够**：动态配色是以 ThemeOverlay 套在主题之上的，优先级更高，所以
+         `ZcodeRemoteApp` 里把 SettingsActivity 从动态配色中排除了（见那里的注释）。两处缺一不可。 -->
+    <style name="Theme.ZcodeRemote.Miuix" parent="Theme.ZcodeRemote">
+        <item name="colorPrimary">@color/miuix_primary</item>
+        <item name="colorOnPrimary">@color/miuix_on_primary</item>
+        <item name="colorSurfaceContainerHighest">@color/miuix_secondary</item>
+        <item name="colorOutline">@color/miuix_outline</item>
     </style>
 </resources>

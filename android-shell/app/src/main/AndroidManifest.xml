@@ -5,8 +5,18 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
+    <!-- 后台承载期间持 PARTIAL_WAKE_LOCK：前台服务只保证进程活着，不保证 CPU 醒着；
+         熄屏后 CPU 一睡，原生心跳与上游帧读取都会停（docs/15 §7.1 的官方基线里有这一条）。 -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
     <!-- QR scanning -->
     <uses-permission android:name="android.permission.CAMERA" />
+
+    <!-- Android 16 Live Updates (ColorOS 16 流体云). A normal, non-runtime
+         permission: declaring it is what makes the app eligible at all. The
+         actual promotion is opt-in per notification (see notify/LiveUpdate.kt)
+         and the user can still switch it off in Settings. -->
+    <uses-permission android:name="android.permission.POST_PROMOTED_NOTIFICATIONS" />
 
     <!-- Android 13+ runtime permission for the task notifications -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
@@ -53,6 +63,13 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+
+            <!-- The launcher long-press menu (重新扫码 / 打开设置). Static, so it
+                 exists before the app has ever run, and it must be declared on
+                 the MAIN/LAUNCHER activity. -->
+            <meta-data
+                android:name="android.app.shortcuts"
+                android:resource="@xml/shortcuts" />
         </activity>
 
         <activity
@@ -60,7 +77,7 @@
             android:exported="false"
             android:label="@string/settings_title"
             android:parentActivityName=".MainActivity"
-            android:theme="@style/Theme.ZcodeRemote" />
+            android:theme="@style/Theme.ZcodeRemote.Miuix" />
 
         <!-- Keeps the process (and therefore the WebView + its relay socket)
              alive while backgrounded, and owns the ongoing "running tasks"
@@ -74,6 +91,31 @@
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="维持在后台与用户自有桌面设备的远程控制长连接,以便持续接收任务状态并发送通知" />
         </service>
+
+        <!-- adb 可**后台**调用的诊断入口。存在的理由：诊断指令原本只挂在
+             MainActivity 的 intent 上，而 am start 会把退到后台的应用拉回前台
+             ——可见性一变，要测的后台现场就毁了。广播不碰 Activity 生命周期。
+             只接受 shell(2000)/root(0) 发来的广播（见 DiagReceiver）。
+             用法见 README「诊断指令全集」：am broadcast -n <pkg>/.DiagReceiver
+             -a com.zcode.remote.action.DIAG 再带 diag_cmd 这个 string extra。 -->
+        <receiver
+            android:name=".DiagReceiver"
+            android:exported="true"
+            android:permission="android.permission.DUMP">
+            <intent-filter>
+                <action android:name="com.zcode.remote.action.DIAG" />
+            </intent-filter>
+        </receiver>
+
+        <!-- 「知道了」动作：已完成卡自己撤自己（2026-09-17）。
+
+             为什么需要它：占着提升位的卡必须是 ongoing（LiveUpdate 的平台硬条件），
+             而 ongoing 通知在 AOSP 里用户滑不掉——所以那张"已完成"的卡必须有出口。
+             降级成普通通知（没抢到提升位）时可以照常滑动清除，这条动作是给芯片卡用的。
+             不导出：只有我们自己的 PendingIntent 能送到。 -->
+        <receiver
+            android:name=".notify.CardDismissReceiver"
+            android:exported="false" />
 
         <!-- Hands the exported diagnostics file to a share target (settings ->
              分享日志). Nothing else in the app is exposed through it. -->

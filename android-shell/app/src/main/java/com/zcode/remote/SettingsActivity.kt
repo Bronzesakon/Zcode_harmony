@@ -4,6 +4,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.content.res.Configuration
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -16,11 +17,14 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
-import com.google.android.material.materialswitch.MaterialSwitch
+import androidx.core.view.WindowInsetsControllerCompat
 import com.zcode.remote.core.Diagnostics
 import com.zcode.remote.core.RemoteUrl
 import com.zcode.remote.core.ShellLog
+import com.zcode.remote.core.enableThemeEdgeToEdge
+import com.zcode.remote.core.padForStatusBarAndIme
 import com.zcode.remote.databinding.ActivitySettingsBinding
 
 /**
@@ -32,6 +36,12 @@ import com.zcode.remote.databinding.ActivitySettingsBinding
  * serve that: the survival readout (inbound-frame counters, refreshed once per
  * second while the screen is open) and the log export, because the file survives
  * the process and can be shared without a computer.
+ *
+ * The screen is laid out in the MiuiX design language (see
+ * res/values/miuix_styles.xml for the metric and colour sourcing): a small top
+ * app bar with a back arrow, sections introduced by a small bold title, and one
+ * 16dp-rounded card per section holding title + summary rows with a chevron on
+ * the right.
  */
 class SettingsActivity : AppCompatActivity() {
 
@@ -40,23 +50,33 @@ class SettingsActivity : AppCompatActivity() {
     private var refresh: Runnable? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        enableThemeEdgeToEdge()
         super.onCreate(savedInstanceState)
         ShellRuntime.init(this)
         binding = ActivitySettingsBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        binding.root.padForStatusBarAndIme()
+        // A native screen: the strip behind the status bar is the page's own
+        // surface colour of this screen, and the icons follow the system theme.
+        // (The main screen overrides both from what the page reports.)
+        val dark = (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
+            Configuration.UI_MODE_NIGHT_YES
+        WindowInsetsControllerCompat(window, binding.root).isAppearanceLightStatusBars = !dark
+        binding.root.setBackgroundColor(
+            ContextCompat.getColor(this, R.color.miuix_surface)
+        )
 
-        setSupportActionBar(binding.toolbar)
-        binding.toolbar.setNavigationOnClickListener { finish() }
+        binding.btnBack.setOnClickListener { finish() }
 
         binding.currentUrl.text = ShellRuntime.prefs().remoteUrl
             ?.let { RemoteUrl.toDisplayString(it) }
             ?: getString(R.string.settings_current_url_none)
 
-        binding.btnChangeUrl.setOnClickListener {
+        binding.rowChangeUrl.setOnClickListener {
             startActivity(Intent(this, MainActivity::class.java).setAction(ACTION_CHANGE_URL))
             finish()
         }
-        binding.btnReloadWeb.setOnClickListener {
+        binding.rowReloadWeb.setOnClickListener {
             startActivity(Intent(this, MainActivity::class.java).setAction(MainActivity.ACTION_RELOAD))
             finish()
         }
@@ -68,18 +88,6 @@ class SettingsActivity : AppCompatActivity() {
         }
 
         binding.rowBattery.setOnClickListener { requestBatteryExemption() }
-
-        val switch: MaterialSwitch = binding.switchSubscribeAll
-        switch.isChecked = ShellRuntime.prefs().subscribeAllWorkspaces
-        switch.setOnCheckedChangeListener { _, checked ->
-            ShellRuntime.prefs().subscribeAllWorkspaces = checked
-            Diagnostics.info(if (checked) "已开启订阅所有工作区" else "已关闭订阅所有工作区")
-            updateSubscribeAllState()
-            // Apply live so the user does not need to reload the page.
-            evaluate(
-                "window.__zcodeShellSetSubscribeAll && window.__zcodeShellSetSubscribeAll($checked);"
-            )
-        }
 
         binding.rowDiagnostics.setOnClickListener { showDiagnostics() }
         binding.rowShareLog.setOnClickListener { shareLog() }
@@ -95,7 +103,6 @@ class SettingsActivity : AppCompatActivity() {
         super.onResume()
         updatePermissionState()
         updateBatteryState()
-        updateSubscribeAllState()
         // Fresh counters matter most right after returning from the background.
         evaluate("window.__zcodeShellReportLiveness && window.__zcodeShellReportLiveness();")
         startRefreshLoop()
@@ -138,13 +145,6 @@ class SettingsActivity : AppCompatActivity() {
         val exempt = power?.isIgnoringBatteryOptimizations(packageName) == true
         binding.batteryState.text = getString(
             if (exempt) R.string.settings_battery_exempt else R.string.settings_battery_not_exempt
-        )
-    }
-
-    private fun updateSubscribeAllState() {
-        binding.subscribeAllState.text = getString(
-            if (ShellRuntime.prefs().subscribeAllWorkspaces) R.string.settings_subscribe_all_on
-            else R.string.settings_subscribe_all_off
         )
     }
 

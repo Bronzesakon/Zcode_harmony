@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- MiuiX 卡片底色：16dp 圆角纯色块，无阴影无描边（对应 CardDefaults.CornerRadius +
+     surfaceContainer）。 -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <solid android:color="@color/miuix_surface_container" />
+    <corners android:radius="@dimen/miuix_card_corner" />
+</shape>

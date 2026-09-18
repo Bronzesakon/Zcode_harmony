@@ -1,38 +1,64 @@
 name: Android Shell Build
 
-# Quality gates + a signed APK for the android-shell thin client.
+# Quality gates + an installable APK for the android-shell thin client.
 #
 # Nothing is installed locally: the shell is built entirely in the cloud
-# (migration doc, D13). The workflow is arranged for wall-clock speed:
+# (migration doc, D13). Two things shape this file:
 #
-#   js     ─┐
-#            ├─► release (tags only)
-#   build  ─┘
+# 1. WALL-CLOCK SPEED. `js` and `build` are separate jobs so they run
+#    CONCURRENTLY (the JS suite needs no JDK and no Android SDK, so leaving it in
+#    the build job would add its runtime to the critical path for nothing), and
+#    `build` runs ONE Gradle invocation for both the unit tests and the APK —
+#    testing the release variant shares `compileReleaseKotlin` with
+#    assembleRelease, so sources compile once instead of once per variant.
+#    Shallow clone + Gradle caching keep repeat runs to ~2-3 minutes.
 #
-#   * `js` and `build` are separate jobs so they run CONCURRENTLY. The JS suite
-#     needs no JDK and no Android SDK, so leaving it in the build job would add
-#     its runtime to the critical path for nothing.
-#   * `build` runs ONE Gradle invocation for both the unit tests and the APK.
-#     Testing the release variant shares `compileReleaseKotlin` with
-#     `assembleRelease`, so sources compile once instead of once per variant, and
-#     a second Gradle startup is avoided.
-#   * Shallow clone + Gradle dependency/build caching keep repeat runs to ~2 min.
+# 2. RELEASE FLOW (user decision, 2026-09-10):
+#      pre branch  -> publishes a PRE-RELEASE automatically, tagged
+#                     v<version>-pre.<run number>, so a test build is one tap
+#                     away on the Releases page instead of hidden in Artifacts.
+#      v* tag      -> publishes a normal Release, notes taken from CHANGELOG.md.
+#    A tag created here with GITHUB_TOKEN does not re-trigger this workflow
+#    (GitHub suppresses events from its own token), so the pre-release path
+#    cannot recurse.
 #
-# Build failures are re-emitted as ::error:: annotations on purpose: Actions
-# logs need authentication to read, while annotations are rendered into the job
-# page's HTML. Whoever debugs this build has no local Android toolchain, so the
-# annotations are the only failure channel they can actually see.
+# Build failures are re-emitted as ::error:: annotations on purpose: Actions logs
+# need authentication to read (they 404 anonymously), while annotations are
+# rendered into the job page HTML. Whoever debugs this build has no local Android
+# toolchain, so annotations are the only failure channel they can actually see.
+# tools/watch_ci.py reads them without gh or a token.
 on:
   push:
-    branches: [main, beta]
+    branches: [main, pre]
     tags: ['v*']
+    # Only the paths that can change the APK. Documentation and the local-only
+    # reference archives (android-shell/docs, ColorOS_docs) are deliberately absent,
+    # which is how doc-only commits avoid spending a build.
+    #
+    # NOTE: GitHub rejects a workflow that uses `paths` and `paths-ignore` for the
+    # same event — the run is created and fails validation with no jobs at all
+    # (observed). Hence one filter, listing the code paths explicitly.
     paths:
-      - 'android-shell/**'
+      - 'android-shell/app/**'
+      - 'android-shell/tools/**'
+      - 'android-shell/gradle/**'
+      - 'android-shell/*.gradle.kts'
+      - 'android-shell/gradle.properties'
+      - 'android-shell/gradlew'
+      - 'android-shell/gradlew.bat'
+      - 'android-shell/.gitattributes'
       - '.github/workflows/android-shell.yml'
       - '.github/scripts/android-shell-release-notes.ps1'
   pull_request:
     paths:
-      - 'android-shell/**'
+      - 'android-shell/app/**'
+      - 'android-shell/tools/**'
+      - 'android-shell/gradle/**'
+      - 'android-shell/*.gradle.kts'
+      - 'android-shell/gradle.properties'
+      - 'android-shell/gradlew'
+      - 'android-shell/gradlew.bat'
+      - 'android-shell/.gitattributes'
       - '.github/workflows/android-shell.yml'
       - '.github/scripts/android-shell-release-notes.ps1'
   workflow_dispatch:
@@ -40,19 +66,20 @@ on:
 permissions:
   contents: read
 
-# A newer push supersedes an in-flight build of the same branch.
+# A newer push supersedes an in-flight build of the same ref. The ref is part of
+# the key, so a push to pre never cancels a build of main.
 concurrency:
   group: android-shell-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   # ---------------------------------------------------------------------------
-  # The injected JavaScript protocol layer. Catches the bug class that would
-  # otherwise only show up on a device — wire-format regressions, fragmentation,
-  # bridge routing — and needs neither a JDK nor an Android SDK.
+  # Fast static gate: the injected JavaScript layer plus a structural Kotlin
+  # check. Everything here needs neither a JDK nor an Android SDK, so it stays
+  # off the build job's critical path.
   # ---------------------------------------------------------------------------
   js:
-    name: Protocol tests (Node)
+    name: Static checks (Node + Kotlin)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -69,6 +96,20 @@ jobs:
           # cannot be verified offline.
           node -e "const [maj]=process.versions.node.split('.').map(Number); if (maj < 20) { console.error('Node 20+ required for node --test'); process.exit(1); }"
           node --test
+
+      # About a second, and it catches what hand-editing produces — unbalanced
+      # delimiters, a package that disagrees with its directory, leftover merge
+      # markers — instead of leaving those to surface minutes later in Gradle.
+      - name: Kotlin structure check
+        working-directory: android-shell
+        run: python3 tools/check_kotlin_structure.py
+
+      # Also about a second, and it is the faster half of what `aapt2 link` would
+      # otherwise be the only one to notice: a resource name that does not exist.
+      # Kept in this job (not the build job) so a typo costs ~40 s, not ~3 min.
+      - name: Resource reference check
+        working-directory: android-shell
+        run: python3 tools/check_resources.py
 
   # ---------------------------------------------------------------------------
   # Kotlin/Java build, unit tests and the signed APK.
@@ -91,6 +132,33 @@ jobs:
           distribution: temurin
           java-version: '17'
           cache: gradle
+
+      # Version numbers, computed from the branch (see app/build.gradle.kts):
+      #   versionCode = run number, so every build installs over the previous one
+      #   versionName = "<base>-pre.<n>" on pre, "<base>" elsewhere
+      # Values go through $GITHUB_ENV, which later steps (including Gradle) and
+      # the publishing jobs read.
+      - name: Resolve version
+        id: version
+        working-directory: android-shell
+        run: |
+          base=$(sed -n 's/^zcodeBaseVersion=//p' gradle.properties | tr -d '\r' | head -1)
+          if [ -z "$base" ]; then
+            echo "::error::could not read zcodeBaseVersion from gradle.properties"
+            exit 1
+          fi
+          if [ "${GITHUB_REF}" = "refs/heads/pre" ]; then
+            name="${base}-pre.${GITHUB_RUN_NUMBER}"
+          else
+            name="$base"
+          fi
+          {
+            echo "ZCODE_VERSION_NAME=$name"
+            echo "ZCODE_VERSION_CODE=${GITHUB_RUN_NUMBER}"
+            echo "BASE_VERSION=$base"
+            echo "VERSION_TAG=v$name"
+          } >> "$GITHUB_ENV"
+          echo "version = $name (code ${GITHUB_RUN_NUMBER})"
 
       # Restore the release keystore from GitHub Secrets so CI-built APKs share
       # the signature of every other build of this app (overwrite-install works).
@@ -146,12 +214,15 @@ jobs:
             annotate() {
               tr -d '\r' | sed 's/%/%25/g' | cut -c1-900 | sed 's/^/::error::/'
             }
-            # 编译错误（Kotlin 的 e: 行最有用）与 Gradle 任务级失败
-            grep -aE "^(e: |error: )|Execution failed for task|Could not resolve|Unresolved reference|What went wrong" gradle-build.log | head -15 | annotate || true
+            # 编译错误（Kotlin 的 e: 行最有用）与 Gradle 任务级失败。
+            # `: error: ` 这一支是给 aapt2 的：资源链接失败时它的行是
+            # `<文件>:<行>: error: <原因>`，行首是路径而不是 `error:`——只锚行首会把整段漏掉，
+            # 于是 "failed linking references" 在注解里看不到是哪一条引用（2026-09-12 白跑了一轮）。
+            grep -aE "^(e: |error: )|: error: |Execution failed for task|Could not resolve|Unresolved reference|What went wrong" gradle-build.log | head -15 | annotate || true
             # 单元测试失败
             grep -aE "FAILED|AssertionError|expected:<|Expected .* but was" gradle-build.log | head -10 | annotate || true
-            echo "---- Gradle 日志末尾 60 行（供人直接阅读）----"
-            tail -60 gradle-build.log
+            echo "---- Gradle 日志末尾 60 行（同时以注解形式发出，便于匿名读取）----"
+            tail -60 gradle-build.log | annotate
             exit "$status"
           fi
 
@@ -193,8 +264,172 @@ jobs:
           retention-days: 30
 
   # ---------------------------------------------------------------------------
-  # Publishing needs a write token, so it is isolated here instead of widening
-  # the permissions of the build job (which runs on untrusted PR code).
+  # pre branch -> the ROLLING pre-release. This is the everyday path: push to
+  # pre and the same release always holds the newest APK, so installing a test
+  # build is one stable link
+  # (…/releases/download/android-pre/zcode-remote.apk) instead of a new tag per
+  # push.
+  #
+  # Why rolling instead of one v<version>-pre.<run> per push: the tag space is
+  # shared with the HarmonyOS app in this repository (a tag per run piles up
+  # near-identical releases), and the build you actually want is always the
+  # newest one. The trade-off is that the tag no longer identifies a build, so
+  # the title carries the in-app versionName AND the build time, and the notes
+  # list this round's commits plus both timestamps.
+  #
+  # Modelled on sevnX's build.yml, which uses the same shape for its main builds.
+  # ---------------------------------------------------------------------------
+  prerelease:
+    name: Publish rolling pre-release
+    if: github.ref == 'refs/heads/pre'
+    needs: [js, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      - name: Download APK artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: zcode-remote-apk-${{ github.sha }}
+          path: dist
+
+      # Composed in its own step (and echoed to the log) so the exact text can be
+      # read straight out of a run when a release edit ever goes wrong.
+      - name: Compose title and notes
+        working-directory: android-shell
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          base=$(sed -n 's/^zcodeBaseVersion=//p' gradle.properties | tr -d '\r' | head -1)
+          if [ -z "$base" ]; then
+            echo "::error::could not read zcodeBaseVersion from gradle.properties"
+            exit 1
+          fi
+          name="${base}-pre.${{ github.run_number }}"
+          # No `v` prefix on purpose: a `v*` tag would match this workflow's own
+          # release trigger and start a second run.
+          tag="android-pre"
+          notes="$GITHUB_WORKSPACE/pre-notes.md"
+          round="$GITHUB_WORKSPACE/round.txt"
+
+          # Timestamps in UTC+8, computed arithmetically rather than through
+          # TZ=Asia/Shanghai: the runner's tz database (and whether `date` honours
+          # TZ at all) is not something this should depend on.
+          cst() {  # $1 = ISO timestamp, or "" for now; $2 = date format
+            local epoch
+            if [ -n "$1" ]; then
+              epoch=$(date -u -d "$1" +%s)
+            else
+              epoch=$(date -u +%s)
+            fi
+            date -u -d "@$((epoch + 28800))" "$2"
+          }
+
+          # The push timestamp comes from the commit, not from "now", so the two
+          # numbers in the notes stay meaningful even for a re-run.
+          push_time=$(cst "$(git log -1 --pretty=%cI)" '+%Y-%m-%d %H:%M:%S')
+          build_time=$(cst '' '+%Y-%m-%d %H:%M:%S')
+          stamp=$(cst '' '+%m-%d %H:%M')
+
+          # 本轮变更 = the commits this build adds on top of the commit the
+          # rolling release currently points at. Read through the compare API
+          # because this job only has a shallow clone; on the first run (no tag
+          # yet) or after a rebase/force-push it degrades to the pushed commit.
+          prev=$(git ls-remote origin "refs/tags/$tag" | cut -f1)
+          count=0
+          if [ -n "$prev" ] && [ "$prev" != "$GITHUB_SHA" ]; then
+            gh api "repos/${{ github.repository }}/compare/$prev...$GITHUB_SHA" \
+              --jq '.commits[] | "- " + (.commit.message | split("\n")[0])' \
+              > "$round" 2>/dev/null || true
+            count=$(grep -c '^- ' "$round" || true)
+          fi
+
+          echo "## 本轮变更" > "$notes"
+          echo "" >> "$notes"
+          if [ "${count:-0}" -gt 0 ]; then
+            echo "共 ${count} 个提交（\`${GITHUB_SHA:0:7}\`）：" >> "$notes"
+            echo "" >> "$notes"
+            cat "$round" >> "$notes"
+            if [ "$count" -eq 1 ]; then
+              # A single commit is usually the whole round: keep its body too,
+              # which is where the reasoning and the verification notes live.
+              echo "" >> "$notes"
+              gh api "repos/${{ github.repository }}/commits/$GITHUB_SHA" \
+                --jq '.commit.message | split("\n")[1:] | join("\n") | sub("^\\s+"; "")' \
+                >> "$notes" 2>/dev/null || true
+            fi
+          else
+            git log -1 --pretty=%B >> "$notes"
+          fi
+          {
+            echo ""
+            echo "---"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "| --- | --- |"
+            echo "| 应用内版本 | \`$name\`（versionCode ${{ github.run_number }}） |"
+            echo "| 推送时间 | $push_time（UTC+8） |"
+            echo "| 编译完成 | $build_time（UTC+8） |"
+            echo "| 来源 | \`pre\` 分支 · 运行 #${{ github.run_number }} |"
+            echo ""
+            echo "> 滚动发布：资产名固定，下载链接 \`…/releases/download/$tag/zcode-remote.apk\` 始终指向最新构建。"
+            echo "> \`versionCode\` 取 CI 运行号，可直接覆盖安装上一个版本。"
+          } >> "$notes"
+
+          {
+            echo "ROLLING_TAG=$tag"
+            echo "ROLLING_TITLE=ZCode 远程 预发布 · $name · $stamp"
+            echo "ROLLING_VERSION=$name"
+          } >> "$GITHUB_ENV"
+
+          echo "=== 标题 ==="
+          echo "ZCode 远程 预发布 · $name · $stamp"
+          echo "=== 说明 ==="
+          cat "$notes"
+
+      - name: Publish (overwrite the rolling release)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          files=(dist/zcode-remote.apk dist/zcode-remote.apk.md5)
+          for file in "${files[@]}"; do
+            if [ ! -f "$file" ]; then
+              echo "::error::missing release asset $file"
+              exit 1
+            fi
+          done
+          if gh release view "$ROLLING_TAG" >/dev/null 2>&1; then
+            # Fixed asset names + --clobber: the previous download is replaced in
+            # place, so the link users keep is never invalidated.
+            gh release upload "$ROLLING_TAG" "${files[@]}" --clobber
+            # The tag has to move too. GitHub renders the release page (and its
+            # "Source code" links) from the tag, so leaving it on the first build
+            # would advertise a commit that the asset no longer matches.
+            git push --force origin "HEAD:refs/tags/$ROLLING_TAG"
+            gh release edit "$ROLLING_TAG" \
+              --title "$ROLLING_TITLE" \
+              --notes-file pre-notes.md
+          else
+            gh release create "$ROLLING_TAG" \
+              --target "$GITHUB_SHA" \
+              --title "$ROLLING_TITLE" \
+              --notes-file pre-notes.md \
+              --prerelease \
+              "${files[@]}"
+          fi
+          echo "published $ROLLING_VERSION -> $ROLLING_TAG"
+
+  # ---------------------------------------------------------------------------
+  # v* tag -> formal Release, notes from the "## [X.Y.Z]" changelog section.
+  # Isolated from build because publishing needs a write token, and the build job
+  # runs on untrusted PR code.
   # ---------------------------------------------------------------------------
   release:
     name: Publish GitHub Release

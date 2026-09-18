@@ -14,6 +14,7 @@ import sys
 BACKSLASH = chr(92)
 QUOTE = chr(34)
 APOS = chr(39)
+BACKTICK = chr(96)
 
 
 def strip_noncode(src: str) -> str:
@@ -41,6 +42,15 @@ def strip_noncode(src: str) -> str:
             while i < n and src[i] != QUOTE:
                 if src[i] == BACKSLASH:
                     i += 1
+                i += 1
+            i += 1
+        elif c == BACKTICK:
+            # A back-quoted identifier (Kotlin lets a function name be almost any
+            # text, e.g. a test name). Skip it before the apostrophe rule can see
+            # it: `the system's theme` would otherwise open a phantom char literal
+            # and swallow the rest of the line, including a brace.
+            i += 1
+            while i < n and src[i] != BACKTICK:
                 i += 1
             i += 1
         elif c == APOS:

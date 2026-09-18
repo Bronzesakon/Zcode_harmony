@@ -6,12 +6,18 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
+import android.provider.OpenableColumns
 import android.view.View
+import android.webkit.ConsoleMessage
+import android.webkit.ValueCallback
+import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
@@ -21,17 +27,25 @@ import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.Toast
 import androidx.activity.addCallback
+import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import com.zcode.remote.core.Diagnostics
+import com.zcode.remote.core.PageBarColor
+import com.zcode.remote.core.PageBarState
+import com.zcode.remote.core.PageTheme
 import com.zcode.remote.core.Prefs
 import com.zcode.remote.core.RemoteUrl
+import com.zcode.remote.core.UploadMime
+import com.zcode.remote.core.enableThemeEdgeToEdge
+import com.zcode.remote.core.padForStatusBarAndIme
 import com.zcode.remote.databinding.ActivityMainBinding
 
 /**
@@ -47,22 +61,53 @@ import com.zcode.remote.databinding.ActivityMainBinding
  *     background-survival shell wants.
  *  3. Back does not finish the Activity: it backgrounds the task, so the
  *     connection survives the way it does in the HarmonyOS build.
+ *
+ * There is no app bar. The page starts directly under the status bar, and the
+ * strip above it is painted with the page's own top-surface colour, which the
+ * injected layer reports by name (see core/PageBarColor.kt). The former overflow
+ * menu's three actions live on the launcher long-press menu instead
+ * (res/xml/shortcuts.xml) plus the two native panels.
  */
 class MainActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityMainBinding
     private lateinit var prefs: Prefs
 
+    /** Which page state the status-bar strip is currently painted for. */
+    private var pageBarState: PageBarState = PageBarState.DEFAULT
+
+    /** The theme the page resolved for itself; null until it says. */
+    private var pageTheme: PageTheme? = null
+
     /** Script used when the WebView lacks document-start support (fallback). */
-    private var fallbackScript: String? = null
+    /**
+     * 注入脚本缓存。每次主帧加载有三道时机（见 installInjection / injectStable），
+     * 都用同一份脚本；只在首次成功读取时缓存，读失败不缓存（下次加载重试）。
+     */
+    private var injectionScript: String? = null
 
     /** Set when a notification tap asked us to locate a task. */
     private var pendingLocate: Pair<String, String>? = null
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private var locateAttempts = 0
-    /** The host the injected script was installed for, if any. */
-    private var injectedHost: String? = null
+
+    /**
+     * Console lines captured from the page for this load. The page is a chatty
+     * production SPA and this log is also written to a file that the user is
+     * expected to share, so the capture is capped per load rather than endless.
+     */
+    private var consoleLines = 0
+
+    /** Uptime at onPageStarted, for the "how long did the page take" line. */
+    private var pageStartedAt = 0L
+
+    /**
+     * onPageFinished callbacks seen for the current document. WebView fires it
+     * more than once (SPA history changes, late subframes), and only the first
+     * one can be compared against the load start — see onPageFinished.
+     */
+    private var finishCallbacks = 0
 
     private val scanLauncher = registerForActivityResult(ScanContract()) { result ->
         val contents = result.contents
@@ -83,31 +128,74 @@ class MainActivity : AppCompatActivity() {
             Diagnostics.info(if (granted) "通知权限已授予" else "通知权限被拒绝")
         }
 
+    /**
+     * The `<input type="file">` callback currently waiting for a pick. It lives
+     * here rather than in the dialog because the result arrives after the dialog
+     * is gone, and it must be invoked exactly once or the page's upload hangs.
+     */
+    private var pendingFileCallback: ValueCallback<Array<Uri>>? = null
+
+    // Four launchers rather than two: FileChooserParams says whether the page
+    // asked for one file or many, and each picker has its own contract. Both
+    // photo contracts fall back to ACTION_OPEN_DOCUMENT by themselves on devices
+    // without the photo picker, so no manual fallback is needed.
+
+    private val photoPickerSingle = registerForActivityResult(
+        ActivityResultContracts.PickVisualMedia(),
+    ) { uri -> deliverPickedFiles(uri?.let { listOf(it) }.orEmpty()) }
+
+    private val photoPickerMultiple = registerForActivityResult(
+        ActivityResultContracts.PickMultipleVisualMedia(MAX_UPLOAD_ITEMS),
+    ) { uris -> deliverPickedFiles(uris) }
+
+    private val documentPickerSingle = registerForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri -> deliverPickedFiles(uri?.let { listOf(it) }.orEmpty()) }
+
+    private val documentPickerMultiple = registerForActivityResult(
+        ActivityResultContracts.OpenMultipleDocuments(),
+    ) { uris -> deliverPickedFiles(uris) }
+
     override fun onCreate(savedInstanceState: Bundle?) {
+        // Must precede setContentView: see enableThemeEdgeToEdge().
+        enableThemeEdgeToEdge()
         super.onCreate(savedInstanceState)
         ShellRuntime.init(this)
         prefs = ShellRuntime.prefs()
 
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
-        setSupportActionBar(binding.toolbar)
+        // targetSdk 35 forces edge-to-edge. The top inset becomes the page's top
+        // padding so the page's own header is not covered by the status bar's
+        // clock; the bottom is left immersed on purpose (see the function).
+        binding.root.padForStatusBarAndIme()
+        // Before the page says anything, the strip takes the boot surface for the
+        // *current* system appearance, so there is never a frame with light icons
+        // on a light strip.
+        applyStatusBarSurface()
 
         binding.btnScan.setOnClickListener { startScan() }
         binding.btnPaste.setOnClickListener { pasteFromClipboard() }
         binding.btnManual.setOnClickListener { showManualEntry() }
         binding.btnRetry.setOnClickListener { reloadPage() }
         binding.btnChangeUrl.setOnClickListener { showSetup() }
+        binding.btnSettings.setOnClickListener { openSettings() }
 
         configureWebView()
         installBackHandling()
-        handleIntent(intent)
+        // The intent may already have decided what the screen should be — asking
+        // for a new link must not be undone by the automatic load right below.
+        val intentHandled = handleIntent(intent)
         ShellRuntime.setJsEvaluator { script -> binding.webview.evaluateJavascript(script, null) }
+        ShellRuntime.setPageStateListener { state, theme -> onPageStateReported(state, theme) }
 
-        val stored = prefs.remoteUrl
-        if (stored == null) {
-            showSetup()
-        } else {
-            applyUrl(stored)
+        if (!intentHandled) {
+            val stored = prefs.remoteUrl
+            if (stored == null) {
+                showSetup()
+            } else {
+                applyUrl(stored)
+            }
         }
     }
 
@@ -128,8 +216,10 @@ class MainActivity : AppCompatActivity() {
             mediaPlaybackRequiresUserGesture = false
             mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
             cacheMode = WebSettings.LOAD_DEFAULT
-            useWideViewPort = true
-            loadWithOverviewMode = true
+            // Deliberately NOT setting useWideViewPort / loadWithOverviewMode:
+            // they exist to make legacy desktop pages fit, and on a responsive
+            // SPA they can make the viewport width disagree with the visible
+            // area (content then looks off-centre relative to the scrollbar).
             // The default UA is kept deliberately: the page does its own mobile
             // feature detection and a custom UA could change its behaviour.
         }
@@ -143,6 +233,19 @@ class MainActivity : AppCompatActivity() {
         // WebView.java (`public void setRendererPriorityPolicy(int, boolean)`),
         // not the static call the migration doc's shorthand suggested.
         webView.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false)
+
+        // 滚动条只归注入层管（见 assets/inject.js 第 7 节）：网页自己的
+        // `::-webkit-scrollbar{width:14px}` 决定了布局要留出 14px，而 Chromium 在
+        // 安卓上不画自己的合成器滚动条——官方源码注释写得很直白：
+        // `// Android WebView uses system scrollbars, so make ours invisible.`
+        // （codereview.chromium.org/2620743003）。所以那条"默认样式"的滚动条是
+        // **Android View 画的**，网页 CSS 只能决定它占多宽。
+        //
+        // 注入层负责把宽度归零（布局回正）并自绘一条与网页同款式的悬浮指示条；
+        // 这里再把 View 层那条多余的默认条关掉，否则它会压在指示条旁边一起显示。
+        // 关掉它不影响滚动本身，也不影响页面内其它滚动容器的可用性。
+        webView.isVerticalScrollBarEnabled = false
+        webView.scrollBarStyle = View.SCROLLBARS_INSIDE_OVERLAY
 
         webView.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(
@@ -166,17 +269,48 @@ class MainActivity : AppCompatActivity() {
 
             override fun onPageStarted(view: WebView, url: String, favicon: android.graphics.Bitmap?) {
                 super.onPageStarted(view, url, favicon)
-                fallbackScript?.let { script ->
-                    // No document-start support: inject as early as we can. The
-                    // page may already have opened its socket, which is exactly
-                    // why document-start is preferred.
-                    view.evaluateJavascript(script, null)
-                }
+                consoleLines = 0
+                finishCallbacks = 0
+                pageStartedAt = SystemClock.elapsedRealtime()
+                Diagnostics.info("网页开始加载")
+                // A fresh document boots with the page background at the top (the
+                // boot shell), so drop back to that surface until the new document
+                // reports otherwise. Without this a reload keeps the *previous*
+                // document's header colour under the status bar.
+                onPageStateReported(PageBarState.BOOT.token, null)
+                // 稳定注入第二道：document-start 因任何形态失效时，这里以最早
+                // 可得的时机补注。幂等守卫让已注入的文档近乎零成本地跳过。
+                injectStable(view)
             }
 
             override fun onPageFinished(view: WebView, url: String) {
                 super.onPageFinished(view, url)
+                finishCallbacks += 1
+                val elapsed = if (pageStartedAt > 0L) {
+                    SystemClock.elapsedRealtime() - pageStartedAt
+                } else {
+                    -1L
+                }
+                // Only the FIRST finish callback can be measured against the load
+                // start. Later ones (SPA route changes, late frames) share that
+                // start point, so measuring them produced absurd numbers like
+                // "用时 736007 ms" for a document whose own timing said ttfb=397 ms.
+                // Report the index instead and let the number stand alone.
+                if (elapsed >= 0L) {
+                    pageStartedAt = 0L
+                }
+                // The console count is printed on purpose: it is the one number
+                // that says whether the page's own logs are reaching the file at
+                // all, which a silent "0 行" makes obvious.
+                Diagnostics.info(
+                    "网页加载完成(第 ${finishCallbacks} 次回调)" +
+                        (if (elapsed >= 0L) "，用时 $elapsed ms" else "") +
+                        " · ${RemoteUrl.toDisplayString(url)}" +
+                        " · 控制台已捕获 $consoleLines 行",
+                )
                 hideError()
+                // 稳定注入第三道：加载完成再兜一次（幂等）。
+                injectStable(view)
                 maybeRequestNotificationPermission()
                 tryLocate()
             }
@@ -193,32 +327,117 @@ class MainActivity : AppCompatActivity() {
                 showError(getString(R.string.error_network) + if (description.isEmpty()) "" else "\n($description)")
             }
         }
+
+        // File uploads. WebView ships no default chooser, so without this the
+        // page's <input type="file"> silently does nothing.
+        webView.webChromeClient = object : WebChromeClient() {
+            /**
+             * The page's own console, routed into the shell's diagnostics.
+             *
+             * This exists because the questions that matter here — "why does a
+             * conversation take ten seconds to open", "what did the app do when
+             * the fluid cloud showed up" — are answered by the page's own logs,
+             * and the shell has no other way to see them: without adb there is no
+             * remote inspector, and the log file is the only channel the phone
+             * can hand back. The injected script reports its own numbers the same
+             * way (see assets/inject.js), so both land in one timeline.
+             */
+            override fun onConsoleMessage(msg: ConsoleMessage): Boolean {
+                val level = when (msg.messageLevel()) {
+                    ConsoleMessage.MessageLevel.ERROR -> "error"
+                    ConsoleMessage.MessageLevel.WARNING -> "warn"
+                    else -> "web"
+                }
+                if (consoleLines > MAX_CONSOLE_LINES) {
+                    return true
+                }
+                consoleLines += 1
+                if (consoleLines == MAX_CONSOLE_LINES + 1) {
+                    Diagnostics.log(
+                        "info",
+                        "[web] 控制台输出已达 ${MAX_CONSOLE_LINES} 行上限，本次加载后续省略",
+                    )
+                    return true
+                }
+                Diagnostics.log(level, "[web:${msg.lineNumber()}] ${condense(msg.message())}")
+                return true
+            }
+
+            override fun onProgressChanged(view: WebView, newProgress: Int) {
+                super.onProgressChanged(view, newProgress)
+                if (newProgress == 100) {
+                    Diagnostics.info("网页渲染进度 100%")
+                }
+            }
+
+            override fun onShowFileChooser(
+                webView: WebView,
+                filePathCallback: ValueCallback<Array<Uri>>,
+                fileChooserParams: WebChromeClient.FileChooserParams,
+            ): Boolean {
+                if (fileChooserParams.mode == WebChromeClient.FileChooserParams.MODE_SAVE) {
+                    // Saving is a separate flow (ACTION_CREATE_DOCUMENT) and is
+                    // not implemented yet. Returning false keeps the previous
+                    // behaviour instead of holding a callback we never fire.
+                    Diagnostics.log("warn", "网页请求保存文件，暂未实现（MODE_SAVE）")
+                    return false
+                }
+                // A second request while one is still pending would strand the
+                // first callback and freeze that input.
+                if (pendingFileCallback != null) {
+                    Diagnostics.log("warn", "上传请求：上一个选择仍未返回，先取消它")
+                }
+                pendingFileCallback?.onReceiveValue(null)
+                pendingFileCallback = filePathCallback
+                showUploadSourceDialog(fileChooserParams)
+                return true
+            }
+        }
     }
 
     /**
-     * Installs the injected scripts for [url]. Called before loadUrl so the hook
-     * is in place before the page opens its WebSocket — the single most
-     * important timing constraint in this design (§5.1).
+     * 稳定注入：任何一次主帧加载都有三道互相独立的时机，缺哪道都兜得住——
+     *   1. document-start（addDocumentStartJavaScript）：主道，抢在页面任何
+     *      脚本之前，能拿到首帧 WebSocket。注册挂在 WebView 实例上、跨 loadUrl
+     *      持续生效，因此每次加载前都无条件重装一次（同脚本幂等）。
+     *   2. onPageStarted：页面开始加载即补注。document-start 因任何未知的
+     *      上层/引擎形态没有生效时，这里是最早的可得时机。
+     *   3. onPageFinished：加载完成再兜一道。
+     * 脚本自带 __zcodeShellInstalled 幂等守卫：已注入的文档里重复执行近零成本。
+     * 后两道只在 document-start 失效时才真正装上（会漏首帧、通知恢复延迟，
+     * inject.js 会打「注入未在 document-start 生效」的取证行）——远好于整层缺席。
      */
-    private fun installInjection(url: String) {
-        val webView = binding.webview
+    private fun ensureInjectionScript(): String? {
+        injectionScript?.let { return it }
         val script = (readAsset("zcode-protocol.js") ?: "") + "\n" + (readAsset("inject.js") ?: "")
-        if (script.isBlank()) {
+        if (script.isNotBlank()) {
+            injectionScript = script
+        }
+        return script.ifBlank { null }
+    }
+
+    private fun installInjection(url: String) {
+        val script = ensureInjectionScript()
+        if (script == null) {
             Diagnostics.log("error", "注入脚本缺失，通知功能将不可用")
             return
         }
+        val webView = binding.webview
         if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
-            fallbackScript = null
             val rules = setOf(RemoteUrl.originRule(url), "https://*.$ALLOWED_ROOT")
             WebViewCompat.addDocumentStartJavaScript(webView, script, rules)
             Diagnostics.info("已安装 document-start 注入 (${rules.joinToString()})")
         } else {
-            fallbackScript = script
             Diagnostics.log(
                 "warn",
-                "系统 WebView 不支持 document-start 注入，回退到 onPageStarted（可能漏掉首帧）",
+                "系统 WebView 不支持 document-start 注入，依赖加载期补注（可能漏首帧）",
             )
         }
+    }
+
+    private fun injectStable(view: WebView) {
+        val script = ensureInjectionScript() ?: return
+        view.evaluateJavascript(script, null)
     }
 
     private fun readAsset(name: String): String? = try {
@@ -236,15 +455,9 @@ class MainActivity : AppCompatActivity() {
         binding.webview.visibility = View.VISIBLE
         binding.setupPanel.visibility = View.GONE
         hideError()
-        val host = try {
-            Uri.parse(url).host
-        } catch (e: Exception) {
-            null
-        }
-        if (injectedHost != host) {
-            installInjection(url)
-            injectedHost = host
-        }
+        // 稳定注入：每次加载前都无条件重装 document-start 注册（同脚本幂等，
+        // 注册挂在 WebView 实例上——这里不再做 host 去重，防任何路径漏装）。
+        installInjection(url)
         ShellRuntime.ensureServiceRunning(this)
         binding.webview.loadUrl(url)
     }
@@ -252,6 +465,7 @@ class MainActivity : AppCompatActivity() {
     private fun reloadPage() {
         val url = prefs.remoteUrl ?: return showSetup()
         hideError()
+        installInjection(url)
         binding.webview.loadUrl(url)
     }
 
@@ -324,40 +538,72 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
-    // ------------------------------------------------------------- notification
+    // ------------------------------------------------------- status bar surface
+    //
+    // The app bar is gone, so the strip behind the status bar *is* the top of the
+    // page's own chrome and has to be painted with the page's top-surface colour.
+    // The injected layer reports names (which page state, which theme) and the
+    // fixed table in core/PageBarColor.kt turns them into literals — the shell
+    // never reads a colour out of the page at runtime, same rule as the
+    // HarmonyOS build.
 
-    override fun onCreateOptionsMenu(menu: android.view.Menu): Boolean {
-        menuInflater.inflate(R.menu.menu_main, menu)
-        return true
+    /**
+     * Called from the WebView's bridge thread. Hop to the main thread before
+     * touching views; the state is deduped there too, because a busy page emits
+     * several reports per second.
+     */
+    private fun onPageStateReported(stateToken: String?, themeToken: String?) {
+        runOnUiThread {
+            val state = PageBarColor.stateOf(stateToken)
+            val theme = PageBarColor.themeOf(themeToken)
+            if (state == pageBarState && theme == pageTheme) {
+                return@runOnUiThread
+            }
+            pageBarState = state
+            pageTheme = theme
+            applyStatusBarSurface()
+        }
     }
 
-    override fun onOptionsItemSelected(item: android.view.MenuItem): Boolean {
-        return when (item.itemId) {
-            R.id.action_reload -> {
-                reloadPage(); true
-            }
-            R.id.action_scan -> {
-                startScan(); true
-            }
-            R.id.action_settings -> {
-                startActivity(Intent(this, SettingsActivity::class.java)); true
-            }
-            else -> super.onOptionsItemSelected(item)
-        }
+    private fun applyStatusBarSurface() {
+        val dark = pageTheme?.let { it == PageTheme.DARK } ?: isSystemDark()
+        val color = PageBarColor.resolve(pageBarState, dark)
+        // The strip is the root's own background: the root is padded down by the
+        // status bar inset, so this colour shows exactly in that strip and
+        // nowhere else (the WebView covers everything below it).
+        binding.root.setBackgroundColor(color)
+        val controller = WindowInsetsControllerCompat(window, binding.root)
+        controller.isAppearanceLightStatusBars = PageBarColor.appearanceLightStatusBars(pageTheme)
+        // The gesture bar floats over the page, so its icons have to agree with
+        // the page too. Only matters for 3-button navigation (API 26+).
+        controller.isAppearanceLightNavigationBars = PageBarColor.appearanceLightStatusBars(pageTheme)
+        Diagnostics.info(PageBarColor.describe(pageBarState, pageTheme, color))
+    }
+
+    private fun isSystemDark(): Boolean =
+        (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
+            Configuration.UI_MODE_NIGHT_YES
+
+    private fun openSettings() {
+        startActivity(Intent(this, SettingsActivity::class.java))
     }
 
     override fun onResume() {
         super.onResume()
-        notifyForegroundState(true)
         // Ask the injected layer for fresh counters: if we just came back from a
         // long background stint, this is what resolves the survival verdict.
         ShellRuntime.requestLivenessReport()
+        // The page's theme can have changed while the app was away, and a system
+        // dark-mode switch does not mutate its DOM — so ask for a fresh report
+        // instead of waiting for the observer.
+        ShellRuntime.evaluateJs(
+            "window.__zcodeShellReportPageState && window.__zcodeShellReportPageState();"
+        )
     }
 
     override fun onPause() {
         // Intentionally NOT calling webView.onPause(): it would suspend the
         // page's timers (including its relay heartbeat).
-        notifyForegroundState(false)
         super.onPause()
     }
 
@@ -379,19 +625,14 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        // A callback that outlives the WebView would leak it, and the page would
+        // sit waiting on that input forever.
+        pendingFileCallback?.onReceiveValue(null)
+        pendingFileCallback = null
         // Drop the evaluator: it closes over this Activity's binding.
         ShellRuntime.setJsEvaluator(null)
+        ShellRuntime.setPageStateListener(null)
         super.onDestroy()
-    }
-
-    private fun notifyForegroundState(foreground: Boolean) {
-        if (!::binding.isInitialized) return
-        val script = "window.__zcodeShellSetAppForeground && window.__zcodeShellSetAppForeground($foreground);"
-        try {
-            binding.webview.evaluateJavascript(script, null)
-        } catch (e: Exception) {
-            Diagnostics.log("debug", "前台状态同步失败: ${e.message}")
-        }
     }
 
     /**
@@ -415,24 +656,56 @@ class MainActivity : AppCompatActivity() {
 
     // ------------------------------------------------------- notification tap
 
-    private fun handleIntent(intent: Intent?) {
+    /**
+     * Acts on the intent the Activity was started (or re-started) with.
+     *
+     * @return true when the intent has already put the screen into the state the
+     *   user asked for, so [onCreate] must not run its automatic "load the stored
+     *   URL" step on top of it. The two shortcut actions return opposite values
+     *   on purpose: 换个链接 replaces the screen (so it must win), while 打开设置
+     *   just pushes a screen on top (so the page still has to load underneath).
+     */
+    private fun handleIntent(intent: Intent?): Boolean {
+        if (intent?.action == ACTION_DIAG) {
+            // adb 驱动的诊断测试点（KICK 实验 / 手动轻推 / 体征快照）：
+            //   adb shell am start -n com.zcode.remote/.MainActivity \
+            //       -a com.zcode.remote.action.DIAG --es diag_cmd kick_test
+            runDiagCommand(intent.getStringExtra(EXTRA_DIAG_CMD).orEmpty())
+            return false
+        }
         if (intent?.action == ACTION_RELOAD) {
             reloadPage()
-            return
+            return prefs.remoteUrl != null
+        }
+        if (intent?.action == ACTION_SCAN) {
+            // Launcher long-press -> 重新扫码. With no stored link the setup panel
+            // *is* the scanner entry, so going there is the same action; with one
+            // stored, the page keeps loading behind the scanner.
+            if (prefs.remoteUrl == null) {
+                showSetup()
+                return true
+            }
+            startScan()
+            return false
+        }
+        if (intent?.action == ACTION_OPEN_SETTINGS) {
+            openSettings()
+            return false
         }
         if (intent?.action == SettingsActivity.ACTION_CHANGE_URL) {
             // The settings screen asked for a new link.
             showSetup()
-            return
+            return true
         }
-        if (intent?.action != ACTION_LOCATE_TASK) return
+        if (intent?.action != ACTION_LOCATE_TASK) return false
         val sessionId = intent.getStringExtra(EXTRA_SESSION_ID).orEmpty()
         val title = intent.getStringExtra(EXTRA_TASK_TITLE).orEmpty()
-        if (title.isEmpty() && sessionId.isEmpty()) return
+        if (title.isEmpty() && sessionId.isEmpty()) return false
         pendingLocate = sessionId to title
         locateAttempts = 0
         Diagnostics.info("通知点击: 尝试定位任务")
         tryLocate()
+        return false
     }
 
     /**
@@ -469,20 +742,227 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // --------------------------------------------------------------- diag adb
+
+    private var pendingDiag: String? = null
+    private var diagAttempts = 0
+
+    /**
+     * adb 驱动的诊断测试点（注入层就绪后把指令转给 __zcodeShellDiag）。
+     * 冷启动时注入脚本要等页面 boot 完才就绪，所以沿用 tryLocate 的重试模式。
+     */
+    private fun runDiagCommand(cmd: String) {
+        if (cmd.isEmpty()) return
+        Diagnostics.log("info", "诊断指令: $cmd")
+        // 原生侧命令（Tier2 实验、后台失速自愈开关）统一走 ShellRuntime.runNativeDiag：
+        // 与 DiagReceiver（adb broadcast → 后台可用）共用同一份实现，避免两处漂移。
+        if (ShellRuntime.runNativeDiag(cmd)) return
+        when (cmd) {
+            // 被动旁观总开关（二分用）：关掉后注入层只剩"零侵入三件事"——滚动条归零 CSS、
+            // 状态页面上报、页面日志汇；不再 hook WebSocket、不逐帧观测、不发心跳探针。
+            // 两条都会重载页面，好让配置立刻生效。
+            "passive_off", "passive_on" -> {
+                val on = cmd == "passive_on"
+                prefs.passiveObserve = on
+                Diagnostics.log(
+                    "warn",
+                    "诊断：被动旁观已${if (on) "开启" else "关闭"}——" +
+                        if (on) {
+                            // 说清"+ 探针"的边界：只读壳下前台一帧都不发（页面自己的 10s
+                            // 心跳在前台是准的），只有退到后台才由原生泵补帧。
+                            "注入层恢复只读观测（逐帧读、绝不写：不关 socket、不重载；心跳探针仅后台发）"
+                        } else {
+                            "注入层只保留滚动条 + 状态页面上报 + 页面日志汇，重载页面中"
+                        },
+                )
+                binding.webview.reload()
+                return
+            }
+        }
+        pendingDiag = cmd
+        diagAttempts = 0
+        tryDiag()
+    }
+
+    private fun tryDiag() {
+        val cmd = pendingDiag ?: return
+        if (!ShellRuntime.isInjectedReady()) {
+            if (diagAttempts >= MAX_LOCATE_ATTEMPTS) {
+                Diagnostics.log("warn", "放弃诊断指令（注入脚本未就绪）: $cmd")
+                pendingDiag = null
+                return
+            }
+            diagAttempts += 1
+            mainHandler.postDelayed({ tryDiag() }, LOCATE_RETRY_MS)
+            return
+        }
+        pendingDiag = null
+        val script = "window.__zcodeShellDiag && window.__zcodeShellDiag(" +
+            org.json.JSONObject.quote(cmd) + ");"
+        try {
+            binding.webview.evaluateJavascript(script, null)
+        } catch (e: Exception) {
+            Diagnostics.log("warn", "执行诊断脚本失败: ${e.message}")
+        }
+    }
+
+    // ------------------------------------------------------------- file upload
+
+    /**
+     * Mirrors the HarmonyOS build: a modal offering 相册 or 文件, then the matching
+     * system picker. Neither path needs a storage permission — the photo picker
+     * grants access to just the chosen media, and SAF grants access to just the
+     * chosen documents.
+     */
+    private fun showUploadSourceDialog(params: WebChromeClient.FileChooserParams) {
+        val multiple = params.mode == WebChromeClient.FileChooserParams.MODE_OPEN_MULTIPLE
+        val pickMode = if (multiple) "多选" else "单选"
+        val mimeTypes = UploadMime.normalisePlatform(params.acceptTypes?.toList())
+        val request = PickVisualMediaRequest(visualMediaTypeFor(mimeTypes))
+        Diagnostics.info("上传请求：网页打开选择器（$pickMode）accept=${mimeTypes.joinToString()}")
+
+        UploadSourceDialog(
+            context = this,
+            onPickImages = {
+                Diagnostics.info("上传方式：相册（$pickMode）")
+                try {
+                    if (multiple) {
+                        photoPickerMultiple.launch(request)
+                    } else {
+                        photoPickerSingle.launch(request)
+                    }
+                } catch (e: Exception) {
+                    Diagnostics.log("warn", "相册选择器打不开：${e.message}")
+                    deliverPickedFiles(emptyList())
+                }
+            },
+            onPickFiles = {
+                Diagnostics.info("上传方式：文件（$pickMode）accept=${mimeTypes.joinToString()}")
+                try {
+                    if (multiple) {
+                        documentPickerMultiple.launch(mimeTypes)
+                    } else {
+                        documentPickerSingle.launch(mimeTypes)
+                    }
+                } catch (e: Exception) {
+                    Diagnostics.log("warn", "文件选择器打不开：${e.message}")
+                    deliverPickedFiles(emptyList())
+                }
+            },
+            onCancelled = { deliverPickedFiles(emptyList()) },
+        ).show()
+    }
+
+    /**
+     * The 相册 tile opens the photo picker, which only handles image/video. This
+     * mirrors the HarmonyOS build's IMAGE_TYPE, except that an explicitly
+     * video-only `accept` gets the video grid rather than a photo-only one.
+     */
+    private fun visualMediaTypeFor(
+        mimeTypes: Array<String>,
+    ): ActivityResultContracts.PickVisualMedia.VisualMediaType =
+        if (mimeTypes.isNotEmpty() && mimeTypes.all { it.startsWith("video/") }) {
+            ActivityResultContracts.PickVisualMedia.VideoOnly
+        } else {
+            ActivityResultContracts.PickVisualMedia.ImageOnly
+        }
+
+    /**
+     * Hands the pick back to the WebView. The contract is that the callback is
+     * invoked exactly once, with null meaning "cancelled" — never invoking it is
+     * what leaves an `<input type="file">` permanently stuck.
+     */
+    private fun deliverPickedFiles(uris: List<Uri>) {
+        val callback = pendingFileCallback ?: return
+        pendingFileCallback = null
+        Diagnostics.info(
+            if (uris.isEmpty()) "文件选择已取消"
+            else "已选择 ${uris.size} 个文件，交回网页：${describePickedFiles(uris)}"
+        )
+        callback.onReceiveValue(if (uris.isEmpty()) null else uris.toTypedArray())
+    }
+
+    /**
+     * 一行、有界的选择结果：每个文件 名称（mime，大小），最多列 5 个。这是
+     * 「安卓端 pick 到网页内发送」链条的安卓侧终点——文件是否按预期到达网页，
+     * 类型/大小对不对，看这一行就够。
+     */
+    private fun describePickedFiles(uris: List<Uri>): String {
+        val parts = uris.take(5).map { uri ->
+            try {
+                var name = ""
+                var size = -1L
+                contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                    val nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    val sizeIdx = cursor.getColumnIndex(OpenableColumns.SIZE)
+                    if (cursor.moveToFirst()) {
+                        if (nameIdx >= 0) name = cursor.getString(nameIdx) ?: ""
+                        if (sizeIdx >= 0 && !cursor.isNull(sizeIdx)) size = cursor.getLong(sizeIdx)
+                    }
+                }
+                if (name.length > 40) {
+                    name = name.take(40) + "…"
+                }
+                "$name（${contentResolver.getType(uri) ?: "?"}, ${humanSize(size)}）"
+            } catch (e: Exception) {
+                "（读取失败：${e.message}）"
+            }
+        }
+        val more = if (uris.size > 5) " …共 ${uris.size} 个" else ""
+        return parts.joinToString() + more
+    }
+
+    private fun humanSize(bytes: Long): String = when {
+        bytes < 0 -> "大小未知"
+        bytes < 1024 -> "${bytes}B"
+        bytes < 1024 * 1024 -> "%.1fKB".format(bytes / 1024.0)
+        else -> "%.1fMB".format(bytes / 1024.0 / 1024.0)
+    }
+
     private fun toast(message: String) {
         Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
+    }
+
+    /**
+     * One line, bounded. A page console message can carry a whole stack trace or
+     * a multi-line object dump, and both the ring buffer and the shared log file
+     * are meant to stay readable.
+     */
+    private fun condense(message: String): String {
+        val single = message.replace('\n', ' ').replace('\r', ' ').trim()
+        return if (single.length > MAX_CONSOLE_CHARS) {
+            single.take(MAX_CONSOLE_CHARS) + "…(共 ${single.length} 字符)"
+        } else {
+            single
+        }
     }
 
     companion object {
         const val ACTION_LOCATE_TASK = "com.zcode.remote.action.LOCATE_TASK"
         const val ACTION_RELOAD = "com.zcode.remote.action.RELOAD"
+
+        /** Launcher long-press shortcut: rescan the desktop's QR code. */
+        const val ACTION_SCAN = "com.zcode.remote.action.SCAN"
+
+        /** Launcher long-press shortcut: open the settings screen. */
+        const val ACTION_OPEN_SETTINGS = "com.zcode.remote.action.OPEN_SETTINGS"
+
+        /** adb 驱动的诊断测试点：KICK 实验 / 手动轻推 / 体征快照（--es diag_cmd）。 */
+        const val ACTION_DIAG = "com.zcode.remote.action.DIAG"
+        const val EXTRA_DIAG_CMD = "diag_cmd"
         const val EXTRA_SESSION_ID = "session_id"
         const val EXTRA_TASK_TITLE = "task_title"
-        const val EXTRA_WORKSPACE_KEY = "workspace_key"
 
         private const val BRIDGE_NAME = "ZCodeShell"
         private const val ALLOWED_ROOT = "z.ai"
         private const val LOCATE_RETRY_MS = 600L
         private const val MAX_LOCATE_ATTEMPTS = 40
+
+        /** Console capture budget for one page load (see onConsoleMessage). */
+        private const val MAX_CONSOLE_LINES = 200
+        private const val MAX_CONSOLE_CHARS = 400
+
+        /** Mirrors the HarmonyOS build's PhotoViewPicker maxSelectNumber. */
+        private const val MAX_UPLOAD_ITEMS = 5
     }
 }

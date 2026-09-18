@@ -26,5 +26,13 @@
 /.cache/
 /.dsh-hdc/
 /.dsh-hvigor-tmp/
+# adb-bridge（安卓真机调试）的截图 / pull / 取回的日志，仅本机
+/.adb-bridge/
 # 安卓薄壳子工程（android-shell/）**随仓库上传**，不要在根上忽略它；
 # 其自身的构建产物与签名文件由 android-shell/.gitignore 处理。
+
+# 根目录下的临时 APK / 校验文件（子目录规则不覆盖根，2026-09-16 审计补上：
+# 此前 zcode-remote-pre93/pre95.apk 及 .md5 处于"未忽略"状态，`git add -A` 会
+# 直接提交 13MB 二进制）
+/*.apk
+/*.apk.md5
