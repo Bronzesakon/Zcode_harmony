@@ -488,6 +488,12 @@ class Notifier(private val context: Context) {
             action = MainActivity.ACTION_LOCATE_TASK
             putExtra(MainActivity.EXTRA_SESSION_ID, sessionId)
             putExtra(MainActivity.EXTRA_TASK_TITLE, title)
+            // 2026-09-18：**必须带上工作区键**。点卡片时若页面已被原生承载顶掉（KICKED 终态），
+            // 壳要靠 `(workspaceKey, sessionId)` 把"下次加载要打开哪个任务"预设进页面自己的
+            // 持久化槽位（`zcode-v4-last-session:v1:<workspaceKey>`），再重载 —— 那是页面自己
+            // 实现的"重载后回到上次任务"通路，也是唯一不靠点 DOM 的跳转方式。
+            // 此前这个参数收了却从没放进来，所以那条路一直缺一半。
+            if (workspaceKey.isNotEmpty()) putExtra(MainActivity.EXTRA_WORKSPACE_KEY, workspaceKey)
         }
         return PendingIntent.getActivity(
             context,

@@ -1588,7 +1588,7 @@
 
     var locateTimer = null;
 
-    G.__zcodeShellLocateTask = function (sessionId, title) {
+    G.__zcodeShellLocateTask = function (sessionId, title, presetUsed) {
         var attempts = 0;
         if (locateTimer) {
             clearInterval(locateTimer);
@@ -1597,6 +1597,26 @@
         locateTimer = setInterval(function () {
             attempts += 1;
             try {
+                // ⭐ 成功信号优先（2026-09-18）：先看"是不是已经在任务详情页里了"。
+                //
+                // 为什么需要：走"预设 + 重载"那条路时，**页面自己**会打开目标任务
+                // （见 __zcodeShellPresetTask），根本不需要去任务列表里点任何东西。
+                // 而这里若照旧去找列表元素，必然找不到、随后打出"未在任务列表里找到"，
+                // 那是**假警报**（真机上误导过一次）。判据与 `页面体征` 同一套读取：
+                // `chat && timeline && rows >= 0` 就是"正开着一条对话、且时间线已就绪"。
+                //
+                // ⚠️ **只在 presetUsed 时短路**：否则用户本来停在别的会话里点卡片时，
+                // 会被误判成"已到位"而跳不过去。
+                if (presetUsed) {
+                    var vit = readVitals();
+                    if (vit && vit.chat && vit.timeline && typeof vit.rows === 'number' && vit.rows >= 0) {
+                        diag('info', '已在任务详情页（时间线 ' + vit.rows + ' 行）：无需再点任务列表' +
+                            (title ? ' · ' + title : ''));
+                        clearInterval(locateTimer);
+                        locateTimer = null;
+                        return;
+                    }
+                }
                 var el = findTaskElement(title);
                 if (el) {
                     clickElement(el);
@@ -1613,12 +1633,61 @@
             }
             if (attempts >= 10) {
                 // Give up quietly: the app is open, the user can find the task.
-                diag('info', '未能在页面上定位任务(页面可能已改版): ' + title);
+                // 2026-09-18：区分两种来路。走了"预设 + 重载"那条路时，页面**自己**会打开
+                // 目标任务，所以此刻在任务列表里当然找不到它——报"页面可能已改版"是**假警报**
+                // （真机上正是这样误导过一次）。那种情况只留一行说明，别吓人。
+                diag('info', presetUsed
+                    ? '未在任务列表里找到（本次走"预设+重载"，页面通常已自行打开该任务）: ' + title
+                    : '未能在页面上定位任务(页面可能已改版): ' + title);
                 clearInterval(locateTimer);
                 locateTimer = null;
             }
         }, 300);
         return true;
+    };
+
+    /**
+     * 把「下次加载要打开哪个任务」预设进**页面自己的持久化槽位**，供随后的一次重载使用。
+     *
+     * 为什么是这个槽位（2026-09-18，用 CDP 在真机页面上读代码 + 实测确认）：
+     * 页面**自己**实现了"重载后回到上次任务"——
+     *   `zcode-v4-last-session:v1:<workspaceKey>`（值 = 纯 sessionId 字符串），
+     *   在**每个 renderer 首次挂载**时、且满足 `rendererReload && activeSessionId === null
+     *   && draftFocusVersion === 0` 时被读出并 `selectSession(那个 sessionId)`；
+     *   之后 activeSessionId 变化时页面自己回写该槽位、为 null 时删除。
+     * 也就是说：**"重载"就是那个跳转**，我们只需在重载前把目标任务写进去，
+     * 不必去点 DOM（那条 3 秒就放弃的定位路只在页面正常时才有意义）。
+     *
+     * 同时把路由状态钉成 `chat`：页面的"当前在哪个页面"存在 `history.state.zcodeMobilePage`
+     * （取值 `'chat'` | `'home'`），**不看 URL**；而 `history.state` 跨重载保留。
+     * 不钉的话，页面可能落在 `home`（任务列表），就进不了详情页。
+     *
+     * 只在"点通知卡片定位"那条路上由原生调用，调用方随后立刻 reload。
+     */
+    G.__zcodeShellPresetTask = function (workspaceKey, sessionId) {
+        try {
+            if (workspaceKey && sessionId) {
+                G.localStorage.setItem('zcode-v4-last-session:v1:' + workspaceKey, sessionId);
+            }
+            var st = (G.history && G.history.state) || null;
+            if (!st || st.zcodeMobilePage !== 'chat') {
+                var next = {};
+                if (st) {
+                    for (var k in st) {
+                        if (Object.prototype.hasOwnProperty.call(st, k)) {
+                            next[k] = st[k];
+                        }
+                    }
+                }
+                next.zcodeMobilePage = 'chat';
+                G.history.replaceState(next, '');
+            }
+            diag('info', '已预设下次加载要打开的任务: ' + workspaceKey + ' / ' + sessionId);
+            return true;
+        } catch (e) {
+            diag('warn', '预设下次任务失败: ' + e);
+            return false;
+        }
     };
 
     // -----------------------------------------------------------------------

@@ -329,7 +329,9 @@ class MainActivity : AppCompatActivity() {
                 // 稳定注入第三道：加载完成再兜一次（幂等）。
                 injectStable(view)
                 maybeRequestNotificationPermission()
-                tryLocate()
+                // 预设期间让路：那条路的延迟兜底调用（`presetUsed = true`）才是该跑的那次，
+                // 这里抢先跑只会对着"还没打开任务的页面"点空、并打出假警报（见 presetLocatePending）。
+                if (!presetLocatePending) tryLocate()
             }
 
             override fun onReceivedError(
@@ -717,11 +719,20 @@ class MainActivity : AppCompatActivity() {
         if (intent?.action != ACTION_LOCATE_TASK) return false
         val sessionId = intent.getStringExtra(EXTRA_SESSION_ID).orEmpty()
         val title = intent.getStringExtra(EXTRA_TASK_TITLE).orEmpty()
+        val workspaceKey = intent.getStringExtra(EXTRA_WORKSPACE_KEY).orEmpty()
         if (title.isEmpty() && sessionId.isEmpty()) return false
         pendingLocate = sessionId to title
         locateAttempts = 0
         Diagnostics.info("通知点击: 尝试定位任务")
-        tryLocate()
+        // 走"预设 + 重载"那条路时，页面会**自己**打开目标任务（那是页面实现的"重载后回到上次任务"）；
+        // 此时再把页内 DOM 定位器当作首选会打出"页面可能已改版"的**假警报**。所以只把它降级成兜底：
+        // 延迟更久再跑，且它的放弃文案会说明"已走预设那条路"。
+        val presetPath = maybeReloadForKickedPage(workspaceKey, sessionId)
+        if (presetPath) {
+            mainHandler.postDelayed({ tryLocate(presetUsed = true) }, PRESET_LOCATE_FALLBACK_MS)
+        } else {
+            tryLocate()
+        }
         return false
     }
 
@@ -732,8 +743,9 @@ class MainActivity : AppCompatActivity() {
      * and the document-start script only reports readiness after the page has
      * booted. Failure is silent by design — the user still gets the page.
      */
-    private fun tryLocate() {
+    private fun tryLocate(presetUsed: Boolean = false) {
         val target = pendingLocate ?: return
+        if (presetUsed) presetLocatePending = false
         if (!ShellRuntime.isInjectedReady()) {
             if (locateAttempts >= MAX_LOCATE_ATTEMPTS) {
                 Diagnostics.log("info", "放弃定位（注入脚本未就绪），仅打开应用")
@@ -750,6 +762,10 @@ class MainActivity : AppCompatActivity() {
             append(org.json.JSONObject.quote(target.first))
             append(',')
             append(org.json.JSONObject.quote(target.second))
+            append(',')
+            // 告诉注入层"这次是否已走预设+重载那条路"——它据此调整放弃时的文案，
+            // 避免在页面**已经自己打开目标任务**的情况下打出"页面可能已改版"的假警报。
+            append(if (presetUsed) "true" else "false")
             append(");")
         }
         try {
@@ -757,6 +773,66 @@ class MainActivity : AppCompatActivity() {
         } catch (e: Exception) {
             Diagnostics.log("warn", "执行定位脚本失败: ${e.message}")
         }
+    }
+
+    /**
+     * 点通知卡片时，若页面**很可能已被原生承载顶掉**（KICKED 终态），先把它重载一次。
+     *
+     * **为什么不靠定位点 DOM**：页面的 KICKED 是**终态**（"已被其他设备接管"，自己不回来），
+     * 那种页面上根本没有任务列表，`__zcodeShellLocateTask` 必然在 3 秒后静默放弃；
+     * 而原生那 24 秒重试只等"注入就绪位"，KICKED 页面**早就就绪**（文档加载完了，只是内容是终态页）
+     * ⟹ **两道超时全都用不上**，这就是"点卡片进不去"的直接原因。
+     *
+     * **为什么重载就够了**：页面**自己实现了"重载后回到上次任务"**——
+     * `zcode-v4-last-session:v1:<workspaceKey>` 值为纯 sessionId，页面在每个 renderer 首次挂载时
+     * 会把它读出来并 `selectSession(...)`（详见注入层 `__zcodeShellPresetTask` 的注释与真机取证）。
+     * 所以顺序必须是：**先把目标任务预设进那个槽位 → 再把承载交还 → 最后重载**。
+     *
+     * ⚠️ **交还那一步不能省**：单控制端互斥，承载不先停掉的话，页面重载后自己也会被再顶一次
+     * （父代理 2026-09-18 用 CDP 实测到：重载后页面确实订阅了会话、随即又被 KICKED 回终态）。
+     *
+     * **判据取保守**：只有"承载在跑 或 本次后台承载跑过"才重载——否则页面本来是好的，
+     * 白闪一次没有意义。**宁可不重载。**
+     */
+    /**
+     * "预设 + 重载"那条路正在进行中（从发出重载到延迟兜底定位跑完为止）。
+     *
+     * 为什么需要它：`onPageFinished` 里**还有一次** `tryLocate()`（`onPageFinished` 是页面每次加载完成
+     * 都会回调的）。重载会触发它，于是它抢在"页面自己打开目标任务"之前去点 DOM、找不到、打出
+     * `未能在页面上定位任务(页面可能已改版)` 的**假警报**——父代理 2026-09-18 真机上被它误导过一次。
+     * 有这一位，那条回调在预设期间就让路给延迟兜底那次调用。
+     */
+    private var presetLocatePending = false
+
+    private fun maybeReloadForKickedPage(workspaceKey: String, sessionId: String): Boolean {
+        if (!ShellRuntime.carrierMayHaveKickedPage()) {
+            Diagnostics.info("定位：页面未处于可疑态，直接定位（不重载）")
+            return false
+        }
+        val script = buildString {
+            append("window.__zcodeShellPresetTask && window.__zcodeShellPresetTask(")
+            append(org.json.JSONObject.quote(workspaceKey))
+            append(',')
+            append(org.json.JSONObject.quote(sessionId))
+            append(");")
+        }
+        ShellRuntime.evaluateJs(script)
+        // 先交还承载：否则页面重载后自己也配不上（单控制端互斥，它会被再顶一次）。
+        ShellRuntime.handBackCarrierForLocate()
+        // 让定位重试去等**新**文档：复位注入就绪位（与页面加载回调走同一条路）。
+        // 不复位的话，`tryLocate` 会立刻对着**旧**文档跑完那 10 次、3 秒后放弃，而新文档还没开始加载。
+        ShellRuntime.onPageStarted()
+        locateAttempts = 0
+        presetLocatePending = true
+        mainHandler.postDelayed({
+            try {
+                binding.webview.reload()
+                Diagnostics.info("定位：页面疑似被顶掉，已重载（带任务预设，等新文档就绪后再定位）")
+            } catch (e: Exception) {
+                Diagnostics.log("warn", "定位重载失败: ${e.message}")
+            }
+        }, 300L)
+        return true
     }
 
     // --------------------------------------------------------------- diag adb
@@ -950,10 +1026,18 @@ class MainActivity : AppCompatActivity() {
         const val EXTRA_DIAG_CMD = "diag_cmd"
         const val EXTRA_SESSION_ID = "session_id"
         const val EXTRA_TASK_TITLE = "task_title"
+        /** 工作区键（= 工作区路径，与 `TaskStore.Workspace.key` 同源）。2026-09-18 起随通知卡片一起下发。 */
+        const val EXTRA_WORKSPACE_KEY = "workspace_key"
 
         private const val BRIDGE_NAME = "ZCodeShell"
         private const val ALLOWED_ROOT = "z.ai"
         private const val LOCATE_RETRY_MS = 600L
+        /**
+         * 走了"预设 + 重载"那条路时，页内 DOM 定位器**降级为兜底**，等这么久再跑：
+         * 页面要先加载、再由它自己的"重载后回到上次任务"打开目标任务，通常 2–4 秒。
+         * 等够了再跑，日志里才不会出现"没找到任务"的假警报。
+         */
+        private const val PRESET_LOCATE_FALLBACK_MS = 9000L
         private const val MAX_LOCATE_ATTEMPTS = 40
 
         /** Console capture budget for one page load (see onConsoleMessage). */

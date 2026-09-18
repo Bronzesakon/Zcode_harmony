@@ -801,6 +801,31 @@ object ShellRuntime {
     private var carrierRanThisStint = false
 
     /**
+     * 通知卡片点击定位用：**页面是否可能已被承载顶掉**（KICKED 终态）。
+     *
+     * 判据刻意保守——**宁可漏判，不可误判**（误判会让本来好好的页面白闪一次重载）：
+     *   * 承载**此刻在跑** ⟹ 它必然把页面顶掉了（单控制端互斥）；或
+     *   * **本次后台承载跑过**（[carrierRanThisStint]）⟹ 页面很可能在后台期间被顶过。
+     * 只在这两种情况下，`MainActivity` 才走"预设任务 + 交还 + 重载"那条路。
+     */
+    fun carrierMayHaveKickedPage(): Boolean = Tier2Probe.isRunning() || carrierRanThisStint
+
+    /**
+     * 通知卡片点击定位用：**把承载交还给页面**，并清掉与它相关的状态。
+     *
+     * 为什么这一步不能省（2026-09-18 父代理用 CDP 实测）：单控制端互斥下，只要原生承载还在配对，
+     * 页面重载后**自己也会被再顶一次**、又回到 KICKED 终态 —— 那重载就白做了。
+     */
+    fun handBackCarrierForLocate() {
+        if (Tier2Probe.isRunning()) {
+            Tier2Probe.stop("通知点击定位：先交还")
+            Diagnostics.log("warn", "定位：先停掉原生承载，把连接还给页面")
+        }
+        clearCarrierState()
+        carrierRanThisStint = false
+    }
+
+    /**
      * 防误判用的 socket 生命周期观测：静默期内 socket 计数变了 ⇒ 页面在重拨，等它。
      *
      * 现场（2026-09-16 02:21，回前台那一下）：页面自己 `recoverConnection → reconnectNow`
