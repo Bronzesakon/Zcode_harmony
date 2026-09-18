@@ -84,6 +84,11 @@
     // 同一个结论，所以这里照抄它的做法：握手之后**先订对话，再订索引**。
     var EVENT_CONVERSATION_FRAME = 'onDynamicConversationFrame';
     var METHOD_SUBSCRIBE_CONVERSATION = 'subscribeConversationV4';
+    /**
+     * 运行态整表（页面自己订的那条 controller 流，见 `_forwardControllerTasks`）。
+     * 这是"哪些任务在跑"的**全局**正源：`sessions-index` 只跟随页面在听的那一个工作区。
+     */
+    var CONTROLLER_TASKS_TOPIC = 'controller/tasks-index';
     /** 一次最多订几条对话：卡片只显示得下少数几张，多订只是白烧桌面端。 */
     var CONVERSATION_MAX = 2;
     /** 单条对话订阅的等待上限。宁可放弃，也**绝不能挡住索引订阅**（否则通知全瞎）。 */
@@ -1080,6 +1085,8 @@
         // 也没有任何效果，客户端不接受"我该主动开桥"这个状态了。
 
         this.onSessions = null;
+        /** 运行态整表（页面自己的 controller 流）→ 原生，纯被动转发。 */
+        this.onControllerTasks = null;
         this.onStatus = null;
         this.onPageRpcCall = null;
         this.onPageRpcResult = null;
@@ -1744,6 +1751,24 @@
             .catch(function (err) {
                 bridge._logResyncFailed = String(err);
             });
+    };
+
+    /**
+     * 把页面自己那条 `controller/tasks-index` 的逻辑帧转给原生（纯被动，零写入）。
+     *
+     * 只做转发、不在这里解析：帧形状（snapshot / deltas / 缺口判定）在 Kotlin 侧
+     * `ControllerTasksState` 里已经有一份**带单测**的实现，JS 再写一遍就是第二个真相。
+     * 原生按 `{kind:'complete', frame:…}` 的信封收（与它自己的 wire 同构）。
+     */
+    RemoteClient.prototype._forwardControllerTasks = function (data) {
+        if (typeof this.onControllerTasks !== 'function') {
+            return;
+        }
+        try {
+            this.onControllerTasks({kind: 'complete', frame: data});
+        } catch (e) {
+            // 观测层绝不打断页面自己的流量
+        }
     };
 
     RemoteClient.prototype._emitSessions = function (key, bridge, state, source) {
@@ -2552,6 +2577,16 @@
             typeof data.topic === 'string' && data.topic.indexOf('conversation/') === 0) {
             this._pageConversationTrafficAt = Date.now();
             this._trackConversationText(data);
+        }
+        // 第三条源（2026-09-18）：**页面自己订的** `controller/tasks-index`。
+        // 为什么单列一条：`sessions-index` 那条只能跟随"页面此刻在听的那一个工作区"
+        // （见 _observeOutboundListen），而"哪些任务在跑"是全局的——用户在别的
+        // 工作区里继续跑任务时，壳里 `runningTaskRefs()` 会是空的，卡片/接管全都
+        // 无从谈起（真机 2026-09-18 09:14 就是这个现场）。这条帧页面本来就收，
+        // 解析交给原生那份**已被单测钉过**的 ControllerTasksState，这里只做转发。
+        if (header[0] === RES_EVENT_FIRE && data && typeof data === 'object' &&
+            data.topic === CONTROLLER_TASKS_TOPIC) {
+            this._forwardControllerTasks(data);
         }
         // 入站 topic 直方图：每个新 topic 打一行（最多 8 种）。
         // 为什么要有它：真机 2026-09-15 出现"对话订阅 8 次全部 ack 成功、对话帧却是 0"，

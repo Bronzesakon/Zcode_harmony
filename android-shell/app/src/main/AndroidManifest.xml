@@ -107,6 +107,16 @@
             </intent-filter>
         </receiver>
 
+        <!-- 「知道了」动作：已完成卡自己撤自己（2026-09-17）。
+
+             为什么需要它：占着提升位的卡必须是 ongoing（LiveUpdate 的平台硬条件），
+             而 ongoing 通知在 AOSP 里用户滑不掉——所以那张"已完成"的卡必须有出口。
+             降级成普通通知（没抢到提升位）时可以照常滑动清除，这条动作是给芯片卡用的。
+             不导出：只有我们自己的 PendingIntent 能送到。 -->
+        <receiver
+            android:name=".notify.CardDismissReceiver"
+            android:exported="false" />
+
         <!-- Hands the exported diagnostics file to a share target (settings ->
              分享日志). Nothing else in the app is exposed through it. -->
         <provider

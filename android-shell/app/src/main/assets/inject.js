@@ -816,6 +816,12 @@
                 noteRunningActivity(update);
             } catch (e) {}
         };
+        // 第三条源：页面自己订的 `controller/tasks-index`（全局运行态整表）。
+        // `sessions-index` 只能跟随页面在听的那一个工作区，所以这是"别的在工作区里
+        // 跑着的任务"唯一能被壳看见的路（真机 2026-09-18 09:14）。
+        next.onControllerTasks = function (wire) {
+            post('controllertasks', wire);
+        };
         next.onPageRpcCall = function (call) {
             try {
                 notePageRpcCall(call);

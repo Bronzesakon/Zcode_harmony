@@ -91,6 +91,8 @@
     <string name="notification_title_completed">任务完成</string>
     <string name="notification_title_attention">需要你的处理</string>
     <string name="notification_title_failed">任务已结束</string>
+    <!-- 「已完成」卡上的动作：占着提升位的卡必须是 ongoing，用户滑不掉，所以给它一个出口。 -->
+    <string name="card_dismiss">知道了</string>
     <string name="keepalive_channel_name">后台连接</string>
     <string name="keepalive_channel_desc">保持与桌面端的连接，以持续接收任务状态</string>
     <string name="keepalive_title">ZCode 远程正在后台运行</string>

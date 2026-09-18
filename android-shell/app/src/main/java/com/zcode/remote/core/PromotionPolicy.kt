@@ -23,17 +23,36 @@ object PromotionPolicy {
     const val MAX_PROMOTED = 2
 
     /**
-     * @return the notification ids that should request promotion, out of
-     *   [running] (which is the full running set from [TaskStore]).
+     * A card whose task has finished and is being kept on purpose (2026-09-17):
+     * the *same* notification, status word flipped to 已完成, left up for the user
+     * to dismiss instead of vanishing.
      */
-    fun choose(running: List<TaskStore.RunningNotification>, max: Int = MAX_PROMOTED): Set<Int> {
-        if (running.isEmpty() || max <= 0) return emptySet()
-        return running
+    data class Finished(val id: Int, val completedAt: Long)
+
+    /**
+     * @return the notification ids that should request promotion, out of
+     *   [running] (the full running set from [TaskStore]) plus any [finished] cards
+     *   still being held.
+     *
+     * A finished card competes for the same slots but always **loses** to a live
+     * one: the strip is for activity that is happening, and a task that finished
+     * ten minutes ago must never keep a running task off it. Losing a slot does not
+     * delete it — it drops back to an ordinary dismissible notification
+     * (see `Notifier.syncRunningTasks`).
+     */
+    fun choose(
+        running: List<TaskStore.RunningNotification>,
+        finished: List<Finished> = emptyList(),
+        max: Int = MAX_PROMOTED,
+    ): Set<Int> {
+        if (max <= 0) return emptySet()
+        val live = running
             .sortedWith(
                 compareByDescending<TaskStore.RunningNotification> { it.status == TaskStatus.WAITING }
                     .thenByDescending { it.activityAt }
             )
-            .take(max)
-            .mapTo(LinkedHashSet()) { it.id }
+            .map { it.id }
+        val done = finished.sortedByDescending { it.completedAt }.map { it.id }
+        return (live + done).take(max).toCollection(LinkedHashSet())
     }
 }

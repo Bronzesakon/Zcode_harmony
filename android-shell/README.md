@@ -56,7 +56,7 @@
 
 ## 项目现状（先读这一节）
 
-**一句话**：主体功能已落地，测试全绿（**JS 96 项 + Kotlin 99 项**）；真机当前跑的是**本机出的 `1.0.0-local.163`**（不走 CI、不写预发布），而 `pre` 每次推送仍会把最新 APK **覆写**到滚动预发布 [android-pre](https://github.com/Bronzesakon/Zcode_harmony/releases/tag/android-pre)（固定链接 `…/releases/download/android-pre/zcode-remote.apk`，可直接覆盖安装）——**真机验证已过十六轮**（一加 PLC110 / ColorOS 16 / API 36 / WebView 153–154）。**第十五轮两条已定案**：① 壳不再拆页面连接（「只读壳」，见「实现要点」14）；② 可见性劫持已停用，且**回前台"加载不出来"这一条已被真机证实修好**（页面自己走回 `recoverConnection`）。**"后台约 60 秒墙"已在第十六轮（2026-09-16 这一夜）定案并解决**：退后台约 60–70s 后 **Chromium 的网络栈整条停止工作**（页面新建 `fetch` 76 秒既不成功也不失败），而**同一刻原生 Java 侧裸 TCP 67ms、HTTPS 200**——所以页面侧任何自救都不可能成功，**只有换承载连接的那一层**；落地形态是「链路判死 → 原生接管 → 回前台交还」，**端到端已验收**（后台/熄屏都在跟手、回前台不需要重载、一小时长测 30 拍全绿），取证见「已知问题」与 `docs/18`。**多工作区/多任务订阅已收口**：E1 真机跑通＝桌面端**能同时开多座桥、但同一时刻只服务一座**（服务权归"最近订阅成功"者），于是做法定为**主动轮换**，**按 2 座优化**（ColorOS 只并发 2 张实况窗）；桥数上限已抬到 **5**（成本取舍，产品上限仍是 2 张卡），且**承载能自己从 `bootstrap-response.tasks` 发现"哪些工作区在跑"**（定向接管）。落地与取证见 `docs/18` §3.1–§3.8。**「提前接管」（停在概览页退后台也能喂卡片）已真机验收**：162 正向跑通（有在跑任务 + 概览页 + HOME ⇒ ~30s 出候选、~40s 桥就绪，**不走** ~100s 的判死路径），163 修掉"接管后一拍把 `KICKED` 帧误判成链路已恢复 ⇒ 交还又立刻重配对"并复验通过，取证见 `docs/18` §3.10。下表按"还剩什么没结论"排：
+**一句话**：主体功能已落地，测试全绿（**JS 97 项 + Kotlin 108 项**）；真机当前跑的是**本机出的 `1.0.0-local.168`**（不走 CI、不写预发布），而 `pre` 每次推送仍会把最新 APK **覆写**到滚动预发布 [android-pre](https://github.com/Bronzesakon/Zcode_harmony/releases/tag/android-pre)（固定链接 `…/releases/download/android-pre/zcode-remote.apk`，可直接覆盖安装）——**真机验证已过十六轮**（一加 PLC110 / ColorOS 16 / API 36 / WebView 153–154）。**第十五轮两条已定案**：① 壳不再拆页面连接（「只读壳」，见「实现要点」14）；② 可见性劫持已停用，且**回前台"加载不出来"这一条已被真机证实修好**（页面自己走回 `recoverConnection`）。**"后台约 60 秒墙"已在第十六轮（2026-09-16 这一夜）定案并解决**：退后台约 60–70s 后 **Chromium 的网络栈整条停止工作**（页面新建 `fetch` 76 秒既不成功也不失败），而**同一刻原生 Java 侧裸 TCP 67ms、HTTPS 200**——所以页面侧任何自救都不可能成功，**只有换承载连接的那一层**；落地形态是「链路判死 → 原生接管 → 回前台交还」，**端到端已验收**（后台/熄屏都在跟手、回前台不需要重载、一小时长测 30 拍全绿），取证见「已知问题」与 `docs/18`。**多工作区/多任务订阅已收口**：E1 真机跑通＝桌面端**能同时开多座桥、但同一时刻只服务一座**（服务权归"最近订阅成功"者），于是做法定为**主动轮换**，**按 2 座优化**（ColorOS 只并发 2 张实况窗）；桥数上限已抬到 **5**（成本取舍，产品上限仍是 2 张卡），且**承载能自己从 `bootstrap-response.tasks` 发现"哪些工作区在跑"**（定向接管）。落地与取证见 `docs/18` §3.1–§3.8。**「提前接管」（停在概览页退后台也能喂卡片）已真机验收**：162 正向跑通（有在跑任务 + 概览页 + HOME ⇒ ~30s 出候选、~40s 桥就绪，**不走** ~100s 的判死路径），163 修掉"接管后一拍把 `KICKED` 帧误判成链路已恢复 ⇒ 交还又立刻重配对"并复验通过，取证见 `docs/18` §3.10。**卡片生命周期与运行态三条源在 164→168 落地**（用户三句话驱动，取证见 `docs/18` §3.11）：① 结束＝**同一条卡片记录原地改状态**（3s 观察窗吃掉轮次缝，不再撤卡重发，完成后留到用户点「知道了」）；② 运行态补上**第三条源**——页面自己订的 `controller/tasks-index`（全局 89 个任务，不再只看页面正在跟随的那一个工作区）；③ 承载覆盖**无条件包含有在跑任务的工作区**（桥不再开在没人跑的工作区上，正文不再只剩工作区名）；④ 运行态判定从**固定优先级**改成**"谁后到谁算数"**（三源时刻表；桌面端暂停后卡片不再永远"运行中"）。下表按"还剩什么没结论"排：
 
 | # | 待验证 / 待排查 | 现状 | 怎么看 |
 | --- | --- | --- | --- |
@@ -181,11 +181,13 @@ bridge → 桌面端 `rpc-transport-fault` → 壳重开（每次 4 条 RPC：he
 
 ### 已知问题 D3：完成卡片（流体云完成提示）
 
-完成卡片表示"刚刚结束"，踩在规范边上（`ColorOS_docs/06-…/01-创建实时更新通知（Views 实现指南）.md` 里除硬性要求外还有
-「如果活动发生在过去，请勿使用实时更新」一句），是本应用里最可能被判为"不该提升"的一张。因用户明确要求"完成后强提示"
-仍做，但**只挂 15 秒**，持久记录仍在 `task_completed` 渠道的普通通知里。**若哪天真机发现流体云不再出卡，第一步就是把
-这张 15 秒卡片去掉再试**（该卡片是否被真实完成事件正常触发，尚未真机验证）。被提升的卡片走 promoted 路径，
-「默认展开、不可折叠」是它自带的，"弹出展开为方框"效果即来源于此，不是我们控制的。
+**2026-09-18 改版（`docs/18` §3.11 A）**：那张"另开 id、15 秒自动撤"的完成卡**已经删掉**——它会和运行卡
+抢两个提升位，而且撤卡+新建让卡片闪。现在的形态是：任务停止 **3 秒**（观察窗）后，**同一条卡片记录原地**
+把状态词换成 `已完成`、正文冻结在最后一次正文，并挂一个「知道了」动作（被提升的卡必须是 `ongoing`，
+用户滑不掉，所以给它一个出口）；**让位**给在跑的任务时降级成普通通知，那时可以照常滑动清除。
+持久记录仍在 `task_completed` 渠道的普通通知里（可听、可清除）。
+规范边界不变：官方 UX 指南说"活动发生在过去请勿使用实时更新"，这张卡是本应用里最可能被判"不该提升"的一张
+——**若哪天流体云不再出卡，第一步仍是先把它去掉再试**。
 
 ### 已知问题 E：附件上传在所有客户端无应答——`zcode-agent.attachmentBeginV4`（2026-09-12，桌面端）
 
@@ -230,12 +232,12 @@ hook 挂在 `WebSocket.prototype` 上、对补注前已存在的页面连接同�
 
 | job | 内容 | 首次 | 有缓存 |
 | --- | --- | --- | --- |
-| `js` | Node 协议层 + 注入层测试（96 项），不需要 JDK/SDK | ~1 min | ~40 s |
-| `build` | 单次 Gradle 调用：release 单元测试（99 项）+ `assembleRelease` + 签名校验 | ~4 min | ~2m 45s |
+| `js` | Node 协议层 + 注入层测试（97 项），不需要 JDK/SDK | ~1 min | ~40 s |
+| `build` | 单次 Gradle 调用：release 单元测试（108 项）+ `assembleRelease` + 签名校验 | ~4 min | ~2m 45s |
 | `prerelease` | 仅 `pre` 分支：把最新 APK **覆写**到滚动预发布 Release（固定下载链接） | ~20 s | ~20 s |
 | `release` | 仅 `v*` tag：用 CHANGELOG 段落发正式 Release | ~20 s | ~20 s |
 
-测试构成：JS **96 项**（`tools/protocol.test.js` + `tools/inject.test.js`，含手算黄金字节；其中 6 项钉「对话流 → 卡片正文」的帧契约：snapshot 取最后一段 `assistantText`、`row.delta` 只拼同一行、工具/子代理/reasoning 不覆盖正文、原生种子优先且上限 `CONVERSATION_MAX`；5 项钉**只读壳契约**（含 2026-09-17 新增的"默认配置零写入"）：前台心跳零写入、回前台零写入、进对话卡住不重载、卡住不连刷、默认即被动不主动开桥；**另 4 项钉后台承载**（2026-09-16 加）：交还兜底「有线/有帧就不重载」与「零 socket 零帧才重载一次」、推动函数 event 档只派发合成 `online`、close 档真关线）；Kotlin **99 项 / 10 个测试类**（`@Test` 实数：`NotifyStateTest` 30 + `RelayWireTest` 21 + `UploadMimeTest` 8 + `ControllerTasksStateTest` 8 + `CarrierHandbackTest` 7（2026-09-17 加：提前接管那条路的交还判据）+ `PromotionPolicyTest` 7 + `PageBarColorTest` 6 + `SurvivalVerdictTest` 5 + `RelayBridgeTest` 5 + `Tier2ProofTest` 2）。数字以实测为准（`node --test` 报 tests 行；Kotlin 数 `@Test`），**改测试后请同步这一行**。**这些是唯一能在无设备条件下验证的东西**，真机行为一律以设备为准。
+测试构成：JS **97 项**（`tools/protocol.test.js` + `tools/inject.test.js`，含手算黄金字节；其中 6 项钉「对话流 → 卡片正文」的帧契约：snapshot 取最后一段 `assistantText`、`row.delta` 只拼同一行、工具/子代理/reasoning 不覆盖正文、原生种子优先且上限 `CONVERSATION_MAX`；5 项钉**只读壳契约**（含 2026-09-17 新增的"默认配置零写入"）：前台心跳零写入、回前台零写入、进对话卡住不重载、卡住不连刷、默认即被动不主动开桥；**另 4 项钉后台承载**（2026-09-16 加）：交还兜底「有线/有帧就不重载」与「零 socket 零帧才重载一次」、推动函数 event 档只派发合成 `online`、close 档真关线）；Kotlin **108 项 / 10 个测试类**（`@Test` 实数：`NotifyStateTest` 32 + `RelayWireTest` 21 + `UploadMimeTest` 8 + `ControllerTasksStateTest` 8 + `CarrierHandbackTest` 7（2026-09-17 加：提前接管那条路的交还判据）+ `ControllerTasksStateTest` 13（2026-09-18 加：运行态三源时效、凭空长出工作区）+ `PromotionPolicyTest` 7 + `PageBarColorTest` 6 + `SurvivalVerdictTest` 5 + `RelayBridgeTest` 5 + `Tier2ProofTest` 2）。数字以实测为准（`node --test` 报 tests 行；Kotlin 数 `@Test`），**改测试后请同步这一行**。**这些是唯一能在无设备条件下验证的东西**，真机行为一律以设备为准。
 
 省时间的几个点：`js` 不与 Android 构建串行；`testReleaseUnitTest` 与 `assembleRelease` 放在**同一次 Gradle 调用**里（共享 `compileReleaseKotlin`，源码只编译一次、Gradle 只启动一次）；`fetch-depth: 1`；`actions/setup-java` 的 `cache: gradle` 会恢复 `~/.gradle`（依赖缓存 + 本地 build cache）；`org.gradle.configuration-cache=true` 且 `problems=warn`，所以配置缓存只可能加速、不会让构建失败。
 
@@ -530,6 +532,29 @@ zcode-remote.apk -> CN=ZCode Remote, OU=Mobile, O=ZCode, L=Unknown, ST=Unknown, 
     （**call，安全**，带 `title` 与 `activity.lastActivityAt`，可做周期刷新）、被动解析页面自己的
     `controller/tasks-index` 帧（零写入）。取证与逐条证据见 `docs/18` §3.7。
 
+22. **运行态有**三条**源，不能合并成一条；判定必须是"谁后到谁算数"（2026-09-18，`docs/18` §3.11）。**
+    三源与各自盲区：① **`controller/tasks-index`**（`liveStatus`）——**全局**（真机 89 个任务、7 个工作区），
+    但**骑在页面的 socket 上**（原生承载一接管页面就被顶掉，这条流随之死掉；原生自己发 `listen` 会让桌面端
+    host 崩，见要点 21 ⛔）；② **`sessions-index`**（持久 `phase`）——页面被动跟随与承载桥两条路都有，
+    但**按工作区订阅**（页面停在 A 就只看得到 A，这正是"页面显示 41 个任务、壳只看到 2 个"的现场）；
+    ③ **会话流 `turnHeader.state`**——最准最实时，但**只在承载里**、且只覆盖订阅的那几条会话。
+    接法：页面那条 controller 流由注入层**纯被动转发**给原生（`post('controllertasks')` → 复用带单测的
+    `ControllerTasksState`，JS 不重写解析）；三条源各记**报到时刻**，`TaskStore.phaseOverlay` 取最新的一份
+    （SI 的相位在 base 里，"返回 null"即用它）。**两个必守的细节**：`applyConversationRunState` **相位没变
+    也要盖时刻**、`applyLivePreview`（正文在流）要**续期**——否则一条"正跑着但相位从没变过"的会话会被
+    一份新到的持久态报告判成结束。**承载覆盖**同理：`carrierCoverageTargets()` 里"有在跑任务的工作区"
+    **不受 `multi_ws_*` 开关管**（那是卡片的本体）——否则桥会开在页面当前那个没人跑的工作区上，
+    卡片正文只剩工作区名（真机 09:28 现场）。
+
+23. **卡片的生命周期是"一条记录走到底"：建 → 原地刷新 → 原地改状态 → 用户清掉（2026-09-18，`docs/18` §3.11 A）。**
+    通知 id = 任务 id，从头到尾只有这一条记录：**结束不是撤卡**，而是把它改成 `已完成 · 任务名`
+    （同一渠道、同一 id、正文冻结）并挂「知道了」动作；**新一轮不是重建**，而是同 id 覆盖回 `运行中`。
+    两个必须记住的前提：① **"结束"要持续停 3 秒才算**（`NotifyState.COMPLETION_HOLD_MS`；真机测到的轮次缝是
+    0.4–0.55s，窗内又跑起来＝什么都没发生），窗口到期靠 `Update.nextFlushAtMs` 定时回灌（任务结束后不再有新帧）；
+    ② 被提升的卡**必须 `ongoing`**（平台硬条件）而 `ongoing` 通知**用户滑不掉**，所以"留到用户清掉"由
+    「知道了」动作 + **让位降级**（没抢到提升位 ⇒ `ongoing=false` ⇒ 可滑动清除）共同兜住。
+    提升位：完成卡参与抢位但**永远排在在跑的任务之后**（`PromotionPolicy.choose(running, finished)`）。
+
 ## 任务通知（这是壳存在的理由）
 
 三个渠道，**创建时**就定下重要性——Android 不允许事后改渠道重要性，所以「待确认要响、运行中要静」必须靠分渠道：
@@ -670,7 +695,7 @@ M3 基线的做法（2026-09-11 落地）：
 
 ```powershell
 cd android-shell
-node --test tools/inject.test.js tools/protocol.test.js   # 96 项：线格式、分片重组、通道客户端、会话索引、注入层、页面 RPC 取证
+node --test tools/inject.test.js tools/protocol.test.js   # 97 项：线格式、分片重组、通道客户端、会话索引、注入层、页面 RPC 取证
 python tools/check_kotlin_structure.py   # 括号配平 / 包名与目录一致 / 合并残留（约 1 秒）
 python tools/check_resources.py          # 资源引用名是否存在（约 1 秒，补 aapt2 只在 CI 跑的缺口）
 python tools/watch_ci.py                 # 读 CI 状态与失败原因（无需 gh / 无需 token）
@@ -788,8 +813,16 @@ MSYS_NO_PATHCONV=1 "$ADB" devices -l                 # 确认出现设备
 
 ### 一句话状态
 
-真机当前跑的是**本机出的 `1.0.0-local.163`**（同签名覆盖安装，**零 CI 消耗**）。**163 这一轮只做一件事：
-把「提前接管」验正，并修掉它路上的一个交还误判。** ① **162 正向跑通**：有在跑任务 + 停在概览页 + HOME
+真机当前跑的是**本机出的 `1.0.0-local.168`**（同签名覆盖安装，**零 CI 消耗**）。**164→168 这一轮由用户三句话驱动**：
+"结束时把卡片标成已完成、新一轮只刷新不重建"、"你的代码没有正确接收状态列表"、"桌面端暂停了但卡片还显示运行中"。
+四条落地（取证 **`docs/18` §3.11**）：① **卡片生命周期**——3s 观察窗 + **同一条记录原地改状态**
+（建 → 原地刷新 → `已完成` → 用户点「知道了」清掉；不再撤卡重发）；② **运行态第三条源**——页面自己订的
+`controller/tasks-index`（纯被动转发，解析复用 `ControllerTasksState`），壳终于看得到"页面显示 41 个任务、
+壳只看到 2 个"之外的全部工作区；③ **承载覆盖**无条件包含有在跑任务的工作区（桥不再开在没人跑的工作区上，
+卡片正文不再只剩工作区名 `default`）；④ **判定改成"谁后到谁算数"**（三源时刻表），暂停后卡片不再永远"运行中"。
+**仍未验**：12s 轮换一拍（§3.9 ⑥）、设置页人工一眼；**待拍板**：完成卡跨进程重启要不要持久化。
+
+**上一轮（162/163：提前接管验正 + 交还误判）**：① **162 正向跑通**：有在跑任务 + 停在概览页 + HOME
 ⇒ ~30s `候选提前接管`、~40s `bridge ready` + `活进展`（**不走** ~100s 的判死路径），卡片正文与日志同刻一致
 （`when`/`android.text` 三方核对）；② 抓到并修掉"**接管后一拍把桌面端的 `KICKED` 帧误判成"链路已恢复"
 ⇒ 交还又立刻重配对**"——新增纯函数 `core/CarrierHandback.kt`（+7 条单测）：提前接管那条路要等页面
@@ -868,8 +901,8 @@ MSYS_NO_PATHCONV=1 "$ADB" devices -l                 # 确认出现设备
 **pre.101 追加**（pre.100 真机的两条新证据逼出来的）：`subscribeControllerV4` **超时**
 （那条流看来由桌面**窗口进程**提供，而接管正好把页面顶掉）→ 运行态改用**会话流自己的
 `turnHeader.state`** 兜底（`ConversationTail.turnRunning()` → `TaskStore.applyConversationRunState`，
-store 三级优先级：controller > 会话流 > SI 持久态）；controller 订阅**移到索引订阅之后**、
-超时 30 s→12 s，不再挡住握手主路径。
+store 运行态判定：**三源各记报到时刻、谁后到谁算数**，2026-09-18 之前是固定优先级 `controller > 会话流 > SI`，
+见「实现要点」22）；controller 订阅**移到索引订阅之后**、超时 30 s→12 s，不再挡住握手主路径。
 
 ### 下一步（新会话第一件事）
 
@@ -885,12 +918,21 @@ store 三级优先级：controller > 会话流 > SI 持久态）；controller �
      不变、页面零重载；**裸 `am start` 会新建 Activity 实例**（`standard` 启动模式 + 隐式 `NEW_TASK`），
      就是交接文本里那条"页面重载 + KICKED"的来源。
    **仍未验**：12s 轮换一拍 / 失败只回收一座（§3.9 ⑥，需要两个不同工作区各一个在跑任务）、
-   设置页人工一眼（`SettingsActivity` 未导出）、**卡片在"轮次结束→新一轮开始"之间撤回再重建（1s 级）要不要去抖**——待拍板。
+   设置页人工一眼（`SettingsActivity` 未导出）。
+0.5 **【已完成 2026-09-18 上午】卡片生命周期 + 运行态三条源（164→168，取证 `docs/18` §3.11）。**
+   用户三句话驱动："结束时标成已完成、新一轮只刷新不重建"、"你的代码没有正确接收状态列表"、
+   "暂停了但卡片还显示运行中"。四条落地：① 3s 观察窗 + **同一条记录原地改状态**（建 → 原地刷新 →
+   `已完成` → 用户点「知道了」清掉）；② 运行态补上**第三条源**（页面自己的 `controller/tasks-index`，
+   纯被动转发，解析复用 `ControllerTasksState`）；③ 承载覆盖**无条件包含有在跑任务的工作区**；
+   ④ `phaseOverlay` 从固定优先级改成**三源时刻表、谁后到谁算数**。
+   **仍未验 / 待拍板**：① "留住的完成卡"在**进程重启后**会退化成普通可滑除通知（`finishedCards` 是内存态，
+   要做持久化再说）；② 前台 + 页面停在概览页时正文仍可能只有工作区名（只读壳的固有边界）；
+   ③ 长时间无人清理的完成卡会一直占一个提升位（会不会触发 ColorOS 的"活动发生在过去"判罚，需观察）。
 1. **多工作区 + 定向接管：已收口并真机验收（151→158）**。读 **`docs/18` §3.1–§3.8**（E1 证据、两次修法
    往返、空更新 bug、N=2 主动轮换、12s 节奏与"门槛必须小于拍长"、发现链与两个形状坑、上限 5）。
    **可选的下一步（都没做）**：① 用 `Ng.remoteSessionId` 省掉"等 SI 才知道 sessionId"；
    ② `window-controller.listTaskList`（**call，安全**）做周期性刷新，可拿到 `title` 与
-   `activity.lastActivityAt`；③ 被动解析页面自己的 `controller/tasks-index` 帧（零写入的第三条源）；
+   `activity.lastActivityAt`；③ ~~被动解析页面自己的 `controller/tasks-index` 帧~~ **已接（165，见「实现要点」22）**；
    ④ 抬到 3 座以上的**安卓侧真机验证**（判据见 `docs/18` §3.8；本仓库未做，已委托鸿蒙侧）。
    ⚠️ **每轮开测前先补开关**（内存态，进程重启即丢）：`bc multi_ws_on` + `bc coverage_ws_clear`，
    再用 `bc stall_state` 确认 `多工作区=true`：
@@ -1044,7 +1086,7 @@ store 三级优先级：controller > 会话流 > SI 持久态）；controller �
 cd android-shell
 python tools/check_kotlin_structure.py     # 一秒：括号配平 / 包名与目录一致 / 合并残留
 python tools/check_resources.py            # 一秒：每个 @type/name 是否都有定义
-node --test tools/inject.test.js tools/protocol.test.js   # 96 项（protocol + inject）
+node --test tools/inject.test.js tools/protocol.test.js   # 97 项（protocol + inject）
 python tools/watch_ci.py                   # 匿名读 CI 状态与编译错误注解（单次读取；失败/取消时退出码非 0）
 bash tools/device_check.sh                 # 真机一键验收（取包→装→清日志→跑→打印全部判据）
 ```
@@ -1158,7 +1200,7 @@ MSYS_NO_PATHCONV=1 "$ADB" -s "$S" shell "L=/sdcard/Android/data/com.zcode.remote
   出包命令见「本机开发」；`adb install -r` 直接覆盖安装，**不消耗 CI**。CI 仍然是可选通路
   （`git push origin pre` → js 检查 + `:app:testReleaseUnitTest` + APK → 滚动预发布 `android-pre`）。
   本地出包前务必先跑门禁（下面两条），因为本地编译**同样**只报类型错误、不保证行为正确。
-- **本地能跑的检查**：`node --test tools/inject.test.js tools/protocol.test.js`（96 项）、
+- **本地能跑的检查**：`node --test tools/inject.test.js tools/protocol.test.js`（97 项）、
   `python tools/check_kotlin_structure.py`
   （括号配平 / 包名 / 同文件重名——**不同嵌套类里的同名 fun 也会被点名**，改名即可）、
   `python tools/check_resources.py`；读 CI 用 `python tools/watch_ci.py`（含 `e:` 注解行；

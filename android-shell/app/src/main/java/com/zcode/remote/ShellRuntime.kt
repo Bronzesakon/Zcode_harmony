@@ -7,6 +7,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import com.zcode.remote.core.CarrierHandback
+import com.zcode.remote.core.CompletionEvent
 import com.zcode.remote.core.Diagnostics
 import com.zcode.remote.core.NotifyState
 import com.zcode.remote.core.Prefs
@@ -72,6 +73,13 @@ object ShellRuntime {
     private val lock = Any()
     private var pendingRemovedIds = LinkedHashSet<Int>()
     private var latestRunning: List<TaskStore.RunningNotification> = emptyList()
+
+    /**
+     * 还没交给通知层的完成事件（2026-09-17）。它们和 [pendingRemovedIds] 一样要累积：
+     * 「完成」的落地形态是**同一条卡片记录改状态**（见 `Notifier.syncRunningTasks`），
+     * 所以这两件事必须在同一次 flush 里一起到，否则会先撤卡再补状态（就是那个闪烁）。
+     */
+    private var pendingCompleted: List<CompletionEvent> = emptyList()
     private var pendingFlush: Runnable? = null
     private var lastPublishAt = 0L
 
@@ -746,9 +754,15 @@ object ShellRuntime {
     /**
      * 承载这一轮要开哪些工作区的桥（多工作区方向，见 `docs/17`）。
      *
-     * 优先级：诊断覆盖清单 > 多工作区开关 > 只开页面工作区（返回空，交给 `Tier2Probe` 决定）。
-     * 开关打开时＝ page 工作区 ∪ **发现链**"有活动任务的工作区" ∪ store 里在跑任务的工作区，
-     * 上限 [MULTI_WS_COVERAGE_CAP]。
+     * 优先级：诊断覆盖清单 > 【**有在跑任务的工作区**（无条件）】∪ 页面工作区（多工作区开关打开时）
+     * ∪ **发现链**"有活动任务的工作区"，上限 [MULTI_WS_COVERAGE_CAP]。
+     *
+     * **为什么"有在跑任务的工作区"不再受开关管**（2026-09-18 真机）：那是**卡片的本体**。
+     * 开关（内存态，重启即丢）关着、页面又停在别的工作区时，桥会开在页面那个工作区上：
+     * 现场是 `Tier2: 只开页面当前工作区的桥：E:\MiMo…`，而任务在
+     * `C:\Users\wdn32\.zcode\workspace\default` 里跑 —— 运行集对、卡片在，但**没人订阅那条
+     * 对话**，卡片正文只能落到工作区名（用户看到的就是 `default` 三个字母）。
+     * 多工作区**开关**留给"页面工作区也要覆盖"这件事，以及诊断 A/B。
      *
      * **发现链**（2026-09-17 加，见 `docs/18` §3.7）＝从**已经在收的**两处响应解析出来的活动工作区
      * （`bootstrap-response.result.tasks` 必填 / `workspace-list-response.result.tasks` 可选）。
@@ -756,14 +770,12 @@ object ShellRuntime {
      */
     private fun carrierCoverageTargets(): List<String> {
         if (coverageOverride.isNotEmpty()) return coverageOverride
-        if (!multiWorkspaceCoverage) return emptyList()
         val out = LinkedHashSet<String>()
-        if (pageWorkspaceKey.isNotEmpty()) out.add(pageWorkspaceKey)
+        if (multiWorkspaceCoverage && pageWorkspaceKey.isNotEmpty()) out.add(pageWorkspaceKey)
         // **这里不读发现链**（2026-09-17 删掉那行 `Tier2Probe.discoveredCoverage()`）：
         // 本函数在**承载启动前**算，而发现链的数据（bootstrap/workspace-list 的 tasks）
         // 要配对之后才有——那一刻它必然是空表，留着只会让后人误以为"发现链已经并进来了"。
-        // 真正的并入点在 `Tier2Probe.startCoverage()`（日志行 `Tier2: 发现链给出 …`），
-        // 而且它只在本函数返回非空（多工作区开关打开）时才并入。
+        // 真正的并入点在 `Tier2Probe.startCoverage()`（日志行 `Tier2: 发现链给出 …`）。
         for ((key, _) in store.runningTaskRefs()) {
             if (out.size >= MULTI_WS_COVERAGE_CAP) break
             if (key.isNotEmpty()) out.add(key)
@@ -1461,6 +1473,17 @@ object ShellRuntime {
                     pageWorkspaceTaskId = data.optString("taskId")
                     Diagnostics.log("info", "页面当前工作区（原生承载的唯一目标）：$key")
                 }
+                "controllertasks" -> {
+                    // 第三条源：**页面自己订的** `controller/tasks-index`（全局运行态整表）。
+                    // 为什么必须有它：壳原来的两条腿是「页面正在听的那一个工作区的
+                    // sessions-index」+「已订阅会话的 turnHeader.state」，于是用户在**别的**
+                    // 工作区里继续跑任务时，壳里 `runningTaskRefs()` 是空的（真机 2026-09-18
+                    // 09:14：页面 7 个工作区 41 个任务、任务正在 default 里跑，壳只看到 MiMo
+                    // 的 2 个已完成）。这条帧页面本来就收，解析复用 `ControllerTasksState`。
+                    // 纯被动：不产生任何协议写入，缺口也不重同步（页面自己会补快照）。
+                    val data = root.optJSONObject("data") ?: return
+                    onPageControllerFrame(data)
+                }
                 "pagevitals" -> {
                     // DOM 体征快照（卡死看门狗布防/撤防/放弃时的现场）。
                     val data = root.optJSONObject("data") ?: return
@@ -1519,6 +1542,40 @@ object ShellRuntime {
     /** Tier2 原生任务事件入口（M3c）：更新形状与注入层 post('sessions') 同构。 */
     fun acceptNativeSessions(update: JSONObject) {
         onSessions(update)
+    }
+
+    /**
+     * 页面自己订的 `controller/tasks-index`（第三条源，2026-09-18）。
+     *
+     * 状态机与 Tier2 那条用的是同一个 [ControllerTasksState]（snapshot / deltas / 缺口
+     * 判定都有单测），所以这里只做三件事：喂帧、把整表投影交给 [TaskStore.applyLiveTasks]、
+     * 发布。
+     *
+     * **不设 `userIsAway()` 门槛**：前台的页面本来就在收这条流，而"用户正在别的客户端上
+     * 跑任务、手机上却什么都没有"恰恰是前台现场。也**不做重同步**——只读壳不写页面协议；
+     * 缺口丢弃即可，页面自己的订阅很快会补一份快照。
+     */
+    private val pageControllerTasks = com.zcode.remote.core.ControllerTasksState()
+
+    private var lastPageLiveRunning = -1
+
+    private fun onPageControllerFrame(wire: JSONObject) {
+        if (!pageControllerTasks.applyWire(wire)) return
+        val tasks = pageControllerTasks.liveTasks()
+        val running = tasks.count { it.phase in com.zcode.remote.core.NotifyState.RUNNING_PHASES }
+        if (running != lastPageLiveRunning) {
+            lastPageLiveRunning = running
+            val keys = tasks.filter { it.phase in com.zcode.remote.core.NotifyState.RUNNING_PHASES }
+                .map { it.workspaceKey }
+                .distinct()
+                .joinToString(" | ")
+            Diagnostics.log(
+                "info",
+                "页面运行态：${tasks.size} 个任务 · 在跑 $running 个" +
+                    (if (keys.isEmpty()) "" else "（$keys）"),
+            )
+        }
+        applyUpdate(store.applyLiveTasks(tasks))
     }
 
     private fun onSessions(data: JSONObject?) {
@@ -1616,6 +1673,9 @@ object ShellRuntime {
         // list in a way the user is actively watching for — publish those at
         // once and let only the chatter be throttled.
         val urgent = update.completed.isNotEmpty() || update.attention.isNotEmpty()
+        // 观察窗到期要回来一趟（见 [scheduleCompletionFlush]）：任务结束后不再有新帧，这一拍
+        // 就是「已完成」唯一能出现的时机。放在这里的顺序无关紧要，但**必须在提前 return 之前**。
+        scheduleCompletionFlush(update.nextFlushAtMs)
         // **空更新（"无变化"）绝不能发布**：TaskStore 用"四个列表全空"表示什么都没变，
         // 而 [enqueueOngoing] 把 `running` 当作**当前运行集**——一个空列表会把已发布的
         // 运行集抹成 0（流体云卡片随之被系统收回，下一拍再提升即"重建"）。
@@ -1624,17 +1684,29 @@ object ShellRuntime {
         enqueueOngoing(update, throttled = !urgent)
     }
 
+    /** 观察窗到期时回来算一次（见 [NotifyState.COMPLETION_HOLD_MS]）。 */
+    private val completionFlush = Runnable { applyUpdate(store.flushDueCompletions()) }
+
+    private fun scheduleCompletionFlush(atMs: Long) {
+        mainHandler.removeCallbacks(completionFlush)
+        if (atMs <= 0L) return
+        mainHandler.postDelayed(completionFlush, (atMs - System.currentTimeMillis()).coerceAtLeast(0L))
+    }
+
     /**
      * Coalesces ongoing-notification updates.
      *
      * Removals are accumulated (union) while the running list is replaced by the
      * newest — a trailing publish must not lose the cancellation that an
      * intermediate update requested, which is the bug this shape exists to
-     * prevent.
+     * prevent. Completion events are accumulated for the same reason, and because
+     * the card is not cancelled but *changed state*: the two must reach the
+     * notifier together (see [pendingCompleted]).
      */
     private fun enqueueOngoing(update: TaskStore.Update, throttled: Boolean) {
         synchronized(lock) {
             pendingRemovedIds.addAll(update.removedIds)
+            if (update.completed.isNotEmpty()) pendingCompleted = pendingCompleted + update.completed
             latestRunning = update.running
             val elapsed = System.currentTimeMillis() - lastPublishAt
             pendingFlush?.let { mainHandler.removeCallbacks(it) }
@@ -1650,28 +1722,34 @@ object ShellRuntime {
     }
 
     private fun flushOngoing() {
-        // Returning a pair keeps the critical section from having to assign
+        // Returning a triple keeps the critical section from having to assign
         // declarations that are read outside it.
         val snapshot = synchronized(lock) {
             pendingFlush = null
             val running = latestRunning
             val removed = pendingRemovedIds.toList()
+            val completed = pendingCompleted
             pendingRemovedIds.clear()
+            pendingCompleted = emptyList()
             lastPublishAt = System.currentTimeMillis()
-            running to removed
+            Triple(running, removed, completed)
         }
         if (snapshot.second.isNotEmpty()) {
+            // 这里**只报事实**（这一拍谁离开了运行集）。"撤回"与否由通知层决定——走进
+            // 完成态的那张卡是不撤的（原地改状态），所以那句话只能由 Notifier 打，
+            // 否则日志会写着"卡片撤回"而卡片其实还在（真机 2026-09-18 09:40 读到过）。
             val after = snapshot.first.joinToString(" ") { "#" + it.id }
-            Diagnostics.info(
-                "卡片撤回 id=${snapshot.second.joinToString(" ")}" +
-                    "（撤回后运行集 ${snapshot.first.size} 个：$after）",
+            Diagnostics.log(
+                "debug",
+                "运行集移除 id=${snapshot.second.joinToString(" ")}" +
+                    "（移除后运行集 ${snapshot.first.size} 个：$after）",
             )
         }
         notifier.syncRunningTasks(
             TaskStore.Update(
                 running = snapshot.first,
                 removedIds = snapshot.second,
-                completed = emptyList(),
+                completed = snapshot.third,
                 attention = emptyList(),
             )
         )
@@ -1689,24 +1767,7 @@ object ShellRuntime {
         notifier.postServiceNotification(notifier.buildServiceNotification(running.size, text))
     }
 
-    private fun currentRunning(): List<TaskStore.RunningNotification> =
-        store.workspaces().flatMap { workspace ->
-            workspace.running.map { task ->
-                val status = if (task.isWaitingForUser) TaskStatus.WAITING else TaskStatus.RUNNING
-                TaskStore.RunningNotification(
-                    id = com.zcode.remote.core.NotifyState.notificationIdFor(workspace.key, task.sessionId),
-                    workspaceKey = workspace.key,
-                    workspaceTitle = workspace.title,
-                    task = task,
-                    status = status,
-                    body = com.zcode.remote.core.NotifyState.formatBody(
-                        task.preview,
-                        workspace.title,
-                    ),
-                    activityAt = task.lastActivityAt,
-                )
-            }
-        }
+    private fun currentRunning(): List<TaskStore.RunningNotification> = store.runningNotifications()
 
     // --------------------------------------------------------------- lifecycle
 

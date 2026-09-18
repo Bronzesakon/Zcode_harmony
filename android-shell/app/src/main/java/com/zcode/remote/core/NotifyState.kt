@@ -27,8 +27,10 @@ data class TaskSnapshot(
  *
  * [RUNNING] / [WAITING] are the two a *live* task is allowed to carry (D9 — a
  * third live state was considered and rejected). [COMPLETED] is not a third live
- * state: it exists only for the transient card that pops when a task finishes
- * (D15). [statusOf] never returns it, which is what keeps the D9 rule intact.
+ * state: it is the state the **same** card moves to once the task has been stopped
+ * for [NotifyState.COMPLETION_HOLD_MS] (D15 as revised on 2026-09-17 — it used to
+ * be a second, separate card id, which is what made the card blink). [statusOf]
+ * never returns it, which is what keeps the D9 rule intact.
  */
 enum class TaskStatus(val label: String) {
     RUNNING("运行中"),
@@ -62,6 +64,13 @@ data class NotifyUpdate(
     val running: List<TaskSnapshot>,
     val completed: List<CompletionEvent>,
     val attention: List<AttentionEvent>,
+    /**
+     * Sessions whose task has gone terminal but is still inside the completion
+     * observation window (see [NotifyState.COMPLETION_HOLD_MS]). They must keep
+     * counting as running, so the live card is never cancelled for a gap that
+     * turns out to be a turn boundary.
+     */
+    val heldRunning: Set<String> = emptySet(),
 )
 
 /**
@@ -90,12 +99,33 @@ class NotifyState {
     private val notifiedInteractions = HashSet<String>()
 
     /**
+     * Tasks observed stopped whose observation window has not elapsed yet:
+     * workspaceKey -> (sessionId -> when the stop was first seen).
+     *
+     * 真机 2026-09-17 晚定案（取证 `docs/18` §3.10 ⑤）：agent 一轮结束、下一轮
+     * **0.4–0.55s** 后重新开始，`turnHeader.state` 就是 `结束 → 在跑`。旧逻辑把"结束"那一拍
+     * 当完成 ⇒ 撤运行卡 + 另发一张 15s「已完成」卡 + 0.5s 后又建运行卡：卡片闪一次、
+     * 可听提示白响一声、同一任务两张卡去抢两个提升位。**"任务结束"必须持续停着才算**，
+     * 所以这里加一个观察窗 [COMPLETION_HOLD_MS]：窗内又跑起来＝什么都没发生
+     * （那张卡一秒都不用动，这正是"只刷新、不重建"的前提）。
+     */
+    private val pendingCompletions = HashMap<String, HashMap<String, Long>>()
+
+    /**
      * Folds a fresh view of one workspace in. [tasks] must be the workspace's
      * *complete* task list — removals are detected by absence, exactly as the
      * reference implementation does.
+     *
+     * [nowMs] is passed in (rather than read here) so the observation window is
+     * testable and so a caller that already has a clock does not read a second one.
      */
-    fun apply(workspaceKey: String, tasks: List<TaskSnapshot>): NotifyUpdate {
+    fun apply(
+        workspaceKey: String,
+        tasks: List<TaskSnapshot>,
+        nowMs: Long = System.currentTimeMillis(),
+    ): NotifyUpdate {
         val previous = previousPhases[workspaceKey].orEmpty()
+        val pending = pendingCompletions.getOrPut(workspaceKey) { HashMap() }
         val nowPhases = HashMap<String, String>(tasks.size)
         val byId = HashMap<String, TaskSnapshot>(tasks.size)
         for (task in tasks) {
@@ -116,35 +146,83 @@ class NotifyState {
         }
 
         val completed = ArrayList<CompletionEvent>()
-        for ((sessionId, wasPhase) in previous) {
-            if (wasPhase !in RUNNING_PHASES) continue
-            val now = nowPhases[sessionId] ?: continue
-            if (now !in TERMINAL_PHASES) continue
-            val task = byId.getValue(sessionId)
+        val held = HashSet<String>()
+        // 已经在观察窗里的任务先处理：它们**上一拍就已经是终态**了，不会再走下面那条
+        // "running → terminal" 的转移，所以撤销与到期必须在这里独立判一次（漏了这一步，
+        // 窗口会永远挂着——真机表现是完成卡永远不出现、定时器一直重排）。
+        for ((sessionId, since) in pending.toMap()) {
+            val now = nowPhases[sessionId]
+            if (now == null || now in RUNNING_PHASES || now !in TERMINAL_PHASES) {
+                pending.remove(sessionId)
+                continue
+            }
+            if (nowMs - since < COMPLETION_HOLD_MS) {
+                held.add(sessionId)
+                continue
+            }
+            pending.remove(sessionId)
             completed.add(
                 CompletionEvent(
                     workspaceKey,
-                    task,
+                    byId.getValue(sessionId),
                     failed = now in FAILED_PHASES,
                 )
             )
         }
+        // 新的转移：这一拍才第一次看到"停了" ⇒ 开窗（不撤卡、不提醒，等下一拍验证）。
+        for ((sessionId, wasPhase) in previous) {
+            if (wasPhase !in RUNNING_PHASES) continue
+            // A task that vanished from the list must not fire a completion later
+            // when it comes back with a terminal phase; its pending goes with it.
+            val now = nowPhases[sessionId]
+            if (now == null) {
+                pending.remove(sessionId)
+                continue
+            }
+            if (now in RUNNING_PHASES || now !in TERMINAL_PHASES) continue
+            if (pending.containsKey(sessionId)) continue
+            pending[sessionId] = nowMs
+            held.add(sessionId)
+        }
 
-        // A task that vanished from the list must not fire a completion later
-        // when it comes back with a terminal phase.
         previousPhases[workspaceKey] = nowPhases
 
-        return NotifyUpdate(running = running, completed = completed, attention = attention)
+        return NotifyUpdate(
+            running = running,
+            completed = completed,
+            attention = attention,
+            heldRunning = held,
+        )
+    }
+
+    /**
+     * When the earliest observation window elapses (0 = nothing pending).
+     *
+     * The caller needs this to come back on time: a task that ends and then goes
+     * quiet produces no further frames, so without a timer the completion would
+     * never be announced until the next unrelated update.
+     */
+    fun nextCompletionDeadlineMs(): Long {
+        var earliest = 0L
+        for (workspace in pendingCompletions.values) {
+            for (since in workspace.values) {
+                val due = since + COMPLETION_HOLD_MS
+                if (earliest == 0L || due < earliest) earliest = due
+            }
+        }
+        return earliest
     }
 
     /** Drops a workspace's history, e.g. when it stops being subscribed. */
     fun forget(workspaceKey: String) {
         previousPhases.remove(workspaceKey)
+        pendingCompletions.remove(workspaceKey)
     }
 
     fun reset() {
         previousPhases.clear()
         notifiedInteractions.clear()
+        pendingCompletions.clear()
     }
 
     /**
@@ -216,22 +294,15 @@ class NotifyState {
         }
 
         /**
-         * Notification id of the transient card posted when a task finishes.
+         * How long a task must stay stopped before it counts as finished.
          *
-         * A separate id on purpose: the live card for the same task is being
-         * cancelled in the same update, and reusing the id would race the two
-         * (whichever landed last would win). The two ranges do not overlap, so a
-         * completion card can never be confused with — or cancel — a live one.
+         * 真机（2026-09-17 22:43/22:51）测到的"轮次缝"是 **0.4–0.55s**：agent 一轮结束、
+         * 下一轮立刻开始。3s 给这个量级留了一个数量级余量，又短到真正完成时那个
+         * 「已完成」标记几乎立刻出现。窗口内的"停"不算结束，那张卡一秒都不用动。
          */
-        fun completionCardIdFor(workspaceKey: String, sessionId: String): Int {
-            val hash = 31 * workspaceKey.hashCode() + sessionId.hashCode()
-            return COMPLETION_CARD_BASE + (hash and 0x7FFFFFFF) % COMPLETION_CARD_RANGE
-        }
+        const val COMPLETION_HOLD_MS = 3_000L
 
         const val ONGOING_ID_BASE = 100_000
         const val ONGOING_ID_RANGE = 800_000
-
-        const val COMPLETION_CARD_BASE = 900_001
-        const val COMPLETION_CARD_RANGE = 99_000
     }
 }

@@ -785,6 +785,61 @@ test('passive mode follows the page stream without writing anything itself', asy
 });
 
 // ---------------------------------------------------------------------------
+// 第三条源：页面自己的 controller/tasks-index
+// ---------------------------------------------------------------------------
+
+test('the page controller stream is forwarded to native as a passive frame', async () => {
+    // 为什么单钉这一条（2026-09-18 真机）：壳"哪些任务在跑"原来只有两条腿——页面正在听的
+    // 那**一个**工作区的 sessions-index，和已订阅会话的 turnHeader.state。用户在别的工作区里
+    // 继续跑任务时 `runningTaskRefs()` 是空的：页面显示 7 个工作区 41 个任务、任务正在 default
+    // 里跑，壳只看到另一个工作区的 2 个已完成。页面自己订的 controller 流是全局的，
+    // 这条测试钉住"它会被转发给原生"，而且转发**不需要**我们知道那个工作区。
+    const page = setupPage();
+    try {
+        const socket = new globalThis.WebSocket('wss://relay.example');
+        const link = connectDesktop(socket);
+
+        socket.send(JSON.stringify({type: 'auth_init', role: 'terminal', device_sid: 'sid-1'}));
+        socket.receive({type: 'pair_status_ack', pair_status: 'matched'});
+        await wait(600);
+
+        // 页面自己的 controller 桥：壳既不认识这个 bridge，也没订过这个 topic。
+        const pageBridge = 'page-controller-bridge';
+        const frame = {
+            topic: 'controller/tasks-index',
+            subscriptionId: 'sub-1',
+            logEpoch: 'e1',
+            fromSeq: 0,
+            toSeq: 1,
+            payload: {kind: 'snapshot', snapshot: {logEpoch: 'e1', tasks: [
+                {
+                    address: {workspacePath: 'C:\\ws\\default', workspaceIdentity: 'ws-default', taskId: 'sess_run'},
+                    meta: {title: '正在跑的任务', workspacePath: 'C:\\ws\\default'},
+                    liveStatus: 'running'
+                }
+            ]}}
+        };
+        const fireBody = encodeBody([page.protocol.RES_EVENT_FIRE, 7], frame);
+        for (const payload of fragment(fireBody, pageBridge, 2)) {
+            socket.receive({type: 'data', payload});
+        }
+        await wait(60);
+
+        const posts = findPost(page.posts, 'controllertasks');
+        assert.strictEqual(posts.length, 1, '运行态帧必须转给原生');
+        assert.strictEqual(posts[0].data.kind, 'complete');
+        assert.strictEqual(posts[0].data.frame.topic, 'controller/tasks-index');
+        assert.strictEqual(posts[0].data.frame.payload.snapshot.tasks[0].liveStatus, 'running');
+        assert.strictEqual(
+            link.sentLog.filter((text) => text.includes('workspace-list-request')).length, 0,
+            '只读壳：转发观测到的帧不等于写协议');
+        link.stop();
+    } finally {
+        page.teardown();
+    }
+});
+
+// ---------------------------------------------------------------------------
 // task locator
 // ---------------------------------------------------------------------------
 

@@ -35,6 +35,23 @@ class NotifyStateTest {
 
     // ------------------------------------------------------------------ running
 
+    /**
+     * Drives a task to a terminal phase **through the observation window**.
+     *
+     * 2026-09-17: a task must stay stopped for [NotifyState.COMPLETION_HOLD_MS] before
+     * it counts as finished (a turn boundary is 0.4–0.55s on the real device), so a
+     * single terminal tick no longer announces anything. Returns the update that
+     * finally announces it.
+     */
+    private fun NotifyState.finish(
+        ws: String,
+        tasks: List<TaskSnapshot>,
+        startMs: Long = 1_000L,
+    ): NotifyUpdate {
+        apply(ws, tasks, startMs)
+        return apply(ws, tasks, startMs + NotifyState.COMPLETION_HOLD_MS)
+    }
+
     @Test
     fun `running phases produce running tasks`() {
         val state = NotifyState()
@@ -66,13 +83,21 @@ class NotifyStateTest {
     // --------------------------------------------------------------- completion
 
     @Test
-    fun `running to terminal fires exactly one completion`() {
+    fun `running to terminal fires exactly one completion, after the window`() {
         val state = NotifyState()
         state.apply("ws", listOf(task("a", "running")))
-        val first = state.apply("ws", listOf(task("a", "completed", preview = "done")))
+        // 第一拍只开观察窗：这一拍**不是**结束（真机 0.4–0.55s 的轮次缝就是这么被吃掉的）。
+        val started = state.apply("ws", listOf(task("a", "completed", preview = "done")), 1_000L)
+        assertTrue("the first terminal tick must only open the window", started.completed.isEmpty())
+        assertEquals("the task keeps counting as running while held", setOf("a"), started.heldRunning)
+        assertEquals(1_000L + NotifyState.COMPLETION_HOLD_MS, state.nextCompletionDeadlineMs())
+
+        val first = state.apply("ws", listOf(task("a", "completed", preview = "done")), 1_000L + NotifyState.COMPLETION_HOLD_MS)
         assertEquals(listOf("a"), first.completed.map { it.task.sessionId })
         assertEquals("done", first.completed[0].task.preview)
         assertFalse(first.completed[0].failed)
+        assertTrue(first.heldRunning.isEmpty())
+        assertEquals("nothing is pending any more", 0L, state.nextCompletionDeadlineMs())
 
         // Still terminal on the next tick: no repeat.
         val second = state.apply("ws", listOf(task("a", "completed")))
@@ -80,12 +105,33 @@ class NotifyStateTest {
     }
 
     @Test
+    fun `a turn gap shorter than the window is not a completion`() {
+        // 真机现场（2026-09-17 22:51:50）：结束 → 0.55s 后又在跑。旧逻辑在这里撤了卡、
+        // 发了完成卡、还响了一声提示。新逻辑：什么都没发生。
+        val state = NotifyState()
+        state.apply("ws", listOf(task("a", "running")), 1_000L)
+        val ended = state.apply("ws", listOf(task("a", "completedSuccess")), 1_100L)
+        assertTrue(ended.completed.isEmpty())
+        assertEquals(setOf("a"), ended.heldRunning)
+        val again = state.apply("ws", listOf(task("a", "running")), 1_600L)
+        assertTrue("a new turn cancels the pending completion", again.completed.isEmpty())
+        assertTrue(again.heldRunning.isEmpty())
+        assertEquals("and nothing is left to flush", 0L, state.nextCompletionDeadlineMs())
+        // 之后真的停了，仍然只算一次完成。
+        state.apply("ws", listOf(task("a", "completed")), 2_000L)
+        assertEquals(
+            1,
+            state.apply("ws", listOf(task("a", "completed")), 2_000L + NotifyState.COMPLETION_HOLD_MS).completed.size,
+        )
+    }
+
+    @Test
     fun `a re-run fires a second completion`() {
         val state = NotifyState()
         state.apply("ws", listOf(task("a", "running")))
-        assertEquals(1, state.apply("ws", listOf(task("a", "completed"))).completed.size)
-        state.apply("ws", listOf(task("a", "running")))
-        assertEquals(1, state.apply("ws", listOf(task("a", "failed"))).completed.size)
+        assertEquals(1, state.finish("ws", listOf(task("a", "completed"))).completed.size)
+        state.apply("ws", listOf(task("a", "running")), 9_000L)
+        assertEquals(1, state.finish("ws", listOf(task("a", "failed")), 10_000L).completed.size)
     }
 
     @Test
@@ -102,7 +148,7 @@ class NotifyStateTest {
         for (phase in NotifyState.TERMINAL_PHASES) {
             val state = NotifyState()
             state.apply("ws", listOf(task("a", "running")))
-            val update = state.apply("ws", listOf(task("a", phase)))
+            val update = state.finish("ws", listOf(task("a", phase)))
             assertEquals("phase $phase must fire a completion", 1, update.completed.size)
         }
     }
@@ -112,11 +158,14 @@ class NotifyStateTest {
         for (phase in listOf("failed", "error", "cancelled", "completedInterrupted")) {
             val state = NotifyState()
             state.apply("ws", listOf(task("a", "running")))
-            assertTrue("$phase must be reported as a failure", state.apply("ws", listOf(task("a", phase))).completed[0].failed)
+            assertTrue(
+                "$phase must be reported as a failure",
+                state.finish("ws", listOf(task("a", phase))).completed[0].failed,
+            )
         }
         val state = NotifyState()
         state.apply("ws", listOf(task("a", "running")))
-        assertFalse(state.apply("ws", listOf(task("a", "completedSuccess"))).completed[0].failed)
+        assertFalse(state.finish("ws", listOf(task("a", "completedSuccess"))).completed[0].failed)
     }
 
     @Test
@@ -125,11 +174,11 @@ class NotifyStateTest {
         state.apply("ws-1", listOf(task("a", "running")))
         state.apply("ws-2", listOf(task("b", "running")))
         // ws-2 reports, ws-1 does not: ws-1's phase must survive.
-        val update = state.apply("ws-2", listOf(task("b", "completed")))
+        val update = state.finish("ws-2", listOf(task("b", "completed")))
         assertEquals(1, update.completed.size)
         assertEquals("ws-2", update.completed[0].workspaceKey)
         // A later ws-1 transition is still detected.
-        val later = state.apply("ws-1", listOf(task("a", "completed")))
+        val later = state.finish("ws-1", listOf(task("a", "completed")), 5_000L)
         assertEquals(1, later.completed.size)
         assertEquals("ws-1", later.completed[0].workspaceKey)
     }
@@ -139,7 +188,7 @@ class NotifyStateTest {
         val state = NotifyState()
         state.apply("ws-1", listOf(task("same-id", "running")))
         state.apply("ws-2", listOf(task("same-id", "running")))
-        val update = state.apply("ws-2", listOf(task("same-id", "completed")))
+        val update = state.finish("ws-2", listOf(task("same-id", "completed")))
         assertEquals(1, update.completed.size)
         assertEquals("ws-2", update.completed[0].workspaceKey)
     }
@@ -269,23 +318,12 @@ class NotifyStateTest {
     }
 
     @Test
-    fun `the completion card id never collides with a live one`() {
-        // The live card is cancelled in the same update that posts the completion
-        // card; overlapping ranges would let one cancel the other.
-        val ongoingMax = NotifyState.ONGOING_ID_BASE + NotifyState.ONGOING_ID_RANGE - 1
-        val cardMin = NotifyState.COMPLETION_CARD_BASE
-        assertTrue("card range must start above the live range", cardMin > ongoingMax)
-        for (key in listOf("ws-1", "ws-2", "C:\\Users\\x\\.zcode\\workspace\\default")) {
-            for (session in listOf("s-1", "s-2", "")) {
-                val card = NotifyState.completionCardIdFor(key, session)
-                assertTrue(card in cardMin until (cardMin + NotifyState.COMPLETION_CARD_RANGE))
-                assertNotEquals(NotifyState.notificationIdFor(key, session), card)
-            }
-        }
-        assertEquals(
-            NotifyState.completionCardIdFor("ws-1", "s-1"),
-            NotifyState.completionCardIdFor("ws-1", "s-1"),
-        )
+    fun `there is one id per task, live or finished`() {
+        // 2026-09-17：完成不再是"另开一条记录"（旧 D15 那张另开 id 的 15s 完成卡会闪，
+        // 而且和运行卡抢两个提升位）。同一条记录原地改状态 ⇒ id 只有一个来源。
+        val live = NotifyState.notificationIdFor("ws-1", "s-1")
+        assertTrue(live >= NotifyState.ONGOING_ID_BASE)
+        assertTrue(live < NotifyState.ONGOING_ID_BASE + NotifyState.ONGOING_ID_RANGE)
     }
 
     // ------------------------------------------------------------------- store
@@ -307,15 +345,57 @@ class NotifyStateTest {
         assertEquals("运行中 · 重构登录", first.title)
         assertEquals("已改 auth", first.body)
 
-        // 'a' finishes, 'b' keeps running: one added, one cancelled, one event.
-        val next = store.applyWorkspace(
+        // 'a' finishes, 'b' keeps running. 结束那一拍**什么都不变**：a 还在观察窗里，
+        // 仍然算运行中（所以卡片不会被撤——2026-09-17 之前这里会撤卡 + 另发完成卡）。
+        val held = store.applyWorkspace(
             key = "ws", title = "仓库", path = "/repo", identity = "ws", source = "active",
             tasks = listOf(task("b", "prewarming", title = "写测试"), task("a", "completed")),
         )
+        assertEquals(2, held.running.size)
+        assertTrue(held.removedIds.isEmpty())
+        assertTrue(held.completed.isEmpty())
+        assertTrue("窗口到期要有人回来算一次", held.nextFlushAtMs > 0L)
+
+        // 窗口走完（任务结束后不再有新帧，只能靠这一拍回灌）：撤一张、一个完成事件，
+        // 而且**撤的就是那张卡自己的 id** —— 通知层据此"改状态"而不是"撤了再建"。
+        val next = store.flushDueCompletions(System.currentTimeMillis() + NotifyState.COMPLETION_HOLD_MS)
         assertEquals(1, next.running.size)
         assertEquals("b", next.running[0].task.sessionId)
         assertEquals(listOf(first.id), next.removedIds)
         assertEquals(listOf("a"), next.completed.map { it.task.sessionId })
+        assertEquals(
+            first.id,
+            NotifyState.notificationIdFor(next.completed[0].workspaceKey, next.completed[0].task.sessionId),
+        )
+        assertEquals("窗口用掉了就不该再有下一次", 0L, next.nextFlushAtMs)
+    }
+
+    @Test
+    fun `a turn gap never cancels the card`() {
+        // 真机 2026-09-17 22:51:50 的回归：结束 → 0.55s 后新一轮。旧逻辑撤卡 + 发完成卡 +
+        // 建新卡（卡片闪、提示白响、两张卡抢两个提升位）。新逻辑：卡一秒都不用动。
+        val store = TaskStore()
+        val added = store.applyWorkspace(
+            key = "ws", title = "仓库", path = "/repo", identity = "ws", source = "active",
+            tasks = listOf(task("a", "running", title = "压测", preview = "在跑")),
+        )
+        val liveId = added.running[0].id
+        val ended = store.applyWorkspace(
+            key = "ws", title = "仓库", path = "/repo", identity = "ws", source = "active",
+            tasks = listOf(task("a", "completedSuccess")),
+        )
+        assertTrue("结束那一拍不撤卡", ended.removedIds.isEmpty())
+        assertEquals(listOf(liveId), ended.running.map { it.id })
+        assertTrue(ended.completed.isEmpty())
+
+        val resumed = store.applyWorkspace(
+            key = "ws", title = "仓库", path = "/repo", identity = "ws", source = "active",
+            tasks = listOf(task("a", "running", title = "压测", preview = "第二轮")),
+        )
+        assertTrue(resumed.removedIds.isEmpty())
+        assertTrue(resumed.completed.isEmpty())
+        assertEquals(listOf(liveId), resumed.running.map { it.id })
+        assertEquals("观察窗该被撤销，不留定时器", 0L, resumed.nextFlushAtMs)
     }
 
     @Test
