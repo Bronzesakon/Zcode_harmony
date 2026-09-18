@@ -101,11 +101,7 @@
         <receiver
             android:name=".DiagReceiver"
             android:exported="true"
-            android:permission="android.permission.DUMP">
-            <intent-filter>
-                <action android:name="com.zcode.remote.action.DIAG" />
-            </intent-filter>
-        </receiver>
+            android:permission="android.permission.DUMP" />
 
         <!-- 「知道了」动作：已完成卡自己撤自己（2026-09-17）。
 

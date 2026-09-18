@@ -161,13 +161,10 @@ class SettingsActivity : AppCompatActivity() {
     // ---------------------------------------------------------------- actions
 
     private fun openNotificationSettings() {
-        val intent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
-                .putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
-        } else {
-            Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
-                .setData(Uri.fromParts("package", packageName, null))
-        }
+        // minSdk = 26（= O）⇒ `ACTION_APP_NOTIFICATION_SETTINGS` 恒可用（API 26 起），
+        // 曾经那条 `ACTION_APPLICATION_DETAILS_SETTINGS` 兜底分支永远走不到，已删。
+        val intent = Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+            .putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
         try {
             startActivity(intent)
         } catch (e: Exception) {

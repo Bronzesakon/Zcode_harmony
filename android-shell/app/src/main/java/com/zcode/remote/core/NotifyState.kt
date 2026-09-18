@@ -14,7 +14,6 @@ data class TaskSnapshot(
     val preview: String,
     val pendingInteractionId: String,
     val lastActivityAt: Long,
-    val hasBackgroundWork: Boolean,
 ) {
     /** The reference client falls back to the id when a task has no title yet. */
     val displayTitle: String get() = title.ifEmpty { sessionId }
@@ -57,19 +56,33 @@ data class CompletionEvent(
     val finalPreview: String = task.preview,
 )
 
-/** A task that needs the user's attention (permission / input request). */
+/**
+ * A task that needs the user's attention (permission / input request).
+ *
+ * 2026-09-18 审计：这里原本还带一份 `interactionId: String`，与
+ * [TaskSnapshot.pendingInteractionId] 是**同一个字符串**（[NotifyState.apply] 就是从后者
+ * 取的）。全仓没有任何消费读点，却让"去重到底按哪个字段"多出一个候选，遂删。
+ * **交互号只住在任务快照上**，去重表 [NotifyState.notifiedInteractions] 也照它记。
+ */
 data class AttentionEvent(
     val workspaceKey: String,
     val task: TaskSnapshot,
-    val interactionId: String,
 )
 
 /**
  * The result of folding one workspace's sessions-index snapshot into the
- * state: what is running now, what just finished, what needs attention.
+ * state: what just finished, what needs attention, and which tasks are being
+ * held inside the observation window.
+ *
+ * 2026-09-18 审计：这里原本还有一份 `running: List<TaskSnapshot>`，**生产端从来不看**——
+ * 壳上那张运行清单由 [TaskStore.buildRunningList] 独立重算，而那一份才是能渲染的东西
+ * （`RunningNotification`，带通知 id / 状态词 / 正文）。本类算出来的那份纯属白算，
+ * 唯一的读者是 `NotifyStateTest` 里五个断言（B1 已改成对展示层断言）。
+ * 既然"谁算运行中"只该有一个家，家就留在展示层
+ * （[TaskStore] 的 `runningIn()`：相位 ∈ [RUNNING_PHASES] **或**在观察窗里），
+ * 本类不再复述一遍。
  */
 data class NotifyUpdate(
-    val running: List<TaskSnapshot>,
     val completed: List<CompletionEvent>,
     val attention: List<AttentionEvent>,
     /**
@@ -141,15 +154,11 @@ class NotifyState {
             byId[task.sessionId] = task
         }
 
-        val running = ArrayList<TaskSnapshot>()
         val attention = ArrayList<AttentionEvent>()
         for (task in tasks) {
-            if (task.phase in RUNNING_PHASES) {
-                running.add(task)
-            }
             val interactionId = task.pendingInteractionId
             if (interactionId.isNotEmpty() && notifiedInteractions.add(interactionId)) {
-                attention.add(AttentionEvent(workspaceKey, task, interactionId))
+                attention.add(AttentionEvent(workspaceKey, task))
             }
         }
 
@@ -196,7 +205,6 @@ class NotifyState {
         previousPhases[workspaceKey] = nowPhases
 
         return NotifyUpdate(
-            running = running,
             completed = completed,
             attention = attention,
             heldRunning = held,

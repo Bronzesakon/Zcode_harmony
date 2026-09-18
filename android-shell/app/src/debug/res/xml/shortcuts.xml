@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- ⚠️ 这是 debug 变体的覆盖副本，**不是冗余文件，不要删**（2026-09-18 审计补）。
+
+     为什么需要它：`app/build.gradle.kts` 给 debug 加了 `applicationIdSuffix = ".debug"`，
+     所以 debug 包装出来是 `com.zcode.remote.debug`。而 `res/xml/*` **不走清单合并**，
+     `${applicationId}` 占位符在资源 XML 里**不会被替换**，所以 `src/main` 那份硬编码的
+     `com.zcode.remote` 在 debug 安装后指向一个**未安装的包**，两个长按快捷方式全部失效
+     （release 不受影响，因为包名正好对得上）。
+     本文件与 `src/main/res/xml/shortcuts.xml` **逐字相同，只改 `targetPackage`**；
+     `targetClass` 不受后缀影响（后缀改的是 applicationId，类名仍来自 namespace）。
+     ⚠️ 将来改主文件时，这份必须同步改，否则 debug 与 release 的快捷方式会分叉。 -->
+
+<!-- 应用长按菜单（桌面 Shortcut）。
+
+     为什么要它：主界面按需求去掉了顶部标题栏与右侧溢出菜单，原本藏在那里的三个
+     入口随之消失。这里补上其中两个，另一个（刷新网页）留在加载失败面板与设置页里。
+
+     两个 intent 都显式指向 MainActivity 而不是各走各的 Activity：
+       * 冷启动时 MainActivity 先建起来，设置页/扫码器压在它上面，返回键有落点；
+       * 已经在前台/后台时走 onNewIntent（launchMode=singleTop），UI 不会重建。
+     图标用 Google 官方 Material Icons 字形（res/drawable/ic_shortcut_*.xml），不自绘。 -->
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <shortcut
+        android:enabled="true"
+        android:icon="@drawable/ic_shortcut_scan"
+        android:shortcutId="shortcut_scan"
+        android:shortcutLongLabel="@string/shortcut_scan_long"
+        android:shortcutShortLabel="@string/shortcut_scan_short">
+        <intent
+            android:action="com.zcode.remote.action.SCAN"
+            android:targetClass="com.zcode.remote.MainActivity"
+            android:targetPackage="com.zcode.remote.debug" />
+    </shortcut>
+
+    <shortcut
+        android:enabled="true"
+        android:icon="@drawable/ic_shortcut_settings"
+        android:shortcutId="shortcut_settings"
+        android:shortcutLongLabel="@string/shortcut_settings_long"
+        android:shortcutShortLabel="@string/shortcut_settings_short">
+        <intent
+            android:action="com.zcode.remote.action.OPEN_SETTINGS"
+            android:targetClass="com.zcode.remote.MainActivity"
+            android:targetPackage="com.zcode.remote.debug" />
+    </shortcut>
+</shortcuts>

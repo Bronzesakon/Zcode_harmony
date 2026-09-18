@@ -338,7 +338,6 @@
             }
             return originalSend.apply(this, arguments);
         };
-        wrappedSend.__zcodeShellWrapped = true;
         proto.send = wrappedSend;
 
         // Outbound close observation. Which side tore the connection down decides
@@ -375,7 +374,6 @@
             }
             return originalClose.apply(this, arguments);
         };
-        wrappedClose.__zcodeShellWrapped = true;
         proto.close = wrappedClose;
     }
 
@@ -672,8 +670,7 @@
                     lastConvTextSent = conv.text;
                     post('convtext', {
                         topic: conv.topic,
-                        text: conv.text,
-                        frames: conv.frames
+                        text: conv.text
                     });
                 }
             }
@@ -810,11 +807,13 @@
         });
         next.gen = ++clientGenSeq;
         next.bornAt = Date.now();
+        // 4b 补删（2026-09-18，用户裁定）：这里原来还有一个"僵尸订阅指纹"的数据供给调用
+        // ——往一张"每个工作区最近一次 running 任务活动时间"的表里写。那张表与那个函数
+        // 已一并删除：它们唯一的读者 `zombieSuspected` 随看门狗决策机器（§5c）消失后，
+        // 这个调用就只剩"往一张没人读的表里写"。现在这一帧只做它该做的事：把索引读数转给
+        // 原生。（被删的字面名见 docs/18 的删除清单。）
         next.onSessions = function (update) {
             post('sessions', update);
-            try {
-                noteRunningActivity(update);
-            } catch (e) {}
         };
         // 第三条源：页面自己订的 `controller/tasks-index`（全局运行态整表）。
         // `sessions-index` 只能跟随页面在听的那一个工作区，所以这是"别的在工作区里
@@ -857,27 +856,6 @@
         return client;
     }
 
-    /**
-     * 每个工作区"最近一次看到 running 任务有活动"的时间（sessions-index 推送）。
-     * 僵尸订阅检测的判据之一：任务在跑（桌面端在产出）而页面桥零帧。
-     */
-    var runningActivityByKey = {};
-
-    function noteRunningActivity(update) {
-        if (!update || !update.key || !update.sessions) {
-            return;
-        }
-        for (var i = 0; i < update.sessions.length; i += 1) {
-            var task = update.sessions[i];
-            if (task && task.phase === 'running') {
-                var at = task.lastActivityAt || Date.now();
-                if (at > (runningActivityByKey[update.key] || 0)) {
-                    runningActivityByKey[update.key] = at;
-                }
-            }
-        }
-    }
-
     function resetClient() {
         if (client) {
             try {
@@ -906,13 +884,13 @@
     /**
      * Sends a business payload on the socket the page has open.
      *
-     * [quiet] downgrades "no socket is open right now" from a warning to a debug
-     * line. The heartbeat probe uses it: a probe that lands in the gap between
-     * the page closing its socket and opening the next one is routine (the page
-     * rebuilds the connection on its own), whereas the same message from our own
-     * protocol client means a request was actually lost.
+     * 2026-09-16 审计：删掉了 `quiet` 形参（它把"此刻没有可用 socket"从 warn 降成
+     * debug）。它的理由**已经过期**——唯一的使用场合是"心跳探针撞上页面换线的空档
+     * 属于常态"，而心跳探针早已改走 `sendControlFrame`（顶层控制帧，见其注释：
+     * 走 injectPayload 的探针从来没被 ack 过）。今天能走到这里的只有协议客户端
+     * **真要发出去**的请求，发不出去就是丢了一帧，必须报 warn。
      */
-    function injectPayload(payload, quiet) {
+    function injectPayload(payload) {
         var socket = activeSocket;
         if (!socket || socket.readyState !== 1) {
             socket = null;
@@ -923,11 +901,7 @@
                 }
             }
             if (!socket) {
-                if (quiet) {
-                    diag('debug', '暂无可用的 relay socket（等页面重连后由下一次心跳补上）');
-                } else {
-                    diag('warn', '注入失败: 没有可用的 relay socket');
-                }
+                diag('warn', '注入失败: 没有可用的 relay socket');
                 return;
             }
             activeSocket = socket;
@@ -1093,9 +1067,11 @@
         }
         var target = ensureClient();
         try {
-            // Routing (our own bridges, our own pending requests) ...
-            target.acceptPayload(frame.payload);
-            // ... and passive observation of the page's own bridges.
+            // ⚠️ 这里原本还有一行 `target.acceptPayload(frame.payload)`（"我们自己的桥 / 待办请求"路由）。
+            // 它已随**桥路由子系统**一并删除（2026-09-18，第 4 批 4c）：只读壳下壳自己**永不开桥**，
+            // 那个入口剩下的分支恒为 0。**这是活的入站路径**，而那行与下面的被动观察**同在一个 try 里**
+            // ——留着它会抛异常并**连带跳过被动观察**，等于打断活管线（本轮实测：`inject.test.js` 3 项转红）。
+            // 现在只做**被动观察**（页面自己那条桥的入站帧）。
             target.acceptObservedPayload(frame.payload, false);
         } catch (e) {
             diag('warn', 'inbound 处理失败: ' + e);
@@ -1126,10 +1102,7 @@
     //      return from a long background closed a socket the page was about to
     //      recover on its own, turning one self-heal into a full re-open.
     // -----------------------------------------------------------------------
-    var HEARTBEAT_MS = 10000;
     var STALE_MS = 90000;
-    /** Floor between two forced rebuilds, so a dead desktop cannot make us churn. */
-    var RECONNECT_MIN_GAP_MS = 180000;
     /** Consecutive stale readings required before the socket is rebuilt. */
     var STALE_PROBES = 2;
     /** A foreground return with the link silent this long is treated as dead. */
@@ -1153,12 +1126,21 @@
     var KICKED_HEAL_CAP = 2;
     var KICKED_HEAL_STORE = 'zcodeShellKickedHeals';
     var lastPairAckAt = 0;
-    var lastForcedReconnectAt = 0;
     var lastTickAt = 0;
     var staleTicks = 0;
     var appForeground = true;
     var backgroundStartedWallMs = 0;
     var lastBackgroundSilenceLoggedAt = 0;
+    /**
+     * 体征上报的节流闸门（4b，2026-09-18：量具从看门狗那里搬到心跳 tick 上，见
+     * [heartbeatTick]）。60s 这个数值取自被拆掉的看门狗那个 `STALL_REARM_COOLDOWN_MS`；
+     * 本文件里"挂在心跳上的诊断行"一律 60s（`lastBackgroundSilenceLoggedAt`、
+     * [noteReadOnlyRefusal] 同口径）。目的是：量具**永不每跳一帧**。
+     */
+    var VITALS_POST_MIN_GAP_MS = 60000;
+    var lastVitalsPostAt = 0;
+    /** 上一跳的卡态判定，用来认"卡态边沿"（见 [heartbeatTick]）。 */
+    var lastVitalsStalled = false;
 
     /**
      * **只读壳**（2026-09-15 真机定案）。
@@ -1173,6 +1155,7 @@
      *   at forceReconnect ← at heartbeatTick ← at G.__zcodeShellHeartbeat
      *       心跳 ack 陈旧（18:24、18:35、19:40、20:56…）
      *   stallReloadIfAllowed → location.reload()
+     *       （该函数已于 2026-09-18 随看门狗决策机器一并删除；以上是历史证据。）
      *
      * 拆掉的每一次都是**页面正用着的那条** relay 连接，页面只能按自己的梯子重建：
      * 用户看到的就是"发消息转圈""要重连好几次才出来""返回页面是它自己在重连"。
@@ -1388,12 +1371,6 @@
         });
     }
 
-    function startHeartbeat() {
-        setInterval(function () {
-            heartbeatTick();
-        }, HEARTBEAT_MS);
-    }
-
     /**
      * One heartbeat: report the counters, then keep the desktop's pairing state
      * warm with a pair_status_query.
@@ -1422,22 +1399,35 @@
                     's（泵仍在跳，入站帧停了）');
             }
         }
-        // 卡死看门狗的心跳巡检：覆盖没有进对话信标的卡死（如后台挂起回来、
-        // 恢复期页面自己没再发 subscribe）。僵尸订阅检测也在这里：
-        // 任务在跑（sessions-index 活动）而页面桥零业务帧 ≥45s、DOM 却健康——
-        // 2026-09-13 真机实证的形态（socket 重建后页面 runtime 不重建、零自愈）。
+        // 体征量具（4b，2026-09-18 起挂在这里）：量一帧 DOM 体征 → 判卡态 → 上报。
+        //
+        // 为什么挂在心跳上：这台泵是**后台唯一还活着的节拍**（原生每 10s 发令一次，
+        // 见 ShellRuntime.kt 的 PUMP_INTERVAL_MS），而"退后台再回来卡住"那类问题在
+        // 真机日志里只剩这一条周期性仪表——看门狗的决策机器已拆除，量具不能跟着消失。
+        //
+        // 上报口径（沿用拆除前那个 60s 闸门，绝不做成"每跳一帧"）：
+        //   ① 卡态**边沿**（vitalsStalled 由假变真）立刻上报一帧 why='stalled'——
+        //      这就是旧版"心跳巡检判出卡态 → 布防 → postPageVitals('arm')"的那一帧，
+        //      语义不变（拆除清单与取证见 docs/18 §5）；
+        //   ② 其余情况每 VITALS_POST_MIN_GAP_MS（60s）补一帧 why='periodic'。
+        // 上界：稳定态最多每 60s 一帧，永不每跳一帧；心跳本身另有 MIN_TICK_GAP_MS
+        // （5s）去重。DOM 读不到时整拍跳过，不改闸门状态（下次读得到再算）。
         try {
             var vit = readVitals();
-            if (vitalsStalled(vit)) {
-                stallArm('心跳巡检: 正文未就绪');
-            } else if (vit && vit.chat && zombieSuspected(nowMs)) {
-                stallArm('心跳巡检: 僵尸订阅（任务在跑但页面桥 ' + zombieSilenceS +
-                    's 零帧）', true);
-            } else if (vit && (stallState.armed || stallState.gaveUp)) {
-                stallCancel('心跳巡检: 界面已恢复');
+            if (vit) {
+                var stalledNow = vitalsStalled(vit);
+                var vitalsDue = nowMs - lastVitalsPostAt >= VITALS_POST_MIN_GAP_MS;
+                if (stalledNow && !lastVitalsStalled) {
+                    vitalsDue = true;
+                }
+                if (vitalsDue) {
+                    lastVitalsPostAt = nowMs;
+                    postPageVitals(stalledNow ? 'stalled' : 'periodic');
+                }
+                lastVitalsStalled = stalledNow;
             }
         } catch (e) {
-            // 巡检失败不影响心跳本身
+            // 量具失败不影响心跳本身
         }
         reportLiveness();
         reportPerf();
@@ -1632,27 +1622,32 @@
     };
 
     // -----------------------------------------------------------------------
-    // 5b. 进对话铁判准：5 s 内对话详情没就绪 → 直接刷新
+    // 5b. 进对话铁判准：信标后 3s 内对话详情没就绪 → 只记账，不动页面
     //
-    // 用户 2026-09-13 拍板的口径（"5 s 内加载不出对话详情就是铁判准，直接触发页面
-    // 刷新"）。判据不看 DOM 长什么样，只看**页面自己有没有把对话内容拿到**：
+    // 来历：用户 2026-09-13 拍板的口径是"进对话 5 s 内加载不出对话详情就触发页面
+    // 刷新"（判点常量当时取 5 s，现在由 FALLBACK_CHECK_MS 定为 3 s）。2026-09-15
+    // 真机把"触发刷新"这一半定了罪——它正是 SHELL_READ_ONLY 列出的自伤之一——于是
+    // 只读壳下这一段只剩**判定与记账**。判据不看 DOM 长什么样，只看**页面自己有没有
+    // 把对话内容拿到**：
     //
-    //   就绪（信标窗内任一成立即算，此后本轮不再干预）——
+    //   就绪（信标窗内任一成立即算）：本轮收工，只把证据记进 readyAt/readyBy
+    //     （4b 之前这里还要顺手复位看门狗的放弃态；那台机器与它的状态位已于
+    //     2026-09-18 一并删除，见 5c 节头）——
     //     1. 页面日志 v4.conversation.store.connect.completed（页面的
     //        conversation store 连上、快照已应用；空会话同样会走到这里，
     //        所以"新建任务"不会被误刷）；
     //     2. 页面日志 v4.conversation.subscribe.acknowledged / .activated；
     //     3. DOM 时间线已有行（rows > 0）；
     //     4. 页面桥在信标之后收到过任何入站帧（桌面端确实回话了）。
-    //   未就绪 → 到点直接 reload。**跳过"轻推"这一档**：轻推关的是共享 socket，
-    //   而"桌面端不回话"的形态里换一条连接才有用（旧 3 s DOM 判定把轻推串在刷新
-    //   前面，实测要 ~9 s 才刷，且标题回退态还要被轻推绕一圈）。
+    //   未就绪 → 第一次判定记一笔"本会轻推"（[nudgeReconnect]），再等
+    //   STALL_RELOAD_MS（3 s，本段自己的常量）判第二次；第二次仍未就绪 →
+    //   记一笔"本会刷新"（[reloadForMissingConversation]）。两次都只写日志，
+    //   没有第三拍。
     //
-    // 终止性只留两件（其余守卫按用户要求全部删掉：不看草稿、不看前台、不做标题
-    // 交叉验证）：15 s 最小刷新间隔（跨 reload 由 sessionStorage 记），以及连续
-    // 刷新上限（到顶放弃，任何就绪信号到达即复位）。没有间隔，刚 reload 的新页
-    // 会在 +5 s 被判"没内容"从而无限刷新；有了它，卡住的页面每 ~15 s 重来一次，
-    // 加载成功的页面一次都不刷。
+    // **已作废、别重走**：这里曾有一整套刷新梯子——15 s 最小刷新间隔（跨 reload 由
+    // sessionStorage 记）+ 连续刷新上限 + `location.reload()`。三件都已删除（2026-09-16
+    // 审计）：真机证明"拿我们的观测去否定页面的事实"是自伤，40 秒里拆 10 次，用户
+    // 看到的就是"转圈 / 要重连好几次"。
     // -----------------------------------------------------------------------
     var FALLBACK_TITLE_TEXT = '新建任务';
     var FALLBACK_PLACEHOLDER_PREFIX = '向 ZCode 提问';
@@ -1668,24 +1663,25 @@
         'zcode-agent.subscribeConversationV4': 1,
         'zcode-agent.conversationRowsRangeV4': 1
     };
-    /** 进入会话后先给页面 3s 自己恢复；进行中流文本连续 5s 不更新也触发同一恢复梯子。 */
+    /** 进入会话后先给页面 3s 自己恢复；信标 +3s 就是本段的判定点。 */
     var FALLBACK_CHECK_MS = 3000;
     /**
-     * "前台对话流多久没新帧算异常"。
+     * 第一次判定的**延时复用**：`fallbackCheck` 未就绪时再等 3s 判第二次
+     * （本段唯一的读者；4b 之前它由看门狗的 `stallFire` 共用，那台机器已删）。
      *
-     * **5s → 60s（2026-09-15 真机定案）**。桌面端的推送本来就稀疏（README「已知问题 B」：
-     * 页面拿到快照后整段只有心跳帧是常态），5 秒静默被判成"卡死"的直接后果是看门狗
-     * **每秒布防、每 4 秒撤防一轮、永不停止**，其中一部分还会走到"轻推"（关 socket）。
-     * 真机实测 15 分钟内：布防 19 次 / 轻推 11 次 / socket close 13 次——用户看到的
-     * "进对话要重连好多次才出来"和"发送按钮一直转圈"都是它。
+     * ⚠️ 名字里的 "RELOAD" 是历史遗留：它服务过的那套刷新梯子已于 2026-09-16 删除，
+     * 现在只表示"§5b 的第二次判定延时"，**没有任何 reload 语义**。值与
+     * `FALLBACK_CHECK_MS` 相同（3000），所以换用它不会改变行为。
+     *
+     * 历史取证（原 `CONVERSATION_STALE_MS = 60000` 的注释，该常量随看门狗巡检一起
+     * 删除，取证存 docs/18）：桌面端推送本来就稀疏，5s 静默被判成"卡死"的直接后果是
+     * 看门狗每秒布防、每 4 秒撤防一轮；真机实测 15 分钟内布防 19 次 / 轻推 11 次 /
+     * socket close 13 次——用户看到的"进对话要重连好多次才出来"就是它。
      */
-    var CONVERSATION_STALE_MS = 60000;
-    var FALLBACK_RELOAD_GAP_MS = 15000;
-    var FALLBACK_STORE_AT = 'zcodeShellFastRefreshAt';
+    var STALL_RELOAD_MS = 3000;
 
     var fallbackTimer = null;
     var fallbackState = {
-        lastReloadAt: 0,
         beaconAt: 0,
         beaconGen: 0,
         readyAt: 0,
@@ -1798,9 +1794,9 @@
     }
 
     /**
-     * 进对话信标：重置 5 s 铁判准窗（快速切换时以最后一次信标为准）。
+     * 进对话信标：武装 3 s 铁判准窗（快速切换时以最后一次信标为准）。
      * 页面卡住时它每 ~10 s 重发一次同样的请求，信标因此会连续重来——那正是
-     * 我们希望它重来的形态：每次都重新给 5 s，就绪信号一到就停。
+     * 我们希望它重来的形态：每次都重新给 3 s，就绪信号一到就停。
      */
     function scheduleFallbackCheck() {
         if (fallbackTimer) {
@@ -1858,9 +1854,10 @@
     }
 
     /**
-     * 铁判准判定点（信标 +5 s）。就绪 → 本轮收工；未就绪 → 直接刷新页面。
+     * 铁判准判定点（信标 +3 s）。就绪 → 本轮收工；未就绪 → 交给 nudgeReconnect /
+     * reloadForMissingConversation，只读壳下两者都只记账、不动页面（见 5b 节头部）。
      * 链路在此期间换代（页面已经在自己重连）就跳过本轮：那种形态下页面正在
-     * 恢复，插一刀只会更慢；换代后的新信标会重新给 5 s。
+     * 恢复，插一刀只会更慢；换代后的新信标会重新给 3 s。
      */
     function fallbackCheck() {
         if (fallbackTimer) {
@@ -1875,7 +1872,7 @@
         }
         var clientNow = client;
         if (state.beaconGen && (!clientNow || clientNow.gen !== state.beaconGen)) {
-            diag('debug', '进对话 5s 判定：期间链路换代（' +
+            diag('debug', '进对话 3s 判定：期间链路换代（' +
                 (clientNow ? '第 ' + state.beaconGen + '→' + clientNow.gen : '客户端已销毁') +
                 '），本轮不判（页面正按自己的梯子重连）');
             return;
@@ -1885,7 +1882,8 @@
             diag('debug', '进对话 ' +
                 Math.round((Date.now() - state.beaconAt) / 1000) + 's 已就绪（' +
                 reasons.join('、') + '）');
-            stallCancel('进对话 5s 判定：对话详情已就绪');
+            // 4b 之前这里还要 stallCancel() 复位看门狗的放弃态；那台机器与它的状态位
+            // 已于 2026-09-18 删除，就绪只记在 fallbackState.readyAt/readyBy 上。
             return;
         }
         var el = '';
@@ -1899,27 +1897,31 @@
         } catch (e) {
             el = 'DOM 不可读';
         }
-        diag('warn', '进对话 5s 未出对话详情' + (el ? '（' + el + '）' : '') +
-            '：先尝试最小内推（重建页面 relay 连接）');
+        diag('warn', '进对话 3s 未出对话详情' + (el ? '（' + el + '）' : '') +
+            '：只读壳不内推（本会重建页面 relay 连接）');
         if (!state.nudgedAt) {
             state.nudgedAt = Date.now();
-            nudgeReconnect('进对话 5s 未出详情');
+            nudgeReconnect('进对话 3s 未出详情');
             fallbackTimer = setTimeout(fallbackCheck, STALL_RELOAD_MS);
             return;
         }
-        diag('warn', '最小内推后仍未出对话详情：整体刷新页面');
-        reloadForMissingConversation('进对话 5s 未出对话详情');
+        diag('warn', '二次判定仍未出对话详情：只读壳不刷新页面（只记录）');
+        reloadForMissingConversation('进对话 3s 未出对话详情');
     }
 
     /**
-     * 铁判准的刷新动作。与卡死看门狗共享同一套终止性状态（15 s 间隔 + 连续
-     * 上限 + 就绪即复位），但**不经过轻推**：见 5b 节头部的决策说明。
+     * 铁判准的**刷新动作**——只读壳下它只剩"记账"：写一行拒绝日志，再抓一帧页面
+     * 体征（why='giveup'）。`location.reload()` 永远不会发生。
+     *
+     * 4b（2026-09-18）：原先这里还置上一个与看门狗共用的"放弃态"闩锁字段，它已随那台
+     * 机器一起删除——能读它的四处（布防 / 撤防 / 心跳巡检 / 1s 巡检）全在被删的机器里，
+     * §5b 自己一行都不读它，留着就是一个"只写不读"的字段。（字面标识符见 docs/18 的
+     * 删除清单，这里不再写出，免得后人 grep 到一个已死的名字。）
      */
     function reloadForMissingConversation(reason) {
         // 和"轻推"同源的一条路：进对话没看到内容就重载页面。真机里它同样是拿
         // "我们的观测"去否定"页面的事实"——只读壳下只记录，不动页面。
         // 2026-09-16 审计：历史实现（两级刷新 + sessionStorage 限流 + 连续上限）已删除。
-        stallState.gaveUp = true;
         diag('warn', '只读壳：不因"' + reason + '"重载页面（只记录，等页面自己恢复）');
         postPageVitals('giveup');
     }
@@ -1929,7 +1931,7 @@
 
     /**
      * 进对话信标（页面自己发出的会话请求）。已有在跑的判定窗就不重置——
-     * 重置会把"5 s 铁判准"变成"5 s + 每次重试顺延"：真机实测正是这样拖到 ~9 s
+     * 重置会把"3 s 铁判准"变成"3 s + 每次重试顺延"：真机实测正是这样拖到 ~9 s
      * 才刷（页面 transport 的 await 门控让订阅请求晚 4 s 才发出去，信标跟着晚）。
      * 窗口只由"进入对话"那一刻起算，DOM 视图信标通常几百毫秒内就到。
      */
@@ -1938,11 +1940,11 @@
         var session = args && args.sessionId ? String(args.sessionId) : '';
         if (age >= 0 && age < FALLBACK_CHECK_MS) {
             diag('debug', '进对话信标 ' + method + (session ? '（' + session + '）' : '') +
-                '落在此前已武装的 5s 窗内，不顺延');
+                '落在此前已武装的 3s 窗内，不顺延');
             return;
         }
         diag('debug', '进对话信标 ' + method + (session ? '（' + session + '）' : '') +
-            '→ 武装 5s 铁判准');
+            '→ 武装 3s 铁判准');
         scheduleFallbackCheck();
     }
 
@@ -1970,7 +1972,12 @@
         }
     }
 
-    /** Test and console debugging surface for the fast refresh. */
+    /**
+     * Test and console debugging surface for the fast refresh.
+     *
+     * 4b（2026-09-18）：`arm` / `cancel` / `fire` / `stall` 四个看门狗出口已随决策机器
+     * 删除——留在这里就是四个指向不存在标识符的悬空引用。
+     */
     G.__zcodeShellFallback = {
         note: notePageRpcCall,
         beacon: noteConversationEntryBeacon,
@@ -1983,82 +1990,44 @@
         timer: function () {
             return fallbackTimer;
         },
-        arm: stallArm,
-        cancel: stallCancel,
-        vitals: readVitals,
-        fire: stallFire,
-        stall: function () {
-            return stallState;
-        }
+        vitals: readVitals
     };
 
     // -----------------------------------------------------------------------
-    // 5c. 卡死看门狗（stall watchdog，2026-09-12 用户拍板的三级处置）
+    // 5c. 卡死看门狗 —— **决策机器已于 2026-09-18 拆除，只留量具**（勿重走）
     //
-    // 需求：卡死 3s 内必须有可见的恢复动作，动作从轻到重，刷新是最后一档。
+    // 历史（2026-09-12 用户拍板的三级处置，**已作废**）：
+    //   phase 0（布防后 3s）→ 先看桌面端是否还在下发：在发就跳过干预；没在发就"轻推"
+    //     （关闭共享 relay socket，让页面走它自己的重连-重订阅梯子）。
+    //   phase 1（再 3s）→ 仍无内容才 reload；连续 2 次到顶放弃（sessionStorage 计数
+    //     跨 reload 边界），恢复信号到达后自动复位；15s 刷新间隔保留。
+    //   撤防/复位信号曾是：DOM 就绪（标题+输入框）、页面日志的订阅确认
+    //     （subscribe.acknowledged / store.connect.completed）、心跳巡检恢复正常；
+    //     错误横幅（chat-error-banner）出现即撤防。
     //
-    //   phase 0（布防后 3s）→ 先看桌面端是否还在下发：在发就跳过干预（内容在
-    //     路上，掐 socket 只会更慢）；没在发就"轻推"——关闭共享 relay socket，
-    //     让页面走它自己的重连-重订阅梯子。可见性劫持（第 1 节）摘掉了页面的
-    //     pagehide/visibilitychange/freeze 监听，页面自己的 suspend→recover
-    //     快路在本壳里永远不可达，所以"借页面自身恢复"只剩 socket 这一条通路；
-    //     页面对 socket 重建有一整套设计好的恢复（重连→换代→重订阅），代价
-    //     约 2-5s，不丢 UI，快照审计（docs/05 @4700682/@2257650）证实。
-    //   phase 1（再 3s）→ 仍无内容才 reload。连续 2 次到顶放弃（sessionStorage
-    //     计数跨 reload 边界），恢复信号到达后自动复位；15s 刷新间隔保留。
+    // 2026-09-15 真机把三级处置全部定罪为自伤（关 socket → 页面重连 → 5s 窗重新武装
+    // → 再关，40 秒里 10 次），只读壳（SHELL_READ_ONLY）先把三个终点掏空成一行拒绝
+    // 日志。2026-09-18 审计（4b）把**决策机器本身**删净，一行不留：布防/判定/撤防
+    // （stallArm / stallFire / stallReloadIfAllowed / stallCancel / stallState 及其全部
+    // 字段）、心跳巡检、1s 前台巡检（conversationStreamStallTick +
+    // startConversationStreamMonitor）、僵尸订阅指纹（zombieSuspected + ZOMBIE_*）、
+    // 页面日志失败事件布防（PAGE_LOG_STALL_EVENTS），以及它们共用的常量。
     //
-    // 撤防/复位信号：DOM 就绪（标题+输入框）、页面日志的订阅确认
-    // （v4.conversation.subscribe.acknowledged / store.connect.completed）、
-    // 心跳巡检恢复正常。错误横幅（chat-error-banner）出现即撤防——那是页面
-    // 在正常报错，刷新解决不了。
+    // 留下的是**量具**（本节的幸存者，逐项注明读者）：
+    //   [readVitals]            DOM 体征快照（只读属性，不碰布局）；
+    //   [vitalsStalled]         卡态判据——唯一读者是 [heartbeatTick]；
+    //   [postPageVitals]        体征上报——why=stalled/periodic 来自心跳，giveup 来自 §5b；
+    //   [nudgeReconnect]        拒绝动手的记账（§5b 第一次到点、§5d 手动诊断的出口）；
+    //   [notePageLogEvent]      页面日志的**订阅确认**入口（§5b 就绪信号的唯一生产入口）。
+    // "进对话卡住"这件事现在只由 §5b 的铁判准记账；"页面挂了"只由页面自己的重连梯子 +
+    // KICKED 终态自愈（[healKickedOnForeground]）+ 回前台死链兜底（[healDeadLinkOnResume]）
+    // 负责。**本壳不干预页面**——往后再想加"到点就动手"的机器，先读这一段。
     // -----------------------------------------------------------------------
-    var STALL_NUDGE_MS = 3000;
-    var STALL_RELOAD_MS = 3000;
-    var STALL_RELOAD_CAP = 2;
-    /**
-     * 撤防后多久之内不再重新布防。
-     *
-     * 真机 2026-09-15：20:18–20:50 这一段看门狗布防 **267 次**、撤防 265 次——
-     * 全部是同一对理由在打转（`前台对话流连续 Ns 无新动态` → 3s 后 `判定时已恢复`，
-     * 下一跳再布防）。原因是两条判据看的东西不同：巡检看的是"我们有没有看到对话帧"，
-     * 判定看的是"DOM 健不健康"，而"我们看不到帧、页面却是好的"恰恰是常见状态。
-     * 只读壳下这个看门狗已经不能动手了，它的价值只剩"什么时候我们会想动手"这条
-     * 诊断量，所以给它一个退避，别用 537 行日志把真正的事件淹掉。
-     */
-    var STALL_REARM_COOLDOWN_MS = 60000;
-    var STALL_STORE_RELOADS = 'zcodeShellStallReloads';
-    /** 布防的页面日志事件：仅梯子已耗尽的终态（retry_scheduled 是页面还在自救，不动）。 */
-    var PAGE_LOG_STALL_EVENTS = {
-        'v4.conversation.store.connect.failed': 1,
-        'v4.conversation.subscribe.failed': 1
-    };
+    /** 页面日志里的"订阅确认"：§5b 就绪信号的生产入口（唯一读者 [notePageLogEvent]）。 */
     var PAGE_LOG_RECOVER_EVENTS = {
         'v4.conversation.store.connect.completed': 1,
         'v4.conversation.subscribe.acknowledged': 1,
         'v4.conversation.subscribe.activated': 1
-    };
-    var stallState = {
-        armed: false,
-        phase: 0,
-        timer: null,
-        since: 0,
-        deadline: 0,
-        armReason: '',
-        gaveUp: false,
-        lastReloadAt: 0,
-        skipNudge: false,
-        streamStalled: false,
-        /** 上次撤防的时刻（见 STALL_REARM_COOLDOWN_MS）。 */
-        lastCancelAt: 0,
-        // 连续刷新计数的内存权威；sessionStorage 是跨 reload 边界的镜像
-        // （storage 可能被拒，内存值仍保住单次加载内的上限语义）。
-        reloadCount: parseInt((function () {
-            try {
-                return G.sessionStorage ? G.sessionStorage.getItem(STALL_STORE_RELOADS) : null;
-            } catch (e) {
-                return null;
-            }
-        })(), 10) || 0
     };
 
     /**
@@ -2086,7 +2055,18 @@
         }
     }
 
-    /** 卡态判定：聊天页在、无错误横幅、且（输入框灰着 或 标题回退）。 */
+    /**
+     * 卡态判定：聊天页在、无错误横幅、且（输入框灰着 或 标题回退）。
+     *
+     * 4b（2026-09-18）：唯一的读者是 [heartbeatTick] 的体征量具。它只回答"现在是不是
+     * 卡态"，**不再驱动任何动作**——旧读者（stallArm / stallFire / 心跳巡检 /
+     * 页面日志布防）全已随决策机器删除。
+     *
+     * 历史取证（随 `zombieSuspected` 一起删除，存档见 docs/18）：2026-09-13 真机实证过
+     * 一种"僵尸订阅"形态——桌面端任务仍在产出，而页面桥 ≥45s 零业务帧、DOM 却完全
+     * 健康，根因是 socket 重建后页面 runtime 不重建。那套指纹（45s 帧静默 + 60s 活动
+     * 新鲜度）曾与本节共生，现已不存在。
+     */
     function vitalsStalled(v) {
         if (!v || !v.chat || v.errorBanner) {
             return false;
@@ -2094,6 +2074,13 @@
         return v.composerDisabled || v.fallbackTitle;
     }
 
+    /**
+     * 体征上报（原生 `pagevitals` 通道，ShellRuntime 打成一行 `页面体征(why): {...}`）。
+     * why 的三个来源：
+     *   'stalled'  / 'periodic' —— [heartbeatTick]（前者是卡态边沿，后者是 60s 周期）；
+     *   'giveup'               —— §5b [reloadForMissingConversation]。
+     * 只读 DOM，永不写页面。
+     */
     function postPageVitals(why) {
         try {
             var v = readVitals();
@@ -2103,130 +2090,14 @@
         } catch (e) {}
     }
 
-    var ZOMBIE_FRAME_SILENCE_MS = 45000;
-    var ZOMBIE_ACTIVITY_FRESH_MS = 60000;
-    var zombieSilenceS = 0;
-
     /**
-     * 僵尸订阅指纹（2026-09-13 真机实证）：桌面端对本会话的任务仍在产出
-     * （sessions-index 里 running 任务的 lastActivityAt 在 60s 内推进），
-     * 而页面桥 ≥45s 没有收到任何业务帧，且 DOM 完全健康——三方都以为
-     * 别人在办。socket 重建后页面 runtime 不重建是根因。
-     */
-    function zombieSuspected(nowMs) {
-        var clientNow = client;
-        if (!clientNow || typeof clientNow.lastPageBridgeTrafficAt !== 'function' ||
-            typeof clientNow.pageBridgeSessionIds !== 'function') {
-            return false;
-        }
-        // 桌面活着才布防：pair ack 不是 matched（桌面掉线/休眠）时刷新页面无意义。
-        if (!relayPaired) {
-            return false;
-        }
-        var lastTraffic = Math.max(clientNow.lastPageBridgeTrafficAt() || 0,
-            clientNow.bornAt || 0);
-        var silence = nowMs - lastTraffic;
-        if (silence < ZOMBIE_FRAME_SILENCE_MS) {
-            return false;
-        }
-        var ids = clientNow.pageBridgeSessionIds();
-        for (var key in ids) {
-            var at = runningActivityByKey[key] || 0;
-            if (at && nowMs - at < ZOMBIE_ACTIVITY_FRESH_MS) {
-                zombieSilenceS = Math.round(silence / 1000);
-                return true;
-            }
-        }
-        return false;
-    }
-
-    function stallArm(reason, skipNudge) {
-        if (stallState.gaveUp) {
-            return;
-        }
-        var v = readVitals();
-        if (v && v.errorBanner) {
-            return;
-        }
-        var nowMs = Date.now();
-        if (!stallState.armed) {
-            stallState.armed = true;
-            stallState.phase = 0;
-            stallState.since = nowMs;
-            stallState.deadline = nowMs + STALL_NUDGE_MS;
-            stallState.skipNudge = skipNudge === true;
-        } else if (stallState.phase === 0) {
-            // 首判没到前允许顺延；phase 1 起页面自己的 10s 重试信标会不断
-            // 进来，绝不能让它们把刷新判定无限顺延。
-            stallState.deadline = nowMs + STALL_NUDGE_MS;
-            if (skipNudge === true) {
-                stallState.skipNudge = true;
-            }
-        }
-        stallState.armReason = reason;
-        if (!stallState.timer) {
-            stallState.timer = setTimeout(stallFire,
-                Math.max(0, stallState.deadline - nowMs));
-        }
-        diag('info', '卡死看门狗布防（' + reason + '）phase=' + stallState.phase +
-            '，' + Math.round(Math.max(0, stallState.deadline - nowMs) / 1000) + 's 后判定');
-        postPageVitals('arm');
-    }
-
-    function stallFire() {
-        stallState.timer = null;
-        if (!stallState.armed) {
-            return;
-        }
-        if (stallState.skipNudge) {
-            // 僵尸布防的"恢复"判据是帧流，不是 DOM——僵尸的 DOM 本来就健康，
-            // 用 vitalsStalled 判会在 3s 判定点把自己撤掉（首轮真机实测踩中）。
-            if (!zombieSuspected(Date.now())) {
-                stallCancel('判定时帧流已恢复');
-                return;
-            }
-        } else {
-            var v = readVitals();
-            // 只在体征"可读且健康"时撤防；读不到（DOM 半拆/极端环境）不算恢复，
-            // 继续走梯子——布防理由本身已经是证据。
-            if (v && !vitalsStalled(v)) {
-                stallCancel('判定时已恢复');
-                return;
-            }
-        }
-        if (stallState.phase === 0) {
-            stallState.phase = 1;
-            if (stallState.skipNudge) {
-                // 僵尸订阅形态：轻推（关 socket）只会让页面重连配对，runtime
-                // 照旧不重建（2026-09-13 实测），直接进刷新判定。
-                diag('info', '卡死看门狗：僵尸订阅形态，跳过轻推直达刷新判定');
-            } else {
-                var trafficAt = client && typeof client.lastPageBridgeTrafficAt === 'function' ?
-                    client.lastPageBridgeTrafficAt() : 0;
-                if (trafficAt >= stallState.since) {
-                    diag('info', '卡死看门狗：桌面端仍在下发（内容在路上），跳过轻推');
-                } else if (Date.now() - lastForcedReconnectAt <= RECONNECT_MIN_GAP_MS) {
-                    // **这里以前缺了一道门**：`nudgeReconnect` 头顶的注释写着"与
-                    // forceReconnect 共享 180s 限流时钟"，但它只写 `lastForcedReconnectAt`
-                    // 从不读——于是"布防→判定→轻推"可以每 4 秒一轮无限循环，每次都把
-                    // 页面的 socket 拆掉（2026-09-15 真机：11 次轻推）。
-                    // 受限流时不轻推、**也不进刷新判定**：刚干预过就不该再加一刀。
-                    stallCancel('距上次链路干预不足 ' +
-                        Math.round(RECONNECT_MIN_GAP_MS / 1000) + 's，不重复轻推');
-                    return;
-                } else {
-                    nudgeReconnect(stallState.armReason || '页面无进展');
-                }
-            }
-            stallState.deadline = Date.now() + STALL_RELOAD_MS;
-            stallState.timer = setTimeout(stallFire, STALL_RELOAD_MS);
-            return;
-        }
-        stallReloadIfAllowed();
-    }
-
-    /**
-     * 轻推：关掉共享 socket，恢复归页面。
+     * 轻推页面 socket。**只读壳下不再动手**：本会关掉共享 socket 逼页面重连，如今只记
+     * 一行拒绝日志并 `return false`（见下方函数体）。留在标题位是为了让下面那段
+     * "为什么限流必须唯一收口"的教训有个主语。
+     *
+     * ⚠️ **下面那段教训描述的实现与常量都已不存在**（2026-09-16 审计删掉常量与看门狗里
+     * 那个恒假分支；2026-09-18 审计 4b 连看门狗本身一并拆除）——今天本函数只写一行
+     * 日志，没有任何限流逻辑。原文保留，是为了别重犯同一个正反馈环。
      *
      * ⚠️ **限流必须在这里（唯一收口），不能只放在某个调用方**——2026-09-15 真机教训：
      * 上一版只在看门狗那条路上加了限流，而"进对话 5s 未出详情"这条**直接调用**它，
@@ -2238,8 +2109,10 @@
      * 实测每 ~4 秒一轮、连续 10 次，用户看到的就是"点进对话要重连好多次才出来"，
      * 以及"发消息一直转圈"（socket 在发送途中被拆）。**每一次轻推都保证了下一次失败。**
      *
-     * 与心跳陈旧路径的 [forceReconnect] 共享同一个 180s 时钟——这也是本函数注释里
-     * 一直写着、但此前没有实现的意图：一次干预之后，这条链路上 180 秒内不再开刀。
+     * 与心跳陈旧路径的 [forceReconnect] 曾经共享同一个 180s 限流时钟
+     * （`RECONNECT_MIN_GAP_MS`）：本函数只写它的时间戳、从不读，所以那道"一次干预
+     * 之后 180 秒内不再开刀"的闸门其实从没生效过。2026-09-16 审计把常量与看门狗里
+     * 那个恒假分支（`Date.now()-0 <= 180000`）一并删了——今天两个函数都只记账。
      */
     function nudgeReconnect(reason) {
         // 只读壳：连"轻推"也不做。这条路上最恶性的正反馈（关 socket→页面重连
@@ -2249,81 +2122,18 @@
         return false;
     }
 
-    function stallReloadIfAllowed() {
-        // 只读壳：**永不自动重载**。重载会把页面自己的订阅、视图、滚动位置全部推倒
-        // （用户回来看到的是"它自己在重连/重载"），而它换来的只是一次握手——收益远
-        // 小于代价。看门狗到此为止，只把状态记清楚。
-        // 2026-09-16 审计：历史实现（刷新间隔 + 连续上限 + location.reload）已删除。
-        stallState.gaveUp = true;
-        stallState.armed = false;
-        diag('warn', '只读壳：不自动重载页面（看门狗停止干预，等页面自己恢复）');
-        postPageVitals('giveup');
-    }
-
-    function stallCancel(reason) {
-        var wasActive = stallState.armed || stallState.gaveUp;
-        if (stallState.timer) {
-            clearTimeout(stallState.timer);
-            stallState.timer = null;
-        }
-        stallState.armed = false;
-        stallState.phase = 0;
-        stallState.skipNudge = false;
-        // 记住撤防时刻：巡检据此退避（见 STALL_REARM_COOLDOWN_MS），
-        // 否则"布防→3s 判定恢复→立刻再布防"会每 4 秒刷一轮日志。
-        stallState.lastCancelAt = Date.now();
-        if (stallState.gaveUp) {
-            diag('info', '卡死看门狗解除放弃态: ' + reason);
-        }
-        stallState.gaveUp = false;
-        if (wasActive) {
-            stallState.reloadCount = 0;
-            storeSet(STALL_STORE_RELOADS, '0');
-            diag('info', '卡死看门狗撤防: ' + reason);
-            postPageVitals('cancel');
-        }
-    }
-
-    function conversationStreamStallTick() {
-        try {
-            if (!appForeground || !relayPaired || !fallbackState.chatView || stallState.gaveUp) {
-                return;
-            }
-            var at = client && typeof client.lastPageConversationTrafficAt === 'function' ?
-                client.lastPageConversationTrafficAt() : 0;
-            if (!at || Date.now() - at < CONVERSATION_STALE_MS) {
-                return;
-            }
-            if (!stallState.armed &&
-                Date.now() - stallState.lastCancelAt > STALL_REARM_COOLDOWN_MS) {
-                stallArm('前台对话流连续 ' + Math.round((Date.now() - at) / 1000) + 's 无新动态', false);
-            }
-        } catch (e) {
-            // Recovery monitoring must never affect the page.
-        }
-    }
-
-    function startConversationStreamMonitor() {
-        // 同上：被动旁观关掉时，这个 1s 一跳的卡死巡检也一并停掉（它本来就是围着
-        // 逐帧观测与看门狗转的）。
-        if (config().passiveObserve === false) {
-            return;
-        }
-        if (G.__zcodeShellConversationMonitor) return;
-        G.__zcodeShellConversationMonitor = setInterval(conversationStreamStallTick, 1000);
-    }
-
-
+    /**
+     * 页面日志汇（[installPageLogSink] 的出口）的**唯一入口**。
+     *
+     * 4b（2026-09-18）：这里原本还有"失败事件 → 布防看门狗"那一半
+     * （`PAGE_LOG_STALL_EVENTS` = store.connect.failed / subscribe.failed），已随决策机器
+     * 删除。**剩下的这一半绝对不能删**：页面自述的订阅确认是 §5b 就绪信号的
+     * 唯一生产入口——`noteConversationReady` 在全仓只有这里一个生产调用点，
+     * 删掉 §5b 就永远等不到就绪信号（`README.md:162`、清点报告 §1.1）。
+     */
     function notePageLogEvent(name) {
-        if (PAGE_LOG_STALL_EVENTS[name]) {
-            if (vitalsStalled(readVitals())) {
-                stallArm('页面日志 ' + name);
-            } else {
-                diag('debug', '页面日志失败事件（当前界面无卡态，不布防）: ' + name);
-            }
-        } else if (PAGE_LOG_RECOVER_EVENTS[name]) {
+        if (PAGE_LOG_RECOVER_EVENTS[name]) {
             noteConversationReady(name);
-            stallCancel('页面日志 ' + name);
         }
     }
 
@@ -2334,7 +2144,8 @@
     //       -a com.zcode.remote.action.DIAG --es diag_cmd kick_test|l1_test|vitals
     //
     //   vitals   读一次 DOM 体征并落日志；
-    //   l1_test  手动触发一次轻推（验证 socket 关闭→页面自愈链路）；
+    //   l1_test  手动走一次"轻推"路径（只读壳下它只留一行拒绝日志——见
+    //            nudgeReconnect：socket 永远不会被关）；
     //   kick_test Tier2 可行性实验：用页面同款 URL+auth_init 开第二条
     //            WebSocket，观察 relay 的 KICK/takeover 语义（第二条是被
     //            接纳还是把旧连接踢掉）。全部结果走 diag/pagelog 落日志，
@@ -2488,7 +2299,7 @@
     //
     // 这条写操作的两句自问（「实现要点」14 的规矩）：
     //   ① 页面自己做不到这件事吗？——做不到：它不知道自己已经瞎了（没有入站帧
-    //      就没有任何信号，看门狗又被自己的 suspend 清掉了）。
+    //      就没有任何信号，**页面自己的**看门狗又被它的 suspend 清掉了）。
     //   ② 怎么知道它已经失败了？——"完全没有任何入站帧"持续 ≥35s，而壳每 10s
     //      还在发 probe：健康的链路上 probe 一定有 ack（真机健康窗 `链路 ack 1~5/10s`），
     //      连 ack 都没有就是链路已死，不是"桌面端安静"。
@@ -2772,7 +2583,9 @@
             }
             var label = String((el.getAttribute && (el.getAttribute('aria-label') ||
                 el.getAttribute('title'))) || '') + String(el.textContent || '');
-            if (label.indexOf('发送') >= 0 || label.indexOf('发送消息') >= 0 ||
+            // 2026-09-16 审计：删掉被蕴含的析取项 `indexOf('发送消息')`——`'发送消息'`
+            // 里含 `'发送'`，前者成立则后者必然成立，它一个分支都多不出来。
+            if (label.indexOf('发送') >= 0 ||
                 label.indexOf('Send') >= 0 || label.indexOf('提交') >= 0) {
                 return el;
             }
@@ -2849,6 +2662,11 @@
     /**
      * 填入文本并发送。`compose|<文本>`；只由 adb 显式触发。
      * 返回一行摘要字符串（原生日志与它对齐看时序）。
+     *
+     * ⚠️ 这个返回值**今天没有任何消费方**：唯一调用点是下面 `__zcodeShellDiag` 的
+     * `compose|` 分支，它丢掉返回值、只回 `true`；也没有任何测试读它。留着它是因为
+     * 信息并没有丢——每条失败路径都已经用 `diag('warn', …)` 把同一句话写进原生日志
+     * ——它只是"将来想在 adb 里一眼看出走了哪条发送路径"时的出口，删它只能省几行。
      */
     G.__zcodeShellComposeSend = function (text) {
         try {
@@ -3003,11 +2821,6 @@
                 reportPageState();
                 return;
             }
-            forceReconnect(silence < 0 ?
-                '回前台且从未收到帧' :
-                '回前台时已静默 ' + Math.round(silence / 1000) + 's');
-            reportPageState();
-            return;
         }
         // 只读壳：不写、**也不假装收到过 ack**。原先这里把 lastPairAckAt 拨到现在，
         // 等于用一个没发生的 ack 去掩盖真实的陈旧——那是自欺，观测层最不该做的事。
@@ -3019,15 +2832,7 @@
             reportPageState();
             return;
         }
-        lastPairAckAt = Date.now();
-        staleTicks = 0;
-        // 同上：控制帧必须顶层 type，不能包成 data 载荷（否则永远拿不到 ack）。
-        sendControlFrame({
-            type: 'pair_status_query',
-            device_sid: deviceSid,
-            client_ts: Date.now()
-        });
-        reportPageState();    };
+    };
 
     /**
      * Re-reports the page's visual state. Called on every return to the
@@ -3042,15 +2847,6 @@
         }
     }
 
-    /**
-     * Reports the CSS viewport metrics.
-     *
-     * This exists to make layout problems measurable instead of a screenshot
-     * argument: if innerWidth * devicePixelRatio does not match the WebView's
-     * own width, the page is being laid out at a different scale than it is
-     * displayed at, which shows up as content sitting off-centre relative to
-     * the scrollbar.
-     */
     /**
      * 滚动条到底占了多少宽——"14px 有没有真的还回来"的**唯一硬判据**。
      *
@@ -3082,6 +2878,15 @@
         }
     }
 
+    /**
+     * Reports the CSS viewport metrics.
+     *
+     * This exists to make layout problems measurable instead of a screenshot
+     * argument: if innerWidth * devicePixelRatio does not match the WebView's
+     * own width, the page is being laid out at a different scale than it is
+     * displayed at, which shows up as content sitting off-centre relative to
+     * the scrollbar.
+     */
     function reportViewport() {
         // Wrapped because it runs from a timer: by the time it fires the
         // document may be going away, and an exception here would escape into
@@ -3232,7 +3037,7 @@
      * 它判"当前在不在对话里"）。为什么铁判准也要认它：第一个信标是页面自己发的
      * `subscribeConversationV4`/`conversationRowsRangeV4`，可当页面传输层已经坏掉
      * 时，用户点进任务**连这个请求都不会发出去**——只认 RPC 信标就会整窗漏掉，
-     * 那正是"还是做不到"的形态。视图一旦出现就武装 5 s，与 RPC 信标等价。
+     * 那正是"还是做不到"的形态。视图一旦出现就武装 3 s，与 RPC 信标等价。
      */
     function noteChatViewEntered() {
         var has = false;
@@ -3255,7 +3060,7 @@
             // 误判成"没内容"而白刷一次。
             return;
         }
-        diag('debug', '进入对话视图（DOM 信标）→ 武装 5s 铁判准');
+        diag('debug', '进入对话视图（DOM 信标）→ 武装 3s 铁判准');
         scheduleFallbackCheck();
     }
 
@@ -3386,6 +3191,10 @@
                 return;
             }
             var style = document.createElement('style');
+            // 标记位：**全仓没有任何选择器或脚本查询它**（两处赋值、零处读取）。
+            // 属性名与取值是从已回滚的滚动条注入 v1 逐字继承的——`git show 43c6998`
+            // 撤掉的正是同一个 style 元素上的同一对键值。留着只为在 devtools 里
+            // 一眼认出"这条 CSS 是壳塞进去的"，不是给代码用的钩子。
             style.setAttribute('data-zcode-shell', 'scrollbar-width');
             style.textContent = SCROLLBAR_CSS;
             parent.appendChild(style);
@@ -3510,6 +3319,9 @@
         }
         var spec = readPageBarSpec();
         var el = document.createElement('div');
+        // 同上：只写不读的标记位（没有任何选择器查询它）。取值沿用同一个
+        // `data-zcode-shell` 命名空间，好让 devtools 里"壳画的悬浮滚动条"与
+        // "壳塞的滚动条 CSS"一眼可分。
         el.setAttribute('data-zcode-shell', 'scrollbar');
         var s = el.style;
         // Out of flow and never a hit target: the page's own interaction and
@@ -3727,7 +3539,6 @@
     } catch (e) {
         diag('error', 'WebSocket hook 失败: ' + e);
     }
-    startConversationStreamMonitor();
     installLongTaskObserver();
     // 只报 href：`subscribeAll` 随 D7 一起删除（2026-09-17），别再往这帧里加"能力开关"。
     post('ready', {href: location.href});

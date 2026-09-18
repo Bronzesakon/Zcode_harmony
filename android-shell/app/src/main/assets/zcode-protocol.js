@@ -82,74 +82,12 @@
     // ——同一座桥上索引先上去之后，对话订阅永远不回包（真机 20:0x：每 36s 重试、连续
     // 12 分钟全超时；18:35 成功那次纯属轮询线程抢到了正确顺序）。Kotlin Tier2 侧也是
     // 同一个结论，所以这里照抄它的做法：握手之后**先订对话，再订索引**。
-    var EVENT_CONVERSATION_FRAME = 'onDynamicConversationFrame';
-    var METHOD_SUBSCRIBE_CONVERSATION = 'subscribeConversationV4';
     /**
      * 运行态整表（页面自己订的那条 controller 流，见 `_forwardControllerTasks`）。
      * 这是"哪些任务在跑"的**全局**正源：`sessions-index` 只跟随页面在听的那一个工作区。
      */
     var CONTROLLER_TASKS_TOPIC = 'controller/tasks-index';
-    /** 一次最多订几条对话：卡片只显示得下少数几张，多订只是白烧桌面端。 */
-    var CONVERSATION_MAX = 2;
-    /** 单条对话订阅的等待上限。宁可放弃，也**绝不能挡住索引订阅**（否则通知全瞎）。 */
-    var CONVERSATION_SUBSCRIBE_MS = 12000;
 
-    /**
-     * ⛔ **我们是否自己订阅对话流——默认关，别轻易打开。**
-     *
-     * 真机 2026-09-15 定案：**页面自己已经订着用户正在看的那条会话**，我们再订一份就是
-     * 重复订阅（日志里同一个 `sess_46daf1dd-…` 出现两次），并且会对它发
-     * `resyncConversationV4 {forceSnapshot:true}`。后果是**页面的接收流被挤掉**：
-     * 用户现场看到"消息发出去了、桌面端跑了三轮十秒一回复，手机端只有『工作中』+转圈，
-     * 连桌面端点了暂停也不更新"——**而全程在前台**。
-     *
-     * **对照实验**：鸿蒙版是同一个网页的纯壳、没有任何订阅，跟踪完全正常。
-     *
-     * 所以正确形态是**纯旁观**：页面的流照旧，我们从入站帧里读正文
-     * （`_trackConversationText` 已按真实帧结构修好：载荷在 `frame`、`kind` 在顶层）。
-     * 这条同 README「实现要点」13 的不变式：*页面已覆盖的工作区/会话，绝不重复开桥/订阅*。
-     */
-    var CONVERSATION_SUBSCRIBE_ENABLED = false;
-
-    // ---- 对话流的看门狗与主动重锚（照 zemote 抄；六个参数逐条对应）----
-    //
-    // 背景：**网页端不做周期性 resync/forceSnapshot**——订阅一次，靠推送 + 缺口恢复。
-    // 而桌面端的推送是稀疏、且由它自己决定的，所以一轮回复结束后页面就静在那儿不动
-    // （**前台也一样卡**）。zemote 之所以能连续稳定几分钟，靠的就是下面这套"主动要"。
-    // 出处：`E:\zemote\lib\protocol\conversation.dart:1055-1068`（看门狗）与
-    // `:943-968`（重锚请求）。
-    /** 重锚方法名。 */
-    var METHOD_RESYNC_CONVERSATION = 'resyncConversationV4';
-    /** 看门狗周期（zemote 同值：10s）。 */
-    var CONVERSATION_WATCHDOG_MS = 10000;
-    /** 静默多久算异常（zemote 同值：20s）。太短会误伤稀疏推送。 */
-    var CONVERSATION_QUIET_MS = 20000;
-    /** 两次重锚的最小间隔——本机额外加的节流：桌面端可能真的长时间不下发帧。 */
-    var CONVERSATION_RESYNC_MIN_GAP_MS = 20000;
-    /** 连续这么多次重锚都没换来帧就熔断，等帧自己回来再解除（防churn）。 */
-    var CONVERSATION_RESYNC_MAX_STRIKES = 5;
-    /** "正文最近还在涨"就视作该会话在跑（JS 侧没有 conversation store，只能这样近似）。 */
-    var CONVERSATION_ACTIVE_TEXT_MS = 120000;
-    /** 已经不动的 phase：选"订哪几条"时排到最后。 */
-    var TERMINAL_PHASES = {
-        completedSuccess: true,
-        completedInterrupted: true,
-        completedFailed: true,
-        completedError: true,
-        failed: true,
-        cancelled: true,
-        error: true
-    };
-
-    /**
-     * 每个工作区"上一轮见过的会话清单"——**必须跨 RemoteClient 实例存活**。
-     *
-     * 每次 relay 断线重连都会重建 client（`resetClient()`），而"开桥时要先订对话"这一步
-     * 只能拿上一轮的清单（那一刻没有新索引）。挂在实例上就会被重连清空，于是候选永远为空
-     * ——与当年 `pageCoverage` 丢在重连后是同一类错（真机 2026-09-15：v107 装了 55 秒
-     * 一条 `subscribed conversation` 都没有，就是因为这个）。
-     */
-    var sessionsByKeyCache = {};
 
     // Page-RPC tracing budgets (see RemoteClient.prototype._tracePageCall).
     // A page call slower than this is what "opening a task takes forever" looks
@@ -168,41 +106,7 @@
     // 阈值低于它会误报。报告后从 pending 摘除，不占用下一窗口。
     var PAGE_RPC_SILENCE_MS = 30000;
 
-    // How many times one workspace may fault and be reopened within a single
-    // relay connection before we stop trying (see _handleDegraded).
-    //
-    // Zero, on field evidence: reopening does not help a workspace the desktop
-    // refuses. A 2026-09-12 round logged `default` and `Mimo` faulting every
-    // 40–75 s, each time with the reopen "succeeding" and faulting again — every
-    // reopen costs 4 RPCs (hello / initialize / subscribeSessionsIndex / listen)
-    // on the SAME relay socket the page is using to open whatever the user just
-    // tapped. With 5–7 bridged workspaces that is the churn the user sees as
-    // "tapping a task after a long background loads forever". One strike per
-    // connection, then the key waits for the next relay connection (or the
-    // cross-connection cooldown below). The evidence for the refusal is the fault
-    // itself; a workspace that was merely unlucky gets its retry one connection
-    // later, which is exactly what the cooldown math is for.
-    var MAX_REOPENS_PER_BRIDGE = 0;
 
-    // A workspace that faults once is a transient transport problem and deserves
-    // a retry. One that faults again on the NEXT connection is the desktop
-    // refusing it, and re-opening it there is what closed the loop: a relay
-    // rebuild wiped the per-connection budget, the burst re-opened the bridge,
-    // and the fault came back on the same cadence (field log: `default` faulted
-    // every ~45 s, forever). After this many distinct connections have faulted on
-    // one key it goes on cooldown. Deliberately reversible — the cooldown expires
-    // and the key is tried again — so a desktop that was merely unreachable for a
-    // while can never cost notification coverage permanently.
-    var FAULT_COOLDOWN_CONNECTIONS = 3;
-    var FAULT_COOLDOWN_MS = 10 * 60 * 1000;
-
-    // Total time the subscription burst may spend waiting for the page to be
-    // idle, spread across its workspaces. The gate in inject.js keeps the burst
-    // from STARTING while the page is busy; this keeps it from ploughing on when
-    // the user opens a task mid-burst. Bounded, so a chatty page cannot stretch
-    // the burst without limit.
-    var BURST_YIELD_TOTAL_MS = 8000;
-    var BURST_YIELD_POLL_MS = 120;
 
     // V4 capabilities (notably sessions-index) are gated on the desktop's
     // protocol version negotiation: a 0.x value here silently disables them.
@@ -472,6 +376,18 @@
 
     // -----------------------------------------------------------------------
     // rpc-frame: outbound fragmentation
+    //
+    // ⚠️ 4c（2026-09-18）：本类与紧随其后的 `RpcFrameAssembler`（入站重组）、
+    // `ChannelClient`（请求-应答配对）已**不在生产路径**上——它们的调用者是"主动开桥"
+    // 那条路，而只读壳下壳自己**永不开桥**（写 `_bridges` 的只有 `openBridge`，
+    // 其驱动 `start()` 已于 2026-09-17 / D7 删除）。
+    //
+    // **保留它们是刻意的**（用户 2026-09-18 裁定；"删净 / 保留 / 折中"三选一里选了保留）：
+    //   * 它们是**线格式的参照实现**——帧信封、分片、ack 长什么样，以此为准；
+    //   * 另有 **7 项协议测试**压在它们身上，那是仓里唯一记录"线上帧长什么样"的东西。
+    //
+    // ⚠️ **欠账**：生产里真正在跑的重组器是 `RemoteClient._tryAssemble`，
+    // 它**今天仍然零单测**。将来若要动重组逻辑，先想到这一点。
     // -----------------------------------------------------------------------
     function RpcFrameSender(options) {
         this.bridgeSessionId = options.bridgeSessionId;
@@ -611,14 +527,6 @@
     };
 
     /** Drops assemblies that never completed (a fragment was lost). */
-    RpcFrameAssembler.prototype.purgeStale = function (maxAgeMs) {
-        var now = Date.now();
-        for (var key in this._assemblies) {
-            if (now - this._assemblies[key].at > maxAgeMs) {
-                delete this._assemblies[key];
-            }
-        }
-    };
 
     // -----------------------------------------------------------------------
     // ChannelClient — request/response + event listen over a bridge
@@ -820,6 +728,31 @@
         this.sessions = {};
         this.ready = false;
         this.needsResync = false;
+        /**
+         * 本工作区的会话清单是否**因序号缺口而陈旧**（4c 工程前置，2026-09-18）。
+         *
+         * 与 `needsResync` **不是同一件事**：那个说"该去要一份重同步了"，这个说
+         * "这一路读数**不可信**了"——原生侧要拿它决定"要不要把这次读数当成『没有在跑
+         * 的任务』"（`ShellRuntime` 的提前接管闸门只问"有没有在跑"，见
+         * `TaskStore.runningTaskRefs()`；陈旧期间判成空 = 卡片/接管被误关）。
+         *
+         * 置位：增量帧跳号（见 applyLogicalFrame）。**只有一处清除**：下一次**成功应用
+         * 整窗快照**——快照把整窗拉回，缺口自愈（重订阅与重同步都会带来快照）。
+         *
+         * ⚠️ 这里有个**已经实测钉住**的反直觉处，接手时别按直觉改：缺口之后本状态机对
+         * 每一帧增量都判失败（`seq` 不动），**一帧都不上报**，所以"成功应用"与"缺口自愈"
+         * 是同一件事。后果是把 `stale` 挂到 `_emitSessions` 的载荷上，它**永远不会有 true
+         * 的那一天**；要让原生知道，得在**检出那一拍**另外发一次上报（`tools/protocol.test.js`
+         * 的「被动：缺口把该工作区标为陈旧…」把"缺口期间一帧都不上报"一并钉住了）。
+         *
+         * 4c（2026-09-18）落地情况：上报那一帧就是 [_emitSessionsStale]（**仅标记帧**，
+         * `staleOnly: true`，列表不许落地）；原生的落点是 `TaskStore` 的 `staleSince` /
+         * 可信窗口（见该文件的注释），载荷字段的对照表写在 `_emitSessionsStale` 上。
+         * 本文件的单测钉住"检出跃迁恰好发一帧、且那一帧带的是冻结旧读数"。
+         */
+        this.stale = false;
+        /** 检出缺口的那一帧的 `fromSeq`：**只给日志用**，不是可用位点。 */
+        this.gapFromSeq = null;
         this._fragments = {};
     }
 
@@ -902,12 +835,20 @@
                 }
             }
             this.seq = toSeq;
+            // 整窗拉回 ⇒ 缺口自愈。**这是 [stale] 唯一的解除条件**（见构造函数里的注释）。
+            this.stale = false;
+            this.gapFromSeq = null;
         } else if (payload.kind === 'deltas') {
             var fromSeq = typeof frame.fromSeq === 'number' ? frame.fromSeq : this.seq;
             if (fromSeq !== this.seq) {
                 // Lost an update: the caller must resync, otherwise the phase
                 // table silently drifts and completion events are missed.
                 this.needsResync = true;
+                // 4c 工程前置：漏了一帧增量 ⇒ **从这一拍起本工作区的读数不可信**。
+                // 注意 `seq` 有意不动：缺口期间后续每一帧都会再判失败一次，直到整窗快照
+                // 把它拉回来——"卡在缺口上"是这里的设计，不是漏改。
+                this.stale = true;
+                this.gapFromSeq = fromSeq;
                 return false;
             }
             var deltas = Array.isArray(payload.deltas) ? payload.deltas : [];
@@ -991,63 +932,6 @@
     }
 
     // -----------------------------------------------------------------------
-    // Bridge — one workspace's RPC endpoint
-    // -----------------------------------------------------------------------
-    function Bridge(options) {
-        this.key = options.key;
-        this.scope = options.scope;
-        this.info = options.info;
-        this.bridgeSessionId = options.bridgeSessionId;
-        this.generation = options.generation;
-        this.recoveryId = options.recoveryId;
-        this.sender = null;
-        this.assembler = null;
-        this.channels = null;
-        this.closed = false;
-        this._clientHello = null;
-    }
-
-    Bridge.prototype.attach = function (sendPayload, options) {
-        var self = this;
-        this.sender = new RpcFrameSender({
-            bridgeSessionId: this.bridgeSessionId,
-            bridgeGeneration: this.generation,
-            recoveryId: this.recoveryId,
-            sendPayload: sendPayload
-        });
-        this.assembler = new RpcFrameAssembler({
-            bridgeSessionId: this.bridgeSessionId,
-            onLog: options.onLog,
-            onAck: function (messageSeq) {
-                sendPayload({
-                    zcode_type: 'rpc-frame-ack',
-                    bridgeSessionId: self.bridgeSessionId,
-                    ackMessageSeq: messageSeq
-                });
-            },
-            onMessage: function (bytes) {
-                self.channels.handleMessage(bytes);
-            }
-        });
-        this.channels = new ChannelClient({
-            sendBody: function (bytes) {
-                self.sender.sendMessage(bytes);
-            },
-            // Share the socket with the page's own client: keep our request ids
-            // far away from the small integers it allocates.
-            idBase: options.idBase,
-            onLog: options.onLog
-        });
-    };
-
-    Bridge.prototype.acceptPayload = function (payload) {
-        if (this.closed || !this.assembler) {
-            return false;
-        }
-        return this.assembler.acceptPayload(payload);
-    };
-
-    // -----------------------------------------------------------------------
     // RemoteClient — the business layer
     // -----------------------------------------------------------------------
     /**
@@ -1062,8 +946,15 @@
      *
      * Events (assign callbacks):
      *   onSessions(update)   {key, title, workspacePath, workspaceIdentity,
-     *                         source, sessions:[...]}
-     *   onStatus(status)     {active, passive, workspaces, bridges, reason}
+     *                         source, sessions:[...], stale, staleOnly}
+     *                         `stale`/`staleOnly` 是 4c 新增（老字段一个不改名、不删）：
+     *                         整表帧 = `stale:false, staleOnly:false`（列表可落地）；
+     *                         检出缺口的**仅标记帧** = `true,true`（只取标记，不落地列表）。
+     *                         对照表与理由见 `_emitSessionsStale`。
+     *   onStatus(status)     {passive, workspaces, reason}
+     *                         ⚠️ `active` 于 2026-09-17（D7）移除、`bridges` 于 2026-09-18（4c）
+     *                         随桥路由子系统移除——后者统计"壳自己开着的桥数"，只读壳下恒 0，
+     *                         是个**永远报 0 的假指标**，故原生侧也一并停读（`ShellRuntime.onStatus`）。
      *   onPageRpcCall(call)  {name, args} — every promise call the page sends,
      *                        observed outbound. subscribeConversationV4 is the
      *                        "the user just opened a task" beacon (inject.js
@@ -1096,24 +987,13 @@
         // 沉默线不受影响——它们没有重复来源）。
         this.suppressPageRpcMirror = false;
 
-        this._pending = {};
-        // Two indexes on purpose: workspaces are addressed by key (for
-        // lifecycle/status) while inbound rpc-frames are addressed by
-        // bridgeSessionId. Mixing them up silently drops every response.
-        this._bridges = {};
-        this._bridgesById = {};
-        this._activeKeys = {};
-        // Frames can arrive for a bridge before openBridge's await continuation
-        // has attached the transport (the desktop pushes Initialize the moment
-        // it accepts the bridge). Anything addressed to a bridge we requested
-        // is held here and flushed on attach. Bridges we did NOT request — i.e.
-        // the page's own — are never buffered, so this cannot grow on their
-        // traffic.
-        this._pendingBridgePayloads = {};
-        this._inflightOpens = 0;
-        this._bridgeSeq = 0;
-        this._bridgeGeneration = 0;
-        this._clientHello = null;
+        // 【4c·2026-09-18 删除】这里原来是壳自己开桥的那套机件：`_pending`
+        // （请求-应答配对）、`_bridges`/`_bridgesById`（按工作区/按 bridgeSessionId
+        // 两张桥表）、`_activeKeys`、`_pendingBridgePayloads`/`_inflightOpens`
+        // （开桥在飞窗口的缓冲）、`_bridgeSeq`/`_bridgeGeneration`/`_clientHello`。
+        // 它们**全部**只有一个写点：`openBridge`，而它由注入层永不调用的 `start()`
+        // 驱动（只读壳契约；见下面 passive 段的注释）。2026-09-18 随桥路由子系统
+        // 一并删除。⚠️ 将来若恢复开桥，这一整套必须一起加回来。
 
         // Passive side. What the page streams is a fact about the PAGE, not about
         // this client instance, so callers that rebuild the client on a relay
@@ -1129,8 +1009,9 @@
         // deliver it in the real app (the tests passed only because they built
         // the state object explicitly). Mutating the shared object here is what
         // makes the promise true.
-        var sharedMaps = ['passive', 'outboundListenIds', 'bridgeWorkspace',
-            'pageBridges', 'pageOwned', 'faultStreak', 'cooldownUntil'];
+        // 4c（2026-09-18）：随桥路由子系统删掉了 pageBridges / pageOwned /
+        // faultStreak / cooldownUntil 四项（读者全在已删的 active 路径里）。
+        var sharedMaps = ['passive', 'outboundListenIds', 'bridgeWorkspace'];
         if (this._shared) {
             for (var mi = 0; mi < sharedMaps.length; mi += 1) {
                 if (!this._shared[sharedMaps[mi]]) {
@@ -1141,43 +1022,12 @@
         this._passive = (this._shared && this._shared.passive) || {};
         this._outboundListenIds = (this._shared && this._shared.outboundListenIds) || {};
         this._bridgeWorkspace = (this._shared && this._shared.bridgeWorkspace) || {};
-        // Workspaces we know the PAGE has a bridge for. `_passive` only covers
-        // the ones where the page also streams a sessions-index; the page's
-        // conversation bridge does not send that listen, so keying "do not
-        // duplicate this" on `_passive` alone missed it.
-        this._pageBridges = (this._shared && this._shared.pageBridges) || {};
-        // 本连接内观察到页面桥证据（bridge-ready / 会话索引监听）的工作区。
-        // 故意 per-client 不共享：socket 重建 = 新连接，页面必须在新的连接上
-        // 重新自证覆盖，壳才能继续让位；僵尸态（页面 runtime 不随重建恢复）
-        // 下没有新证据，壳就会接管该工作区的通知覆盖（2026-09-13 真机结论）。
-        this._pageCoveredKeys = {};
-        // Workspaces we have given up on because the page holds them and the
-        // desktop refused our duplicate. Only ever set on that evidence, so a
-        // transient fault can never silently cost us notification coverage.
-        this._pageOwned = (this._shared && this._shared.pageOwned) || {};
-        // Fault history outlives the client too, and for the opposite reason to
-        // `_faultCounts` below: rebuilding the relay connection must NOT hand a
-        // repeatedly-refused workspace a clean slate, or the loop never ends.
-        this._faultStreak = (this._shared && this._shared.faultStreak) || {};
-        this._cooldownUntil = (this._shared && this._shared.cooldownUntil) || {};
-        // Faults already counted for this relay connection: one connection earns
-        // one strike however many times it reopens the same key within it.
-        this._faultedInConnection = {};
-        // bridgeSessionIds WE asked for, so a `workspace-bridge-ready` can be
-        // attributed to the shell or to the page. Needed because ownership is
-        // decided from that reply, and our own reply arrives before the bridge
-        // is registered in _bridgesById.
-        this._requestedBridgeIds = {};
-        // Faults counted per relay connection, deliberately NOT shared: after a
-        // reconnect the desktop's state is different, so the workspace gets one
-        // more chance. Within one connection a workspace that keeps faulting is
-        // not going to be accepted, and every reopen costs 4 RPCs on the socket
-        // the page is using. Injectable so a test does not have to wait out the
-        // reopen delay.
-        this._maxReopens = typeof options.maxReopensPerBridge === 'number' ?
-            options.maxReopensPerBridge : MAX_REOPENS_PER_BRIDGE;
-        this._faultCounts = {};
-        this._started = false;
+        // 【4c·2026-09-18 删除】页面覆盖机件（`_pageBridges`/`_pageCoveredKeys`/
+        // `_pageOwned`）、跨连接 fault 冷却（`_faultStreak`/`_cooldownUntil`/
+        // `_faultedInConnection`/`_maxReopens`/`_faultCounts`）、"这桥是不是我们
+        // 自己要的"（`_requestedBridgeIds`）与 `_started`。
+        // 判据：它们要么只被已删的 active/开桥路径读写，要么只写不读（见报告
+        // 「删前锚点」表）。⚠️ 恢复开桥时必须整套加回。
         this._lastStatus = null;
 
         // Page-RPC trace: what the page itself asks the desktop for, and how
@@ -1204,20 +1054,16 @@
     }
 
     /** True once start() has run and will not run again on its own. */
-    RemoteClient.prototype.isStarted = function () {
-        return this._started === true;
-    };
 
     /** The state a caller must carry across relay reconnects (see constructor). */
     RemoteClient.prototype.sharedState = function () {
+        // 4c（2026-09-18）：键集收窄到**仍活着**的三张表。原来还有
+        // pageBridges / pageOwned / faultStreak / cooldownUntil——它们的读写点
+        // 全在已删的 active 开桥路径里，留着就是"只写不读的摆设"。
         return {
             passive: this._passive,
             outboundListenIds: this._outboundListenIds,
-            bridgeWorkspace: this._bridgeWorkspace,
-            pageBridges: this._pageBridges,
-            pageOwned: this._pageOwned,
-            faultStreak: this._faultStreak,
-            cooldownUntil: this._cooldownUntil
+            bridgeWorkspace: this._bridgeWorkspace
         };
     };
 
@@ -1238,48 +1084,7 @@
         return count;
     };
 
-    /**
-     * Resolves once the page has no request outstanding, or once [untilMs] has
-     * passed. Used between the burst's workspaces so the shell's 4 RPCs per
-     * workspace do not sit in front of whatever the user just tapped; the
-     * deadline is what keeps a page that is never idle from stretching it.
-     */
-    RemoteClient.prototype.awaitPageIdle = function (untilMs) {
-        var self = this;
-        return new Promise(function (resolve) {
-            var check = function () {
-                if (self.inFlightPageRpcs() === 0 || Date.now() >= untilMs) {
-                    resolve();
-                    return;
-                }
-                setTimeout(check, BURST_YIELD_POLL_MS);
-            };
-            check();
-        });
-    };
 
-    /**
-     * Records that the page opened its own bridge for a workspace.
-     *
-     * On its own this is not enough to drop ours: the page holding a bridge does
-     * not prove it streams that workspace's sessions-index, and dropping on a
-     * guess would silently cost notification coverage. The decision is made in
-     * `_handleDegraded`, where this evidence is combined with the desktop
-     * actually refusing our bridge.
-     *
-     * 2026-09-13 真机证据（l1_test 僵尸复现）：页面 runtime 在 socket 重建后
-     * 不会重建——配对恢复、runtime 全灭、零自愈。所以"页面已覆盖"的证据必须
-     * 按连接代次：本连接内观察到页面桥证据才允许让位，跨重建的旧证据作废
-     * （pageCoverage 共享态里的 _pageBridges/_pageOwned 只代表历史）。
-     */
-    RemoteClient.prototype._notePageBridge = function (key) {
-        if (!key || this._pageBridges[key]) {
-            return;
-        }
-        this._pageBridges[key] = true;
-        this._pageCoveredKeys[key] = true;
-        this._log('页面自己持有 bridge：' + key);
-    };
 
     /**
      * 页面桥的反查表：workspaceKey → 该页面桥的 bridgeSessionId。
@@ -1294,9 +1099,13 @@
     RemoteClient.prototype.pageBridgeSessionIds = function () {
         var out = {};
         for (var id in this._bridgeWorkspace) {
-            if (this._bridgesById[id] || this._requestedBridgeIds[id]) {
-                continue;
-            }
+            // 【只读壳下永不命中，恢复开桥时必须加回】这里原来是
+            // `if (this._bridgesById[id] || this._requestedBridgeIds[id]) continue;`
+            // ——把壳自己开的桥从反查表里排除掉。两张表在生产里恒空（唯一写点
+            // `openBridge` 由注入层永不调用的 `start()` 驱动），所以这个过滤
+            // 逐位等价于不存在；2026-09-18（4c）随两张表一并删除。
+            // ⚠️ 恢复开桥时必须加回，否则这个反查表会把壳自己的桥当成页面桥交出去，
+            // `degrade_test` 会往壳的桥上灌伪造帧。
             out[this._bridgeWorkspace[id]] = id;
         }
         return out;
@@ -1306,18 +1115,14 @@
         if (!this.onStatus) {
             return;
         }
-        var bridges = 0;
-        for (var key in this._bridges) {
-            if (!this._bridges[key].closed) {
-                bridges += 1;
-            }
-        }
+        // 4c（2026-09-18）：这里原来先数 `bridges`（壳自己开着的桥数）。
+        // 只读壳下 `_bridges` 恒空 ⟹ 这个字段**结构性恒 0**，是假指标；
+        // 2026-09-18 随桥表一并删除（原生 ShellRuntime 的读数同步删掉）。
         var passive = 0;
         for (var p in this._passive) {
             passive += 1;
         }
         var status = {
-            bridges: bridges,
             passive: passive,
             reason: reason || ''
         };
@@ -1328,430 +1133,17 @@
         }
     };
 
-    // ---------------------------------------------------------------- requests
-
-    RemoteClient.prototype._request = function (payload, match, timeoutMs) {
-        var self = this;
-        var requestId = payload.requestId;
-        return new Promise(function (resolve, reject) {
-            var timer = setTimeout(function () {
-                delete self._pending[requestId];
-                reject(new Error('request ' + requestId + ' timed out'));
-            }, timeoutMs || 30000);
-            self._pending[requestId] = {
-                match: match,
-                resolve: function (value) {
-                    clearTimeout(timer);
-                    resolve(value);
-                },
-                reject: function (err) {
-                    clearTimeout(timer);
-                    reject(err);
-                }
-            };
-            self._send(payload);
-        });
-    };
 
     /** Every inbound business payload must be fed here. */
-    RemoteClient.prototype.acceptPayload = function (payload) {
-        if (!payload || typeof payload !== 'object') {
-            return;
-        }
-        var type = payload.zcode_type;
-        if (type === 'rpc-frame' || type === 'rpc-frame-ack') {
-            var bridge = this._bridgesById[payload.bridgeSessionId];
-            if (bridge) {
-                bridge.acceptPayload(payload);
-                return;
-            }
-            var buffer = this._pendingBridgePayloads[payload.bridgeSessionId];
-            if (buffer) {
-                if (buffer.length < 128) {
-                    buffer.push(payload);
-                } else {
-                    this._log('pre-attach buffer full for ' + payload.bridgeSessionId);
-                }
-                return;
-            }
-            // While a bridge open is in flight the desktop may address frames
-            // to a bridgeSessionId it chose itself, so keep a short-lived
-            // catch-all that attach() filters by the real id. Outside that
-            // window nothing is buffered, so the page's own traffic is ignored.
-            if (this._inflightOpens > 0) {
-                var catchAll = this._pendingBridgePayloads['*'] ||
-                    (this._pendingBridgePayloads['*'] = []);
-                if (catchAll.length < 128) {
-                    catchAll.push(payload);
-                }
-            }
-            return;
-        }
-        if (type === 'bridge-degraded') {
-            this._handleDegraded(payload);
-        }
-        // Responses are matched by predicate, not by our requestId: the
-        // desktop does not guarantee that a reply echoes it.
-        for (var id in this._pending) {
-            var pending = this._pending[id];
-            var value = null;
-            try {
-                value = pending.match(payload);
-            } catch (e) {
-                value = null;
-            }
-            if (value) {
-                delete this._pending[id];
-                pending.resolve(value);
-                return;
-            }
-        }
-    };
 
     /** True while a workspace the desktop keeps refusing is being backed off. */
-    RemoteClient.prototype._inCooldown = function (key) {
-        var until = this._cooldownUntil[key];
-        return typeof until === 'number' && until > Date.now();
-    };
 
-    /**
-     * One strike per relay connection for a workspace the desktop degraded, and
-     * the cooldown once strikes run out.
-     *
-     * `_faultCounts` only bounds the churn inside one connection; a relay rebuild
-     * used to reset it, so a workspace the desktop refuses on every connection was
-     * retried on every connection. Striking across connections is what turns that
-     * into a back-off. The count is cleared when the cooldown is applied, so the
-     * attempt after it starts from zero rather than cooling down on its first
-     * fault.
-     *
-     * Returns true when the caller must not reopen the key.
-     */
-    RemoteClient.prototype._noteFault = function (key) {
-        if (this._faultedInConnection[key]) {
-            return this._inCooldown(key);
-        }
-        this._faultedInConnection[key] = true;
-        var streak = (this._faultStreak[key] || 0) + 1;
-        if (streak < FAULT_COOLDOWN_CONNECTIONS) {
-            this._faultStreak[key] = streak;
-            return false;
-        }
-        delete this._faultStreak[key];
-        this._cooldownUntil[key] = Date.now() + FAULT_COOLDOWN_MS;
-        this._log('冷却 ' + key + '：连续 ' + streak + ' 条 relay 连接都被桌面端 fault，' +
-            Math.round(FAULT_COOLDOWN_MS / 60000) + ' 分钟内不再为它开 bridge（到期自动重试）');
-        return true;
-    };
 
-    RemoteClient.prototype._handleDegraded = function (payload) {
-        var bridgeSessionId = payload.bridgeSessionId;
-        var reason = payload.reason || 'unknown';
-        // The desktop sometimes explains the fault in the same payload; without
-        // it a repeated fault on one workspace is indistinguishable from any other.
-        var detail = payload.message || payload.error || payload.detail;
-        for (var key in this._bridges) {
-            var bridge = this._bridges[key];
-            if (bridge.bridgeSessionId !== bridgeSessionId) {
-                continue;
-            }
-            this._log('bridge degraded for ' + key + ': ' + reason +
-                (detail ? ' · ' + detail : ''));
-            // Two pieces of evidence together mean "we cannot have this one":
-            // the page opened its own bridge for the workspace, AND the desktop
-            // is refusing ours. Only then do we give up on it for good — a bare
-            // fault is not proof, and treating it as proof would silently cost
-            // notification coverage for a healthy workspace.
-            if (this._pageBridges[key] && !this._pageOwned[key]) {
-                this._pageOwned[key] = true;
-                this._log('放弃 ' + key + '：页面自己持有该工作区，桌面端拒绝我们的重复 bridge（通知改由页面侧覆盖）');
-                this._forgetBridge(key);
-                this._emitStatus('degraded ' + key);
-                return;
-            }
-            if (this._noteFault(key)) {
-                this._forgetBridge(key);
-                this._emitStatus('degraded ' + key);
-                return;
-            }
-            this._faultCounts[key] = (this._faultCounts[key] || 0) + 1;
-            if (this._faultCounts[key] > this._maxReopens) {
-                // No alternative evidence, but the desktop keeps rejecting it on
-                // this relay connection (observed on `default`: once every ~47s,
-                // on and on). Every reopen costs 4 RPCs on the socket the page is
-                // using, so stop for this connection; the next relay connection
-                // gives it one more chance, since the desktop's state may differ.
-                this._log('本次连接放弃重开 ' + key + '（已 fault ' + this._faultCounts[key] + ' 次）');
-                this._forgetBridge(key);
-                this._emitStatus('degraded ' + key);
-                return;
-            }
-            this._scheduleReopen(key, 1);
-        }
-    };
 
-    RemoteClient.prototype.listWorkspaces = function () {
-        var requestId = randomId('zcshell-ws');
-        var self = this;
-        return this._request({
-            zcode_type: 'workspace-list-request',
-            requestId: requestId
-        }, function (payload) {
-            if (payload.zcode_type !== 'workspace-list-response') {
-                return null;
-            }
-            if (payload.requestId !== requestId) {
-                return null;
-            }
-            var result = payload.result;
-            if (Array.isArray(result)) {
-                return result;
-            }
-            if (result && Array.isArray(result.workspaces)) {
-                return result.workspaces;
-            }
-            return [];
-        }, 20000).then(function (list) {
-            self._log('workspace list: ' + list.length);
-            return list;
-        });
-    };
 
-    RemoteClient.prototype.openBridge = function (workspace, generation, recoveryId) {
-        var key = workspaceKeyOf(workspace);
-        if (!key) {
-            return Promise.reject(new Error('workspace has no key'));
-        }
-        var self = this;
-        var bridgeSessionId = randomId('zcshell-bridge');
-        var requestId = randomId('zcshell-bopen');
-        var scope = { workspacePath: workspace.workspacePath };
-        if (workspace.workspaceIdentity) {
-            scope.workspaceIdentity = workspace.workspaceIdentity;
-        }
-        var payload = {
-            zcode_type: 'workspace-bridge-open',
-            requestId: requestId,
-            bridgeSessionId: bridgeSessionId,
-            bridgeGeneration: generation,
-            workspaceKey: key
-        };
-        if (recoveryId) {
-            payload.recoveryId = recoveryId;
-        }
-        // Start buffering before the request goes out: the desktop may push
-        // Initialize before this promise resolves.
-        this._pendingBridgePayloads[bridgeSessionId] = [];
-        this._requestedBridgeIds[bridgeSessionId] = true;
-        this._inflightOpens += 1;
-        return this._request(payload, function (reply) {
-            if (reply.bridgeSessionId !== bridgeSessionId) {
-                return null;
-            }
-            if (reply.zcode_type === 'workspace-bridge-error') {
-                return { error: String(reply.error || 'workspace-bridge-error') };
-            }
-            if (reply.zcode_type === 'workspace-bridge-ready') {
-                return { info: reply.bridge || {} };
-            }
-            return null;
-        }, 30000).then(function (reply) {
-            if (reply.error) {
-                self._releaseInflight(bridgeSessionId, null);
-                throw new Error(reply.error);
-            }
-            var info = reply.info;
-            var bridge = new Bridge({
-                key: key,
-                scope: scope,
-                info: info,
-                bridgeSessionId: info.bridgeSessionId || bridgeSessionId,
-                generation: typeof info.bridgeGeneration === 'number' ?
-                    info.bridgeGeneration : generation,
-                recoveryId: info.recoveryId
-            });
-            bridge.attach(function (out) {
-                self._send(out);
-            }, {
-                onLog: function (message) {
-                    self._log('[' + key + '] ' + message);
-                },
-                idBase: self._idBase
-            });
-            self._bridges[key] = bridge;
-            self._bridgesById[bridge.bridgeSessionId] = bridge;
-            self._log('bridge ready for ' + key + ' (' + bridge.bridgeSessionId + ')');
-            // Replay whatever arrived while the bridge was still being set up;
-            // this is where the desktop's Initialize frame usually comes from.
-            var buffered = self._releaseInflight(bridgeSessionId, bridge.bridgeSessionId);
-            for (var i = 0; i < buffered.length; i++) {
-                bridge.acceptPayload(buffered[i]);
-            }
-            self._emitStatus('bridge open ' + key);
-            return bridge;
-        }, function (err) {
-            self._releaseInflight(bridgeSessionId, null);
-            throw err;
-        });
-    };
 
-    /**
-     * Ends the "bridge open in flight" window and returns every frame buffered
-     * for it, in arrival order. Must run on the failure path too, otherwise the
-     * catch-all buffer would keep growing on the page's own traffic.
-     */
-    RemoteClient.prototype._releaseInflight = function (requestedId, actualId) {
-        var out = (this._pendingBridgePayloads[requestedId] || []).slice();
-        delete this._pendingBridgePayloads[requestedId];
-        if (actualId && actualId !== requestedId) {
-            out = out.concat(this._pendingBridgePayloads[actualId] || []);
-            delete this._pendingBridgePayloads[actualId];
-        }
-        var catchAll = this._pendingBridgePayloads['*'];
-        if (catchAll) {
-            for (var i = 0; i < catchAll.length; i++) {
-                if (catchAll[i].bridgeSessionId === requestedId ||
-                    (actualId && catchAll[i].bridgeSessionId === actualId)) {
-                    out.push(catchAll[i]);
-                }
-            }
-        }
-        this._inflightOpens = Math.max(0, this._inflightOpens - 1);
-        if (this._inflightOpens === 0) {
-            delete this._pendingBridgePayloads['*'];
-        }
-        // Stop claiming this id: anything that arrives for it now belongs to a
-        // bridge whose ownership is already settled.
-        delete this._requestedBridgeIds[requestedId];
-        if (actualId) {
-            delete this._requestedBridgeIds[actualId];
-        }
-        return out;
-    };
 
-    /**
-     * Handshake + subscribe + listen. The desktop gates V4 capabilities on the
-     * clientHello exchange, so it must run before subscribeSessionsIndexV4.
-     */
-    RemoteClient.prototype.subscribeSessionsIndex = function (bridge) {
-        var self = this;
-        var state = new SessionsIndexState();
-        var hello = this._clientHello || DEFAULT_CLIENT_HELLO;
-        var cleanup = {
-            listener: null,
-            subscriptionId: null
-        };
 
-        var run = bridge.channels
-            .call(CHANNEL_CONVERSATION, 'helloConversationV4', [], 45000)
-            .then(function () {
-                return bridge.channels.call(CHANNEL_CONVERSATION, 'initializeConversationV4', [{
-                    kind: 'clientHello',
-                    protocolVersion: hello.protocolVersion,
-                    clientId: randomId('zcshell-client'),
-                    clientKind: hello.clientKind,
-                    appVersion: hello.appVersion
-                }], 45000);
-            })
-            .then(function () {
-                // **顺序是语义**：对话订阅必须在索引订阅之前（见常量区的注释）。
-                // 这一步失败不影响索引——它只是卡片跟手的增强。
-                return self._subscribeConversationsBeforeIndex(bridge);
-            })
-            .then(function () {
-                var args = {};
-                for (var k in bridge.scope) {
-                    args[k] = bridge.scope[k];
-                }
-                args.runtimePolicy = 'existing-only';
-                return bridge.channels.call(CHANNEL_CONVERSATION, METHOD_SUBSCRIBE_SI, [args], 60000);
-            })
-            .then(function (result) {
-                var ack = result && result.ack ? result.ack : null;
-                cleanup.subscriptionId = ack && ack.subscriptionId ? ack.subscriptionId : null;
-                if (!cleanup.subscriptionId) {
-                    throw new Error('subscribeSessionsIndexV4: no ack.subscriptionId');
-                }
-                cleanup.listener = bridge.channels.addEventListener(
-                    CHANNEL_CONVERSATION,
-                    EVENT_SESSIONS_INDEX,
-                    bridge.scope,
-                    function (data) {
-                        if (!data || typeof data !== 'object') {
-                            return;
-                        }
-                        if (!data.topic || String(data.topic).indexOf('sessions-index/') !== 0) {
-                            return;
-                        }
-                        if (state.applyWireFrame(data)) {
-                            self._emitSessions(bridge.key, bridge, state, 'active');
-                            // **真正的钩子在这里**：会话清单是随快照帧异步到达的
-                            // （ack 之后），所以"刚 subscribe 完"那一刻候选还是空的。
-                            // 状态第一次就绪时补订一次对话流，每座桥只补一次。
-                            if (!bridge._convSubscribeTried && state.ready) {
-                                bridge._convSubscribeTried = true;
-                                self._subscribeConversationsBeforeIndex(bridge);
-                            }
-                        }
-                        if (state.needsResync) {
-                            state.needsResync = false;
-                            self._resyncSessionsIndex(bridge, cleanup.subscriptionId, state);
-                        }
-                    }
-                );
-                self._log('subscribed sessions-index for ' + bridge.key);
-                // 索引到手之后**再试一次**对话订阅：上面那次在开桥时清单还是空的（首次
-                // 连接必然如此，JS 堆刚重建），而连接现在很稳、不一定会有第二次开桥。
-                //
-                // 顺序约束（"索引先上桥之后对话订阅不回包"）是 Kotlin 侧的实测；这里做
-                // 一次低成本实测——成功就拿到流式正文，失败只会留一行
-                // `subscribe conversation failed`，绝不挡住任何东西。
-                self._subscribeConversationsBeforeIndex(bridge);
-                return {
-                    key: bridge.key,
-                    scope: bridge.scope,
-                    state: state,
-                    dispose: function () {
-                        if (cleanup.listener) {
-                            cleanup.listener.dispose();
-                            cleanup.listener = null;
-                        }
-                        if (!cleanup.subscriptionId) {
-                            return Promise.resolve();
-                        }
-                        var args = {};
-                        for (var k in bridge.scope) {
-                            args[k] = bridge.scope[k];
-                        }
-                        args.subscriptionId = cleanup.subscriptionId;
-                        args.runtimePolicy = 'existing-only';
-                        return bridge.channels
-                            .call(CHANNEL_CONVERSATION, METHOD_UNSUBSCRIBE_SI, [args], 15000)
-                            .catch(function () {});
-                    }
-                };
-            });
-
-        return run;
-    };
-
-    RemoteClient.prototype._resyncSessionsIndex = function (bridge, subscriptionId, state) {
-        var args = {};
-        for (var k in bridge.scope) {
-            args[k] = bridge.scope[k];
-        }
-        args.subscriptionId = subscriptionId;
-        args.runtimePolicy = 'existing-only';
-        if (state.logEpoch) {
-            args.base = { logEpoch: state.logEpoch, seq: state.seq };
-        }
-        this._log('resync sessions-index for ' + bridge.key + ' (gap at seq ' + state.seq + ')');
-        bridge.channels
-            .call(CHANNEL_CONVERSATION, METHOD_RESYNC_SI, [args], 30000)
-            .catch(function (err) {
-                bridge._logResyncFailed = String(err);
-            });
-    };
 
     /**
      * 把页面自己那条 `controller/tasks-index` 的逻辑帧转给原生（纯被动，零写入）。
@@ -1771,11 +1163,26 @@
         }
     };
 
+    /**
+     * **整表帧**（可落地）：`sessions` 是刚成功应用过的一帧读数。
+     *
+     * 4c（2026-09-18）：载荷多两个字段，老字段**一个都不改名、不删**；原生侧字段缺失
+     * 时按"不陈旧"处理，所以老读数路径不受影响。对照表见 [_emitSessionsStale]。
+     *   * `stale` —— 上报这一刻本状态机是否处于序号缺口。**它并不恒 false**
+     *     （2026-09-18 真机实测更正了原来那句"恒 false"的断言）：
+     *     `stale` 只由**整窗快照**解除，而**序号对得上的增量帧同样会成功应用**
+     *     （缺口期间 `seq` 有意冻结，桌面端重发同一段时会重新对上）——那些帧走到这里时
+     *     `stale` 仍为 true。原生对此的处理正是想要的：带 `stale:true` 的整表帧**列表不落地**，
+     *     `staleSince` 保留到下一次整窗快照（见 `TaskStore.applyWorkspace` 的守卫）。
+     *     ⚠️ **不要**据此反推"应用成功 ⟹ 不陈旧"：被动路径的"已自愈"日志曾因这个错假设
+     *     逐帧刷屏（成因、真机取证与正确判据见那段代码的注释）。
+     *   * `staleOnly` —— 恒 false：本帧是普通整表帧，`sessions` **可以**落地。
+     */
     RemoteClient.prototype._emitSessions = function (key, bridge, state, source) {
         var list = state.list();
-        // 留住这份清单（**模块级**，跨 client 重建存活）：开桥时"对话订阅必须先于
-        // 索引订阅"，而那一刻唯一能用的"在跑会话"就是上一轮拿到的这份。
-        sessionsByKeyCache[key] = list;
+        // 4c（2026-09-18）：这里原来还往模块级的 `sessionsByKeyCache` 写一份
+        // （供"开桥时先订对话"用）。那条对话自订阅路已删，这份缓存只写不读，
+        // 随写入点一并删除。
         if (!this.onSessions) {
             return;
         }
@@ -1786,501 +1193,67 @@
             workspacePath: scope.workspacePath || '',
             workspaceIdentity: scope.workspaceIdentity || '',
             source: source,
-            sessions: list
+            sessions: list,
+            stale: state.stale === true,
+            staleOnly: false
         });
     };
 
     /**
-     * 挑出该工作区"值得订对话流"的会话：在跑的优先，其次最近活动的。
+     * 4c：**仅标记帧**——检出序号缺口那一拍**额外**发一次的上报。
      *
-     * 注意 `phase` 是**持久态**（轮次边界才变），所以它只能当粗筛；真正的"此刻在跑"
-     * 在 controller 流的 liveStatus 里，JS 侧拿不到。有 `hasBackgroundWork` 的一律
-     * 当作活的——那是页面自己标出来的。
-     */
-    RemoteClient.prototype._conversationCandidates = function (key) {
-        var out = [];
-        var push = function (id) {
-            if (id && out.indexOf(id) < 0 && out.length < CONVERSATION_MAX) {
-                out.push(id);
-            }
-        };
-        // 1) **原生给的种子最优先**：它是权威的"在跑"（原生 TaskStore），而且活过页面
-        //    重载。开桥那一刻本轮的会话清单还没到——快照帧是索引订阅 ack 之后才来的，
-        //    所以只有它一定有东西（真机 2026-09-15：只靠 JS 侧缓存时这里恒为 0）。
-        //    优先**现问**（provider），因为 TaskStore 是随索引帧长起来的，创建 client
-        //    时的快照在刚重装/重启后必然为空。
-        var seedMap = this.nativeRunningSessions || {};
-        if (typeof this.nativeRunningSessionsProvider === 'function') {
-            try {
-                var live = this.nativeRunningSessionsProvider();
-                if (live && typeof live === 'object') {
-                    seedMap = live;
-                }
-            } catch (e) {
-                // 退回创建时的快照
-            }
-        }
-        var seed = seedMap[key] || [];
-        for (var s = 0; s < seed.length; s += 1) {
-            push(seed[s]);
-        }
-        // 2) JS 侧上一轮的索引缓存（模块级、跨 resetClient 存活）兜底。
-        var list = sessionsByKeyCache[key] || [];
-        var live = [];
-        var rest = [];
-        for (var i = 0; i < list.length; i += 1) {
-            var item = list[i];
-            if (!item || !item.sessionId) {
-                continue;
-            }
-            if (item.hasBackgroundWork || !TERMINAL_PHASES[String(item.phase)]) {
-                live.push(item);
-            } else {
-                rest.push(item);
-            }
-        }
-        var byRecency = function (a, b) {
-            return (b.lastActivityAt || 0) - (a.lastActivityAt || 0);
-        };
-        live.sort(byRecency);
-        rest.sort(byRecency);
-        for (var j = 0; j < live.length; j += 1) {
-            push(live[j].sessionId);
-        }
-        for (var k = 0; k < rest.length; k += 1) {
-            push(rest[k].sessionId);
-        }
-        return out;
-    };
-
-    /**
-     * 订该工作区在跑会话的对话流（握手之后、索引订阅之前调用）。
+     * 为什么必须单独一帧：缺口之后本状态机对每一帧增量都判失败（`seq` 有意不动），
+     * 于是"成功应用"与"缺口自愈"是同一件事——把 `stale` 挂在整表帧上，它**永远不会有
+     * true 的那一天**（`tools/protocol.test.js` 的「被动：缺口把该工作区标为陈旧…」把
+     * "缺口期间一帧都不上报"钉住了）。要让原生在缺口**刚刚发生**时就列其为不可信，
+     * 只能在检出那一拍另发一帧。按**跃迁**发，不逐帧发。
      *
-     * 失败一律咽掉：它只是"卡片跟手"的增强，**绝不能挡住索引订阅**——索引一断，
-     * 通知就全瞎了。所以每条都带超时，整体再包一层 catch。
-     */
-    RemoteClient.prototype._subscribeConversationsBeforeIndex = function (bridge) {
-        // ⛔ **默认关闭（2026-09-15 真机定案，勿轻易打开）**
-        //
-        // 这一段是"重复订阅"：**页面自己已经订着当前会话**，我们又给同一个 sessionId 开
-        // 了一份（日志里同一个 `sess_46daf1dd-…` 出现两次：一次是页面
-        // `v4 conversation subscription activated`，一次是我们的
-        // `subscribed conversation for sess_46daf1dd-…`），并且从 v122 起还每 20s 对它发
-        // `resyncConversationV4 {forceSnapshot:true}`。
-        //
-        // 后果（用户 2026-09-15 现场报告）：消息发出去了、桌面端跑了三轮十秒一回复，
-        // 手机端**只有"工作中"+转圈、内容全程不更新，连桌面端点了暂停也不更新**——
-        // 页面的接收流被我们的重复订阅挤掉了。
-        // **对照实验最有说服力**：鸿蒙版是同一个网页的纯壳、没有任何订阅，它跟踪完全正常。
-        //
-        // 这恰好违反本项目自己反复得出的不变式：**页面已覆盖的工作区/会话，绝不重复
-        // 开桥/订阅**（README「实现要点」13）。所以这里回到"纯旁观"形态：
-        // 页面的流照旧，我们从入站帧里读正文（`_trackConversationText`，已按真实帧结构修好）。
-        if (!CONVERSATION_SUBSCRIBE_ENABLED) {
-            return Promise.resolve();
-        }
-        var ids = this._conversationCandidates(bridge.key);
-        // 候选数一律记一行：为 0 时这条路径是静默的，而"为什么没订上"正是
-        // 2026-09-15 那轮排查里唯一看不见的东西。
-        this._log('对话流候选 ' + bridge.key + '：' + ids.length + ' 条' +
-            (ids.length ? '（' + ids.join(', ') + '）' : ''));
-        if (ids.length === 0) {
-            return Promise.resolve();
-        }
-        var jobs = [];
-        for (var i = 0; i < ids.length; i += 1) {
-            jobs.push(this._subscribeOneConversation(bridge, ids[i]));
-        }
-        return Promise.all(jobs).catch(function () {});
-    };
-
-    RemoteClient.prototype._subscribeOneConversation = function (bridge, sessionId) {
-        var self = this;
-        var args = {};
-        for (var k in bridge.scope) {
-            args[k] = bridge.scope[k];
-        }
-        args.sessionId = sessionId;
-        return bridge.channels
-            .call(CHANNEL_CONVERSATION, METHOD_SUBSCRIBE_CONVERSATION, [args], CONVERSATION_SUBSCRIBE_MS)
-            .then(function (result) {
-                var ack = result && result.ack ? result.ack : null;
-                var subId = ack && ack.subscriptionId ? ack.subscriptionId : null;
-                if (!subId) {
-                    throw new Error('subscribeConversationV4: no ack.subscriptionId');
-                }
-                if (!self._convSubs) {
-                    self._convSubs = {};
-                }
-                var sub = {
-                    key: bridge.key,
-                    sessionId: sessionId,
-                    bridge: bridge,
-                    subscriptionId: subId,
-                    logEpoch: null,
-                    seq: 0,
-                    lastFrameAt: Date.now(),
-                    lastTextAt: 0,
-                    lastResyncAt: 0,
-                    resyncCount: 0,
-                    resyncing: false
-                };
-                self._convSubs[sessionId] = sub;
-                bridge.channels.addEventListener(
-                    CHANNEL_CONVERSATION,
-                    EVENT_CONVERSATION_FRAME,
-                    bridge.scope,
-                    function (data) {
-                        if (!data || typeof data !== 'object' || !data.topic) {
-                            return;
-                        }
-                        if (String(data.topic).indexOf('conversation/') !== 0) {
-                            return;
-                        }
-                        self._acceptConversationFrame(sub, data);
-                    }
-                );
-                self._startConversationWatchdog();
-                self._log('subscribed conversation for ' + sessionId +
-                    ' (sub ' + subId + ')');
-            })
-            .catch(function (err) {
-                self._log('subscribe conversation failed for ' + sessionId + ': ' + err);
-            });
-    };
-
-    /**
-     * 收一条对话逻辑帧：**先按 subscriptionId 过滤**，再记位点、判缺口、最后提取正文。
+     * 为什么这一帧**不能落地**：它怀里那份 `sessions` 是**冻结的旧读数**（缺口之前最后
+     * 一次成功应用的列表）。原生若照常 `applyWorkspace`，会把该工作区 SI 的时刻戳整表
+     * 重盖（`TaskStore.applyWorkspace` 里 `siPhasesAt` 那一段），让旧 SI 反过来压过
+     * controller / 会话流覆盖层——**这一帧自己就会制造一次它要防的降级**。所以形状上
+     * 显式标成 `staleOnly: true`，语义是"只取标记，`sessions` 不是读数"。
      *
-     * 逐条对应 zemote 的 `SubscriptionBase._acceptLogicalFrame`
-     * （`E:\zemote\lib\protocol\conversation.dart:1048-1053`）：
-     *   * `frame['subscriptionId'] != subId` → 直接丢（两条会话同时订阅时，帧落在同一个
-     *     事件通道上，不按 id 过滤就会串味）；
-     *   * 收到帧就刷新 `_lastFrameAt`（看门狗据此算静默时长）；
-     *   * 缺口交给 state 层判（zemote 是 `applyFrame(frame, onGap: _resync)`）。
+     * 与整表帧的对照（原生按这两个字段分流，**字段缺失 = 不陈旧**）：
+     *
+     *   | 帧         | stale | staleOnly | 原生动作                                  |
+     *   |------------|-------|-----------|-------------------------------------------|
+     *   | 整表帧     | false | false     | 照常落地；清除该工作区陈旧标记与可信窗口   |
+     *   | 仅标记帧   | true  | true      | **只记陈旧，不碰列表**                     |
+     *
+     * 不写 `sessionsByKeyCache`：那里存的是"上一份可用读数"，本帧不是读数，别拿它顶掉。
      */
-    RemoteClient.prototype._acceptConversationFrame = function (sub, data) {
-        if (!sub || sub.disposed) {
+    RemoteClient.prototype._emitSessionsStale = function (key, bridge, state) {
+        if (!this.onSessions) {
             return;
         }
-        if (data.subscriptionId && String(data.subscriptionId) !== String(sub.subscriptionId)) {
-            return;
-        }
-        sub.lastFrameAt = Date.now();
-        // 位点：真实帧结构里 `frame` 才是载荷（见 _trackConversationText 顶部注释），
-        // 所以 fromSeq/toSeq/logEpoch 依次在 **frame → payload → 顶层** 三处找。
-        var body = data.frame && typeof data.frame === 'object' ? data.frame :
-            (data.payload && typeof data.payload === 'object' ? data.payload : data);
-        var from = typeof data.fromSeq === 'number' ? data.fromSeq :
-            (typeof body.fromSeq === 'number' ? body.fromSeq : null);
-        var to = typeof data.toSeq === 'number' ? data.toSeq :
-            (typeof body.toSeq === 'number' ? body.toSeq : null);
-        if (typeof body.logEpoch === 'string') {
-            sub.logEpoch = body.logEpoch;
-        } else if (typeof data.logEpoch === 'string') {
-            sub.logEpoch = data.logEpoch;
-        }
-        // 缺口：跳号立刻重锚，不等看门狗（zemote 的 onGap 是同一个意思）。
-        if (from !== null && sub.seq > 0 && from > sub.seq + 1) {
-            this._resyncConversation(sub, '缺口 fromSeq=' + from + ' > seq=' + sub.seq);
-        }
-        if (to !== null) {
-            sub.seq = to;
-        }
-        var before = this._convText && this._convText[data.topic] ?
-            this._convText[data.topic].text : '';
-        this._trackConversationText(data);
-        var after = this._convText && this._convText[data.topic] ?
-            this._convText[data.topic].text : '';
-        if (after && after !== before) {
-            sub.lastTextAt = Date.now();
-            sub.resyncCount = 0;   // 重锚真的换来了新正文 → 解除熔断计数
-        }
+        var scope = bridge.scope || {};
+        this.onSessions({
+            key: key,
+            title: workspaceTitle(scope),
+            workspacePath: scope.workspacePath || '',
+            workspaceIdentity: scope.workspaceIdentity || '',
+            source: 'passive',
+            sessions: state.list(),
+            stale: true,
+            staleOnly: true
+        });
     };
 
-    /**
-     * 对话流看门狗：**这是"网页前台也会卡、zemote 却连续稳定"的那条分水岭。**
-     *
-     * zemote 每 10s 一跳，静默 ≥20s 且会话**确实在跑**时，主动发
-     * `resyncConversationV4 {forceSnapshot:true, base:{logEpoch,seq}}` —— 它不是等推送，
-     * 是明着要一份完整快照。网页端没有这套，所以桌面端一安静，页面就停在那儿。
-     *
-     * 与 zemote 的两点**有意差异**（都是本机真机教训）：
-     *   ① 加**节流 + 熔断**：这里没有 zemote 那台 conversation store 能精确判"在跑"，
-     *      而桌面端可能真的长时间不下发——无脑重锚会变成 churn；
-     *   ② "在跑"用两个近似判据（正文最近还在涨 / 会话索引里非终态或有后台工作）。
-     */
-    RemoteClient.prototype._startConversationWatchdog = function () {
-        var self = this;
-        if (this._convWatchdog) {
-            return;
-        }
-        this._convWatchdog = setInterval(function () {
-            try {
-                self._conversationWatchdogTick();
-            } catch (e) {
-                // 看门狗自身绝不影响页面
-            }
-        }, CONVERSATION_WATCHDOG_MS);
-    };
 
-    RemoteClient.prototype._conversationWatchdogTick = function () {
-        if (!this._convSubs) {
-            return;
-        }
-        var now = Date.now();
-        for (var sessionId in this._convSubs) {
-            var sub = this._convSubs[sessionId];
-            if (!sub || sub.disposed) {
-                continue;
-            }
-            if (now - sub.lastFrameAt < CONVERSATION_QUIET_MS) {
-                continue;
-            }
-            if (sub.resyncCount >= CONVERSATION_RESYNC_MAX_STRIKES) {
-                continue;
-            }
-            if (now - sub.lastResyncAt < CONVERSATION_RESYNC_MIN_GAP_MS) {
-                continue;
-            }
-            if (!this._conversationLooksActive(sub)) {
-                continue;
-            }
-            this._resyncConversation(sub,
-                '静默 ' + Math.round((now - sub.lastFrameAt) / 1000) + 's');
-        }
-    };
+
+
+
+
 
     /** "这条会话确实在跑吗"——JS 侧没有 conversation store，用两个近似判据。 */
-    RemoteClient.prototype._conversationLooksActive = function (sub) {
-        var now = Date.now();
-        if (sub.lastTextAt && now - sub.lastTextAt < CONVERSATION_ACTIVE_TEXT_MS) {
-            return true;
-        }
-        var list = sessionsByKeyCache[sub.key] || [];
-        for (var i = 0; i < list.length; i += 1) {
-            var session = list[i];
-            if (session && session.sessionId === sub.sessionId) {
-                return session.hasBackgroundWork === true ||
-                    !TERMINAL_PHASES[String(session.phase)];
-            }
-        }
-        return false;
-    };
 
-    /**
-     * 主动重锚：要一份**完整快照**（`forceSnapshot: true`）。
-     *
-     * ⚠️ `base` 是**必填可空**：无基线时要显式传 `null`，省略整个字段会被桌面端的 zod
-     * 拒收（`expected object, received undefined`）——README 记过的真机定案。
-     * 幂等：同一条订阅上并发只跑一次（zemote 的 `_resyncing` 同款）。
-     */
-    RemoteClient.prototype._resyncConversation = function (sub, reason) {
-        var self = this;
-        if (!sub || sub.disposed || sub.resyncing) {
-            return;
-        }
-        sub.resyncing = true;
-        sub.lastResyncAt = Date.now();
-        sub.resyncCount += 1;
-        var args = {};
-        for (var k in sub.bridge.scope) {
-            args[k] = sub.bridge.scope[k];
-        }
-        args.subscriptionId = sub.subscriptionId;
-        args.forceSnapshot = true;
-        args.base = sub.logEpoch ? {
-            logEpoch: sub.logEpoch,
-            seq: sub.seq
-        } : null;
-        this._log('对话重锚 ' + sub.sessionId + '（' + reason + '，第 ' + sub.resyncCount +
-            ' 次，base=' + (sub.logEpoch ? sub.logEpoch + '/' + sub.seq : 'null') + '）');
-        var done = function () {
-            sub.resyncing = false;
-        };
-        sub.bridge.channels
-            .call(CHANNEL_CONVERSATION, METHOD_RESYNC_CONVERSATION, [args], CONVERSATION_SUBSCRIBE_MS)
-            .then(done, function (err) {
-                self._log('对话重锚失败 ' + sub.sessionId + ': ' + err);
-                done();
-            });
-    };
 
-    // ------------------------------------------------------------------ active
-    //
-    // ⚠️ **这一段没有生产调用者**（2026-09-17 起）。
-    //
-    // 它是 D7「订阅所有工作区」的 Tier1 实现：在**页面自己那条 socket** 上开桥 +
-    // 订索引。2026-09-15 真机 A/B 定罪（与页面自己的订阅争用 → 页面卡"工作中"+
-    // 转圈），2026-09-17 用户拍板删开关；注入层那一侧的调度器（`maybeStartActive`）
-    // 与 `__zcodeShellSetSubscribeAll` 已一并删除，所以 `start()` 在真机上**永远不会
-    // 被调用**——注入层恒被动，只读壳契约不允许它再被接回去。（同族的 `retryStart`
-    // 因为彻底零调用，2026-09-17 的死代码清扫里已经删掉。）
-    //
-    // 为什么代码没跟着删：它是唯一端到端跑通过 bridge 握手（hello → initialize →
-    // 对话订阅 → 索引订阅 → listen）的实现，`tools/protocol.test.js` 的 active 组
-    // 用它当 seam 钉住线格式。删除它属于"需要真机回归"的一类（连同下面被
-    // `CONVERSATION_SUBSCRIBE_ENABLED = false` 封死的对话自订阅流），留给下一轮；
-    // 在那之前：**只准从 Node 单测调用，不准从 inject.js 调用**。
-    // -------------------------------------------------------------------------
 
-    RemoteClient.prototype._scheduleReopen = function (key, attempt) {
-        var self = this;
-        var bridge = this._bridges[key];
-        if (!bridge || bridge.closed) {
-            return;
-        }
-        bridge.closed = true;
-        var workspace = {
-            workspacePath: bridge.scope.workspacePath,
-            workspaceIdentity: bridge.scope.workspaceIdentity
-        };
-        if (attempt > 3) {
-            this._log('giving up on ' + key + ' after ' + attempt + ' attempts');
-            this._forgetBridge(key);
-            this._emitStatus('degraded ' + key);
-            return;
-        }
-        var delay = Math.min(30000, 2000 * Math.pow(2, attempt - 1));
-        this._log('reopening ' + key + ' in ' + delay + 'ms (attempt ' + attempt + ')');
-        setTimeout(function () {
-            if (self._passive[key] || self._pageOwned[key] ||
-                self._inCooldown(key)) {
-                return;
-            }
-            self.openBridge(workspace, ++self._bridgeGeneration, bridge.recoveryId)
-                .then(function (next) {
-                    return self.subscribeSessionsIndex(next);
-                })
-                .then(function () {
-                    self._log('recovered ' + key);
-                    self._emitStatus('recovered ' + key);
-                })
-                .catch(function (err) {
-                    self._log('reopen failed for ' + key + ': ' + err);
-                    self._scheduleReopen(key, attempt + 1);
-                });
-        }, delay);
-    };
 
-    /**
-     * Starts (or refreshes) active coverage: one bridge + one sessions-index
-     * subscription per workspace the page is not already covering.
-     *
-     * ⚠️ **注入层永不调用它**（只读壳契约；D7 于 2026-09-17 删除，见本节头注释）。
-     * 只有 `tools/protocol.test.js` 的 active 组会调用它。
-     */
-    RemoteClient.prototype.start = function () {
-        var self = this;
-        if (this._started) {
-            return Promise.resolve();
-        }
-        this._started = true;
-        var startedAt = Date.now();
-        return this.listWorkspaces().then(function (list) {
-            var targets = [];
-            var skipped = 0;
-            var cooled = 0;
-            for (var i = 0; i < list.length; i++) {
-                var workspace = list[i];
-                var key = workspaceKeyOf(workspace);
-                if (!key || targets.length >= self._maxWorkspaces) {
-                    continue;
-                }
-                if (self._inCooldown(key)) {
-                    // This desktop refused the workspace on several consecutive
-                    // relay connections. Re-opening it here is the churn the
-                    // user sees as "正在尝试重连"; wait the cooldown out.
-                    cooled += 1;
-                    continue;
-                }
-                if (self._passive[key] || self._pageOwned[key] || self._activeKeys[key]) {
-                    // The page already has a bridge for this one; do not
-                    // duplicate it. Opening a second bridge for a workspace the
-                    // page owns is what the desktop answers with
-                    // rpc-transport-fault, over and over.
-                    //
-                    // 但让位必须以"本连接上页面还有覆盖证据"为前提
-                    // （_pageCoveredKeys，per-client）：socket 重建后页面 runtime
-                    // 不会重建（2026-09-13 真机实证），旧共享态里的覆盖记录是
-                    // 僵尸——继续让位 = 该工作区通知/实况窗全盲。没有本连接
-                    // 证据就由壳接管；页面日后真恢复了，_dropRedundantBridge
-                    // 会把我们的桥再让出去。
-                    if (!self._activeKeys[key] && !self._pageCoveredKeys[key]) {
-                        self._log('页面覆盖证据不在本连接（' + key + '），由壳接管');
-                    } else {
-                        skipped += 1;
-                        continue;
-                    }
-                }
-                targets.push(workspace);
-            }
-            self._log('active subscribe: ' + targets.length + ' workspace(s) of ' + list.length +
-                (skipped ? '（跳过 ' + skipped + ' 个页面已覆盖）' : '') +
-                (cooled ? '（冷却中 ' + cooled + ' 个）' : ''));
-            // Sequential with a small gap: opening a dozen RPC bridges at once
-            // hammers the desktop and makes failures hard to attribute. Between
-            // workspaces the burst yields while the page has a request in
-            // flight, so tapping a task mid-burst does not leave the page's own
-            // conversation request queued behind the rest of our handshakes. The
-            // yield budget is shared across the whole burst, so this stays
-            // bounded.
-            var yieldUntil = Date.now() + BURST_YIELD_TOTAL_MS;
-            return targets.reduce(function (chain, workspace) {
-                return chain.then(function () {
-                    return self.awaitPageIdle(yieldUntil);
-                }).then(function () {
-                    return self._openAndSubscribe(workspace);
-                }).then(function () {
-                    return new Promise(function (r) {
-                        setTimeout(r, 500);
-                    });
-                });
-            }, Promise.resolve());
-        }).then(function () {
-            // The wall-clock cost of the whole burst is the number that matters:
-            // every one of those RPCs is queued on the same relay socket the
-            // page is using to open whatever the user just tapped.
-            self._log('主动订阅完成：用时 ' + (Date.now() - startedAt) + 'ms');
-            self._emitStatus('active started');
-        }).catch(function (err) {
-            self._log('active subscribe failed: ' + err);
-            self._emitStatus('active failed: ' + err);
-        });
-    };
 
-    RemoteClient.prototype._openAndSubscribe = function (workspace) {
-        var self = this;
-        var key = workspaceKeyOf(workspace);
-        this._activeKeys[key] = true;
-        this._bridgeGeneration += 1;
-        return this.openBridge(workspace, this._bridgeGeneration)
-            .then(function (bridge) {
-                return self.subscribeSessionsIndex(bridge);
-            })
-            .then(function (sub) {
-                self._subs = self._subs || {};
-                self._subs[key] = sub;
-                self._emitStatus('subscribed ' + key);
-            })
-            .catch(function (err) {
-                delete self._activeKeys[key];
-                self._forgetBridge(key);
-                self._log('subscribe failed for ' + key + ': ' + err);
-                self._emitStatus('subscribe failed ' + key);
-            });
-    };
 
     /** Drops both indexes for a workspace; the frame router keys off the id. */
-    RemoteClient.prototype._forgetBridge = function (key) {
-        var bridge = this._bridges[key];
-        delete this._bridges[key];
-        delete this._activeKeys[key];
-        if (bridge) {
-            bridge.closed = true;
-            delete this._bridgesById[bridge.bridgeSessionId];
-        }
-    };
 
     // ----------------------------------------------------------------- passive
 
@@ -2308,12 +1281,15 @@
             var info = payload.bridge;
             if (info.workspaceKey) {
                 this._bridgeWorkspace[payload.bridgeSessionId] = info.workspaceKey;
-                // A ready frame for an id we never requested is the page opening
-                // its own bridge. Recorded, not acted on: dropping ours on this
-                // alone could lose coverage (see _notePageBridge).
-                if (!this._requestedBridgeIds[payload.bridgeSessionId]) {
-                    this._notePageBridge(info.workspaceKey);
-                }
+                // 【只读壳下永假，恢复开桥时必须加回】这里原来是
+                // `if (!this._requestedBridgeIds[payload.bridgeSessionId]) {
+                //     this._notePageBridge(info.workspaceKey); }`——用来区分
+                // "页面自己开的桥"与"壳自己要的桥"。`_requestedBridgeIds` 的唯一写点
+                // 是 `openBridge`（注入层永不调用的 `start()` 驱动）⟹ 恒空 ⟹ 条件恒真。
+                // 2026-09-18（4c）：`_notePageBridge` 与它写的两张页覆盖表（唯一读者
+                // 也都在已删的 active 路径里）一并删除，故此处不再调用。
+                // ⚠️ 恢复开桥时必须把条件与 `_notePageBridge` 一起加回，否则壳自己开的桥
+                // 会被误记为"页面已覆盖"，壳会把该工作区让出去。
             }
         }
     };
@@ -2455,37 +1431,15 @@
         rpc.windowMethods = {};
     };
 
-    /**
-     * 页面确实在流这个工作区，那我们自己的 bridge 就是重复的。桌面端会用
-     * rpc-transport-fault 拒掉重复项，而那个 fault 会触发重开循环——循环打的正是
-     * 用户此刻正在看的工作区。所以一旦页面证明它自己覆盖了这个工作区，就撤掉我们的。
-     * 通知覆盖不会丢：被动侧继续从页面的流量里读 sessions-index。
-     */
-    RemoteClient.prototype._dropRedundantBridge = function (key) {
-        var bridge = this._bridges[key];
-        if (!bridge || bridge.closed) {
-            return;
-        }
-        var sub = this._subs ? this._subs[key] : null;
-        if (sub) {
-            delete this._subs[key];
-            try {
-                var done = sub.dispose();
-                if (done && typeof done.catch === 'function') {
-                    done.catch(function () {});
-                }
-            } catch (e) {
-                // 无论如何都要撤掉这个 bridge，取消失败不影响结论
-            }
-        }
-        this._forgetBridge(key);
-        this._log('页面已接管 ' + key + '，关闭重复 bridge');
-    };
 
     RemoteClient.prototype._observeOutboundRpc = function (payload) {
-        if (this._bridgesById[payload.bridgeSessionId]) {
-            return;
-        }
+        // 【只读壳下永假，恢复开桥时必须加回】这里原来是"跳过壳自己的桥"——
+        // `if (this._bridgesById[payload.bridgeSessionId]) { return; }`。`_bridgesById`
+        // 的唯一写点是 `openBridge`，而它由注入层永不调用的 `start()` 驱动
+        // （见构造函数里 passive 段的注释），所以这张表在生产里**恒空**、这个判断
+        // **恒假**。2026-09-18（4c）随表一并删除。
+        // ⚠️ 若将来恢复开桥，这一句必须加回来，否则壳自己的桥发出的帧会被当成
+        // "页面桥的流量"计入 `_pageRpc`。
         var bytes = this._tryAssemble(payload, true);
         if (!bytes) {
             return;
@@ -2503,16 +1457,9 @@
             return;
         }
         if (header[0] === REQ_PROMISE) {
-            // Learn the page's clientHello so our own handshake agrees with
-            // whatever protocol version the desktop negotiated with it.
-            if (header[3] === 'initializeConversationV4' && Array.isArray(args) &&
-                args[0] && args[0].kind === 'clientHello') {
-                this._clientHello = {
-                    protocolVersion: args[0].protocolVersion,
-                    appVersion: args[0].appVersion,
-                    clientKind: args[0].clientKind
-                };
-            }
+            // 4c（2026-09-18）：这里原来学页面的 clientHello 存进 `_clientHello`，
+            // 供壳自己握手时对齐协议版本。壳不再握手（`subscribeSessionsIndex` 已删）
+            // ⟹ 那个字段只写不读，随写入点一并删除。
             this._tracePageCall(payload.bridgeSessionId, header, args);
             return;
         }
@@ -2533,8 +1480,10 @@
         }
         this._outboundListenIds[payload.bridgeSessionId + '#' + header[1]] = key;
         this._bridgeWorkspace[payload.bridgeSessionId] = key;
-        // 页面在本连接上流这个工作区的直接证据（见 _pageCoveredKeys）。
-        this._pageCoveredKeys[key] = true;
+        // 4c（2026-09-18）：这里原来还盖一个 `_pageCoveredKeys[key] = true`
+        // （"页面在本连接上流这个工作区"的直接证据）。它唯一的读者是已删的
+        // `start()`，"页面覆盖证据按连接代次"那套让位决策随桥路一起没了 ⟹
+        // 只写不读，随读者一并删除。
         if (!this._passive[key]) {
             this._passive[key] = {
                 key: key,
@@ -2544,15 +1493,23 @@
             this._log('passive: following sessions-index of ' + key);
             this._emitStatus('passive tracking ' + key);
         }
-        this._dropRedundantBridge(key);
+        // 4c（2026-09-18）：这里原来是 `this._dropRedundantBridge(key);`——
+        // "页面已证明它在流这个工作区 ⟹ 撤掉我们自己那座重复桥"。该函数首句是
+        // `var bridge = this._bridges[key]; if (!bridge || bridge.closed) return;`，
+        // 而 `_bridges` 在只读壳下恒空 ⟹ 它**恒早退 no-op**；2026-09-18 随桥表
+        // 一并删除。⚠️ 恢复开桥时必须加回，否则桌面端会用 rpc-transport-fault
+        // 拒掉重复桥，而那个 fault 会触发针对"用户此刻正在看的工作区"的重开循环。
+        // 注意：随它消失的还有 `页面已接管 <key>` 那行日志（原唯一出口），
+        // 真机回归判据里不应再期待这一行。
     };
 
     RemoteClient.prototype._observeInboundRpc = function (payload) {
-        if (this._bridgesById[payload.bridgeSessionId]) {
-            this._obsOurs = (this._obsOurs || 0) + 1;
-            return;
-        }
-        this._obsIn = (this._obsIn || 0) + 1;
+        // 【只读壳下永假，恢复开桥时必须加回】这里原来是"跳过壳自己的桥"——
+        // `if (this._bridgesById[payload.bridgeSessionId]) { this._obsOurs += 1; return; }`。
+        // 理由同 `_observeOutboundRpc` 顶部。连带的两个计数器一并删除：
+        // `_obsOurs` 是这个恒假分支的专属计数；`_obsIn` 只写不读（既有孤儿）。
+        // ⚠️ 恢复开桥时必须加回，否则壳自己桥的入站帧会给 `_pageBridgeTrafficAt`
+        // （inject.js §5b 的"内容还在不在下发"判据）盖假章——那正是守卫要防的事。
         // 页面桥的入站流量戳（任何 rpc-frame 都算）：「对话内容是否真的在下发」
         // 的协议层信号——DOM 层看不出内容缺失（标题/输入框都正常），流量看得出。
         // inject.js 的 10s 内容检查用（见 §5b）。
@@ -2629,10 +1586,44 @@
         if (!entry || !data || typeof data !== 'object') {
             return;
         }
+        // ---- 4c 工程前置（2026-09-18）：检出 → 记一行日志 ----
+        //
+        // 为什么落在这里：**这是活的被动观察路径上唯一能看到"序号缺口"的地方**。检出那一步
+        // （状态机判 `fromSeq !== seq`）本来就在活路上可达，但它的消费者——真正去重同步的
+        // `_resyncSessionsIndex`——只写在已死的主动开桥路径里（只读壳下桥恒不开），所以
+        // 这个事件在真机上**从来没有留下过任何痕迹**。这里补的就是"可观测"：
+        // 一行带**工作区键**与**缺口事实**的日志，真机上 grep 得到（走 diag → 原生
+        // Diagnostics/ShellLog，tag=ZCodeRemote）。
+        //
+        // 按**跃迁**记，不按帧记：缺口之后每一帧都会再判失败一次，逐帧记会把日志刷爆。
+        var wasStale = entry.state.stale === true;
         if (entry.state.applyWireFrame(data)) {
+            // ⚠️ 判据必须是**真跃迁**：改前为真 **且** 改后为假。
+            //
+            // 只看改前（`wasStale`）会漏掉一类帧——"**应用成功、但 `stale` 仍未解除**"的帧：
+            //   * `stale` 只由**整窗快照**解除（见 applyLogicalFrame）；
+            //   * 而**序号对得上的增量帧同样返回 true**（缺口期间 `seq` 有意冻结，桌面端重发
+            //     同一段时会重新对上）。
+            // 于是那类帧**每一帧**都命中 `wasStale` ⟹ 每帧记一行"已自愈"。
+            // 真机实测（2026-09-18 20:37–20:41）：4 分钟内数百条，有时 0.5s 内 7 条，
+            // 把 512 KB 的日志**反复刷到轮转**，等于摧毁这个壳赖以排障的历史记录。
+            // **别再退回只看改前的写法。**
+            if (wasStale && entry.state.stale !== true) {
+                this._log('会话清单已自愈：' + key + ' 收到整窗快照，陈旧解除');
+            }
             this._emitSessions(key, {
                 scope: entry.scope
             }, entry.state, 'passive');
+        } else if (!wasStale && entry.state.stale === true) {
+            this._log('会话清单序号缺口：' + key + ' 的增量帧 fromSeq=' +
+                entry.state.gapFromSeq + ' 与本机锚点 seq=' + entry.state.seq +
+                ' 对不上，这一路读数标为陈旧（等下一次整窗快照自愈）');
+            // 检出那一拍**额外一次「仅标记」上报**（4c §4.1）：日志只解决"真机上看得见"，
+            // 原生要据此把该工作区的读数列为不可信（防降级规则的入口 = TaskStore.staleSince）。
+            // 只在这一拍发（与上面那行日志同一去重口径：缺口没解除前不再补发）。
+            this._emitSessionsStale(key, {
+                scope: entry.scope
+            }, entry.state);
         }
     };
 
@@ -2799,22 +1790,16 @@
         if (this._convTextTopic && this._convText && this._convText[this._convTextTopic]) {
             textLen = (this._convText[this._convTextTopic].text || '').length;
         }
-        // 订阅数与重锚数一起报：**只看"帧数"会误判**——没有订阅、或订阅了却不重锚，
-        // 都会表现为"没有帧"，而这两件事的处置完全不同（前者选会话，后者补看门狗）。
-        var subs = 0;
-        var resyncs = 0;
-        if (this._convSubs) {
-            for (var sessionId in this._convSubs) {
-                subs += 1;
-                resyncs += this._convSubs[sessionId].resyncCount || 0;
-            }
-        }
+        // 4c（2026-09-18）：`subs`/`resyncs` 原来取自 `_convSubs`（壳自己订的对话流
+        // 订阅表）。整块对话自订阅簇已删 ⟹ 该表不复存在，这两个数在任何情况下都是 0。
+        // ⚠️ **字段必须保留**（不能从返回值里删）：inject.js 的「页面开销」行会读
+        // `convStats.subs` / `.resyncs`，字段缺失会在真机日志里打印成 undefined。
         return {
             frames: this._convFrames || 0,
             topics: topics,
             textLen: textLen,
-            subs: subs,
-            resyncs: resyncs,
+            subs: 0,
+            resyncs: 0,
             // −1 = 本客户端生命周期内一帧 conversation/* 都没见过（⇒ 页面没在跟任何会话）。
             // 原生"提前接管"的判据就是这个（见 inject.js 的 reportLiveness 与 ShellRuntime）。
             lastFrameAgoMs: this._convLastFrameAt ? Date.now() - this._convLastFrameAt : -1
@@ -2872,13 +1857,8 @@
 
     RemoteClient.prototype.dispose = function () {
         // （曾经这里还有 `this.subscribeAll = false;`——D7 开关本身已删。）
-        for (var key in this._bridges) {
-            this._bridges[key].closed = true;
-        }
-        this._bridges = {};
-        this._bridgesById = {};
-        this._activeKeys = {};
-        this._pending = {};
+        // （4c·2026-09-18：这里原来还重置 `_bridges`/`_bridgesById`/`_activeKeys`/
+        // `_pending` 四张表。四张表已随桥路由子系统删除，重置也就无从谈起。）
     };
 
     // -----------------------------------------------------------------------

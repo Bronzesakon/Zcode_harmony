@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- MiuixCard 的 API 31+ 版本。
+
+     android:clipToOutline 是 API 31 才有的框架属性（API 31 起才在 XML 里生效），
+     写在 values/ 里会让 lint 的 NewApi 报错；31 以下是静默忽略，也就是卡片圆角
+     外的水波纹会溢到四个角上，属于可接受的降级。
+
+     注意 Android 的样式资源是"整个替换"而不是合并：同名 <style> 在限定目录里出现
+     时，会整体取代 values/ 里的那份，不会做 items 合并。因此这里必须把
+     values/miuix_styles.xml 中 MiuixCard 的每一条 item 原样抄全，只多出
+     android:clipToOutline 这一条。少抄一条 = 新设备上静默丢掉一条样式。 -->
+<resources xmlns:app="http://schemas.android.com/apk/res-auto">
+
+    <style name="MiuixCard" parent="">
+        <item name="android:layout_width">match_parent</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:layout_marginStart">@dimen/miuix_card_margin</item>
+        <item name="android:layout_marginEnd">@dimen/miuix_card_margin</item>
+        <item name="android:orientation">vertical</item>
+        <item name="android:background">@drawable/miuix_card_background</item>
+        <item name="android:clipToOutline">true</item>
+    </style>
+</resources>

@@ -42,6 +42,11 @@ class WebAppBridge(private val prefs: Prefs) {
     fun config(): String {
         return try {
             val sessions = JSONObject()
+            // 这个"给每个已知工作区塞空数组"的循环就是上面那条 2026-09-15 教训的**实现机制**，
+            // 不是可以顺手删的冗余。今天这份载荷唯一的可达消费者是注入层那句计数日志
+            // （对话候选那条路被 CONVERSATION_SUBSCRIBE_ENABLED=false 封死），而且它
+            // **零测试覆盖**（tools/inject.test.js 的假 config 只给 passiveObserve）——
+            // 删掉不会有任何门禁报警，只会让"接线断了"重新变得看不出来。
             for (workspace in ShellRuntime.store.workspaces()) {
                 if (!sessions.has(workspace.key)) {
                     sessions.put(workspace.key, JSONArray())

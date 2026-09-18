@@ -79,7 +79,6 @@ class MainActivity : AppCompatActivity() {
     /** The theme the page resolved for itself; null until it says. */
     private var pageTheme: PageTheme? = null
 
-    /** Script used when the WebView lacks document-start support (fallback). */
     /**
      * 注入脚本缓存。每次主帧加载有三道时机（见 installInjection / injectStable），
      * 都用同一份脚本；只在首次成功读取时缓存，读失败不缓存（下次加载重试）。
@@ -183,10 +182,16 @@ class MainActivity : AppCompatActivity() {
 
         configureWebView()
         installBackHandling()
+        // 求值通道必须先于 handleIntent 注册：ACTION_DIAG 会在同一个调用栈里走到
+        // ShellRuntime.dispatchJsDiag，而它在 jsEvaluator 为空时**直接放弃、不排队**
+        // ——冷启动的第一条诊断指令会这样丢掉，偏偏冷启动正是那个重试队列存在的理由。
+        // （configureWebView 已跑过，binding.webview 就绪。）
+        ShellRuntime.setJsEvaluator { script -> binding.webview.evaluateJavascript(script, null) }
         // The intent may already have decided what the screen should be — asking
         // for a new link must not be undone by the automatic load right below.
         val intentHandled = handleIntent(intent)
-        ShellRuntime.setJsEvaluator { script -> binding.webview.evaluateJavascript(script, null) }
+        // 页面状态上报不必跟着提前：它只由注入层从页面里报来，而 handleIntent 里那次
+        // loadUrl 的新文档至少还要一个主循环轮次才 boot，届时这里早已注册完。
         ShellRuntime.setPageStateListener { state, theme -> onPageStateReported(state, theme) }
 
         if (!intentHandled) {
@@ -212,6 +217,8 @@ class MainActivity : AppCompatActivity() {
         webView.settings.apply {
             javaScriptEnabled = true
             domStorageEnabled = true
+            // WebSQL 已废弃但在受支持范围内仍生效（setter 默认为 false）；本行是唯一开启点，故抑制而非删除。
+            @Suppress("DEPRECATION")
             databaseEnabled = true
             mediaPlaybackRequiresUserGesture = false
             mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
@@ -278,6 +285,16 @@ class MainActivity : AppCompatActivity() {
                 // reports otherwise. Without this a reload keeps the *previous*
                 // document's header colour under the status bar.
                 onPageStateReported(PageBarState.BOOT.token, null)
+                // 与上面那条 boot 底色同理：上一份文档的注入层已随文档一起销毁，
+                // 「已就绪」标记（含注入状态行的去重记忆）必须同时归零。
+                // 这是该标记**唯一**的复位点——此前零调用者，于是一旦置真就永不回落：
+                // 重载后设置页误报「已就绪」，而据此放行的两个重试闸门——tryLocate 与
+                // ShellRuntime.dispatchJsDiag（诊断指令唯一的队列）——会把指令发进
+                // 注入层还没 boot 的新文档，`window.__zcodeShell*` 尚不存在，静默丢弃。
+                // 复位**必须在下面补注之前**：新文档的 ready 由注入层跑完后异步重报
+                // （inject.js 末尾 post('ready') → ShellRuntime 的 "ready" 分支），
+                // 先复位再补注，复位就不可能盖掉一条活着的注入。
+                ShellRuntime.onPageStarted()
                 // 稳定注入第二道：document-start 因任何形态失效时，这里以最早
                 // 可得的时机补注。幂等守卫让已注入的文档近乎零成本地跳过。
                 injectStable(view)
@@ -744,18 +761,23 @@ class MainActivity : AppCompatActivity() {
 
     // --------------------------------------------------------------- diag adb
 
-    private var pendingDiag: String? = null
-    private var diagAttempts = 0
-
     /**
-     * adb 驱动的诊断测试点（注入层就绪后把指令转给 __zcodeShellDiag）。
-     * 冷启动时注入脚本要等页面 boot 完才就绪，所以沿用 tryLocate 的重试模式。
+     * 前台诊断入口（adb `am start … -a com.zcode.remote.action.DIAG --es diag_cmd <cmd>`）。
+     *
+     * 这条通道**独占**被动旁观开关（下面的 `passive_off` / `passive_on`）——原生侧的
+     * runNativeDiag 和注入层的 `__zcodeShellDiag` 都没有它；后台通道见 [DiagReceiver]，
+     * 两者都必须在（后者不把应用拉回前台，是唯一能测后台现场的入口）。
+     *
+     * 排队与重放则统一交给 [ShellRuntime.dispatchJsDiag]：注入层要等页面 boot 完才就绪，
+     * 这份「就绪后再发、最多 40 次 × 600ms」的重试原来在这里与后台通道各有一份，
+     * 现在共用一处以免口径漂移。
      */
     private fun runDiagCommand(cmd: String) {
         if (cmd.isEmpty()) return
         Diagnostics.log("info", "诊断指令: $cmd")
-        // 原生侧命令（Tier2 实验、后台失速自愈开关）统一走 ShellRuntime.runNativeDiag：
-        // 与 DiagReceiver（adb broadcast → 后台可用）共用同一份实现，避免两处漂移。
+        // 原生侧命令（Tier2 实验、手动轻推 nudge_now/nudge_close）统一走
+        // ShellRuntime.runNativeDiag：与 DiagReceiver（adb broadcast → 后台可用）
+        // 共用同一份实现，避免两处漂移。
         if (ShellRuntime.runNativeDiag(cmd)) return
         when (cmd) {
             // 被动旁观总开关（二分用）：关掉后注入层只剩"零侵入三件事"——滚动条归零 CSS、
@@ -779,31 +801,7 @@ class MainActivity : AppCompatActivity() {
                 return
             }
         }
-        pendingDiag = cmd
-        diagAttempts = 0
-        tryDiag()
-    }
-
-    private fun tryDiag() {
-        val cmd = pendingDiag ?: return
-        if (!ShellRuntime.isInjectedReady()) {
-            if (diagAttempts >= MAX_LOCATE_ATTEMPTS) {
-                Diagnostics.log("warn", "放弃诊断指令（注入脚本未就绪）: $cmd")
-                pendingDiag = null
-                return
-            }
-            diagAttempts += 1
-            mainHandler.postDelayed({ tryDiag() }, LOCATE_RETRY_MS)
-            return
-        }
-        pendingDiag = null
-        val script = "window.__zcodeShellDiag && window.__zcodeShellDiag(" +
-            org.json.JSONObject.quote(cmd) + ");"
-        try {
-            binding.webview.evaluateJavascript(script, null)
-        } catch (e: Exception) {
-            Diagnostics.log("warn", "执行诊断脚本失败: ${e.message}")
-        }
+        ShellRuntime.dispatchJsDiag(cmd)
     }
 
     // ------------------------------------------------------------- file upload

@@ -152,7 +152,6 @@ class ControllerTasksStateTest {
                     preview = "",
                     pendingInteractionId = "",
                     lastActivityAt = 1L,
-                    hasBackgroundWork = false,
                 ),
             ),
         )
@@ -191,7 +190,6 @@ class ControllerTasksStateTest {
                     preview = "",
                     pendingInteractionId = "",
                     lastActivityAt = 1L,
-                    hasBackgroundWork = false,
                 ),
             ),
         )
@@ -308,7 +306,6 @@ class ControllerTasksStateTest {
         preview = "",
         pendingInteractionId = "",
         lastActivityAt = 1L,
-        hasBackgroundWork = false,
     )
 
     @Test

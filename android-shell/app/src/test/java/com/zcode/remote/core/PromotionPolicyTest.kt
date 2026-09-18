@@ -26,7 +26,6 @@ class PromotionPolicyTest {
             preview = "",
             pendingInteractionId = if (waiting) "i$id" else "",
             lastActivityAt = lastActivityAt,
-            hasBackgroundWork = false,
         )
         return TaskStore.RunningNotification(
             id = id,

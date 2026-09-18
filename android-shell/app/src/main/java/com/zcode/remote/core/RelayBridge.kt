@@ -120,8 +120,6 @@ class BridgeSession(
     private val sendPayloadOut: (JSONObject) -> Unit,
     private val onSessionsUpdate: (JSONObject) -> Unit,
     private val onLogLine: (String) -> Unit,
-    /** controller 流（运行态）变化时的回调：整表投影，见 [ControllerTasksState.liveTasks]。 */
-    private val onLiveTasks: ((List<ControllerTasksState.LiveTask>) -> Unit)? = null,
     /** 会话流推出的运行态（`turnHeader.state`）：会话 id、是否在跑。 */
     private val onTurnState: ((sessionId: String, running: Boolean) -> Unit)? = null,
 ) {
@@ -189,6 +187,11 @@ class BridgeSession(
     /**
      * 四步握手（阻塞，跑在专属线程）：hello → initialize(clientHello) →
      * subscribe → listen。任何一步失败抛 WireException，由管理器记日志跳过。
+     *
+     * `progressSessions` 的默认值**只为测试留着**：生产两处调用（[BridgeManager]
+     * 开桥时传 `runningSessions(...)`、回收重开时传旧桥的会话表）都显式传参，
+     * 只有 `RelayBridgeTest` 里那一次无参调用会用到它。删掉默认值换不来任何行为
+     * 变化，却要改测试调用点，所以保留（它同时是"先订对话再订索引"的入口，见体注释）。
      */
     fun runHandshake(progressSessions: List<String> = emptyList()) {
         channels.callBlocking(RelayWire.CHANNEL_CONVERSATION, "helloConversationV4", emptyList<Any?>(), 45_000)
@@ -197,6 +200,9 @@ class BridgeSession(
             .put("protocolVersion", 3)
             .put("clientId", randomWireId("zcshell-client"))
             .put("clientKind", "mobileApp")
+            // ⚠️ 这是**参考/页面客户端**的版本（与 `assets/zcode-protocol.js:213` 逐字一致），
+            // **不是本应用的版本**——握手链要与页面逐字对齐。本应用自己的版本由 ShellLog
+            // 从 PackageManager 读取后写进日志。**不要"修正"成我们的 versionName**，那会破坏对齐。
             .put("appVersion", "3.6.5")
         channels.callBlocking(
             RelayWire.CHANNEL_CONVERSATION,
@@ -235,10 +241,6 @@ class BridgeSession(
             scope,
         ) { data -> onSessionsWire(data) }
         onLogLine("subscribed sessions-index for $workspaceKey")
-        // 运行态流排最后：它**不是**覆盖的充分条件（真机实测 controller 订阅会
-        // 超时——这条流看起来由桌面端的窗口进程提供，而接管正好把页面顶掉），
-        // 所以绝不能让它挡住握手主路径。失败了也只有一行日志。
-        subscribeControllerTasks()
     }
 
     private fun onSessionsWire(data: Any?) {
@@ -332,159 +334,6 @@ class BridgeSession(
     @Volatile
     private var convFrames = 0
 
-    // ------------------------------------------- 运行态流（controller/tasks-index）
-
-    private val controllerState = ControllerTasksState()
-    private var controllerListenerId = -1L
-    private var controllerSubscriptionId: String? = null
-    private val controllerResyncing = java.util.concurrent.atomic.AtomicBoolean(false)
-    private val installingControllerListener = java.util.concurrent.atomic.AtomicBoolean(false)
-
-    /**
-     * controller 流（运行态 `controller/tasks-index`）总开关。
-     *
-     * ⚠️ **默认关闭**（2026-09-16 01:16 真机定案，而且是**致命**的那一条）：
-     * 原生桥对 `zcode-agent.onDynamicControllerFrame` 的那次 `rpc:listen` 会让**桌面端
-     * host 进程当场 `uncaughtException` 并自毁**：
-     * ```
-     * [rpc:listen] zcode-agent.onDynamicSessionsIndexFrame subscribed   ← 索引流没问题
-     * [rpc:listen] zcode-agent.onDynamicControllerFrame  FAIL {"name":"Error",…}
-     * uncaughtException origin=uncaughtException: …
-     * disposing host resources, reason=uncaughtException:uncaughtException
-     * → [task-realtime] unregistered host + host process (local-1) exited with code 1
-     * ```
-     * 配对→崩溃的间隔**固定 4.3 秒**，本轮三次复现（01:05 / 01:13 / 01:16），
-     * 每次之后桌面端远程控制整体失效（所有 `workspace-bridge` 回 `desktop-disconnected`）、
-     * 页面也跟着 bootstrap 失败。这条流不是"拿不到"的问题，是"**会把桌面端打崩**"。
-     *
-     * 运行态本来就有第二条腿（会话流 `turnHeader.state` → `TaskStore.applyConversationRunState`，
-     * 见 ShellRuntime 的三级优先级：controller > 会话流 > SI 持久态），所以关掉它只损失
-     * "controller 提供的更精确的 liveStatus"。要实验时改这里，**但要知道代价**。
-     */
-    private val controllerStreamEnabled = false
-
-    /**
-     * 订阅运行态流。**失败不致命**：拿不到它时行为退回"只有 sessions-index
-     * 的持久态"，即接管后的卡片会冻住——所以失败必须留在日志里，别静默。
-     */
-    private fun subscribeControllerTasks() {
-        if (!controllerStreamEnabled) {
-            Diagnostics.log(
-                "info",
-                "controller 流已停用（那次 rpc:listen 会让桌面端 host 崩，运行态走会话流兜底）",
-            )
-            return
-        }
-        if (closed || controllerSubscriptionId != null) return
-        if (!installingControllerListener.compareAndSet(false, true)) return
-        try {
-            if (!channels.awaitReady(30_000)) return
-            synchronized(this) {
-                if (!closed && controllerListenerId < 0) {
-                    controllerListenerId = channels.listenEvent(
-                        RelayWire.CHANNEL_CONVERSATION,
-                        RelayWire.EVENT_CONTROLLER_FRAME,
-                        null,
-                    ) { data -> onControllerWire(data) }
-                }
-            }
-            val args = JSONObject()
-                .put("topic", RelayWire.TOPIC_CONTROLLER_TASKS)
-                .put("visibility", "foreground")
-            val result = channels.callBlocking(
-                RelayWire.CHANNEL_CONVERSATION,
-                RelayWire.METHOD_SUBSCRIBE_CONTROLLER,
-                listOf<Any?>(args),
-                // 短超时：这条流拿不到时我们还有会话尾窗的 turn 状态兜底，
-                // 没必要让 30s 的超时拖住覆盖线程。
-                12_000,
-            ) as? JSONObject
-            val subId = result?.optJSONObject("ack")?.optString("subscriptionId").orEmpty()
-            if (subId.isEmpty()) {
-                onLogLine("controller subscribe: no ack.subscriptionId")
-                return
-            }
-            controllerSubscriptionId = subId
-            controllerState.bind(subId)
-            onLogLine("subscribed controller tasks-index for $workspaceKey")
-        } catch (e: Exception) {
-            onLogLine("controller subscribe failed for $workspaceKey: ${e.message}")
-        } finally {
-            installingControllerListener.set(false)
-        }
-    }
-
-    private fun onControllerWire(data: Any?) {
-        val wire = data as? JSONObject ?: return
-        val topic = wire.optString("topic", "")
-        if (topic != RelayWire.TOPIC_CONTROLLER_TASKS) return
-        if (controllerState.applyWire(wire)) {
-            onLiveTasks?.invoke(controllerState.liveTasks())
-        }
-        if (controllerState.needsResync) {
-            controllerState.needsResync = false
-            resyncController()
-        }
-    }
-
-    private fun resyncController() {
-        val subId = controllerSubscriptionId ?: return
-        if (!controllerResyncing.compareAndSet(false, true)) return
-        Thread {
-            try {
-                val args = JSONObject()
-                    .put("subscriptionId", subId)
-                    .put("forceSnapshot", true)
-                    .put(
-                        "base",
-                        controllerState.logEpoch?.let {
-                            JSONObject().put("logEpoch", it).put("seq", controllerState.seq)
-                        } ?: JSONObject.NULL,
-                    )
-                channels.callBlocking(
-                    RelayWire.CHANNEL_CONVERSATION,
-                    RelayWire.METHOD_RESYNC_CONTROLLER,
-                    listOf<Any?>(args),
-                    15_000,
-                )
-                onLogLine("resynced controller tasks-index for $workspaceKey")
-            } catch (e: Exception) {
-                onLogLine("controller resync failed for $workspaceKey: ${e.message}")
-            } finally {
-                controllerResyncing.set(false)
-            }
-        }.start()
-    }
-
-    private fun unsubscribeController() {
-        val subId = controllerSubscriptionId ?: return
-        controllerSubscriptionId = null
-        try {
-            val args = JSONObject().put("subscriptionId", subId)
-            channels.callBlocking(
-                RelayWire.CHANNEL_CONVERSATION,
-                RelayWire.METHOD_UNSUBSCRIBE_CONTROLLER,
-                listOf<Any?>(args),
-                2_000,
-            )
-        } catch (e: Exception) {
-            // 尽力而为
-        }
-        if (controllerListenerId >= 0) {
-            try {
-                channels.removeListener(
-                    RelayWire.CHANNEL_CONVERSATION,
-                    RelayWire.EVENT_CONTROLLER_FRAME,
-                    controllerListenerId,
-                )
-            } catch (e: Exception) {
-                // 关闭路径不再抛
-            }
-            controllerListenerId = -1L
-        }
-        controllerState.resetState()
-    }
-
     /** M4 进展回调（BridgeManager 建桥时挂上：握手与轮询共用）。 */
     @Volatile
     var progressListener: ((sessionId: String, text: String) -> Unit)? = null
@@ -498,10 +347,10 @@ class BridgeSession(
      * 就会把该会话永久拉黑）。
      */
     fun subscribeConversationProgress(sessionId: String) {
-        subscribeConversationProgressInternal(sessionId, fromReanchor = false)
+        subscribeConversationProgressInternal(sessionId)
     }
 
-    private fun subscribeConversationProgressInternal(sessionId: String, fromReanchor: Boolean) {
+    private fun subscribeConversationProgressInternal(sessionId: String) {
         if (closed) return
         // 幂等：已订阅就不再重复订阅。真机 pre.97 定案——轮询每 12s 无条件重订会把
         // subscriptionId 换掉，桌面端把旧订阅判成 fault.subscription.notOwned，同一拍
@@ -552,23 +401,21 @@ class BridgeSession(
         }
     }
 
-    /**
-     * 周期性重挂：退订后重订阅，逼桌面端再推一份 snapshot。
-     *
-     * **这是真机逼出来的**：pre.87 实测订阅建立那一刻拿到一份 snapshot
-     * （"正在执行 Bash"），此后 73 分钟桌面端**一个帧都没再推**——流体云的
-     * `when` 冻在原地。所以"最新进展"不能只赌 push：每隔一段时间重挂一次，
-     * 最坏也只慢一个重挂周期，而不会回到几十分钟级的滞后。
-     */
     /** 当前已建立的对话订阅，用于桥回收时恢复同一批会话。 */
     fun conversationSessionIds(): List<String> = convSubscriptions.keys.toList()
 
-    /** 桥是否还挂着对话订阅（回收决策用：没挂过就没什么可重锚的）。 */
     /** 复制工作区 scope，避免桥回收线程持有可变对象。 */
     fun scopeCopy(): JSONObject = JSONObject(scope.toString())
 
     /**
      * 周期性重挂：保留对话订阅，在同一 subscription 上强制请求新 snapshot。
+     *
+     * **"为什么必须周期性"这件事的原始出处（pre.87 真机实测，别把这段删掉）**：
+     * 订阅建立那一刻只拿到一份 snapshot（"正在执行 Bash"），此后 **73 分钟桌面端一个帧
+     * 都没再推**——流体云的 `when` 就冻在原地。所以"最新进展"**不能只赌 push**：每隔一段
+     * 时间重挂一次，最坏也只慢一个重挂周期，而不会回到几十分钟级的滞后。
+     * （2026-09-18 审计曾删掉旧的"退订后重订阅"描述——那是被推翻的旧做法；但**这条成因
+     * 与做法无关，仍然成立**，故保留在此。）
      *
      * **阻塞式、不自己起线程**（2026-09-16 改动，与 [BridgeManager.reanchorProgress] 配套）：
      * 多座桥的重锚必须**串行**——真机实测两座桥同毫秒各发一条 resync 时，对端每轮只应答
@@ -845,11 +692,6 @@ class BridgeSession(
         if (closed) return
         closed = true
         try {
-            unsubscribeController()
-        } catch (e: Exception) {
-            // 关闭路径不再抛
-        }
-        try {
             unsubscribeConversations()
         } catch (e: Exception) {
             // 关闭路径不再抛
@@ -882,12 +724,6 @@ class BridgeSession(
         }
     }
 }
-
-/**
- * 桥管理器（对应 JS RemoteClient.start 的主动订阅面）：workspace-list →
- * 逐工作区 open+subscribe（失败跳过不拖垮其它）→ 会话更新回调。
- * Tier2 接管模式下页面已死，无需页面覆盖判断。
- */
 
 /** 桥与桥之间的重锚间隔：给对端留出"一次只处理一个 resync"的余量。 */
 private const val REANCHOR_GAP_MS = 500L
@@ -1035,6 +871,11 @@ internal object RelayTaskDigest {
     }
 }
 
+/**
+ * 桥管理器（对应 JS RemoteClient.start 的主动订阅面）：workspace-list →
+ * 逐工作区 open+subscribe（失败跳过不拖垮其它）→ 会话更新回调。
+ * Tier2 接管模式下页面已死，无需页面覆盖判断。
+ */
 class BridgeManager(
     private val sendPayloadOut: (JSONObject) -> Unit,
     private val onSessionsUpdate: (JSONObject) -> Unit,
@@ -1043,9 +884,7 @@ class BridgeManager(
     private val progressSink: ((String, String, String) -> Unit)? = null,
     /** M4：握手时要抢在索引订阅之前订的会话（该工作区当前在跑的任务）。 */
     private val runningSessions: (String) -> List<String> = { emptyList() },
-    /** 运行态流（controller/tasks-index）整表回调，见 [ControllerTasksState]。 */
-    private val liveTaskSink: ((List<ControllerTasksState.LiveTask>) -> Unit)? = null,
-    /** 会话流运行态回调（工作区键、会话 id、是否在跑）——controller 拿不到时的兜底。 */
+    /** 会话流运行态回调（工作区键、会话 id、是否在跑）——两条运行态源之一，**不是"兜底"**。 */
     private val turnStateSink: ((String, String, Boolean) -> Unit)? = null,
     /** 每座桥的开启结果（工作区键、是否成功）：供上层做失败退避（见 Tier2Probe）。 */
     private val onBridgeResult: ((String, Boolean) -> Unit)? = null,
@@ -1054,7 +893,6 @@ class BridgeManager(
     private val relayPending = ConcurrentHashMap<String, PendingRelayRequest>()
     private val bridges = ConcurrentHashMap<String, BridgeSession>()
     private val bridgesById = ConcurrentHashMap<String, BridgeSession>()
-    private val idToKey = ConcurrentHashMap<String, String>()
     private var bridgeGeneration = 0L
     private val recycleInFlight = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
 
@@ -1132,7 +970,6 @@ class BridgeManager(
                     if (bridge != null) {
                         bridges.remove(bridge.workspaceKey, bridge)
                         bridgesById.remove(bridge.bridgeSessionId, bridge)
-                        idToKey.remove(bridge.bridgeSessionId)
                         try {
                             bridge.closeBridge()
                         } catch (closeError: Exception) {
@@ -1193,7 +1030,8 @@ class BridgeManager(
      * ```
      *
      * 每座桥因此按顺序轮流拿到服务窗（N 座 → 每座服务 1 轮、静默 N-1 轮）。
-     * 桥数上限见 [Tier2Probe.DEFAULT_MAX_COVERAGE]（现行 5，成本取舍；产品上限是 2 张提升卡）。
+     * 桥数上限见 [Tier2Probe.DEFAULT_MAX_COVERAGE]（现行 5，成本取舍；**提升卡没有总数上限**——
+     * 2026-09-18 用户否决硬上限，只有"留到用户清掉"的完成卡有界限 `PromotionPolicy.MAX_FINISHED_PROMOTED`）。
      *
      * ⚠️ **不变式：一轮最多一次握手**（2026-09-17）。被服务那座 resync 失败时这一轮**立刻
      * 结束**——只回收那一座，不再顺手回收最饿的那座：旧写法一轮 ≈14s > 12s 拍长（超拍＝
@@ -1290,7 +1128,6 @@ class BridgeManager(
                 if (old != null) {
                     bridges.remove(key, old)
                     bridgesById.remove(old.bridgeSessionId, old)
-                    idToKey.remove(old.bridgeSessionId)
                     try {
                         old.closeBridge()
                     } catch (e: Exception) {
@@ -1421,8 +1258,6 @@ class BridgeManager(
         val recovery = reply.optString("recoveryId").takeIf { it.isNotEmpty() }
             ?: info.optString("recoveryId").takeIf { it.isNotEmpty() }
             ?: recoveryId
-        idToKey[actualId] = key
-        idToKey[bridgeSessionId] = key
         val bridge = BridgeSession(
             workspaceKey = key,
             scope = scope,
@@ -1432,7 +1267,6 @@ class BridgeManager(
             sendPayloadOut = sendPayloadOut,
             onSessionsUpdate = onSessionsUpdate,
             onLogLine = onLogLine,
-            onLiveTasks = liveTaskSink,
             onTurnState = turnStateSink?.let { sink ->
                 { sessionId, running -> sink(key, sessionId, running) }
             },
@@ -1443,7 +1277,6 @@ class BridgeManager(
             return null
         }
         bridgesById[actualId] = bridge
-        idToKey[actualId] = key
         val replayIds = setOf(bridgeSessionId, actualId)
         while (true) {
             val buffered = preOpenBuffer.poll() ?: break
@@ -1491,7 +1324,6 @@ class BridgeManager(
         }
         bridges.clear()
         bridgesById.clear()
-        idToKey.clear()
         relayPending.clear()
         onLogLine("tier2 bridges disposed ($reason)")
     }

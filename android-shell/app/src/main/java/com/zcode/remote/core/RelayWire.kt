@@ -381,6 +381,10 @@ object RelayWire {
     /**
      * 入站重组（对应 JS RpcFrameAssembler）：乱序/分批到达均可，完整即校验交付。
      * 交付前发出 ack（调用方包成 rpc-frame-ack 信封回给桌面端）。
+     *
+     * `onLog` 的默认值**只为测试留着**：生产唯一构造点（`BridgeSession` 的
+     * `assembler`）显式传桥的日志回调，只有测试会省掉它；删掉默认值换 0 行行为
+     * 变化，却要改测试调用点，所以保留。
      */
     class FrameAssembler(
         private val bridgeSessionId: String,
@@ -406,7 +410,6 @@ object RelayWire {
         fun accept(payload: JSONObject): Delivered? {
             if (payload.optString("bridgeSessionId") != bridgeSessionId) return null
             when (payload.optString("zcode_type")) {
-                "rpc-frame-ack" -> return null
                 "rpc-frame" -> Unit
                 else -> return null
             }
@@ -724,6 +727,18 @@ object RelayWire {
             }
         }
 
+        /**
+         * `state.updated` 的落点：**到得了的、刻意的空转**——不是死代码，别删。
+         *
+         * 到得了：`applyDeltas` 里 `"state.updated" -> applyStatePatch(op)` 那一支对应
+         * 真实的 wire op，类文档也把 `state.updated` 列进"已实现的 op"。删掉它就从
+         * "认得这条 op 但不处理"退化成"未知 op"，日后排查协议版本差异会白丢一个信号。
+         *
+         * 空转的理由：这条 op 改的是 conversation-store 的**会话级元数据**
+         * （availability/plan/usage 一类，即类文档括号里那句"不改行"），而本尾窗只维护
+         * [TAIL_ROWS] 行文本，没有任何字段可以承接；真有一天要承接，落点就在这里。
+         * 所以 `op` 形参没人读——保留是为了让"有 op 来、但无事可做"这件事显式。
+         */
         private fun applyStatePatch(op: JSONObject) {
             // state.updated patches conversation-store metadata, not a row.
             // The tail only models rows, so there is deliberately nothing to mutate.

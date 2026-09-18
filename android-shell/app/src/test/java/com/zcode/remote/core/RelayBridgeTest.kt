@@ -176,7 +176,6 @@ class RelayBridgeTest {
         private val assembler = RelayWire.FrameAssembler("br-1")
         private val stop = AtomicBoolean(false)
         private var repliedSubscribe = false
-        private var repliedController = false
         val acks = ConcurrentLinkedQueue<Long>()
         private val thread = Thread {
             while (!stop.get()) {
@@ -197,30 +196,12 @@ class RelayBridgeTest {
                 when (header[3]) {
                     "helloConversationV4" -> reply(id, JSONObject())
                     "initializeConversationV4" -> reply(id, JSONObject().put("ok", true))
-                    "subscribeControllerV4" -> {
-                        if (!repliedController) {
-                            repliedController = true
-                            reply(id, JSONObject().put("ack", JSONObject().put("subscriptionId", "sub-ctl-1")))
-                        }
-                    }
                     "subscribeSessionsIndexV4" -> {
                         if (!repliedSubscribe) {
                             repliedSubscribe = true
                             reply(id, JSONObject().put("ack", JSONObject().put("subscriptionId", "sub-1")))
                         }
                     }
-                }
-                if (header[0] == RelayWire.REQ_EVENT_LISTEN &&
-                    header[3] == RelayWire.EVENT_CONTROLLER_FRAME
-                ) {
-                    // 运行态流：真机契约里只有 liveStatus 能表达"此刻在跑"。
-                    deskPush(
-                        id,
-                        RelayWire.encodeBody(
-                            listOf<Any?>(RelayWire.RES_EVENT_FIRE, id),
-                            controllerSnapshotWire("sub-ctl-1", "s-live", "running"),
-                        ),
-                    )
                 }
                 if (header[0] == RelayWire.REQ_EVENT_LISTEN &&
                     header[3] == RelayWire.EVENT_SESSIONS_INDEX
@@ -332,28 +313,11 @@ class RelayBridgeTest {
             when (header[3]) {
                 "helloConversationV4" -> replyFrame(id, rid, JSONObject())
                 "initializeConversationV4" -> replyFrame(id, rid, JSONObject().put("ok", true))
-                "subscribeControllerV4" -> {
-                    if (subscriptionReplied.putIfAbsent("$id|ctl", true) == null) {
-                        replyFrame(id, rid, JSONObject().put("ack", JSONObject().put("subscriptionId", "sub-ctl-$id")))
-                    }
-                }
                 "subscribeSessionsIndexV4" -> {
                     if (subscriptionReplied.putIfAbsent(id, true) == null) {
                         replyFrame(id, rid, JSONObject().put("ack", JSONObject().put("subscriptionId", "sub-$id")))
                     }
                 }
-            }
-            if (header[0] == RelayWire.REQ_EVENT_LISTEN &&
-                header[3] == RelayWire.EVENT_CONTROLLER_FRAME
-            ) {
-                mgrPush(
-                    id,
-                    rid,
-                    RelayWire.encodeBody(
-                        listOf<Any?>(RelayWire.RES_EVENT_FIRE, rid),
-                        controllerSnapshotWire("sub-ctl-$id", "s-ctl", "running"),
-                    ),
-                )
             }
             if (header[0] == RelayWire.REQ_EVENT_LISTEN && header[3] == RelayWire.EVENT_SESSIONS_INDEX) {
                 mgrPush(
@@ -415,42 +379,6 @@ private fun sessionJson(id: String, title: String, phase: String, lastActivityAt
         .put("lastActivityAt", lastActivityAt)
         .put("hasBackgroundWork", false)
 
-/** controller/tasks-index 快照：任务的运行态在 `liveStatus`，不在会话索引的 phase。 */
-private fun controllerSnapshotWire(subId: String, taskId: String, liveStatus: String): JSONObject =
-    JSONObject()
-        .put("topic", RelayWire.TOPIC_CONTROLLER_TASKS)
-        .put("kind", "complete")
-        .put(
-            "frame",
-            JSONObject()
-                .put("topic", RelayWire.TOPIC_CONTROLLER_TASKS)
-                .put("subscriptionId", subId)
-                .put("logEpoch", "epoch-1")
-                .put("toSeq", 1)
-                .put(
-                    "payload",
-                    JSONObject().put("kind", "snapshot").put(
-                        "snapshot",
-                        JSONObject().put("logEpoch", "epoch-1").put(
-                            "tasks",
-                            JSONArray().put(
-                                JSONObject()
-                                    .put(
-                                        "address",
-                                        JSONObject()
-                                            .put("workspacePath", "/repo/a")
-                                            .put("taskId", taskId),
-                                    )
-                                    .put("meta", JSONObject().put("title", "活任务"))
-                                    .put("membership", JSONObject().put("active", true))
-                                    .put("sourceAvailability", "online")
-                                    .put("liveStatus", liveStatus),
-                            ),
-                        ),
-                    ),
-                ),
-        )
-
 private fun snapshotWire(sessions: List<JSONObject>): JSONObject =
     JSONObject()
         .put("topic", "sessions-index/ws-a")
@@ -466,7 +394,6 @@ private fun snapshotWire(sessions: List<JSONObject>): JSONObject =
                         .put(
                             "snapshot",
                             JSONObject()
-                                .put("workspaceId", "ws-a")
                                 .put("logEpoch", "epoch-1")
                                 .put("sessions", JSONArray(sessions)),
                         ),

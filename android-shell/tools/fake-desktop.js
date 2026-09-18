@@ -6,7 +6,8 @@
  * sessions-index envelopes on demand. `deliver` is the only transport-specific
  * part, which is what lets the same mock serve both seams:
  *
- *   * protocol.test.js -> deliver directly into RemoteClient.acceptPayload()
+ *   * protocol.test.js -> `deliver` 是**空实现**（4c·2026-09-18：`acceptPayload` 已随桥路由
+ *     子系统删除，该套件不再需要向客户端投递；载荷改由协议层自身的入口喂入）
  *   * inject.test.js   -> deliver by dispatching a WebSocket message event
  */
 'use strict';
@@ -59,13 +60,9 @@ class DesktopCore {
         this.bridges = new Map();
         this.subscriptions = [];
         this.sent = [];
-        this.acked = [];
         this.messageSeq = 0;
-        this.subscribeDelayMs = 0;
         /** workspaceKeys whose bridge open must fail. */
         this.failingWorkspaces = new Set();
-        /** Bridge open counter, so each open gets a distinct generation. */
-        this.openCount = 0;
     }
 
     /** Entry point: the client sent us a business payload. */
@@ -84,7 +81,6 @@ class DesktopCore {
                 });
                 break;
             case 'workspace-bridge-open':
-                this.openCount += 1;
                 if (this.failingWorkspaces.has(payload.workspaceKey)) {
                     this.deliver({
                         zcode_type: 'workspace-bridge-error',
@@ -115,7 +111,7 @@ class DesktopCore {
                 this.onRpcFrame(payload);
                 break;
             case 'rpc-frame-ack':
-                this.acked.push(payload.ackMessageSeq);
+                // Recognized and ignored: the fake desktop keeps no ack ledger.
                 break;
             default:
                 break;
@@ -171,13 +167,7 @@ class DesktopCore {
                     workspaceKey: bridge.workspaceKey,
                     scope: args && args[0] ? args[0] : {}
                 });
-                const fire = () => this.replyBody(bridgeSessionId, [201, id],
-                    {ack: {subscriptionId}});
-                if (this.subscribeDelayMs) {
-                    setTimeout(fire, this.subscribeDelayMs);
-                } else {
-                    fire();
-                }
+                this.replyBody(bridgeSessionId, [201, id], {ack: {subscriptionId}});
                 break;
             }
             default:
@@ -224,7 +214,7 @@ function snapshotWire(sessions, toSeq, topic) {
             toSeq: toSeq === undefined ? 1 : toSeq,
             payload: {
                 kind: 'snapshot',
-                snapshot: {workspaceId: 'ws-a', logEpoch: 'epoch-1', sessions: sessions}
+                snapshot: {logEpoch: 'epoch-1', sessions: sessions}
             }
         }
     };

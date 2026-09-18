@@ -28,6 +28,10 @@
 /.dsh-hvigor-tmp/
 # adb-bridge（安卓真机调试）的截图 / pull / 取回的日志，仅本机
 /.adb-bridge/
+# 死代码清理审计（.dsh-audit/）：决策与台帐文档 + 子报告 + 门禁日志 + 设备截图/日志，
+# 是本轮会话的工作产物（约 5.5 MB，含截图与设备日志）。加忽略是为了避免 `git add -A`
+# 把它们扫进仓库；**若要入库，请只挑其中的 *.md**。
+/.dsh-audit/
 # 安卓薄壳子工程（android-shell/）**随仓库上传**，不要在根上忽略它；
 # 其自身的构建产物与签名文件由 android-shell/.gitignore 处理。
 

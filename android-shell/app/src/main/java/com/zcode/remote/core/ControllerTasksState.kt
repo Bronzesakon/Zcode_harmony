@@ -55,15 +55,6 @@ class ControllerTasksState {
         var received = 0
     }
 
-    fun resetState() {
-        logEpoch = null
-        seq = 0
-        subscriptionId = null
-        needsResync = false
-        tasks.clear()
-        fragments.clear()
-    }
-
     fun bind(subId: String) {
         subscriptionId = subId
     }

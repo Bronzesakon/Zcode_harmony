@@ -30,11 +30,9 @@ object PreviewSettle {
     fun delayFor(
         lastPublishAt: Long,
         now: Long,
-        settleMs: Long = SETTLE_MS,
-        maxWaitMs: Long = MAX_WAIT_MS,
     ): Long {
         val sincePublish = (now - lastPublishAt).coerceAtLeast(0L)
-        val remain = (maxWaitMs - sincePublish).coerceAtLeast(0L)
-        return minOf(settleMs, remain)
+        val remain = (MAX_WAIT_MS - sincePublish).coerceAtLeast(0L)
+        return minOf(SETTLE_MS, remain)
     }
 }

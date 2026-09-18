@@ -54,6 +54,12 @@ data class RelayCreds(
  */
 object Tier2Probe {
 
+    /**
+     * 握手 FSM 阶段。[Phase.CONNECTING]（[connectNow] 里赋值、`onOpen` 才转
+     * [Phase.AUTHENTICATING]）是**真实状态，不是漏删**：今天没有任何分支区分它与
+     * AUTHENTICATING（`isRunning()` 把两者一视同仁），保留是为了与页面侧那台状态机
+     * 逐步镜像——少一格，将来要按阶段分支时就得回头补。
+     */
     enum class Phase { IDLE, CONNECTING, AUTHENTICATING, PAIRED, CLOSED }
 
     /**
@@ -192,17 +198,15 @@ object Tier2Probe {
     var progressSink: ((workspaceKey: String, sessionId: String, text: String) -> Unit)? = null
 
     /**
-     * 运行态出口（controller/tasks-index 的整表投影，见 [ControllerTasksState]）。
-     * 与 [progressSink] 同时挂上：运行态决定"哪些任务值得跟踪"，进展决定"卡片正文"。
-     */
-    @Volatile
-    var liveTaskSink: ((List<ControllerTasksState.LiveTask>) -> Unit)? = null
-
-    /**
-     * 会话流运行态出口（兜底）：controller 流拿不到时，用会话尾窗的
-     * `turnHeader.state` 判"在跑"。真机实测 controller 订阅会超时（那条流
-     * 看来由桌面窗口进程提供，而接管正好顶掉页面），没有这条兜底，
-     * 后台卡片就会冻在接管那一刻。
+     * 会话流运行态出口：用会话尾窗的 `turnHeader.state` 判"在跑"。
+     *
+     * **它是两条运行态源之一，不是"兜底"**——与**页面自己订的** controller 流平级，按
+     * "**谁后到谁算数**"参与判定（时刻表见 `TaskStore.livePhasesAt`）。
+     * 它的盲区：按会话生效，只覆盖承载已经订阅的那些工作区——"任务正在别的工作区里跑"
+     * 它看不见，那一格由页面自己的 controller 流补。
+     * （原先还有第三源＝**壳自己订**的 `controller/tasks-index`；那条已于 4a 轮随订阅实现
+     * 一起删除——打开它会让桌面端 host 崩溃自毁，取证见 `docs/18` §4。）
+     * 所以少任何一条源都可能让后台卡片冻在接管那一刻。
      */
     @Volatile
     var turnStateSink: ((workspaceKey: String, sessionId: String, running: Boolean) -> Unit)? = null
@@ -430,7 +434,6 @@ object Tier2Probe {
                 .put("previousState", "authenticating")
                 .put("visibilityState", "hidden")
                 .put("online", true),
-            quiet = false,
         )
         if (onlyWorkspace.isNotEmpty()) {
             val viewState = JSONObject()
@@ -452,7 +455,6 @@ object Tier2Probe {
                             .put("language", "zh-CN")
                             .put("timeZone", java.util.TimeZone.getDefault().id),
                     ),
-                quiet = false,
             )
             Diagnostics.log(
                 "info",
@@ -465,7 +467,6 @@ object Tier2Probe {
             JSONObject()
                 .put("zcode_type", "bootstrap-request")
                 .put("requestId", "zcshell-bootstrap-" + java.util.UUID.randomUUID()),
-            quiet = false,
         )
         Diagnostics.log("warn", "Tier2: 已发 bootstrap-request（补上页面配对后的第一步，1.2s 后开桥）")
         java.util.Timer(true).schedule(
@@ -482,7 +483,7 @@ object Tier2Probe {
         if (stopping || phase == Phase.CLOSED || bridgeManager != null) return
         creds ?: return
         val manager = BridgeManager(
-            sendPayloadOut = { payload -> sendBusinessPayload(payload, quiet = false) },
+            sendPayloadOut = { payload -> sendBusinessPayload(payload) },
             onSessionsUpdate = { update ->
                 try {
                     sessionsSink?.invoke(update)
@@ -499,13 +500,6 @@ object Tier2Probe {
                 }
             },
             runningSessions = { key -> runningSessionsProvider?.invoke(key).orEmpty() },
-            liveTaskSink = { tasks ->
-                try {
-                    liveTaskSink?.invoke(tasks)
-                } catch (e: Exception) {
-                    Diagnostics.log("warn", "Tier2: 运行态回调失败 ${e.message}")
-                }
-            },
             turnStateSink = { key, sessionId, running ->
                 try {
                     turnStateSink?.invoke(key, sessionId, running)
@@ -898,9 +892,9 @@ object Tier2Probe {
         }
     }
 
-    private fun sendBusinessPayload(payload: JSONObject, quiet: Boolean) {
+    private fun sendBusinessPayload(payload: JSONObject) {
         val s = socket ?: run {
-            if (!quiet) Diagnostics.log("warn", "Tier2: 无 socket，业务帧丢弃 ${payload.optString("zcode_type")}")
+            Diagnostics.log("warn", "Tier2: 无 socket，业务帧丢弃 ${payload.optString("zcode_type")}")
             return
         }
         val envelope = JSONObject()

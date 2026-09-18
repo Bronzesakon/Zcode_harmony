@@ -13,6 +13,11 @@ import org.json.JSONObject
  */
 data class SessionEntry(
     val sessionId: String,
+    /**
+     * **协议形状字段**：本层没有任何消费读点（只有这里和 [toJson]/[fromRaw] 的读写），
+     * 但类文档要求与 `zcode-protocol.js` 的同名类逐条对照，那边的 `normalizeSession`
+     * 确实带这个键。留着它两侧的条目形状才一一对应——不是"死字段"，是"没人读的协议字段"。
+     */
     val parentSessionId: String,
     val title: String,
     val phase: String,
@@ -23,7 +28,7 @@ data class SessionEntry(
 ) {
     fun toJson(): JSONObject = JSONObject()
         .put("sessionId", sessionId)
-        .put("parentSessionId", parentSessionId)
+        .put("parentSessionId", parentSessionId) // 协议形状，见字段声明
         .put("title", title)
         .put("phase", phase)
         .put("preview", preview)
@@ -43,7 +48,7 @@ data class SessionEntry(
             }
             return SessionEntry(
                 sessionId = raw.optString("sessionId", ""),
-                parentSessionId = raw.optString("parentSessionId", ""),
+                parentSessionId = raw.optString("parentSessionId", ""), // 同上：读进来只为两侧形状一致
                 title = raw.optString("title", ""),
                 phase = raw.optString("phase", ""),
                 preview = raw.optString("lastAssistantPreview", ""),

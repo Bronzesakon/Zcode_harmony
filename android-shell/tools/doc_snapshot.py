@@ -26,9 +26,9 @@ taken through a rendering extractor and are recorded in the same manifest.
 
 Usage::
 
-    python tools/doc_snapshot.py --probe          # status only, writes nothing
-    python tools/doc_snapshot.py                  # fetch what is missing
-    python tools/doc_snapshot.py --force 03       # refresh one subdirectory
+    python tools/doc_snapshot.py --probe           # status only, writes nothing
+    python tools/doc_snapshot.py                   # fetch what is missing
+    python tools/doc_snapshot.py --force --only 03 # refresh one subdirectory
 """
 
 from __future__ import annotations
@@ -70,7 +70,6 @@ SECTION = "04-界面规范-Android16-M3Expressive"
 LANGS = "01-设计语言与基础"
 PLATFORM = "02-平台行为（Android 16）"
 VIEWS = "03-Views 控件规范（MDC-Android）"
-STATUS = "04-官方状态公告"
 VIEWS_BASE = f"{MDC}/docs"
 
 
@@ -239,41 +238,6 @@ MANIFEST_ENTRIES: list[tuple[str, list[str], str]] = [
         f"{VIEWS}/15-标签页 Tabs 与 Chip.md",
         [f"{VIEWS_BASE}/components/Tabs.md", f"{VIEWS_BASE}/components/Chip.md"],
         "标签页与标签片（设置页若需分组筛选时使用）",
-    ),
-]
-
-# Snapshotted through a rendering extractor because m3.material.io is a
-# JavaScript app; listed so the manifest documents the full section.
-RENDERED_ENTRIES: list[tuple[str, str, str]] = [
-    (
-        f"{LANGS}/01-M3 Expressive 是什么（官方发布说明）.md",
-        "https://m3.material.io/blog/building-with-m3-expressive",
-        "Material 3 Expressive 的官方发布说明",
-    ),
-    (
-        f"{LANGS}/02-颜色 Color（M3 Expressive 色彩系统）.md",
-        "https://m3.material.io/styles/color/system/overview",
-        "M3 Expressive 色彩系统与颜色角色",
-    ),
-    (
-        f"{LANGS}/03-字体 Typography（含强调字阶）.md",
-        "https://m3.material.io/styles/typography/overview",
-        "M3 Expressive 字阶与强调字阶（emphasized）",
-    ),
-    (
-        f"{LANGS}/04-形状 Shape（形状库与形状变形）.md",
-        "https://m3.material.io/styles/shape/overview",
-        "M3 Expressive 形状库与形状变形动效",
-    ),
-    (
-        f"{LANGS}/05-动效 Motion（弹簧动效系统）.md",
-        "https://m3.material.io/styles/motion/overview",
-        "M3 Expressive 弹簧物理动效系统",
-    ),
-    (
-        f"{STATUS}/01-Material Android 转为 Compose 优先（Views 维护模式）.md",
-        "https://m3.material.io/blog/material-is-compose-first",
-        "官方公告：Views 库进入维护模式，1.14 为最后一个稳定版",
     ),
 ]
 
@@ -483,20 +447,6 @@ def save_manifest(manifest: dict) -> None:
     with open(MANIFEST, "w", encoding="utf-8", newline="\n") as fh:
         json.dump(manifest, fh, ensure_ascii=False, indent=2)
         fh.write("\n")
-
-
-def register_rendered(records: list[dict]) -> None:
-    """Record the JS-rendered snapshots (taken outside this script) so the
-    manifest stays the single index of the whole docs tree."""
-    manifest = load_manifest()
-    fresh = {(r["dir"], r["file"]) for r in records}
-    manifest["docs"] = [x for x in manifest["docs"] if (x.get("dir"), x.get("file")) not in fresh]
-    manifest["docs"].extend(records)
-    manifest["docs"].sort(key=lambda x: (x.get("dir", ""), x.get("file", "")))
-    manifest["fetchedAt"] = TODAY
-    manifest["ok"] = len(manifest["docs"])
-    save_manifest(manifest)
-    print(f"registered {len(records)} rendered snapshots, manifest now {manifest['ok']} entries")
 
 
 def main() -> int:

@@ -35,7 +35,7 @@ class DiagReceiver : BroadcastReceiver() {
             return
         }
         Diagnostics.log("info", "诊断广播: $cmd（后台可调用）")
-        // 原生侧命令（Tier2 实验、失速自愈开关）自己处理；其余转给注入层。
+        // 原生侧命令（Tier2 实验、手动轻推 nudge_now/nudge_close）自己处理；其余转给注入层。
         if (ShellRuntime.runNativeDiag(cmd)) return
         ShellRuntime.dispatchJsDiag(cmd)
     }

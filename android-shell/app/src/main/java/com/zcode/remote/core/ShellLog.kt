@@ -47,6 +47,10 @@ object ShellLog {
     /**
      * Called once from Application.onCreate. Also installs the crash handler, so
      * a fatal error still leaves a readable trace in the file.
+     *
+     * @param installCrashHandler 有意保留的开关（今天唯一调用方用默认值）：它是"只开
+     *   日志文件、不接管进程全局崩溃处理链"的唯一入口。删掉只是零收益的签名变更，
+     *   别顺手删——见下方守卫。
      */
     fun init(context: Context, installCrashHandler: Boolean = true) {
         synchronized(lock) {
@@ -96,6 +100,12 @@ object ShellLog {
         }
     }
 
+    /**
+     * 进程结束的分隔线。唯一调用方是 `Application.onTerminate()`，而平台在真机上
+     * **从不投递**该回调（真机进程由内核直接杀掉，没有"优雅退出"这一站），所以真机
+     * 日志里永远看不到这一行——它是**作者知情的保留**（`ZcodeRemoteApp` 处也有注释），
+     * 只为模拟器里那份日志有头有尾。缺这一行不是丢日志，别据此判断进程被杀死。
+     */
     fun markProcessExit(reason: String) {
         append("info", "======== 进程结束：$reason ========", mirrorToLogcat = false)
     }

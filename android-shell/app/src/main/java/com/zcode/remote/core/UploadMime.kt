@@ -42,7 +42,7 @@ object UploadMime {
 
     fun normalise(
         acceptTypes: List<String?>?,
-        resolveExtension: (String) -> String? = { null },
+        resolveExtension: (String) -> String?,
     ): Array<String> {
         val out = LinkedHashSet<String>()
         acceptTypes.orEmpty().forEach { raw ->

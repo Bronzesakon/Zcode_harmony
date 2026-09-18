@@ -1280,8 +1280,13 @@ test('a document-start arrival before <html> exists retries instead of giving up
 // 这一节的历史：2026-09-12 用户拍板过"进对话 3s 后查一次，状态 A（头部停在
 // 新建任务）或状态 B（输入框灰）→ 直接刷新"的粗暴版；2026-09-15 只读壳定案后
 // **刷新这条路被废掉**（壳永不自动重载页面），下面几条测试断言的是现在的口径：
-// 判定照做、状态照记（`__zcodeShellFallback` 的 stall/ready 记账），但
+// 判定照做、状态照记（`__zcodeShellFallback` 的 state/ready 记账），但
 // `reloads` 恒为 0，终止性不再靠"15s 最小刷新间隔"。
+//
+// 4b（2026-09-18）：§5c 卡死看门狗的决策机器整体拆除，`__zcodeShellFallback` 的
+// `arm`/`cancel`/`fire`/`stall` 四个出口随之消失。本节那两条钉子测试里原先读
+// "放弃态"的断言，改用**幸存**的 §5b 状态 + "副作用缺席"重写，契约不变
+// （逐条理由写在各自的断言旁）。
 // ---------------------------------------------------------------------------
 
 const FB = () => globalThis.__zcodeShellFallback;
@@ -1397,7 +1402,7 @@ test('只读壳：进对话 5s 无详情只记账，不轻推也不刷新', () =
         FB().check();
         assert.strictEqual(reloads.length, 0, 'the first deadline must not reload anything');
         assert.ok(findPost(page.posts, 'diag', (d) =>
-            d.message.includes('先尝试最小内推')).length === 1);
+            d.message.includes('进对话 3s 未出对话详情')).length === 1);
         // 真机定罪的那条链（轻推←fallbackCheck，40 秒里拆了 10 次）在只读壳下
         // 只剩这一行日志：说明"我们本来会在这一刻动手"。
         assert.ok(findPost(page.posts, 'diag', (d) =>
@@ -1407,7 +1412,18 @@ test('只读壳：进对话 5s 无详情只记账，不轻推也不刷新', () =
         assert.strictEqual(reloads.length, 0, 'a read-only shell never reloads the page');
         assert.ok(findPost(page.posts, 'diag', (d) =>
             d.message.includes('只读壳：不因')).length === 1);
-        assert.strictEqual(FB().stall().gaveUp, true, 'the deadline stops instead of escalating');
+        // 4b（2026-09-18）：这里原来断言的是看门狗出口（`__zcodeShellFallback` 的
+        // `.stall()`，现已删除）里那个"放弃态"字段——"到点就停下、不升级"。看门狗的决策
+        // 机器连同该字段已整体删除，于是这条契约改由**幸存**的观测钉住，语义一字不变
+        // （README:247 的钉子「进对话卡住不重载」）：
+        //   ① 第二次到点是**终止步**：它走"只记录"那条路，不再武装第三个窗口；
+        //   ② 第一次到点确实记过账（nudgedAt）——证明上面的"不升级"不是"根本没跑到"；
+        //   ③ 全程零重载（本用例上面两条 reloads 断言）。
+        assert.strictEqual(findPost(page.posts, 'diag', (d) =>
+            d.message.includes('二次判定仍未出对话详情')).length, 1,
+            'the second deadline is the terminal step — no escalation, no third window');
+        assert.ok(FB().state().nudgedAt > 0, 'the first deadline was charged');
+        assert.strictEqual(FB().timer(), null, 'the ladder stops: no third deadline is armed');
     } finally {
         restore();
         page.teardown();
@@ -1445,7 +1461,7 @@ test('只读壳：进对话卡住不会重载，也不会连刷；就绪信号�
         FB().note({name: 'zcode-agent.subscribeConversationV4', args: {sessionId: 'sess_1'}});
         FB().check();
         assert.strictEqual(reloads.length, 0, 'the first deadline nudges nothing');
-        assert.ok(findPost(page.posts, 'diag', (d) => d.message.includes('先尝试最小内推')).length === 1);
+        assert.ok(findPost(page.posts, 'diag', (d) => d.message.includes('进对话 3s 未出对话详情')).length === 1);
         clearTimeout(FB().timer());
 
         // 第二次判定：旧版在这里进"整体刷新保底"，只读壳到此为止。
@@ -1453,16 +1469,32 @@ test('只读壳：进对话卡住不会重载，也不会连刷；就绪信号�
         assert.strictEqual(reloads.length, 0, 'the read-only shell never escalates to a reload');
 
         // 无论判定多少次，页面都不会被壳重载。
-        FB().stall().lastReloadAt = Date.now() - 16000;
+        // （此处原来先把 `stallState.lastReloadAt` 拨旧 16s，好让"15s 最小刷新间隔"
+        // 不再是借口。A7 把那个字段与它服务的刷新闸门一并删了——只读壳下刷新路径
+        // 整个不存在，于是这句设置也删掉；断言本身照旧。）
         FB().note({name: 'zcode-agent.conversationRowsRangeV4', args: {sessionId: 'sess_1'}});
         FB().check();
         assert.strictEqual(reloads.length, 0, 'no ladder, no reload — ever');
 
-        // 就绪信号到达 → 复位，状态干净，下一轮照旧能判。
+        // 就绪信号到达 → 本轮干净收工，下一轮照旧能判。
         FB().note({name: 'zcode-agent.subscribeConversationV4', args: {sessionId: 'sess_1'}});
         FB().ready('v4.conversation.store.connect.completed');
         FB().check();
-        assert.strictEqual(FB().stall().gaveUp, false, 'readiness resets the give-up state');
+        // 4b（2026-09-18）：这里原来断言的是看门狗那个"放弃态"闩锁复位为假。放弃态随
+        // 看门狗的决策机器一起删了，但**"就绪信号照样被认账、本轮干净收工、下一轮还能
+        // 重新判"**这条语义仍在（README:247 的钉子「卡住不连刷」），改由幸存的 §5b 记账
+        // + 副作用缺席钉住：
+        //   ① 就绪证据落在本轮的 readyAt/readyBy 上；
+        //   ② 判定器收工后不再有任何挂起的窗口（没有下一拍）。
+        const state = FB().state();
+        assert.strictEqual(state.readyBy, 'v4.conversation.store.connect.completed',
+            'readiness is recorded on the surviving §5b state');
+        assert.ok(state.readyAt >= state.beaconAt,
+            'the readiness evidence belongs to this beacon window');
+        assert.ok(findPost(page.posts, 'diag', (d) =>
+            d.message.includes('已就绪（v4.conversation.store.connect.completed）')).length === 1,
+            'the ready line proves the round closed as "ready" instead of escalating');
+        assert.strictEqual(FB().timer(), null, 'nothing is left armed after the ready round');
     } finally {
         restore();
         page.teardown();
@@ -1505,7 +1537,7 @@ test('进对话铁判准：窗口内的重复信标不顺延（页面重试不�
         assert.strictEqual(FB().state().beaconAt, first,
             'a retry must not slide the deadline');
         assert.ok(findPost(page.posts, 'diag', (d) =>
-            d.message.includes('落在此前已武装的 5s 窗内')).length === 1);
+            d.message.includes('落在此前已武装的 3s 窗内')).length === 1);
         assert.strictEqual(reloads.length, 0, 'no reload before the deadline');
     } finally {
         if (FB().timer()) {

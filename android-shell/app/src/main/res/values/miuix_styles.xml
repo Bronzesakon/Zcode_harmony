@@ -10,8 +10,13 @@
        * SmallTopAppBar：折叠高 52dp，标题左内边距 26dp，导航图标左内边距 16dp，
          标题字阶 headline1 = 17sp Medium。
 
-     字重 Medium 只有 API 28+ 的 textFontWeight 能表达；26/27 上退化成常规，
-     这是可接受的降级，不为了三个版本号去塞字体文件。 -->
+     本文件只放 26+ 都能安全解析的属性。两个更高版本才有的属性拆到了限定目录，
+     靠系统按 API 级别挑选，26/27（字重）、26–30（圆角裁剪）上静默降级：
+       * android:textFontWeight（Medium = 500，API 28+）
+         → MiuixAppBarTitle / MiuixRowTitle 在 values-v28/ 里有整份副本；
+       * android:clipToOutline（API 31+）→ MiuixCard 在 values-v31/ 里有整份副本。
+     限定目录里的同名样式是整体替换而非合并，所以那边的副本必须抄全，改这里时记得同步。
+     字重降级为常规是可接受的，不为了几个版本号去塞字体文件。 -->
 <resources xmlns:app="http://schemas.android.com/apk/res-auto">
 
     <dimen name="miuix_card_corner">16dp</dimen>
@@ -64,7 +69,8 @@
         <item name="android:maxLines">1</item>
         <item name="android:textColor">@color/miuix_on_surface</item>
         <item name="android:textSize">17sp</item>
-        <item name="android:textFontWeight">500</item>
+        <!-- 字重 Medium（500）= android:textFontWeight，API 28+ 才有：
+             见 values-v28/miuix_styles.xml，本文件里不能出现。 -->
     </style>
 
     <!-- ===== 小节标题（SmallTitle） ===== -->
@@ -91,7 +97,8 @@
         <item name="android:layout_marginEnd">@dimen/miuix_card_margin</item>
         <item name="android:orientation">vertical</item>
         <item name="android:background">@drawable/miuix_card_background</item>
-        <item name="android:clipToOutline">true</item>
+        <!-- 圆角裁剪 = android:clipToOutline，API 31+ 才有：
+             见 values-v31/miuix_styles.xml，本文件里不能出现。 -->
     </style>
 
     <!-- ===== 列表行（BasicComponent） ===== -->
@@ -113,7 +120,8 @@
         <item name="android:layout_height">wrap_content</item>
         <item name="android:textColor">@color/miuix_on_background</item>
         <item name="android:textSize">17sp</item>
-        <item name="android:textFontWeight">500</item>
+        <!-- 字重 Medium（500）= android:textFontWeight，API 28+ 才有：
+             见 values-v28/miuix_styles.xml，本文件里不能出现。 -->
     </style>
 
     <style name="MiuixRowSummary" parent="">

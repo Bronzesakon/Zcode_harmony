@@ -21,15 +21,22 @@ const {DesktopCore, fragment, encodeBody, ascii, snapshotWire} = require('./fake
 
 const FRAGMENT_BYTES = 512 * 1024;
 
-// `makeClient` wires a RemoteClient to the shared fake desktop through the
-// direct seam: replies land in RemoteClient.acceptPayload (no WebSocket).
+// `makeClient` wires a RemoteClient to the shared fake desktop.
+//
+// 4c（2026-09-18）：`deliver` 原来是 `client.acceptPayload(payload)`——把桌面端
+// 回给"壳自己那座桥"的业务载荷回灌进 RemoteClient。`acceptPayload` 已随桥路由
+// 子系统删净（只读壳下壳一个字节都不往页面 socket 上写，故永远没有回灌对象），
+// 于是这里落成**显式 no-op**。保留这个参数是因为 DesktopCore 需要它，同时它也是
+// "同一个 mock 服务两个 seam"的说明点：将来若恢复开桥，这里要接回入站分派。
+// ⚠️ 别再假设"每个协议测试都从一个入站总入口进去"——被动组一律直呼
+// `acceptObservedPayload`（见 pageFollows / pagePushes）。
 function makeClient(options) {
     const client = new P.RemoteClient({
         send: () => {},
         log: () => {},
         ...options
     });
-    const desktop = new DesktopCore({deliver: (payload) => client.acceptPayload(payload)});
+    const desktop = new DesktopCore({deliver: () => {}});
     client._send = (payload) => desktop.accepts(payload);
     return {client, desktop};
 }
@@ -311,7 +318,6 @@ test('a large logical frame split into fragments is reassembled', () => {
         payload: {
             kind: 'snapshot',
             snapshot: {
-                workspaceId: 'ws-a',
                 logEpoch: 'e',
                 sessions: [{sessionId: 's1', title: 'x'.repeat(200), phase: 'running'}]
             }
@@ -352,43 +358,6 @@ test('pendingInteraction id is surfaced for the attention notification', () => {
 // RemoteClient — active coverage
 // ---------------------------------------------------------------------------
 
-test('active mode opens one bridge per workspace and streams sessions', async () => {
-    const {client, desktop} = makeClient();
-    desktop.workspaces = [
-        {workspacePath: '/repo/a', workspaceIdentity: 'ws-a'},
-        {workspacePath: '/repo/b', workspaceIdentity: 'ws-b'}
-    ];
-    const updates = [];
-    client.onSessions = (update) => updates.push(update);
-
-    await client.start();
-    assert.strictEqual(desktop.subscriptions.length, 2, 'one subscription per workspace');
-
-    desktop.pushSessionsWire('ws-a', snapshotWire([
-        {sessionId: 's1', title: '重构登录', phase: 'running', lastActivityAt: 1,
-            lastAssistantPreview: '已改 auth_service'}
-    ]));
-    desktop.pushSessionsWire('ws-b', snapshotWire([
-        {sessionId: 's9', title: '写测试', phase: 'prewarming', lastActivityAt: 2}
-    ]));
-
-    const byKey = new Map(updates.map((u) => [u.key, u]));
-    assert.strictEqual(byKey.size, 2);
-    assert.strictEqual(byKey.get('ws-a').sessions[0].title, '重构登录');
-    assert.strictEqual(byKey.get('ws-a').source, 'active');
-    assert.strictEqual(byKey.get('ws-a').title, 'a', 'workspace title falls back to the last path segment');
-    assert.strictEqual(byKey.get('ws-b').sessions[0].phase, 'prewarming');
-});
-
-test('active mode respects the workspace cap（只剩单测 seam：壳永不调用 start）', async () => {
-    const capped = makeClient({maxWorkspaces: 1});
-    capped.desktop.workspaces = [
-        {workspacePath: '/a'}, {workspacePath: '/b'}, {workspacePath: '/c'}
-    ];
-    await capped.client.start();
-    assert.strictEqual(capped.desktop.subscriptions.length, 1);
-});
-
 test('只读壳：没有「订阅所有工作区」开关，客户端自己不开桥（D7 已删，2026-09-17）', () => {
     // 这条原来是 `makeClient({subscribeAll: false})` → "no writes when subscribe-all
     // is off"。开关整个删掉后，等价断言分两半，都要能**独立失败**：
@@ -400,36 +369,6 @@ test('只读壳：没有「订阅所有工作区」开关，客户端自己不�
     assert.strictEqual(client.subscribeAll, undefined,
         'D7 开关已删除：客户端不再有"我该主动开桥"这个状态');
     assert.strictEqual(desktop.sent.length, 0, '构造本身不得写页面 socket');
-});
-
-test('a failing workspace does not abort the others', async () => {
-    const {client, desktop} = makeClient();
-    desktop.workspaces = [
-        {workspacePath: '/ok-1'}, {workspacePath: '/bad'}, {workspacePath: '/ok-2'}
-    ];
-    desktop.failingWorkspaces.add('/bad');
-    await client.start();
-    const opened = desktop.subscriptions.map((s) => s.scope.workspacePath).sort();
-    assert.deepStrictEqual(opened, ['/ok-1', '/ok-2']);
-});
-
-test('a sequence gap triggers a resync call', async () => {
-    const {client, desktop} = makeClient();
-    desktop.workspaces = [{workspacePath: '/repo/a', workspaceIdentity: 'ws-a'}];
-    await client.start();
-    desktop.pushSessionsWire('ws-a', snapshotWire([{sessionId: 's1', phase: 'running'}], 5));
-    const before = desktop.sent.length;
-    desktop.pushSessionsWire('ws-a', {
-        topic: 'sessions-index/ws-a',
-        kind: 'complete',
-        frame: {
-            fromSeq: 4, toSeq: 6,
-            payload: {kind: 'deltas', deltas: [{op: 'session.removed', sessionId: 's1'}]}
-        }
-    });
-    await new Promise((r) => setTimeout(r, 0));
-    const resyncs = desktop.sent.slice(before).filter((p) => p.zcode_type === 'rpc-frame');
-    assert.ok(resyncs.length > 0, 'a resync request must be sent after a gap');
 });
 
 // ---------------------------------------------------------------------------
@@ -466,27 +405,256 @@ test('passive mode reads the page sessions-index without writing anything', () =
     assert.strictEqual(desktop.sent.length, writesBefore, 'passive mode must never write');
 });
 
-test('active mode skips a workspace the page already streams', async () => {
-    const {client, desktop} = makeClient();
-    desktop.workspaces = [
-        {workspacePath: '/repo/page', workspaceIdentity: 'ws-page'},
-        {workspacePath: '/repo/other', workspaceIdentity: 'ws-other'}
-    ];
-    // The page is already on ws-page before we start.
-    const listenBody = encodeBody(
-        [P.REQ_EVENT_LISTEN, 1, 'zcode-agent', P.EVENT_SESSIONS_INDEX],
-        {workspacePath: '/repo/page', workspaceIdentity: 'ws-page'}
+// ---------------------------------------------------------------------------
+// 被动路径的「序号缺口 ⇒ 该工作区陈旧」检出（4c 工程前置，2026-09-18）
+//
+// 背景：增量帧带 `fromSeq`，`fromSeq !== seq` 就是**漏掉了一个增量**。漏增量的后果是壳对
+// "谁在跑"的印象静默漂移——`TaskStore` 有一条真机定案：运行态被会话索引覆盖成"全部完成"
+// ⟹ `runningTaskRefs()` 变空 ⟹ 活进展被丢、流体云卡片冻死；而"提前接管"的第一道闸门问的
+// 正是"有没有在跑"（`ShellRuntime` `earlyTakeoverSince` 那一段）。
+//
+// 检出那一步在活路上本来就可达，但它的消费者（`_resyncSessionsIndex`）只写在**已死的**
+// 主动开桥路径里，所以这个事件在真机上从没留下痕迹。这几条钉的就是新加的那一半：
+//   ① 缺口**按工作区**置位（别的工作区不许被牵连）；
+//   ② **只有整窗快照**能解除（缺口期间 `seq` 有意不动 ⇒ 后续每一帧增量都还会判失败）；
+//   ③ 检出与自愈各记**一行**日志（工作区键 + 缺口事实），且不许逐帧刷屏。
+// ---------------------------------------------------------------------------
+
+/** 让客户端"看见"页面自己对某工作区发起的 sessions-index 订阅（真实入口：出站帧）。 */
+function pageFollows(client, bridgeSessionId, messageSeq, listenId, scope) {
+    const body = encodeBody(
+        [P.REQ_EVENT_LISTEN, listenId, 'zcode-agent', P.EVENT_SESSIONS_INDEX],
+        scope
     );
-    for (const payload of fragment(listenBody, 'page-bridge-9', 1)) {
+    for (const payload of fragment(body, bridgeSessionId, messageSeq)) {
         client.acceptObservedPayload(payload, true);
     }
+}
 
-    await client.start();
+/** 页面那条订阅上推一帧（真实入口：入站 RES_EVENT_FIRE）。 */
+function pagePushes(client, bridgeSessionId, messageSeq, listenId, wire) {
+    const body = encodeBody([P.RES_EVENT_FIRE, listenId], wire);
+    for (const payload of fragment(body, bridgeSessionId, messageSeq)) {
+        client.acceptObservedPayload(payload, false);
+    }
+}
+
+/** 一条跳号的增量帧：本机锚点在 [seq]，来的却是 [fromSeq]→[toSeq]。 */
+function gapDelta(topic, fromSeq, toSeq) {
+    return {
+        topic: topic,
+        kind: 'complete',
+        frame: {
+            fromSeq: fromSeq,
+            toSeq: toSeq,
+            payload: {kind: 'deltas', deltas: [{op: 'session.removed', sessionId: 's1'}]}
+        }
+    };
+}
+
+test('缺口状态机：增量跳号置 stale，且只有整窗快照能清它', () => {
+    const state = new P.SessionsIndexState();
+    assert.strictEqual(state.stale, false, '初始不陈旧');
+    state.applyWireFrame(snapshotWire([{sessionId: 's1', phase: 'running'}], 5));
+    assert.strictEqual(state.stale, false, '成功应用整窗快照后仍然不陈旧');
+
+    assert.strictEqual(state.applyLogicalFrame({
+        fromSeq: 4, toSeq: 6,
+        payload: {kind: 'deltas', deltas: [{op: 'session.removed', sessionId: 's1'}]}
+    }), false);
+    assert.strictEqual(state.stale, true, '跳号 ⇒ 该工作区陈旧');
+    assert.strictEqual(state.gapFromSeq, 4, '缺口事实记下的是那一帧的 fromSeq');
+    assert.strictEqual(state.seq, 5, '锚点不动：缺口期间后续帧还会再判失败');
+    assert.strictEqual(state.list().length, 1, '丢掉的增量不许被应用（既有断言）');
+
+    assert.strictEqual(state.applyLogicalFrame({
+        fromSeq: 9, toSeq: 10,
+        payload: {kind: 'deltas', deltas: [{op: 'session.removed', sessionId: 's1'}]}
+    }), false);
+    assert.strictEqual(state.stale, true, '连续跳号不改变结论（仍陈旧）');
+    assert.strictEqual(state.list().length, 1, '仍然不许应用');
+
+    assert.strictEqual(state.applyWireFrame(snapshotWire([
+        {sessionId: 's1', phase: 'completed'}
+    ], 11)), true);
+    assert.strictEqual(state.stale, false, '整窗快照把它拉回 ⇒ 解除');
+    assert.strictEqual(state.gapFromSeq, null);
+});
+
+test('被动：缺口把该工作区标为陈旧，别的工作区不受牵连，日志只记一行', () => {
+    const logs = [];
+    const {client} = makeClient({log: (message) => logs.push(message)});
+    const updates = [];
+    client.onSessions = (update) => updates.push(update);
+    pageFollows(client, 'page-bridge-a', 11, 3, {workspacePath: '/repo/a', workspaceIdentity: 'ws-a'});
+    pageFollows(client, 'page-bridge-b', 12, 4, {workspacePath: '/repo/b', workspaceIdentity: 'ws-b'});
+
+    pagePushes(client, 'page-bridge-a', 21, 3,
+        snapshotWire([{sessionId: 's1', phase: 'running'}], 5, 'sessions-index/ws-a'));
+    pagePushes(client, 'page-bridge-b', 22, 4,
+        snapshotWire([{sessionId: 's9', phase: 'running'}], 1, 'sessions-index/ws-b'));
+    assert.deepStrictEqual(updates.map((u) => u.key), ['ws-a', 'ws-b']);
+    assert.strictEqual(client._passive['ws-a'].state.stale, false);
+
+    pagePushes(client, 'page-bridge-a', 23, 3, gapDelta('sessions-index/ws-a', 4, 6));
+    assert.strictEqual(client._passive['ws-a'].state.stale, true, '缺口 ⇒ 该工作区陈旧');
+    assert.strictEqual(client._passive['ws-b'].state.stale, false, '别的工作区不许被牵连');
+    // 4c：检出那一拍**额外**发一帧「仅标记」（见下面那条专测）。原来这里断的是
+    // `updates.length === 2`（"判失败的那一帧没有新读数，不该上报"）——那句断言在
+    // 检出那一拍仍然成立，只是现在多了**一帧不携带读数的标记**。所以拆成两半，比原来更严：
+    //   ① 可落地的整表读数仍然只有 2 条（判失败的那一帧一条都没产生）；
+    //   ② 多出来的那一条必须是 `staleOnly === true` 的标记帧。
+    assert.strictEqual(updates.length, 3, '检出那一拍多出一帧仅标记');
+    assert.strictEqual(updates.filter((u) => u.staleOnly !== true).length, 2,
+        '判失败的那一帧没有产生任何可落地的读数');
+    assert.strictEqual(updates[2].staleOnly, true, '多出来的那一条只能是仅标记帧');
+    assert.strictEqual(updates[2].stale, true);
+
+    const gapLogs = logs.filter((m) => m.includes('会话清单序号缺口'));
+    assert.strictEqual(gapLogs.length, 1, '跃迁那一拍记一行');
+    assert.ok(gapLogs[0].includes('ws-a'), '日志必须写清**哪个工作区**');
+    assert.ok(gapLogs[0].includes('fromSeq=4') && gapLogs[0].includes('seq=5'),
+        '也要写清**为什么**（缺口事实）');
+
+    pagePushes(client, 'page-bridge-a', 24, 3, gapDelta('sessions-index/ws-a', 7, 8));
+    assert.strictEqual(logs.filter((m) => m.includes('会话清单序号缺口')).length, 1,
+        '缺口没解除前只记一次，不许逐帧刷屏');
+    assert.strictEqual(updates.length, 3, '缺口期间不再有读数（只剩检出那一拍的仅标记帧）');
+    assert.strictEqual(updates.filter((u) => u.staleOnly !== true).length, 2);
+});
+
+test('被动：下一次整窗快照解除陈旧，上报随之恢复', () => {
+    const logs = [];
+    const {client} = makeClient({log: (message) => logs.push(message)});
+    const updates = [];
+    client.onSessions = (update) => updates.push(update);
+    pageFollows(client, 'page-bridge-a', 11, 3, {workspacePath: '/repo/a', workspaceIdentity: 'ws-a'});
+    pagePushes(client, 'page-bridge-a', 21, 3,
+        snapshotWire([{sessionId: 's1', phase: 'running'}], 5, 'sessions-index/ws-a'));
+    pagePushes(client, 'page-bridge-a', 22, 3, gapDelta('sessions-index/ws-a', 4, 6));
+    assert.strictEqual(client._passive['ws-a'].state.stale, true);
+
+    pagePushes(client, 'page-bridge-a', 23, 3,
+        snapshotWire([{sessionId: 's1', phase: 'completed'}], 11, 'sessions-index/ws-a'));
+    assert.strictEqual(client._passive['ws-a'].state.stale, false, '快照 ⇒ 陈旧解除');
+    assert.strictEqual(updates.length, 3, '解除之后照常上报（快照那一帧）');
+    assert.strictEqual(updates[2].staleOnly, false, '自愈那一帧是普通整表帧（列表可落地）');
+    assert.strictEqual(updates[2].stale, false);
+    assert.deepStrictEqual(updates[2].sessions.map((s) => s.phase), ['completed']);
+    assert.ok(logs.some((m) => m.includes('会话清单已自愈') && m.includes('ws-a')),
+        '自愈也要留一行，否则真机上分不清"自愈了"与"一直陈旧"');
+    assert.strictEqual(logs.filter((m) => m.includes('会话清单序号缺口')).length, 1);
+});
+
+test('被动：跃迁语义——应用成功但 stale 未解除不许记「已自愈」，且两个方向各恰好一次', () => {
+    const logs = [];
+    const {client} = makeClient({log: (message) => logs.push(message)});
+    const updates = [];
+    client.onSessions = (update) => updates.push(update);
+    const healed = () => logs.filter((m) => m.includes('会话清单已自愈')).length;
+    const gap = () => logs.filter((m) => m.includes('会话清单序号缺口')).length;
+
+    pageFollows(client, 'page-bridge-a', 11, 3, {workspacePath: '/repo/a', workspaceIdentity: 'ws-a'});
+    pagePushes(client, 'page-bridge-a', 21, 3,
+        snapshotWire([{sessionId: 's1', phase: 'running'}], 5, 'sessions-index/ws-a'));
+
+    // ── (3) 缺口本身 ⟹ 恰好一次（对称的那条判据）─────────────────────────────
+    pagePushes(client, 'page-bridge-a', 22, 3, gapDelta('sessions-index/ws-a', 4, 6));
+    assert.strictEqual(client._passive['ws-a'].state.stale, true);
+    assert.strictEqual(gap(), 1, '检出那一拍记一行');
+    pagePushes(client, 'page-bridge-a', 23, 3, gapDelta('sessions-index/ws-a', 7, 8));
+    assert.strictEqual(gap(), 1, '缺口没解除前不再补记（逐帧刷屏的对称面）');
+
+    // ── (1) 应用成功、但 stale 仍为真 ⟹ **不**记日志 ──────────────────────────
+    // 构造：缺口期间 state.seq 有意冻结在 5（见 SessionsIndexState.applyLogicalFrame：
+    // 判失败那一支"注意 seq 有意不动"），喂一帧 fromSeq === state.seq 的**增量** ⟹
+    // 序号对得上 ⟹ 应用成功（返回 true）、锚点推进；而 stale 只有整窗快照能清 ⟹ 仍为 true。
+    // 这正是 2026-09-18 20:37–20:41 真机上 4 分钟刷出数百条日志的那类帧。
+    pagePushes(client, 'page-bridge-a', 24, 3, {
+        topic: 'sessions-index/ws-a', kind: 'complete',
+        frame: {fromSeq: 5, toSeq: 6, payload: {kind: 'deltas', deltas: [
+            {op: 'session.upserted', session: {sessionId: 's2', phase: 'running'}}]}}
+    });
+    assert.strictEqual(client._passive['ws-a'].state.stale, true,
+        'stale 未被解除（整窗快照才是唯一解除条件）');
+    assert.strictEqual(client._passive['ws-a'].state.seq, 6,
+        '这一帧确实应用成功了（锚点推进）——"应用成功"与"陈旧解除"是两件事');
+    assert.strictEqual(healed(), 0,
+        '⚠️ 缺陷 B 的钉子：判据必须是**真跃迁**（改前为真 **且** 改后为假）。' +
+        '只看改前的旧写法在这里会记 1 条，并逐帧刷屏');
+    // 这一帧走的是**整表帧**分支（_emitSessions）⟹ 顺带钉住第三种帧形状。
+    assert.strictEqual(updates.length, 3, '缺口那一拍 +1（仅标记），本帧 +1（整表）');
     assert.deepStrictEqual(
-        desktop.subscriptions.map((s) => s.scope.workspaceIdentity),
-        ['ws-other'],
-        'the page-covered workspace must not be duplicated'
-    );
+        {stale: updates[2].stale, staleOnly: updates[2].staleOnly},
+        {stale: true, staleOnly: false},
+        '「stale:true 且 staleOnly:false」的整表帧：列表可落地但读数陈旧——' +
+        '今天没有任何测试钉过这一格');
+
+    // ── (2) 整窗快照 ⟹ **恰好**记一次 ─────────────────────────────────────────
+    pagePushes(client, 'page-bridge-a', 25, 3,
+        snapshotWire([{sessionId: 's1', phase: 'completed'}], 11, 'sessions-index/ws-a'));
+    assert.strictEqual(healed(), 1, '跃迁那一拍恰好一次');
+    assert.strictEqual(client._passive['ws-a'].state.stale, false);
+    pagePushes(client, 'page-bridge-a', 26, 3,
+        snapshotWire([{sessionId: 's1', phase: 'completed'}], 12, 'sessions-index/ws-a'));
+    assert.strictEqual(healed(), 1, '已不陈旧的快照不产生跃迁，不许再记');
+});
+
+// ---------------------------------------------------------------------------
+// 4c：检出那一拍的「仅标记帧」（Q13/Q15 的原生入口）
+//
+// 断的是**上报形状**，不是原生行为——原生那一半（`TaskStore.staleSince` + 可信窗口）
+// 由 `NotifyStateTest` 的 4c 组钉住。这里只回答三个问题：
+//   ① 缺口检出那一拍**恰好**多一帧（跃迁一次，不逐帧、不重复）；
+//   ② 那一帧**显式**区分于整表帧（`staleOnly`），原生不必猜；
+//   ③ 它带的 `sessions` 是**冻结的旧读数**（与上一帧逐字段相同）——正因为它不是新读数，
+//      原生才必须"只取标记、不落地列表"，否则会重盖 SI 时刻戳、自己制造一次降级。
+// ---------------------------------------------------------------------------
+
+test('被动：检出缺口那一拍额外发一帧「仅标记」，列表是冻结旧读数', () => {
+    const {client} = makeClient();
+    const updates = [];
+    client.onSessions = (update) => updates.push(update);
+    pageFollows(client, 'page-bridge-a', 11, 3, {workspacePath: '/repo/a', workspaceIdentity: 'ws-a'});
+    pagePushes(client, 'page-bridge-a', 21, 3,
+        snapshotWire([{sessionId: 's1', phase: 'running'}], 5, 'sessions-index/ws-a'));
+
+    // 整表帧：老字段一个都不少，新字段显式说"不陈旧、可落地"。
+    assert.strictEqual(updates.length, 1);
+    assert.strictEqual(updates[0].stale, false, '整表帧显式声明不陈旧');
+    assert.strictEqual(updates[0].staleOnly, false, '整表帧的列表可以落地');
+    assert.strictEqual(updates[0].source, 'passive');
+    assert.strictEqual(updates[0].workspaceIdentity, 'ws-a');
+    assert.ok(Array.isArray(updates[0].sessions), 'sessions 仍在（老字段不改名、不删）');
+    const frozen = JSON.parse(JSON.stringify(updates[0]));
+    delete frozen.stale;
+    delete frozen.staleOnly;
+
+    pagePushes(client, 'page-bridge-a', 22, 3, gapDelta('sessions-index/ws-a', 4, 6));
+    assert.strictEqual(updates.length, 2, '检出那一拍恰好补一帧');
+    const marker = updates[1];
+    assert.strictEqual(marker.key, 'ws-a');
+    assert.strictEqual(marker.stale, true, '标记该工作区的读数从此不可信');
+    assert.strictEqual(marker.staleOnly, true, '显式区分"仅标记帧"与"普通整表帧"，别让原生猜');
+    const withoutFlags = JSON.parse(JSON.stringify(marker));
+    delete withoutFlags.stale;
+    delete withoutFlags.staleOnly;
+    assert.deepStrictEqual(withoutFlags, frozen,
+        '仅标记帧的形状与整表帧逐字段相同（只有两个新标记不同），且列表就是冻结的旧读数');
+
+    // 跃迁一次：缺口没解除之前不再补发。
+    pagePushes(client, 'page-bridge-a', 23, 3, gapDelta('sessions-index/ws-a', 7, 8));
+    pagePushes(client, 'page-bridge-a', 24, 3, gapDelta('sessions-index/ws-a', 9, 10));
+    assert.strictEqual(updates.length, 2, '检出跃迁恰好一次');
+    assert.strictEqual(updates.filter((u) => u.staleOnly === true).length, 1);
+
+    // 自愈之后：又是一帧普通整表帧，且带回真正的新读数。
+    pagePushes(client, 'page-bridge-a', 25, 3,
+        snapshotWire([{sessionId: 's1', phase: 'completed'}], 11, 'sessions-index/ws-a'));
+    assert.strictEqual(updates.length, 3);
+    assert.strictEqual(updates[2].stale, false);
+    assert.strictEqual(updates[2].staleOnly, false);
+    assert.deepStrictEqual(updates[2].sessions.map((s) => s.phase), ['completed']);
 });
 
 // ---------------------------------------------------------------------------
@@ -497,66 +665,6 @@ test('active mode skips a workspace the page already streams', async () => {
 // relay reconnect used to wipe that knowledge), and what the page itself asks
 // the desktop for when a task is opened.
 // ---------------------------------------------------------------------------
-
-test('page coverage must be re-proven on a new relay connection (zombie rule)', async () => {
-    const pageScope = {workspacePath: '/repo/page', workspaceIdentity: 'ws-page'};
-    const first = makeClient();
-    const listenBody = encodeBody(
-        [P.REQ_EVENT_LISTEN, 1, 'zcode-agent', P.EVENT_SESSIONS_INDEX],
-        pageScope
-    );
-    for (const payload of fragment(listenBody, 'page-bridge-1', 1)) {
-        first.client.acceptObservedPayload(payload, true);
-    }
-
-    // A relay disconnect rebuilds the client. 2026-09-13 真机实证：socket 重建后
-    // 页面 runtime 不会重建（配对恢复但零业务帧、零自愈）——旧连接上的覆盖
-    // 证据是僵尸，跨连接沿用 = 该工作区通知/实况窗全盲。新连接上壳必须接管；
-    // 页面若真恢复了（reload 后重新开桥），观察到的 listen 会再次盖上本连接
-    // 的证据，_dropRedundantBridge 再把壳的桥让出去。
-    const second = makeClient({sharedState: first.client.sharedState()});
-    second.desktop.workspaces = [
-        pageScope,
-        {workspacePath: '/repo/other', workspaceIdentity: 'ws-other'}
-    ];
-    await second.client.start();
-
-    assert.deepStrictEqual(
-        second.desktop.subscriptions.map((s) => s.scope.workspaceIdentity).sort(),
-        ['ws-other', 'ws-page'],
-        'the rebuilt client must take over the workspace the page no longer streams'
-    );
-
-    // 页面在同一连接上恢复流之后，壳的重复桥要让位（回到既有语义）。
-    // 注意只让出 ws-page：ws-other 页面从未覆盖，壳的桥必须留下。
-    for (const payload of fragment(listenBody, 'page-bridge-2', 1)) {
-        second.client.acceptObservedPayload(payload, true);
-    }
-    assert.strictEqual(Object.keys(second.client._bridges).length, 1,
-        'only the re-proven workspace is handed back');
-    assert.ok(!second.client._bridges['ws-page'],
-        'the page bridge replaces ours for the workspace it re-proved');
-});
-
-test('a bridge is dropped once the page proves it streams that workspace', async () => {
-    const logs = [];
-    const {client, desktop} = makeClient({log: (message) => logs.push(message)});
-    desktop.workspaces = [{workspacePath: '/repo/page', workspaceIdentity: 'ws-page'}];
-    await client.start();
-    assert.strictEqual(Object.keys(client._bridges).length, 1, 'opened before the page was seen');
-
-    const listenBody = encodeBody(
-        [P.REQ_EVENT_LISTEN, 1, 'zcode-agent', P.EVENT_SESSIONS_INDEX],
-        {workspacePath: '/repo/page', workspaceIdentity: 'ws-page'}
-    );
-    for (const payload of fragment(listenBody, 'page-bridge-77', 1)) {
-        client.acceptObservedPayload(payload, true);
-    }
-
-    assert.strictEqual(Object.keys(client._bridges).length, 0,
-        'the duplicate bridge must be closed, not left to fault');
-    assert.ok(logs.some((m) => m.includes('页面已接管')), 'and the reason must be logged');
-});
 
 test('page RPCs are traced: slow calls, errors and a per-window summary', () => {
     const logs = [];
@@ -607,174 +715,93 @@ test('page RPCs are traced: slow calls, errors and a per-window summary', () => 
     );
 });
 
-test('a page-held workspace is dropped, not reopened, when the desktop refuses our bridge', async () => {
-    const logs = [];
-    const {client, desktop} = makeClient({log: (message) => logs.push(message)});
-    desktop.workspaces = [{workspacePath: '/repo/page', workspaceIdentity: 'ws-page'}];
-    await client.start();
-    const ours = client._bridges['ws-page'];
-    assert.ok(ours, 'we opened a bridge for it first');
+test('pageBridgeSessionIds 反查页面桥 id：两条活入口都能建表，且不静默丢项', () => {
+    // 4c（2026-09-18）改写：原用例用 `start()` 造一座"壳自己的桥"，来验证
+    // "不许把自己的桥交出去"这一半。开桥路已删 ⟹ 只读壳下**不存在**壳自己的桥，
+    // 那条断言的**构造手段**没有了（不是断言错了）。改由**两条活入口**建表
+    // （这正是 inject.js 的 degrade_test 真正依赖的性质），并把
+    // "交出去的东西一项不漏"继续钉住。
+    const {client} = makeClient();
 
-    // The page opens its own bridge for the same workspace: a ready frame for an
-    // id we never requested is the only way to tell the two apart.
-    client.acceptObservedPayload({
-        zcode_type: 'workspace-bridge-ready',
-        bridgeSessionId: 'page-bridge-1',
-        bridge: {bridgeSessionId: 'page-bridge-1', workspaceKey: 'ws-page'}
-    }, false);
-
-    // Then the desktop refuses ours. Page-held AND refused is the evidence pair;
-    // a bare fault must not be treated as proof (that would lose coverage).
-    client.acceptPayload({
-        zcode_type: 'bridge-degraded',
-        bridgeSessionId: ours.bridgeSessionId,
-        reason: 'rpc-transport-fault'
-    });
-
-    assert.strictEqual(client._pageOwned['ws-page'], true, 'marked page-owned');
-    assert.strictEqual(Object.keys(client._bridges).length, 0, 'our duplicate was dropped');
-    assert.ok(logs.some((m) => m.includes('桌面端拒绝我们的重复 bridge')));
-    assert.ok(!logs.some((m) => m.indexOf('reopening') === 0), 'no reopen loop');
-});
-
-test('pageBridgeSessionIds exposes the page bridge id per workspace and skips our own', async () => {
-    const {client, desktop} = makeClient({log: () => {}});
-    desktop.workspaces = [{workspacePath: '/repo/ours'}, {workspacePath: '/repo/theirs'}];
-    await client.start();
-    assert.ok(client._bridges['/repo/ours'], 'our own bridge exists');
-
-    // The page opens its own bridge for a workspace: a ready frame for an id we
-    // never requested. This id is what a forged bridge-degraded frame must carry
-    // (the page matches it against its own bridge object).
+    // 活入口 ①：入站 `workspace-bridge-ready`（acceptObservedPayload 直接写 `_bridgeWorkspace`）。
     client.acceptObservedPayload({
         zcode_type: 'workspace-bridge-ready',
         bridgeSessionId: 'page-bridge-9',
         bridge: {bridgeSessionId: 'page-bridge-9', workspaceKey: '/repo/theirs'}
     }, false);
+    assert.deepStrictEqual(client.pageBridgeSessionIds(), {'/repo/theirs': 'page-bridge-9'},
+        '① 只喂 workspace-bridge-ready，反查表就要建起来');
 
-    const ids = client.pageBridgeSessionIds();
-    assert.strictEqual(ids['/repo/theirs'], 'page-bridge-9',
-        'the page bridge id is exposed for the degrade path');
-    assert.strictEqual(ids['/repo/ours'], undefined,
-        'our own bridges must never be mistaken for the page bridge');
-});
-
-test('the first fault on a workspace is not reopened (the shipped default)', async () => {
-    const logs = [];
-    // No maxReopensPerBridge override: the default is 0, i.e. one strike per
-    // relay connection. Field evidence (2026-09-12) is that reopening does not
-    // help a refused workspace — it "recovers" and faults again 40–75 s later, at
-    // 4 RPCs per attempt, on the socket the page is using. The retry belongs to
-    // the next relay connection, not to this one.
-    const {client, desktop} = makeClient({log: (message) => logs.push(message)});
-    desktop.workspaces = [{workspacePath: '/repo/flaky'}];
-    await client.start();
-    const ours = client._bridges['/repo/flaky'];
-
-    client.acceptPayload({
-        zcode_type: 'bridge-degraded',
-        bridgeSessionId: ours.bridgeSessionId,
-        reason: 'rpc-transport-fault'
-    });
-
-    assert.strictEqual(Object.keys(client._bridges).length, 0, 'forgotten, not retried');
-    assert.ok(logs.some((m) => m.includes('本次连接放弃重开')));
-    assert.ok(!logs.some((m) => m.indexOf('reopening') === 0), 'and it did not reopen');
-});
-
-test('a workspace the desktop refuses on every connection goes on cooldown', async () => {
-    const logs = [];
-    // The real shape: a relay rebuild replaces the client but keeps the state
-    // object, so the fault history has to live there. Otherwise every rebuild
-    // hands the refused workspace a clean slate and the loop never ends — the
-    // field log showed exactly that on `default`, faulting every ~45 s.
-    const shared = {};
-    const refuse = (client) => {
-        const ours = client._bridges['/repo/refused'];
-        assert.ok(ours, 'the bridge is open before the desktop refuses it');
-        client.acceptPayload({
-            zcode_type: 'bridge-degraded',
-            bridgeSessionId: ours.bridgeSessionId,
-            reason: 'rpc-transport-fault'
-        });
-    };
-    for (let i = 0; i < 3; i += 1) {
-        const made = makeClient({
-            log: (message) => logs.push(message),
-            maxReopensPerBridge: 0,
-            sharedState: shared
-        });
-        made.desktop.workspaces = [{workspacePath: '/repo/refused'}];
-        await made.client.start();
-        refuse(made.client);
+    // 活入口 ②：页面自己的出站 REQ_EVENT_LISTEN（走 _observeOutboundRpc，
+    // 同样写 _bridgeWorkspace）。原用例没覆盖它，而 degrade_test 两条路都吃。
+    const {client: isolated} = makeClient();
+    const listen = encodeBody(
+        [P.REQ_EVENT_LISTEN, 7, 'zcode-agent', P.EVENT_SESSIONS_INDEX],
+        {workspacePath: '/repo/pageonly', workspaceIdentity: 'ws-pageonly'}
+    );
+    for (const payload of fragment(listen, 'page-bridge-listen', 1)) {
+        isolated.acceptObservedPayload(payload, true);
     }
-    assert.ok(
-        logs.some((m) => m.includes('冷却 /repo/refused')),
-        'three consecutive connections must back the workspace off'
-    );
+    assert.deepStrictEqual(isolated.pageBridgeSessionIds(), {'ws-pageonly': 'page-bridge-listen'},
+        '② 只喂一条出站 listen，反查表也要建起来');
 
-    // The next connection skips it, but still covers everything else.
-    const fourth = makeClient({log: (m) => logs.push(m), sharedState: shared});
-    fourth.desktop.workspaces = [
-        {workspacePath: '/repo/refused'},
-        {workspacePath: '/repo/healthy', workspaceIdentity: 'ws-ok'}
-    ];
-    await fourth.client.start();
+    // 页面桥**换 id**（同一工作区又来一条 ready）⟹ 反查表跟到"最后一次被观察到"的那个。
+    client.acceptObservedPayload({
+        zcode_type: 'workspace-bridge-ready',
+        bridgeSessionId: 'page-bridge-10',
+        bridge: {bridgeSessionId: 'page-bridge-10', workspaceKey: '/repo/theirs'}
+    }, false);
+    assert.deepStrictEqual(client.pageBridgeSessionIds(), {'/repo/theirs': 'page-bridge-10'},
+        '同一工作区换桥 ⟹ 反查表跟到最新那个 id（degrade_test 打的就是它）');
+
+    // 替代守卫（原②的位置）：反查表必须覆盖 `_bridgeWorkspace` 里的每一个工作区，
+    // 不再因为"要跳过壳自己的桥"而静默丢项。
     assert.deepStrictEqual(
-        fourth.desktop.subscriptions.map((s) => s.scope.workspaceIdentity),
-        ['ws-ok'],
-        'the cooled workspace is skipped, healthy coverage is untouched'
+        Object.keys(client.pageBridgeSessionIds()).sort(),
+        Array.from(new Set(Object.values(client._bridgeWorkspace))).sort(),
+        '反查表是 _bridgeWorkspace 的满射：一项都不许静默丢掉'
     );
 });
 
-test('a cooled-down workspace is retried once the cooldown expires', async () => {
-    // A back-off, not a permanent drop: a desktop that was unreachable for a
-    // while must not cost notification coverage forever.
-    const shared = {cooldownUntil: {'/repo/refused': Date.now() - 1}};
-    const {client, desktop} = makeClient({sharedState: shared});
-    desktop.workspaces = [{workspacePath: '/repo/refused'}];
-    await client.start();
-    assert.strictEqual(desktop.subscriptions.length, 1, 'an expired cooldown means try again');
-    assert.ok(client.sharedState().cooldownUntil, 'and the map keeps travelling with the state');
-});
+test('共享态必须被「附着」而非「读取复制」（attached, not read）', () => {
+    // 4c（2026-09-18）改写：原用例拿 `_pageOwned` 当载体，那台机器已随桥路由子系统
+    // 删除。但**要保住的回归点一个字没变**：构造函数必须"附着"调用方给的共享 map，
+    // 而不是 `x = shared.x || {}` ——后者会在调用方对象暂时没有该键时**悄悄给出一个
+    // 私有 map**，于是知识随客户端一起死（真机上发生过；单测因为总是显式建好
+    // state 对象而完全看不出来）。载体换成**仍活着**的两张表：
+    // `_bridgeWorkspace` 与 `_passive`（两者都在 sharedState() 的返回里）。
 
-test('page-held evidence survives a relay rebuild (attached, not read)', async () => {
-    // Regression for a silent one: the constructor read the page-owned maps with
-    // `shared.pageOwned || {}`, so a caller object that did not carry the key yet
-    // left the client with a PRIVATE map — the knowledge died with the client in
-    // the real app, while the explicit sharedState() juggling in the tests hid it.
+    // ① 传入**不带任何键**的空对象：这两张表必须与调用方对象是**同一个引用**。
+    //    （这正是原事故的精确形态，原用例没有直接钉。）
+    const bare = {};
+    const a = makeClient({sharedState: bare});
+    assert.strictEqual(a.client._bridgeWorkspace, bare.bridgeWorkspace,
+        '空对象传入时也必须附着：client._bridgeWorkspace === shared.bridgeWorkspace');
+    assert.strictEqual(a.client._passive, bare.passive,
+        '空对象传入时也必须附着：client._passive === shared.passive');
+
+    // ② 用**活入口**往这两张表里写东西，再让第二个客户端接同一份共享态。
     const shared = {};
     const first = makeClient({sharedState: shared});
-    first.desktop.workspaces = [{workspacePath: '/repo/page', workspaceIdentity: 'ws-page'}];
-    await first.client.start();
-    const ours = first.client._bridges['ws-page'];
-
     first.client.acceptObservedPayload({
         zcode_type: 'workspace-bridge-ready',
         bridgeSessionId: 'page-bridge-1',
         bridge: {bridgeSessionId: 'page-bridge-1', workspaceKey: 'ws-page'}
     }, false);
-    first.client.acceptPayload({
-        zcode_type: 'bridge-degraded',
-        bridgeSessionId: ours.bridgeSessionId,
-        reason: 'rpc-transport-fault'
-    });
-    assert.strictEqual(first.client._pageOwned['ws-page'], true, 'marked page-owned');
+    pageFollows(first.client, 'page-bridge-1', 11, 3,
+        {workspacePath: '/repo/page', workspaceIdentity: 'ws-page'});
+    assert.strictEqual(first.client._bridgeWorkspace['page-bridge-1'], 'ws-page');
+    assert.ok(first.client._passive['ws-page'], '活入口②建起了 _passive 项');
 
-    const second = makeClient({sharedState: shared});
-    second.desktop.workspaces = [{workspacePath: '/repo/page', workspaceIdentity: 'ws-page'}];
-    await second.client.start();
-    // 2026-09-13 语义更新：覆盖证据按连接代次（_pageCoveredKeys，per-client），
-    // 共享的 pageOwned 不再让新连接无限让位——socket 重建后页面 runtime 不重建
-    // （僵尸订阅），壳必须接管。本断言保留的回归点是：共享 map 必须被"附着"
-    // 引用而非读取复制（attached, not read），_pageOwned 的知识要跨客户端可见。
-    assert.strictEqual(second.client._pageOwned['ws-page'], true,
-        'the shared page-owned map is attached, not copied');
-    assert.strictEqual(
-        second.desktop.subscriptions.length,
-        1,
-        'without same-connection page evidence the shell takes the workspace over'
-    );
+    const second = makeClient({sharedState: first.client.sharedState()});
+    assert.strictEqual(second.client._bridgeWorkspace['page-bridge-1'], 'ws-page',
+        '共享的 _bridgeWorkspace 跨客户端可见');
+    assert.ok(second.client._passive['ws-page'], '共享的 _passive 跨客户端可见');
+    // 比原用例更严：不只是"值相等"，而是**同一个 map 对象**。
+    assert.strictEqual(second.client._bridgeWorkspace, first.client._bridgeWorkspace,
+        'attached, not read —— 两个客户端必须共用同一个 map 对象');
+    assert.strictEqual(second.client._passive, first.client._passive,
+        'attached, not read —— _passive 同理');
 });
 
 test('in-flight page RPCs are visible, so the burst can wait for them', () => {
@@ -792,32 +819,6 @@ test('in-flight page RPCs are visible, so the burst can wait for them', () => {
         client.acceptObservedPayload(payload, false);
     }
     assert.strictEqual(client.inFlightPageRpcs(), 0, 'and it clears when answered');
-});
-
-test('the burst yields while a page request is in flight, but not past its budget', async () => {
-    const {client} = makeClient();
-    const bridge = 'page-bridge-y';
-    const request = encodeBody([P.REQ_PROMISE, 5, 'zcode-agent', 'openConversationV4'], {});
-    for (const payload of fragment(request, bridge, 1)) {
-        client.acceptObservedPayload(payload, true);
-    }
-    assert.strictEqual(client.inFlightPageRpcs(), 1);
-
-    // A deadline already in the past resolves at once: the budget is what stops
-    // a page that is never idle from stretching the burst.
-    await client.awaitPageIdle(Date.now() - 1);
-
-    // Otherwise it resumes as soon as the reply lands, rather than waiting the
-    // budget out.
-    const started = Date.now();
-    const waiting = client.awaitPageIdle(Date.now() + 5000);
-    await new Promise((r) => setTimeout(r, 30));
-    const ok = encodeBody([P.RES_PROMISE_SUCCESS, 5], {ok: true});
-    for (const payload of fragment(ok, bridge, 2)) {
-        client.acceptObservedPayload(payload, false);
-    }
-    await waiting;
-    assert.ok(Date.now() - started < 3000, 'resumed as soon as the page was idle');
 });
 
 test('onPageRpcCall hands the page\'s outbound call name and args to the shell', () => {
@@ -865,17 +866,22 @@ test('onPageRpcResult hands the page call outcome to the shell', () => {
     assert.deepStrictEqual([results[1].ok, results[1].message], [false, 'disk full']);
 });
 
-test('lastPageBridgeTrafficAt：页面桥入站 rpc-frame 盖章，我方桥与出站不盖', () => {
+test('lastPageBridgeTrafficAt：页面桥入站 rpc-frame 盖章，出站不盖', () => {
     const {client} = makeClient();
     assert.strictEqual(client.lastPageBridgeTrafficAt(), 0, 'nothing seen yet');
 
-    // 我方桥（已登记在 _bridgesById）的入站帧：在盖章点之前就 return。
-    client._bridgesById['shell-bridge-own'] = {workspaceKey: 'ws-own'};
-    const ownBody = encodeBody([P.RES_PROMISE_SUCCESS, 41], {ok: true});
-    for (const payload of fragment(ownBody, 'shell-bridge-own', 1)) {
+    // 4c（2026-09-18）改写：这里原来先往 `_bridgesById` 里塞一条假桥，验证
+    // "我方桥的入站帧不盖章"。那张表已随桥路由子系统删除 ⟹ 只读壳下**不存在**
+    // "壳自己的桥"，那个守卫**无可守对象**（与 CHANGE-PLAN §七「4b 退役
+    // liveTaskSink 那一臂」同型：闸刀与它守护的机器一并删除）。
+    // 原②的语义因此**不是丢了，是没有对象了**；替代断言是它的可观察后果——
+    // 入站帧一律盖章，不再按 bridgeSessionId 区分是谁的桥。
+    const unseenBody = encodeBody([P.RES_PROMISE_SUCCESS, 41], {ok: true});
+    for (const payload of fragment(unseenBody, 'never-observed-bridge', 1)) {
         client.acceptObservedPayload(payload, false);
     }
-    assert.strictEqual(client.lastPageBridgeTrafficAt(), 0, 'our own bridges must not stamp');
+    assert.ok(client.lastPageBridgeTrafficAt() > 0,
+        '任何 bridgeSessionId 的入站 rpc-frame 都盖章（不再有"我方桥"这一格）');
 
     // 页面桥的入站 rpc-frame：盖章。
     const okBody = encodeBody([P.RES_PROMISE_SUCCESS, 42], {rows: []});
@@ -1040,69 +1046,16 @@ test('conversation text: real-shape deltas append to the tracked row', () => {
     assert.strictEqual(client.latestConversationText().text, '开头，接着写');
 });
 
-test('conversation candidates: the live native seed wins over the snapshot', () => {
-    const {client} = makeClient();
-    client.nativeRunningSessions = {'ws-live': ['sess_stale']};
-    client.nativeRunningSessionsProvider = () => ({'ws-live': ['sess_live']});
-    assert.deepStrictEqual(client._conversationCandidates('ws-live'), ['sess_live']);
-    assert.deepStrictEqual(client._conversationCandidates('ws-unknown'), []);
-});
-
 // ---------------------------------------------------------------------------
-// 对话流的看门狗与主动重锚
-//
-// 这一组照抄 `E:\zemote\lib\protocol\conversation.dart:1048-1068 / 943-968` 的契约：
-// 网页端**不做**周期性 resync，所以桌面端一安静页面就停住（前台也一样）；zemote 靠
-// "10s 一跳、静默 20s、且会话确实在跑 → resyncConversationV4{forceSnapshot:true, base}"
-// 主动要快照，才做到连续稳定。这里把那条契约钉住，免得以后又被改回被动等推送。
+// 4c（2026-09-18）：这里原来还有一组「对话流的看门狗与主动重锚」测试（8 项）
+// 与它们的两个夹具（fakeConversationBridge / fakeConversationSub）。它们钉的是
+// **壳自己订阅对话流**那一簇（_subscribeConversationsBeforeIndex →
+// _subscribeOneConversation → _acceptConversationFrame → _startConversationWatchdog
+// → _conversationWatchdogTick → _resyncConversation）：该簇自 2026-09-15 起被
+// `CONVERSATION_SUBSCRIBE_ENABLED = false` 封死，2026-09-18 连同它被删。
+// 「页面的流照旧、我们从入站帧里读正文」这一半仍然活着，覆盖在下面的
+// 「对话流 → 卡片正文」组里（_trackConversationText / latestConversationText）。
 // ---------------------------------------------------------------------------
-
-/** 假 bridge：记录 channels.call 的参数，便于断言重锚请求的内容。 */
-function fakeConversationBridge(key) {
-    const calls = [];
-    return {
-        key: key,
-        scope: {workspacePath: 'E:\\fake-' + key, workspaceIdentity: 'fake-' + key},
-        calls: calls,
-        channels: {
-            call: (channel, method, args) => {
-                calls.push({channel: channel, method: method, args: args});
-                return Promise.resolve({});
-            },
-            addEventListener: () => ({dispose() {}})
-        }
-    };
-}
-
-function fakeConversationSub(bridge, overrides) {
-    return Object.assign({
-        key: bridge.key,
-        sessionId: 'sess_1',
-        bridge: bridge,
-        subscriptionId: 'sub-A',
-        logEpoch: null,
-        seq: 0,
-        lastFrameAt: Date.now(),
-        lastTextAt: 0,
-        lastResyncAt: 0,
-        resyncCount: 0,
-        resyncing: false
-    }, overrides || {});
-}
-
-test('conversation frames are filtered by subscriptionId', () => {
-    const {client} = makeClient();
-    const sub = fakeConversationSub(fakeConversationBridge('ws-filter'));
-    // 别的订阅的帧（两条会话同时订阅时会落在同一个事件通道上）必须丢掉。
-    client._acceptConversationFrame(sub, {
-        topic: 'conversation/sess_1', subscriptionId: 'sub-B', payload: {}
-    });
-    assert.strictEqual(client._convFrames || 0, 0, '不是自己订阅的帧不能算');
-    client._acceptConversationFrame(sub, {
-        topic: 'conversation/sess_1', subscriptionId: 'sub-A', payload: {}
-    });
-    assert.strictEqual(client._convFrames, 1, '自己订阅的帧要收下');
-});
 
 test('conversationFrameStats 报出"最后一帧距今多久"（承载提前接管的判据）', () => {
     const {client} = makeClient();
@@ -1112,103 +1065,22 @@ test('conversationFrameStats 报出"最后一帧距今多久"（承载提前接�
         -1,
         '没见过会话帧时必须报 -1，不能报 0（0 会被误读成"刚刚还在收"）',
     );
-    const sub = fakeConversationSub(fakeConversationBridge('ws-ago'));
-    client._acceptConversationFrame(sub, {
-        topic: 'conversation/sess_1', subscriptionId: 'sub-A', payload: {}
-    });
-    const ago = client.conversationFrameStats().lastFrameAgoMs;
+    // 4c（2026-09-18）改写：这条测试**守的是活函数**（`inject.js` 的 reportLiveness
+    // → ShellRuntime 的"提前接管"判据），所以只能换**构造手段**、不能删。
+    // 原来借 `_acceptConversationFrame` 喂一帧——那个函数随对话自订阅簇删了。
+    // 换成同样活着的入站入口 `_trackConversationText`（`_observeInboundRpc` 在被动路
+    // 上就是这么调它的），它才是 `_convFrames`/`_convLastFrameAt` 的**唯一活写点**。
+    // 连带：`subs`/`resyncs` 随订阅簇恒为 0，但**字段必须还在**——
+    // inject.js 的「页面开销」行会读它们，字段缺失会在真机日志里打印 undefined。
+    const stats = client.conversationFrameStats();
+    assert.strictEqual(stats.subs, 0, '订阅簇已删 ⟹ subs 恒 0（字段仍在）');
+    assert.strictEqual(stats.resyncs, 0, '订阅簇已删 ⟹ resyncs 恒 0（字段仍在）');
+    client._trackConversationText(convSnapshot('conversation/sess_1', [
+        {kind: 'assistantText', rowId: 1, text: '正文'}
+    ]));
+    const after = client.conversationFrameStats();
+    const ago = after.lastFrameAgoMs;
     assert.ok(typeof ago === 'number' && ago >= 0 && ago < 5_000, `刚收到的帧年龄应接近 0，实际 ${ago}`);
-});
-
-test('a sequence gap triggers an immediate conversation resync with its位点', () => {
-    const {client} = makeClient();
-    const bridge = fakeConversationBridge('ws-gap');
-    const sub = fakeConversationSub(bridge, {logEpoch: 'ep-1', seq: 5});
-    client._acceptConversationFrame(sub, {
-        topic: 'conversation/sess_1', subscriptionId: 'sub-A',
-        fromSeq: 9, toSeq: 12, payload: {}
-    });
-    assert.strictEqual(bridge.calls.length, 1, '跳号必须立刻重锚（不等看门狗）');
-    assert.strictEqual(bridge.calls[0].method, 'resyncConversationV4');
-    const args = bridge.calls[0].args[0];
-    assert.strictEqual(args.forceSnapshot, true, '要的是完整快照');
-    assert.deepStrictEqual(args.base, {logEpoch: 'ep-1', seq: 5}, '要带上自己的位点');
-    assert.strictEqual(sub.seq, 12, '位点随后推进到 toSeq');
-});
-
-test('a resync without a baseline sends base: null (never an omitted field)', () => {
-    const {client} = makeClient();
-    const bridge = fakeConversationBridge('ws-base');
-    const sub = fakeConversationSub(bridge, {logEpoch: null});
-    client._resyncConversation(sub, 'test');
-    const args = bridge.calls[0].args[0];
-    // 桌面端的 zod schema 是 `.nullable()` 而不是 `.optional()`：省略会被拒收
-    // （`expected object, received undefined`）——README 记过的真机定案。
-    assert.ok('base' in args, 'base 字段必须存在');
-    assert.strictEqual(args.base, null, '无基线要显式传 null');
-});
-
-test('the conversation watchdog resyncs a quiet but active conversation', () => {
-    const {client} = makeClient();
-    const bridge = fakeConversationBridge('ws-quiet-active');
-    const sub = fakeConversationSub(bridge, {
-        lastFrameAt: Date.now() - 25000,        // 静默 25s > 20s
-        lastTextAt: Date.now() - 1000           // 正文刚还在涨 → 视作在跑
-    });
-    client._convSubs = {sess_1: sub};
-    client._conversationWatchdogTick();
-    assert.strictEqual(bridge.calls.length, 1, '静默且在跑 → 主动要一份快照');
-    assert.strictEqual(sub.resyncCount, 1);
-});
-
-test('the conversation watchdog leaves an idle conversation alone', () => {
-    const {client} = makeClient();
-    const bridge = fakeConversationBridge('ws-idle');
-    // 静默很久，但正文早就停了、会话索引里也没有它 → 不该折腾。
-    const sub = fakeConversationSub(bridge, {
-        lastFrameAt: Date.now() - 60000,
-        lastTextAt: 0
-    });
-    client._convSubs = {sess_1: sub};
-    client._conversationWatchdogTick();
-    assert.strictEqual(bridge.calls.length, 0, '没在跑就别重锚');
-});
-
-test('the conversation watchdog is throttled and circuit-broken', () => {
-    const {client} = makeClient();
-    const bridge = fakeConversationBridge('ws-throttle');
-    const sub = fakeConversationSub(bridge, {
-        lastFrameAt: Date.now() - 25000,
-        lastTextAt: Date.now() - 1000,
-        lastResyncAt: Date.now()            // 刚重锚过 → 节流窗口内
-    });
-    client._convSubs = {sess_1: sub};
-    client._conversationWatchdogTick();
-    assert.strictEqual(bridge.calls.length, 0, '节流窗口内不重复重锚');
-
-    // 熔断：连续多次重锚都没换来帧就停手，等帧自己回来（帧到了会把计数清零）。
-    sub.lastResyncAt = 0;
-    sub.resyncCount = 5;
-    client._conversationWatchdogTick();
-    assert.strictEqual(bridge.calls.length, 0, '到上限就熔断');
-
-    // 并发幂等：正在重锚时不叠加第二次。
-    sub.resyncCount = 0;
-    sub.resyncing = true;
-    client._conversationWatchdogTick();
-    assert.strictEqual(bridge.calls.length, 0, 'resyncing 期间不叠加');
-});
-
-test('conversation candidates: a failing provider falls back, and the cap holds', () => {
-    const {client} = makeClient();
-    // 桥没了（config() 抛了）→ 退回创建时的快照，不能让异常冒出去。
-    client.nativeRunningSessions = {'ws-fb': ['sess_fb']};
-    client.nativeRunningSessionsProvider = () => {
-        throw new Error('bridge gone');
-    };
-    assert.deepStrictEqual(client._conversationCandidates('ws-fb'), ['sess_fb']);
-    // 一次最多订 CONVERSATION_MAX 条：卡片只显示得下少数几张，多订只是白烧桌面端。
-    client.nativeRunningSessionsProvider = () => ({'ws-cap': ['s1', 's2', 's3']});
-    assert.deepStrictEqual(client._conversationCandidates('ws-cap'), ['s1', 's2']);
+    assert.strictEqual(after.frames, 1, '帧计数独立于"有没有解出正文"取');
 });
 
