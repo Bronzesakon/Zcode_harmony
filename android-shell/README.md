@@ -56,7 +56,7 @@
 
 ## 项目现状（先读这一节）
 
-**一句话**：主体功能已落地，测试全绿（**JS 82 项 + Kotlin 122 项**，2026-09-18 全仓清理后实测）；真机当前跑的是**本机出的 `1.0.0-local.186`**
+**一句话**：主体功能已落地，测试全绿（**JS 82 项 + Kotlin 122 项**，2026-09-18 全仓清理后实测）；真机当前跑的是**本机出的 `1.0.0-local.191`**
 （本机出包、同签名 `adb install -r` 覆盖安装、**不消耗 CI**）。`pre` 每次推送会把最新 APK **覆写**到滚动预发布
 [android-pre](https://github.com/Bronzesakon/Zcode_harmony/releases/tag/android-pre)（固定直链 `…/releases/download/android-pre/zcode-remote.apk`）。
 **路线**：走**平台路径**（标准 Android 16 Live Updates，ColorOS 16 渲染为流体云），不走 OPPO 泛在服务卡片框架。
@@ -825,6 +825,366 @@ MSYS_NO_PATHCONV=1 "$ADB" devices -l                 # 确认出现设备
 | `app/src/main/res/` | 资源；应用图标直接复用鸿蒙工程的图层 |
 
 ---
+## 死代码清理收口与鸿蒙移植把手（2026-09-18 四批 · 自包含）
+
+> **一句话状态**：`android-shell` 历史积累的死代码已于 2026-09-18 分 **4 批**系统性清掉，**每批跑全套门禁、第 3/4 批每项各自独立真机回归**；
+> 收口门禁为 **JS 82 项（`protocol` 37 + `inject` 45）/ Kotlin 单测 122 项 · 12 类 · 0 失败 / `lintRelease` 0 error · 36 warning / 编译器警告 0 /
+> 结构检查 42 文件 / 资源检查 25 文件**；设备装 **`1.0.0-local.187`**；清理轮的代码改动提交为 **`b627610`**（40 文件，+2247/−2743，只含 `android-shell/` + 根 `.gitignore`）。
+> ⚠️ **工作区不是干净的**：`b627610` 之后**还有一轮新功能（点通知/流体云卡片 → 进任务详情页，4 个文件）尚未提交**，本文第 5 小节把它当作"机制把手"写进去了——**别把本节读成"全部改动都已入库"**。
+> **本节怎么用**：新会话读完就知道「哪些东西已经删了（别再找、别再当死代码审一遍）」「哪些绝不能删」「改代码会踩什么坑」「往鸿蒙搬要抓哪几处把手」。
+> **详档在哪**：`E:\Zcode_harmony\docs\12-安卓壳死代码清理-结论与决策档.md`（结论/决策台帐/四条陷阱的完整版）与
+> `E:\Zcode_harmony\docs\13-安卓壳真机回归与两个自查缺陷.md`（真机判据与两个缺陷的现场日志）——**两者都是本地文件、不进 git，必须手动拷贝**（见本节第 7 小节）。
+> **本节自包含**：下面每条结论都写在这里，链接只用于"要更多细节时往哪翻"。
+
+### 1. 这一轮到底做了什么（数字都是实测的，按口径读）
+
+**四批的内容与结果**（每批各跑一次全套门禁；第 3/4 批每项各自独立真机回归；**四批的代码改动最后合并为一次提交 `b627610`**，不是每批一个提交）：
+
+| 批 | 做了什么 | 结果与关键数字 |
+| --- | --- | --- |
+| **1** | 文档订正 24 处 + 四个独立问题：**G1** 设置页样式 API 越界（拆 `values-v28`/`values-v31`）、**G2** 注入就绪位只上锁不解锁（修 + 抽出可测的 `core/InjectionReadiness.kt`）、**G3** debug 快捷方式包名、**G4** 抑制 `StaticFieldLeak` 误报、**G7** 删废弃 API | 全绿；**`lintRelease` 由 3 error → 0** |
+| **2** | 机械清理：**A 级 30 条**（零行为变更）+ **B 级 4 条**（删需同批改断言）+ **C 级 14 条**（只标注/归位） | 全绿；**APK −702 KB（−10.8%）**：6,691,869 → 5,972,568 字节 |
+| **3** | **C14** 两条诊断入口的重复外壳合并（**两条入口一个都不删**）+ 冷启动注册顺序 + 三处连带注释 | 全绿 + **真机 5 步全通过**（冷启动首条命令在被合并后**仍到达**） |
+| **4** | **4a** 删 controller 原生订阅接线 → **4b** 删卡死看门狗决策机器（体征改挂心跳）→ **4c** 删桥路由子系统 + 对话自订阅簇 | 全绿 + **三项各自独立真机回归通过** + **两个自查缺陷已修** |
+
+**删掉的代码行数**（当时的权威实测，行号会漂，只作量级参考）：`core/RelayBridge.kt` 1514 → **1342**（4a）、`core/Tier2Probe.kt` 940 → **927**、
+`ShellRuntime.kt` 1892 → **1897**、`assets/inject.js` 3714 → **3558**（4b，`git diff --numstat` 口径 **+137/−293**，**这是权威值**；
+⚠️ 4b 落地记录里另写的"3577"与它对不上，**以 `--numstat` 为准**）、`assets/zcode-protocol.js` 桥路由子系统 **≈280 行**、
+注入层看门狗 **≈267 行核心 + 7 处伴生 ≈ 295 行**、Kotlin 侧 `pagevitals` 分支 8 行。
+
+**测试数怎么变的（⚠️ 只有最后一行是现行口径）**：审计基线 Kotlin **111/11 类**、lint **3 error/41 warning** → 第 3 批末 **protocol 52 / inject 45、Kotlin 114/12 类、lint 0 error** →
+4c-B 之前 **protocol 56**（4c 前置新增了缺口检出的测试）→ **收口：protocol 37 / inject 45（JS 共 82）、Kotlin 122/12 类**。
+JS 项数下降是**删掉压在已死桥路由表面上的用例**并**把混合用例改写到活表面**的结果，不是保护变薄；
+**数字一律以实跑输出为准，不要照抄别处的数字**（本项目历史上多次出现"文档里的测试数与实测不符"）。
+
+**真机回归与两个自查缺陷**（后者是回归期间撞出来的，不在原计划里）：三项各出一个隔离包 —— **181**（仅 4a，JS 资产回退到批次前）、
+**182**（4a+4b）、**183**（全部）；隔离之所以只需回退两个 JS 资产，是因为 4c 的 Kotlin 侧改动**可证惰性**（`TaskStore.guardStaleDowngrade` 的入口条件依赖只由带 `stale` 字段的帧填充的 `staleSince`）。
+回归中撞出并当场修掉：
+
+- **缺陷 A**：承载若在**应用处于后台时**被停掉（`tier2_stop`/`carrier_off`/探针自停，任何非"回前台交还"的路径），而页面此时已被 KICK，
+  则**回前台后页面永远不会恢复**（用户看到"App 打开是死的"，只能 `force-stop`）。根因：兜底重载只写在"回前台那一刻 `Tier2Probe.isRunning()` 仍为真"那一条路上，
+  且页面在接管前就 `dispose` 掉 socket 时它**永远收不到 `KICKED` 帧**、注入层那条自愈也不会触发。
+  修法：新增 `carrierRanThisStint`（自上次回前台以来壳是否启动过承载）+ 一条**关键分支判据日志** `后台原生承载：回前台安排兜底检查…——来路=…`。
+  真机决定性验证：`20:45:46 … 来路=承载已在后台停掉` → `20:45:48.290 网页加载完成(第 1 次回调)，用时 432 ms` → `relay socket open (#1)`（旧代码此刻什么都不做）。
+- **缺陷 B**：4c 的 `会话清单已自愈` 日志**逐帧刷屏**（判据只看"改前为真"、不看"改后为假"），4 分钟数百条，**把 512 KB 的日志反复顶到轮转 = 摧毁排障历史**（父代理为此被骗过两次）。
+  修法：判据改成**真跃迁**（改前为真 **且** 改后为假）；真机同一现场 数百条 → **0 条**，日志 161 KB 平稳增长。
+  **钉住这条语义的单测已补**，在 `tools/protocol.test.js` 的 `被动：跃迁语义——应用成功但 stale 未解除不许记「已自愈」，且两个方向各恰好一次`（该文件 `:549` 一带），
+  且**用计数断言**（不是 `logs.some(...)`——它对"记 1 次"和"记 100 次"同样成立）⇒ 旧判据下必红、新判据下绿（双向取证）。**动这段判据前先跑它。**
+
+**本轮"改动过在跑行为"的地方只有 7 处**（其余删除都属"零读者级"，全仓 grep 找不到读它的人，且门禁与真机回归都不受影响）：
+① 设置页样式按系统版本拆目录；② 接回**注入就绪位复位**（修一个真 bug）；③ 诊断入口合并 + 注册顺序；④ **页面体征改挂心跳**（新增接线）；
+⑤ 4c-A 的**陈旧检出 + 防降级规则**（用户批准的唯一一处新增行为，真机上自然触发过）；⑥ 缺陷 A 的恢复路径（新增）；
+⑦ 移除 `bridges=` 假指标（改一行诊断读数，去掉一个恒 0 的假读数）。
+
+**禁区全程未被突破**：`SHELL_READ_ONLY`、`healDeadLinkOnResume`、`heartbeatTick`、两个未编号的后台保活块、`closeRelaySocketOnNudge`、
+`TaskStore.applyLiveTasks`、`ControllerTasksState`、`TaskStore.Workspace` 的三个形状字段、`appVersion = "3.6.5"` —— **一处都没动**。
+**并且有一道"硬门"实际拦下了一次误删**：4c-B 清点原以为要拔的"跨 4 文件一条链"实测是**两股独立数据流**，其中**原生→原生那一股活着且承重**，
+所以只删了 JS 侧那一股（详见第 3 小节最后一条）。
+
+### 2. 删了什么、为什么它是死的、别再加回来（**按功能域分组**）
+
+> 判"死"的证据标准：**零引用检索 + 逐成员调用方分类**；"读得动但没人读"与"真的不可达"分开定级。
+> 下面每条都按「功能域 → 删了什么 → 为什么它是死的 → 别再加回来（怎么一眼认出有人在走回头路）」写。
+
+**(a) 页面卡死看门狗（注入层 §5c + 原生 `pagevitals` 分支）**
+删掉的是"点进任务长时间不出内容时，壳要不要动手救页面"这整台**决策机器**：布防 / 3 秒判定 / 3 秒到顶的天梯、1 秒巡检定时器、
+僵尸订阅判据、`gaveUp` 闩锁、重载计数与上限常量、`sessionStorage` 往返、以及原生的 `pagevitals` 处理分支（**≈295 行 JS + 8 行 Kotlin**）。
+**为什么它是死的**：只读壳（`inject.js` 的 `var SHELL_READ_ONLY = true`，全文件**只有这一处赋值**）定案后，四个"动手"终点
+（`forceReconnect` / `nudgeReconnect` / `reloadForMissingConversation` / `stallReloadIfAllowed`）**实现体早已删空，只剩一行日志 + `return false`**，
+而**机器还在跑**：`setInterval(conversationStreamStallTick, 1000)` 全仓**没有 `clearInterval` 清它**，整套梯子的全部效果只有 3 类日志 + 一个 `pagevitals` 帧，
+原生收到后**只 `Diagnostics.log` 一行、不做任何判断**。
+**别再加回来**：① **把 `SHELL_READ_ONLY` 改回 `false` 也恢复不了动手能力**（实现体不在了）——"留开关以便做对照实验"这个理由**已不成立**；
+② 删掉的是**机器**，不是**量具**：`readVitals` / `vitalsStalled` / `postPageVitals` / `STALL_RELOAD_MS` 全部保留，
+体征上报**改挂在后台心跳上**（卡态边沿立即一帧 `why=stalled`、其余每 **60s** 一帧 `why=periodic`，**绝不每跳一帧**）；
+③ §5b「进对话铁判准」及其三行"只读壳：不轻推/不重载"日志**保留不动**。**一眼认错**：日志里若再出现 `卡死看门狗布防（…）`/`撤防`/`跳过轻推`/`第 N/2 次刷新页面`，就是有人把它装回来了。
+
+**(b) 页面内桥路由与"对话自订阅"（`assets/zcode-protocol.js` 的 Tier1 遗骸）**
+删掉的是"壳在**页面自己那条 socket** 上给每个工作区开桥、自己订阅会话清单与对话流"这一整套：`RemoteClient.acceptPayload`（每帧被调用却**恒为空转**）、
+五张路由表（`_bridges`/`_bridgesById`/`_pendingBridgePayloads`/`_inflightOpens`/`_pending`）、故障/冷却/重开机制（`_handleDegraded`/`_noteFault`/`_inCooldown`/`_scheduleReopen`/`_forgetBridge`）、
+候选挑选器 `_conversationCandidates`、开关 `CONVERSATION_SUBSCRIBE_ENABLED`、诊断行里的 `bridges=` **假指标**（结构性恒 0），以及压在这些表面上的死测试。
+**为什么它是死的**：那五张表**只由 `openBridge`/`_request` 写**，而只读壳下 `start()/openBridge` **永不调用**（源码级 grep 零生产命中）；
+且这条路**不是"没人接线"，是 2026-09-15 真机 A/B 定罪后由另一套实现取代**——重复订阅把页面的接收流挤掉，用户看到"只有工作中 + 转圈、内容全程不更新"；
+现行唯一在跑的实现是**原生 Tier2 承载 + 发现链**（`RelayBridge` + `Tier2Probe`）。
+**别再加回来**：D7「订阅所有工作区」开关整条已于 2026-09-17 删除，`core/Prefs.kt` 留了墓碑注释「**永远不要**把这条链接回来」；
+**一眼认错**：页面日志/grep 里再出现 `对话流候选`（该行在守卫之后）就说明有人把开关打开了。
+
+**(c) controller 流的"原生自己去订阅"接线（`core/RelayBridge.kt`，4a）**
+删掉的是承载桥握手的最后一步及其到货处理：`controllerStreamEnabled`（恒 `false` 的闸刀）、`subscribeControllerTasks` / `onControllerWire` / `resyncController` / `unsubscribeController`、
+`BridgeSession.onLiveTasks`、`Tier2Probe.liveTaskSink`、`ShellRuntime` 里那条早已失效的回调链，以及 4 段**永不触发**的 controller 测试脚本。
+**为什么它是死的**：闸刀打开会让**桌面端 host 进程当场崩掉**（`[rpc:listen] zcode-agent.onDynamicControllerFrame FAIL` → `uncaughtException` → `host process exited with code 1`，配对到崩固定 4.3 秒），
+所以它是被**政策永久封死**的；`RelayBridgeTest` 里那几段脚本准备的假任务 id（`s-live`/`s-ctl`）**在整个测试文件里没有任何断言引用**——连"假装验证"都没做到。
+**别再加回来**：⛔ **仍然不许发任何 `listen`**（`on*`/`onDynamic*`）——当年那次崩还叠着一个错：`onDynamicControllerFrame` 属于 `window-controller` topic，我们发的是 `zcode-agent`。
+**⚠️ 这一条最容易连带误删**：**页面自己那条** `controller/tasks-index` 流是**活的**（运行态第三条源），
+所以 `core/ControllerTasksState.kt`、`TaskStore.applyLiveTasks`、`TaskStore` 的三份时刻表**一个字都不能碰**。
+`core/RelayWire.kt` 里那 **4 个 controller 常量**（`EVENT_CONTROLLER_FRAME`/`METHOD_SUBSCRIBE_CONTROLLER`/`METHOD_UNSUBSCRIBE_CONTROLLER`/`METHOD_RESYNC_CONTROLLER`）是**协议名册**（KDoc 描述的是**网页端自己**的订阅行为，那条路仍活着）⇒ **保留**。
+
+**(d) 诊断与日志 / 注入就绪（C14、G2、C8、C12a、三处文档）**
+删掉的是**重复的外壳**与几处**永远进不去/永远没人查**的分支：前台那条"等注入就绪再重放"的队列（`pendingDiag`/`diagAttempts`/`tryDiag`，约 21 行）并入共用派发；
+`RelayWire.accept()` 里 `"rpc-frame-ack" -> return null`（与紧随的 `else` **行为等价**、生产与测试都到不了）；发送键匹配里被蕴含的 `indexOf('发送消息')`；三处错位/过期的文档块（归位或删）。
+**为什么它是死的/重复的**：这是本轮**唯一一处"调查后结论与初判相反"**的地方——**两条 adb 入口都活、且不能互相替代**：
+前台 `am start` 通道**独占** `passive_off/passive_on`（观测层总开关，设置页没有入口），后台 `am broadcast` 通道是**唯一能在应用处于后台时问诊**的路（`am start` 会把应用拉回前台、毁掉现场）。
+**别再加回来**：① 两条入口**一个都不能删**；② 合并时**必须同批**把 `ShellRuntime.setJsEvaluator` 提到 `handleIntent` **之前**
+（`MainActivity.onCreate` 里原来是 `handleIntent` 在前，而 `dispatchJsDiag` 在求值通道为空时**直接放弃、不排队** ⇒ 冷启动首条命令会被静默丢弃）；
+③ `G2` 的复位接线（`MainActivity` 的 `onPageStarted` → `ShellRuntime.onPageStarted()` → `InjectionReadiness.reset()`）**有静态检查守着**（`tools/check_kotlin_structure.py` 的接线断言），删了会当场红。
+
+**(e) 机械清理（"零读者级"，A 级 30 条 + B 级 4 条）**
+A 级的典型：两个 `mipmap-xxxhdpi` 启动图标 PNG（**MD5 相同、anydpi-v26 恒胜出 ⇒ 运行时不可达**，删后 APK **−702 KB**）、
+`BridgeManager.idToKey`（**6 处写、0 处读**；路由实际走 `bridgesById`）、两处 `Build.VERSION.SDK_INT >= O` **恒真**分支（minSdk 已是 26）、
+零 import 的 `androidx.lifecycle:lifecycle-runtime-ktx`、多余的 `mipmap-anydpi-v26` 限定符、`tools/doc_snapshot.py` 里 44 行零引用代码、
+描述"已删除的后台失速自愈"的 21 行注释块（它提到的 adb 开关 `stallguard_on` 全仓**零处理器**）、
+注入层几处**删完没整理的死尾**（`__zcodeShellSetAppForeground` 里两段 `return` 之后的不可达代码；
+那处 `reportPageState();    };` 分号与括号挤在一起、正是删除后未整理的疤痕）、`DiagReceiver` 的 `<intent-filter>`（调用一律带 `-n` 显式组件，API 26+ 隐式广播根本投递不到清单接收器）。
+B 级 4 条（**删需同批改断言**，改动时"改断言而不是删断言"）：`NotifyUpdate.running`（生产侧三个构造点全传空清单，真正发通知的运行清单由 `TaskStore.buildRunningList()` 现算）、
+`TaskStore.hasRunningTasks`（同族 `runningTaskRefs()` 才是生产的问法）、`AttentionEvent.interactionId`（去重实际走 `TaskSnapshot.pendingInteractionId`）、
+以及**保留** `TaskStore.removeWorkspace()`（按工作区拆卸的唯一入口，目前仅测试调用——注释写明"唯一的生产拆卸路径是 `reset()`；本函数是留给桥生命周期回收、尚未接线的入口"，**不要把它接到轮换回收上**，那是行为变更不是清理）。
+**别再加回来**：这些删除点原位都留了**墓碑注释**（写明"它存在过、已被删除"）——**验收判据是"残留命中是否都在注释里"，不是"grep 命中数 = 0"**。
+
+**(f) 门禁与资源侧（G1/G3/G4/G7 —— 顺手把门禁修绿）**
+`res/values/miuix_styles.xml` 里 `android:textFontWeight`（需 API 28）与 `android:clipToOutline`（需 API 31）在 minSdk 26 上**静默失效**，
+拆进 `values-v28`/`values-v31` 后 `lintRelease` 才转绿；debug 变体的长按快捷方式 `targetPackage` 硬编码成 `com.zcode.remote`（debug 包名带 `.debug` ⇒ 两个快捷方式指向未安装的包）；
+`ShellRuntime` 的静态 `Notifier` **不是内存泄漏**（`init` 第一件事就是换成 `applicationContext`）⇒ 动作是**抑制误报 + 写明理由**，别去改一个本来正确的设计。
+
+### 3. ⚠️ 不可删除清单（后续轮次**禁止**当死代码删，逐条给理由）
+
+| 项 | 为什么不能删 |
+| --- | --- |
+| `SessionsIndexState.parentSessionId`、`SessionsIndexState.hasBackgroundWork` | **协议形状字段**：Kotlin 侧无消费者，但类文档要求与 `zcode-protocol.js` 同名类逐条对照，且 JS 侧真在用。属"没人读的协议字段"，不是死字段 |
+| `TaskStore.Workspace.{source, path, identity}` | 一族形状字段，**要留一起留、要删一起删**，不许两留一删。`source` 是"来路"枚举（`active`/`passive`/`controller`），wire 键两侧都有测试钉。⚠️ 工作区键 `workspaceIdentity?.trim() \|\| workspacePath` 的算法在 `RelayBridge`/页面，**不在 `TaskStore`**（它收到的是算好的 `key`）——别拿"保住键算法"当这两个字段的免删金牌 |
+| `SHELL_READ_ONLY`、`healDeadLinkOnResume`、`heartbeatTick`、`readVitals`/`vitalsStalled`/`postPageVitals`、`STALL_RELOAD_MS`、`closeRelaySocketForNudge`、两个未编号块（导出 `__zcodeShellNudgeRecover` / `__zcodeShellNetProbe` / `__zcodeShellAfterCarrierReturn`） | 注入层里**被真实调用**的活代码（上一批删完逐个数过引用数）。其中 `SHELL_READ_ONLY` 的两条读取点里跑着活功能（回前台死链兜底）；那几个未编号块的导出被 Kotlin 侧真实调用、并被测试钉住 |
+| `ShellLog.markProcessExit` + `ZcodeRemoteApp.onTerminate` | 平台真机**从不投递** `onTerminate`（`ZcodeRemoteApp` 注释自述 "Only reached in emulated processes"），但它是**刻意保留**的模拟器日志边界。**两个审计代理先后误判过，别再报第三遍** |
+| `ShellRuntime.onPageStarted()` + `core/InjectionReadiness.kt` | **现在有调用方**（`MainActivity` 的页面加载回调），且**有静态检查守着它的接线**（`check_kotlin_structure.py` 的断言"页面加载回调复位注入就绪位"） |
+| `UploadMime.WILDCARD` 的**拼接写法** | 「实现要点」10：写成单个字面量会让 `compileReleaseKotlin` 报语法错（连续三轮 CI 复现、报错逐字节相同） |
+| `appVersion = "3.6.5"`（握手里） | **参考/页面客户端**的版本（与 `zcode-protocol.js` 逐字一致），**不是本应用版本**；我们的版本由 `ShellLog` 从 `PackageManager` 读。**不要"修正"成 `versionName`** |
+| `WebAppBridge.config()` 的 `runningSessions` 播种循环 | 它是 2026-09-15 真机教训的实现机制（**空数组也要给**，否则"0 个在跑的任务"与"接线断了"无法区分），且该载荷**零测试覆盖**（不会被任何门禁拦住）。⚠️ 本文实测（2026-09-18 之后的树）：其消费者（`zcode-protocol.js` 的对话自订阅簇）已在 4c-B 删除 ⇒ `inject.js` 里那两个客户机选项今天**只写不读**，**唯一可见产物是那行接线自证日志 `原生运行集种子：N 个工作区`**——保留它就是保留这条自证 |
+| ⚠️ **`runningSessionsProvider` 这条"原生→原生"链**（`ShellRuntime.kt` 的 `Tier2Probe.runningSessionsProvider` → `Tier2Probe` → `BridgeManager(runningSessions=…)` → `RelayBridge` 的 `runHandshake(runningSessions(key))`；以及"**有在跑任务的工作区排最前**"那处） | 4c-B 的清点一度把它当成"只写不读"、准备删掉，**硬门拦下了**。它**活着且承重**：① `runHandshake(runningSessions(key))` 承担顺序约束——`Tier2Probe` 的 KDoc 明写"**对话订阅必须抢在索引订阅之前，顺序错了桌面端就永远不回包**"；② "有在跑任务的工作区排最前"是 2026-09-15 真机定案。<br>⚠️ **它与上一条"原生→JS"的 `runningSessions` 载荷是两股独立数据流**，别再把它们混成一条链 |
+| `core/ControllerTasksState.kt` + `TaskStore.applyLiveTasks` / 三份时刻表 / `phaseOverlay` | **运行态第三条源的本体，活**（页面自己订的 `controller/tasks-index` 纯被动转发进来）；真机取证 + JS 单测（"the page controller stream is forwarded to native as a passive frame"）+ 12 项 Kotlin 单测三重钉着。⚠️ 曾有一份文档写它"恒空、永不写入"——**那句今天为假，照它删会直接删掉功能**（见第 4 小节） |
+| `core/RelayWire.kt` 的 4 个 controller 常量、三个传输类（`RpcFrameSender`/`RpcFrameAssembler`/`ChannelClient`） | 前者是**协议名册**（描述网页端自己的订阅行为）；后者**已不在生产路径**（类头注释已写明），但按用户裁定保留为**参照实现 + 测试夹具**（压在其上的 7 项测试仍在用）。⚠️ 生产里真正在跑的帧重组器 `RemoteClient._tryAssemble` **至今零单测**（欠账） |
+| `TaskStore.removeWorkspace()`（仅测试调用） | 见第 2 小节 (e)：它是**多工作区功能里唯一缺失的那一步接线**，删了就得从零再写；要删必须连 `NotifyState.forget()` 与那条单测一起删，**不能只删函数** |
+| ~~`Tier2Probe.liveTaskSink`（交还块那一臂）~~ **⛔ 已退役，别去"恢复"它** | 原保留理由（"对称交还块的四个臂构成所有权契约、`controllerStreamEnabled` 是翻回来的护栏"）随闸刀与订阅机器一并删除而消失；且实测该臂**改动前就已是空操作**（全仓唯一写入是 `= null`）。顺带一个**意外收获**：那个"四臂交还块"改前本就**不对称（3 挂 / 4 清）**，退役这一臂后变成 **3 挂 / 3 清、逐一对齐** |
+
+### 4. ⚠️ 改代码前必读的陷阱清单（**都是本轮实测踩到的**）
+
+1. **`git HEAD` 不是"某一批开始前"的状态，别拿它当基准。** 本工作区的 `HEAD` 比某批开始时**更旧**（`HEAD` 的 `inject.js` 带 `startHeartbeat`/`RECONNECT_MIN_GAP_MS`）⇒ `git diff` 会混入并非本批所做的改动（4b 实测混进 75+/110−）。
+   **做隔离回归或改动审计，以"批次前逐文件快照"为基准**；快照已删，但第 4 批结果已提交为 `b627610`，**现在用 git 历史即可**（`b627610^` = 第 1–3 批后的状态）。
+   **两条自保**：拍快照要覆盖"本批**可能**触及的全部文件"（本轮只拍了 8 个，`ShellRuntime.kt`/`TaskStore.kt`/`Tier2Probe.kt` 都没进去，差点做不成隔离回归）；**改动落地、跑真机回归之前**先给"改完的完整树"拍快照。数字口径以 `git diff --numstat` 为准（自报 diff 本轮少算 4+/2− ⟹ **不要用 diff 拼回退，用快照文件整体回退**）。
+2. **文档里出现"看门狗/心跳/重连"时，先看主语是壳还是页面。** 有一条待订正的注释主语是「**页面自己的**看门狗」，照抄会**把页面自己的机制记到壳的账上**。
+3. **删除类改动不能用"grep = 0"当验收判据。** 本轮对 8 个"已删"符号 grep 得到非 0 命中，逐行看**10 处全是注释**（形如"已一并删除：它唯一的读者……随看门狗决策机器消失"）——
+   这些墓碑注释**比 0 命中更好**：后人 grep 到会立刻知道"它存在过、已被删除"。**判据是"残留命中是否都在注释里"**；后续批次统一采用**写字面名**的墓碑写法（可被 grep 到）。
+4. **在"日常使用的真机"上跑侵入式诊断，必须先想清"跑完谁来收拾"。** 4a 回归用了 `tier2_takeover`（**故意把页面连接顶掉**），结果页面被 KICK、90s 窗口内回不来 ⇒ 测试结束后常规判死逻辑**立刻真的接管** ⇒
+   "原生持连接 ↔ 页面反复重连被 KICK"的循环，**用户看到界面一直在闪**，期间一个在跑的任务以 `completedInterrupted` 结束（不能排除与反复开多工作区桥有关）。
+   **纪律**：先评估后果与恢复步骤；**跑完把开关类状态还回原值**（本次 `carrier_off` → `carrier_on`）；出事后先恢复设备、再解释、再继续；恢复优先序 = `tier2_stop` + `carrier_off` → 仍不行则 `force-stop` + `am start`（页面重新加载）。
+5. **子代理中途失败后，第一件事是"查树的一致性"，不是重派。** 本轮两个子代理接连在完成前失败，其中 4c-B 的失败点恰好在"改 `inject.js` 之前"，
+   于是树**一度破损**：`zcode-protocol.js` 已删 `acceptPayload`，而 `inject.js` 仍在 `try { … acceptPayload(…); acceptObservedPayload(…); }` 里调用它——
+   **那一行与被动观察同在一个 `try` 里**，抛异常会**连带跳过被动观察**（实测 `inject.test.js` 由 45/45 掉到 42/45）。
+   判据：`node --check` 两个 JS + 两套 Node 测试 + `python tools/check_kotlin_structure.py`，尤其看**"删定义"与"删调用点"是否落在同一批里完成**。
+6. **grep 纪律：源码级搜索一律显式限定到 `app/src`（或 `tools/`）。** `android-shell/docs/` 里有 **519 个 Kotlin 文件（20.5 MB，`docs/miuix/` 是小米 MiuiX 库的完整源码副本）**，
+   不忽略 gitignore 的搜索（如 `Select-String -Recurse`）会把它们的命中混进来（实测：`resetState` 全目录递归报 16 处，`app/src` 下 **0 处**）。
+   ⚠️ 同时记住 **ripgrep 默认跳过 gitignore 的文件** ⟹ 所有"全仓 grep"严格说是"**除 `docs/`、`scratch/` 外**的全仓"；
+   **判"某能力不存在"之前，必须显式搜 `docs/` 与 `scratch/`**（本轮父代理关于"页面不支持深链""只能点 DOM"的判断**错了两次**，根因就是不知道 `scratch/audit/` 里那两份前置审计存在）。
+7. **应用日志会轮转（上限 512 KB，满则切成 `zcode-shell.log.1`）** ⟹ **读一个时间窗口必须 `cat` 两个文件**（`cat $base/zcode-shell.log.1 $base/zcode-shell.log`），否则会得到**假阴性**（父代理本轮报"9 个关键词全 0"，其实是没读到行）；
+   且**不要用 `wc -l` 的行号当窗口基准**（轮转会让它失效），**用时间戳过滤**。
+8. **"这是平台事实，还是我们自己拍的政策？"——问完再下结论。** 本轮最典型的一处错误：把"ColorOS 只并发提升 2 张卡"当成平台墙，实际**三个任务同时跑时三张卡同时在屏**、
+   `dumpsys notification` 里是三条 `PROMOTED_ONGOING`（系统自己还会多提）——那 2 是**我们自己拍的门**。**涉及"某个上限/假设"的结论，先问这句话**。
+9. **"流体云在跟手"这类结论，必须在同一时刻核对三件东西**（卡片 `android.text`、`when`、系统时间）再回日志找那一拍；**任何单一信号都不算验过**（本轮有过两次误报：把 `when` 前进当成内容刷新、把一小时前的快照当成"接管跑通"）。
+10. **别信文档里的"恒空/永不写入/没有调用方"**：本次审计推翻了 `docs/18` 的四处过期结论（controller 一档"恒空"、`_forgetBridge` "仍活着"、看门狗"每 5s"（实为 **1000ms**）、D7 开关"待拍板"（实为早已删除）），其中**"恒空"那句一旦照做就会删掉活功能**。
+    **纪律**：子代理/文档里的"待裁决"提示**是线索不是结论**；凡涉及"删/改"的定性，先自己 grep 一遍并看**KDoc 在描述谁的行为**。
+
+### 5. 鸿蒙移植把手（Android 机制 → 鸿蒙对应物 / 注意事项）
+
+> 这一节是"把安卓壳这些机制搬到鸿蒙时要抓哪几处把手"。**只给"安卓侧机制 → 鸿蒙对应能力 → 注意事项"**，不重复协议细节（协议细节见「实现要点」1–25）。
+> 鸿蒙侧事实的出处是父工程自己的调研篇（**本地文件、不进 git**）：`E:\Zcode_harmony\docs\09-复刻安卓壳的鸿蒙落地对照.md`（逐项对照表）、
+> `E:\Zcode_harmony\docs\06-ArkWeb后台行为-节流冻结与网络管控.md`（后台 2s/12s 与 10 条弯路对照）、
+> `E:\Zcode_harmony\docs\07-鸿蒙后台保活官方方式全集.md`、`E:\Zcode_harmony\docs\08-鸿蒙ArkWeb能力与API清单.md`、
+> `E:\Zcode_harmony\docs\01`–`05`（实况窗五篇）；父工程 `entry/` 现有代码只用到 `@kit.ArkWeb` 的 `Web`/`webview` 与 `@kit.ArkData` 的 `preferences`。
+
+| 安卓壳的机制（本仓实现） | 鸿蒙对应物 | 注意事项（照搬会踩的坑） |
+| --- | --- | --- |
+| `WebView` 载入 `zcode.z.ai/remote/v4`；**不调 `webView.onPause()`**（会挂起定时器、掐掉页面 relay 心跳）；返回键 `moveTaskToBack(true)`；`setRendererPriorityPolicy` | ArkWeb `Web` 组件 + `WebviewController`；`onActive()` / `onInactive()`；`pauseAllTimers()` / `resumeAllTimers()` | ① **"隐藏"与"暂停"是两个动作**：官方原文明确 `onInactive()` **不暂停 JavaScript**（要暂停得自己调 `pauseAllTimers`）；② 所以**"别调 `onPause()`"这条安卓经验不能平移**——鸿蒙"退后台页面会不会冻结"由**进程是否被挂起**决定，与这个 API 无关；③ **ArkWeb 不会替你省电**：进程活着页面就全速跑 |
+| **document-start 注入三道时机 + 原型层收编**（README「已知问题 F」那套 hack） | `javaScriptOnDocumentStart(scripts)`（官方 document-start 钩子） | **这段弯路在鸿蒙不需要重演**。但两条约束不同：官方注明**按脚本内容字典序执行、不按数组顺序**，且**同内容脚本会被静默去重**；有先后依赖时改用 `runJavaScriptOnDocumentStart` |
+| `addJavascriptInterface`（唯一对象 `window.ZCodeShell`，`postMessage(json)` / `config()`）+ `evaluateJavascript` 驱动 10s 心跳泵 | `javaScriptProxy({object,name,methodList,controller})` 或 `registerJavaScriptProxy`（支持多对象）+ `runJavaScript` / `runJavaScriptExt`；需要"原生主动推 + 页面回 ack"时用 `WebMessagePort` | ① `javaScriptProxy` **只能注册一个对象、只能声明方法不能声明属性**；② `runJavaScript` **必须在 UI 线程**（"把泵放在主线程 Handler"方向一致）；③ 但安卓那条"**两条跳都必须是异步消息**，否则被 Choreographer 同步屏障饿死"是 **Android 特有**，不必然成立（推断） |
+| 前台服务 `specialUse` 保**进程** + `PARTIAL_WAKE_LOCK` 保 **CPU** + `START_STICKY` 拉回 | 短时任务 `requestSuspendDelay`；长时任务 `startBackgroundRunning` + `backgroundModes` + `KEEP_BACKGROUND_RUNNING`；延迟任务 `workScheduler`；代理提醒 `reminderAgentManager` | ① 短时任务硬数字：**单次 ≤3 分钟、单日默认 10 分钟、退后台 5s 内必须申请**；② 长时任务：一个 UIAbility 申请数 **API 21 起最多 10 个**（以前仅 1 个），**通知由系统发、内容不可改**，用户删通知即自动停止；③ **`PARTIAL_WAKE_LOCK` 没有合法等价物**（`runningLock` 的 `BACKGROUND` 类型官方标注废弃）；④ **没有 `START_STICKY` 的等价物**（`appRecovery` 只覆盖崩溃/冻屏后的自恢复，**不覆盖被系统正常回收**）⇒ 安卓"服务被拉回来继续跟手"这段在鸿蒙要改成"**下次启动时对齐**" |
+| **「后台 60 秒墙」→ 判死 → 原生承载接管 → 回前台交还**（本壳最重的一套机制） | ⚠️ **没有对应物**：鸿蒙是 **网络资源 2s 冻结 / 12s 释放**（socket 被 Abort，**连接对象不释放、回前台复用必失败**），且官方明确劝退"纯终端会话/闲置 TCP"类长连接，推荐架构是「**服务端会话托管 + 客户端前台断线秒连**」 | **"判死 → 接管 → 交还"整层在鸿蒙不成立**（不是政策问题，是技术闭环：`DATA_TRANSFER` 长时任务要求进度必须用**实况窗**更新，而实况窗对"远程任务/AI 对话进度"没有匹配场景）。移植时的形态应是：**切后台前记快照 → 前台 `onForeground` 秒级重连 + 拉齐中断期间输出**（先 `close()` 旧对象再 `connect()`） |
+| 判死阈值 **入站帧静默 ≥35s**（3 泵周期 + 余量）；"卡死"只能靠计时推断 | 系统级回调：`onRenderProcessNotResponding` / `onRenderProcessResponding` / `onRenderExited`；`backgroundTaskManager.on('continuousTaskCancel'/'continuousTaskSuspend')`、`getAllContinuousTasks()`；`onBackground`/`onForeground` | **判据量级必须重定**：安卓 35s 是因为 Chromium 在 60–70s 才死，鸿蒙官方冻结线是 **2s/12s**，继续用 35s 会在"早就断了"的窗口里判成健康。**优先用系统回调，计时只做兜底**；"卡死"（页面卡了）与"被挂起"（系统告诉你任务没了）**判据与处置不同** |
+| 三渠道常驻通知（`running_tasks` 静音 / `task_attention` / `task_completed` 有声）+ 组摘要 + 更新节流 ~900ms | Notification Kit：`notificationManager.publish/cancel`、`addSlot(SlotType)`、`NotificationRequest` 的 `isOngoing`/`isUnremovable`/`groupName`/`progress`；点击跳转 `WantAgent` | ① **渠道模型不同**：安卓渠道重要性创建后不可改（靠分渠道实现"运行中要静、待确认要响"），鸿蒙 `SlotType` 决定整套提醒方式且**横幅默认关闭、由用户在设置里开** ⇒ "完成要响"要**提前引导授权**；② **进程被挂起时通知也发不出去** ⇒ 这一步仍受后台任务约束；③ 长时任务自己占一条系统通知，与"每任务一条常驻通知"是两套东西 |
+| 流体云 = Android 16 Live Updates（`POST_PROMOTED_NOTIFICATIONS` + 在常驻通知上写 extras `android.requestPromotedOngoing` / `android.shortCriticalText`） | Live View Kit：`liveViewManager.startLiveView / updateLiveView / stopLiveView`（+ Push 端云通道） | **复刻更重**：① 安卓是"在已有常驻通知上请求提升"，**零申请**；鸿蒙是**独立服务 + 两道权益门**（调试门约 5 工作日；正式门要求已上架且月活 ≥1000、逐场景评审）；② **场景准入对不上**：官方把"后台自动"的进度类场景列为**不适用**、`TIMER` 明确排除"AI 对话时长"；③ 生命周期更硬：**单个实况窗最长 8 小时，>2h 未更新降级、>4h 清除**；应用级流控创建 10 次/秒、更新 20 次/秒（超出静默丢弃）；④ **本地创建依赖应用进程运行**（进程死了没人更新）——与安卓"卡片由系统渲染、进程死了也还在"是本质差异 |
+| `SharedPreferences`（`Prefs`） | `@ohos.data.preferences`（父工程已在用）；需要关系型用 `relationalStore` | **`put` 之后必须 `flush()` 才持久化** |
+| 通知点击后在页面 DOM 里定位任务（D11，"最脆弱的功能"） | 同样脆弱：`WantAgent` 只能把参数带进应用，定位仍要 `runJavaScript` 打 DOM | 建议保持既有的"**优雅降级为仅打开应用**"设计 |
+| **点通知/流体云卡片 → 进任务详情页**（2026-09-18 新增，**替代上面那条"点 DOM"**；4 个文件，**尚未提交**） | 鸿蒙侧同样应做成"**预设 + 重载**"而不是点 DOM：`WantAgent` 只负责把 `workspaceKey`/`sessionId` 带进应用，真正的跳转复用**页面自己**的"重载后回到上次任务"能力 | **机制**：① `notify/Notifier.kt` 补 `EXTRA_WORKSPACE_KEY`（参数本来就在，只是从没放进 intent——"按任务精确跳"一直缺这一半）；② `MainActivity.kt` 收到 `ACTION_LOCATE_TASK` 先走 `maybeReloadForKickedPage(...)`（**预设任务 + 交还承载 + 重载**），并加 `presetLocatePending` 闸门让"预设期间让路"（否则 `onPageFinished` 里那次 `tryLocate()` 会抢先打假警报）；③ `ShellRuntime.kt` 的 `carrierMayHaveKickedPage()` / `handBackCarrierForLocate()` —— **必须先交还原生承载**，否则页面重载后又被 KICK 一次（单控制端互斥，CDP 实测）；④ `assets/inject.js` 的 `__zcodeShellPresetTask(workspaceKey, sessionId)` 写 `localStorage['zcode-v4-last-session:v1:<ws>']` + 把 `history.state.zcodeMobilePage` 钉成 `chat`。<br>**为什么"重载"就等于"跳转"**：页面**自己**实现了"重载后回到上次任务"——那个 `localStorage` 槽位在**每个 renderer 首次挂载**时、且满足 `rendererReload && activeSessionId===null && draftFocusVersion===0` 时被读出并 `selectSession(...)`（出处：bundle `index` 的 `@2430013` 一带）。<br>**真机判据**（`HANDOVER.md` §3.6，`1.0.0-local.190`）：投递前屏上 = `已被其他设备接管`；之后依次 `Tier2: 关闭（通知点击定位：先交还）` → `已预设下次加载要打开的任务: <工作区> / sess_…` → `定位：页面疑似被顶掉，已重载` → `进对话 3s 已就绪（…时间线 29 行、对话流有新帧）`；**屏上 = 任务详情页**。<br>⚠️ **副作用登记**：这是壳对页面的**第六处**写入（写 `localStorage` + 钉 `history.state`）——「实现要点」14 里那份"只允许五处"的清单**尚未同步**（本条只登记，不改那一条） |
+| **应用层不变式（与平台无关，可原样搬运）** | 同构（ArkTS 里就是纯 class / 纯函数） | ① **"空 Update = 什么都没变，不是'运行集为空'"**（`TaskStore` 的 `Update` 四列表全空表示无变化；任何 `Update` **先判空再发布**，否则会把已发布的运行集抹成 0 让卡片被系统收回）；② 运行态判定必须"**谁后到谁算数**"（各源记报到时刻），不能固定优先级；③ 状态词只有两个（`运行中`/`等待确认`）；④ "结束"要**持续停 3 秒**才算；⑤ 卡片正文**安静 250ms 再推、距上次推送不超过 900ms**；⑥ 多工作区**每轮只服务一座桥、只轮换最饿的一座**（一轮 ≤ ~9s，与桥数无关），失败路径**只回收一座**；⑦ **只信原生侧 delta，不信页面侧绝对值**（任何平台都成立） |
+
+**判不出的（不要凭这张表下结论，需真机或官方确认）**：① ArkWeb 里"网页自带 14px 滚动条占宽"的实际表现与最优处理（安卓侧是归零轨道 + 自绘 overlay，鸿蒙是否有同款把手**未查证**）；
+② 鸿蒙是否有与 `setRendererPriorityPolicy` 对等的渲染进程优先级杠杆；③ "应用在后台能否发布本地通知"的官方明文（父 docs/09 标注为**推断**，未找到明文禁令）；
+④ 实况窗能否以"远程任务进度"名义通过权益审核（父 docs/05 的结论是**通过概率低**，属推断）；
+⑤ 鸿蒙侧注入层用什么方式拿到"页面首个 WebSocket"（`javaScriptOnDocumentStart` 是官方钩子，但**钩住 `WebSocket.prototype` 的那套 JS 能否原样复用**未验证）。
+
+### 6. 本机可复现的验证配方（门禁 · 真机 · CDP）
+
+**门禁（本机）**：下面**前三条不需要 Gradle，本文在收口后已重新实跑确认**（结构 42 文件 OK / 资源 25 文件 OK / JS **82 pass · 0 fail**）；最后一条要 Gradle（单测 + lint + 出包），
+耗时较长，**本文没有重跑**，其数字沿用收口时的实测记录（Kotlin **122 / 0 失败**、lint **0 error / 36 warning**）：
+
+```powershell
+cd E:\Zcode_harmony\android-shell
+python tools/check_kotlin_structure.py     # 42 文件；含接线断言（"页面加载回调复位注入就绪位"）
+python tools/check_resources.py            # 25 文件
+node --test tools/protocol.test.js tools/inject.test.js   # 82 项（37 + 45），实测 82 pass / 0 fail
+# Kotlin 单测 + lint + 出包（本机可出包；JAVA_HOME 必须显式指定，否则 JdkImageTransform 因缺 jlink 失败）
+$env:JAVA_HOME='E:\Autopsy-4.22.1\jre'; $env:ANDROID_HOME='E:\AndroidSdk'; $env:ANDROID_SDK_ROOT='E:\AndroidSdk'
+.\gradlew.bat --console=plain :app:testReleaseUnitTest :app:lintRelease :app:assembleRelease
+```
+
+**通过判据**：全绿 + `lintRelease` **无 error** + 编译器警告 **0 条**。⚠️ **`JAVA_HOME` 必须显式指定为 `E:\Autopsy-4.22.1\jre`**：
+默认 JDK 若是 DevEco 的 JBR 21，会因**缺 `jlink.exe`** 而失败（Autopsy JRE 有 jlink、DevEco JBR 没有）——**本轮有两路子代理据此误判"本机跑不了 Kotlin 单测"，那是错的**。
+
+**装机（覆盖安装、保留数据；设备 `3B6F5RE8GCL3LYY7` = OPPO PLC110 / API 36 / Android 16）**：
+
+```powershell
+$env:JAVA_HOME='E:\Autopsy-4.22.1\jre'; $env:ZCODE_VERSION_CODE='187'; $env:ZCODE_VERSION_NAME='1.0.0-local.187'
+cd E:\Zcode_harmony\android-shell; .\gradlew.bat --console=plain :app:assembleRelease
+& 'E:\AndroidSdk\platform-tools\adb.exe' install -r app\build\outputs\apk\release\app-release.apk
+```
+
+⚠️ **必须带 `ZCODE_VERSION_CODE`**（不设时 `versionCode = 1`，机上版本更高会被系统拒绝安装）。`key.properties` 存在且是项目**正式 release 密钥**（SHA-256 `b1150632…c34650`，与本 README「签名密钥」一节逐字节吻合）⇒ 同签名覆盖、保数据。
+
+**真机回归（第 4 批三项各自的判据，可直接复用）**：
+
+| 项 | 步骤 | 通过判据 | ⛔ 反面证据（出现即失败） |
+| --- | --- | --- | --- |
+| **4a** controller 订阅接线 | 冷启动 + `diag_cmd vitals`；回前台等凭证就绪后投 `diag_cmd tier2_takeover`；等 ~90s 自动交还；`stall_state` | `★接管配对成功（matched）`、桥覆盖行、`页面运行态：N 个任务 · 在跑 M 个`、`提升集合变化: […]`、`流体云: 可用 · 样式=BigText ✓`；90s 到点 `Tier2: 关闭（接管验证到点）` + `tier2 bridges disposed`；**回前台交还路径完整跑通**（`tier2 bridges disposed (回前台交还)`） | 任何 `liveTaskSink` / NPE / `Exception` / `FAIL` 字样；卡在 `已接管=true` |
+| **4b** 看门狗决策机器 | 退后台 ≥155s（让原生泵驱动心跳） | 9 个看门狗关键词**全 0**（`卡死看门狗`/`布防`/`撤防`/`不轻推页面 socket`/`不自动重载页面`/`心跳巡检`/`跳过轻推`/`放弃态`/`僵尸`）；**不布防也有周期性体征**：`页面体征(periodic)` **正好每 60s**（泵 10s 一跳 ⟹ 6 跳一帧）；`后台心跳泵已启动（首拍 3s，之后每 10s）` | 任一关键词非 0；体征每跳一帧或断档 |
+| **4c** 桥路由 + 防降级前置 | 冷启动 / 后台 / 回前台三态 | 无缺口时保护**完全惰性**（`陈旧读数`/`因陈旧而放行`/`stale`/`陈旧工作区` 全 0）；`passive: following sessions-index of …`、`订阅状态 passive=1`；冷启动 `注入脚本已就绪` → `网页加载完成(第 1 次回调)，用时 ~400 ms`；**7 项反面证据全 0**（`inbound 处理失败`/`outbound 处理失败`/`订阅状态 bridges=`/`acceptPayload is not a function`/`TypeError`/`ReferenceError`/`Exception`） | 同上任一项非 0 |
+
+> ⚠️ **4c 的真实触发条件是"丢一个增量"，真机无法按需制造**：真机验的是"**惰性 + 无回归**"，规则语义由 **40 项 Kotlin 单测 + 10 个变异体**覆盖（出处：`BATCH4-REGRESSION-REPORT.md` §2 的原话）。
+> **这一点如实登记，不要夸大成"4c 的规则已在真机验证生效"。**
+
+**真机验收的通用手法（第 1/3 批吃过亏，照做）**：① **不要盲点坐标**——要点击 UI 一律 `uiautomator dump` → 取 `bounds` → 点中心（按截图目测点两次都没中，实测该行 bounds 中心 **(618,2262)** 一次点中）；
+② **诊断弹窗的正文不在节点树里**（整块多行 `TextView`）⇒ 看正文必须**截图 + 读图**；③ 判据优先看**日志顺序与计数**（比截图硬），截图只用于"UI 是否渲染正确"；
+④ **窄窗口打不中**：`am start` 自身开销 ~100ms 而一次网页加载只用 ~300–400ms ⇒ 要打进"新文档已开始、注入未就绪"这种窗口时用**突发法**（脚本 `adb push` 到 `/data/local/tmp/` 再 `adb shell sh` 跑，设备侧连发以横跨窗口）。
+
+**取日志（约定：一律从固定路径读）**：
+
+```bash
+MSYS_NO_PATHCONV=1 "$ADB" -s "$S" exec-out cat /sdcard/Android/data/com.zcode.remote/files/logs/zcode-shell.log > x.log
+# ⚠️ 设备端 grep 中文会碎；读窗口要连 .1 一起取（512 KB 轮转，用时间戳过滤，别用行号）
+# 流体云现状：python tools/notif_dump.py   /   dumpsys notification --noredact | grep -E 'android.title=|shortCriticalText|PROMOTED'
+```
+
+**诊断指令（两条通道，`-n` 必带；自定义 action 的隐式广播送不到清单接收器）**：
+
+```bash
+"$ADB" -s $S shell am broadcast -n com.zcode.remote/.DiagReceiver -a com.zcode.remote.action.DIAG --es diag_cmd <cmd>   # 后台可调用、不碰可见性（测后台现场只能用它）
+"$ADB" -s $S shell am start -f 0x20000000 -n com.zcode.remote/.MainActivity -a com.zcode.remote.action.DIAG --es diag_cmd <cmd>  # 前台通道，独占 passive_off/passive_on
+```
+⚠️ 回前台要看页面时**加 `-f 0x20000000`**（SINGLE_TOP）：ActivityRecord 不变、页面零重载；裸 `am start` 会新建 Activity 实例 ⇒ 页面重载 + `KICKED`。
+⚠️ 边界（本轮补记）：后台广播对**原生命令**（`stall_state`/`net_probe`/`carrier_*` 等 16 条）真"后台可用"，对**转给网页的命令**（`vitals`/`bg_state`…）只在"应用已被拉起过、Activity 仍在后台"时可用；进程被回收后由广播重新拉起时，这类命令会被丢弃（只留一行 `无处执行`）。
+
+**CDP 调试法（本轮最有价值的工具：在真机页面上直接求值，把"猜页面行为"变成"读页面事实"）**
+
+```bash
+# 1) 找 WebView devtools socket（⚠️ App 重启后 pid 会变，必须重找、重转）
+adb shell "cat /proc/net/unix | grep -o 'webview_devtools_remote_[0-9]*' | head -1"
+# 2) 转发
+adb forward --remove-all
+adb forward tcp:39385 localabstract:webview_devtools_remote_<pid>
+```
+```powershell
+pwsh -NoProfile -File <本节的 cdp.ps1> -Expr "JSON.stringify(history.state)"     # 读路由契约
+pwsh -NoProfile -File <本节的 cdp.ps1> -Expr "document.body.innerText.slice(0,200)"  # 读屏上正文（判"是否进了任务详情页"）
+```
+前提：应用**已开** WebView 调试（设置里的开关 / `-f 0x20000000` 那条通道）。⚠️ **页面 bundle 是压缩成一整行的 4.78 MB**，`Select-String` 会打印整行 ⇒ **必须取匹配点周围的窗口，别整行输出**。
+下面是这个助手的**全文**（随本节留在 README 里，因此不依赖任何本地文件；同文件另有一份在 `E:\Zcode_harmony\docs\tools\cdp.ps1`，那是**本地文件、不进 git**）：
+
+```powershell
+# CDP 真机求值助手 —— 通过 adb forward 到 WebView devtools socket，在页面里执行 JS 并回传结果
+#
+# 前置（只需一次）：
+#   adb forward tcp:39385 localabstract:webview_devtools_remote_<pid>
+#   （找 pid：adb shell "cat /proc/net/unix | grep webview_devtools"）
+#
+# 用法：
+#   pwsh -File cdp.ps1 -Expr "JSON.stringify(history.state)"
+#   pwsh -File cdp.ps1 -Expr "1+1" -Raw
+param(
+    [Parameter(Mandatory = $true)][string]$Expr,
+    [int]$Port = 39385,
+    [string]$TargetWs = '',
+    [switch]$Raw
+)
+
+$ErrorActionPreference = 'Stop'
+
+if (-not $TargetWs) {
+    $list = (Invoke-WebRequest -Uri "http://127.0.0.1:$Port/json" -TimeoutSec 8 -UseBasicParsing).Content | ConvertFrom-Json
+    $page = $list | Where-Object { $_.type -eq 'page' } | Select-Object -First 1
+    if (-not $page) { throw 'no page target (WebView 是否还活着？pid 变了要重新 forward)' }
+    $TargetWs = $page.webSocketDebuggerUrl
+}
+
+$ws = [System.Net.WebSockets.ClientWebSocket]::new()
+$ct = [System.Threading.CancellationToken]::None
+$ws.ConnectAsync([Uri]$TargetWs, $ct).Wait()
+
+$payload = @{
+    id     = 1
+    method = 'Runtime.evaluate'
+    params = @{ expression = $Expr; returnByValue = $true; awaitPromise = $true }
+} | ConvertTo-Json -Compress -Depth 8
+
+$bytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
+$ws.SendAsync([ArraySegment[byte]]::new($bytes), [System.Net.WebSockets.WebSocketMessageType]::Text, $true, $ct).Wait()
+
+# 收帧：拿满一整条消息（大响应会分片）
+$sb = New-Object System.Text.StringBuilder
+$buf = New-Object byte[] 65536
+do {
+    $seg = [ArraySegment[byte]]::new($buf)
+    $res = $ws.ReceiveAsync($seg, $ct).Result
+    [void]$sb.Append([System.Text.Encoding]::UTF8.GetString($buf, 0, $res.Count))
+} while (-not $res.EndOfMessage)
+$ws.Dispose()
+
+$text = $sb.ToString()
+if ($Raw) { $text; exit 0 }
+
+$obj = $text | ConvertFrom-Json
+if ($obj.result -and $obj.result.exceptionDetails) {
+    'EXCEPTION: ' + ($obj.result.exceptionDetails | ConvertTo-Json -Compress -Depth 6)
+    exit 2
+}
+if ($obj.result -and $obj.result.result) {
+    $v = $obj.result.result
+    if ($v.type -eq 'object' -and $null -ne $v.preview) { $v.preview | ConvertTo-Json -Compress -Depth 6 }
+    elseif ($null -ne $v.value) { [string]$v.value }
+    else { $v | ConvertTo-Json -Compress -Depth 6 }
+} else {
+    $text
+}
+```
+
+**想造流（往网页输入框打字并发送）时的坑**：`adb input tap` + `input text` **进不了 WebView 输入框**，注入层"塞字"也会被页面的 **Lexical 受控编辑器**清掉；
+**能用的是 CDP**（`node tools/cdp.mjs type "<文本>"` → 再点 `button[data-testid="v4-composer-send"]`，**回车不发送**）；`tools/cdp-capture.mjs` 用 Network 域录页面自己的接入契约（逐帧、凭证只留长度）。
+
+### 7. ⚠️ 盲区登记：哪些知识**只在本地文件里**（必须手动拷贝）
+
+**结论先行**：**真正进了版本控制的只有两份 README**（父 `E:\Zcode_harmony\README.md` 与本文）。下面这些**都不在 git 里**，`clone` 拿不到、换机器就没了：
+
+| 知识 | 在哪 | 状态 / 怎么办 |
+| --- | --- | --- |
+| 安卓侧最详细的状态文档 `android-shell/docs/18-全仓审计-错误路线残留与清理.md`（开关史、§3.10 提前接管取证、§3.11 卡片生命周期与运行态三源）及其全部订正 | `android-shell/docs/`（**被 gitignore**，`git ls-files` = 0） | **不进任何提交**，只能手动拷贝。注意 `docs/` 里还有 519 个 Kotlin 文件（`docs/miuix/` 是 MiuiX 库源码副本，20.5 MB） |
+| **`android-shell/scratch/`** —— 含 **`audit/extension-surface.md`（857 行，remote-v4 扩展面/可观测面穷尽盘点）** 与 **`audit/platform-facts.md`（57 KB）**，另有注入层补丁草稿、4 个历史 APK、截图、通知/日志转储 | `android-shell/scratch/`（**被 gitignore**） | ⚠️ **这是本轮最大的盲区**：两份前置审计**全程没被看见**（ripgrep 默认跳过 gitignore 的文件），父代理关于"页面不支持深链""只能点 DOM"的判断**因此错了两次**。**已复制**进父 `docs/`（见下一行），**源文件仍在 `scratch/`** |
+| remote-v4 网页端与安卓平台事实的两份审计 | `E:\Zcode_harmony\docs\10-remote-v4-网页扩展面与可观测面穷尽盘点.md`、`E:\Zcode_harmony\docs\11-remote-v4-平台事实.md` | ✅ 已迁入（复制），但**父 `docs/` 整个目录被 gitignore** ⇒ 仍需手动拷贝 |
+| 本轮清理的**结论 + 决策台帐 + 禁区 + 配方**；真机回归判据与两个自查缺陷；未完成的调研任务书；CDP 助手 | `E:\Zcode_harmony\docs\12-安卓壳死代码清理-结论与决策档.md`、`13-安卓壳真机回归与两个自查缺陷.md`、`14-待办-remote-v4-bootstrap载荷穷举调研.md`、`docs\tools\cdp.ps1` | ✅ 已迁入（12 为**合并重写**，其余正文未删改）；**全在 gitignore 目录里 ⇒ 必须手动拷贝**。`14` 是**未完成**的调研（`bootstrap-response` 约 28 KB 载荷里还有哪些字段没被解析），**保留待做** |
+| 鸿蒙移植的逐项对照与后台行为 | `E:\Zcode_harmony\docs\09-…`、`06-…`、`07-…`、`08-…`、`01`–`05`（实况窗五篇） | 同上：**本地文件、必须手动拷贝**（本文第 5 小节已把要点抄进来了，细节仍需原篇） |
+| `.dsh-audit/`（本轮全部工作产物）：13 份分区原始审计报告（逐成员调用方分类表）、6 份功能域详情、逐符号活/死判定清单（`BATCH4-INVENTORY-4b.md` / `-4c-phaseB.md`，742 行）、50 KB 执行流水、9 份批次任务书、阶段守则（死代码分类体系、证据标准、跨语言核查清单、功能名词典） | `E:\Zcode_harmony\.dsh-audit\`（**被 gitignore**，已列入收工清理范围） | **清理后"查某个具体 `file:line` 证据的原始出处"将不可得**——主要结论与关键行号已进 `docs/12` 与本节。**临时任务书 `14` 依赖的东西不在这里** |
+| 两处真机回归的完整日志 | 设备 `/sdcard/Android/data/com.zcode.remote/files/logs/`（另有 `.1` 轮转） | 仍在设备上；⚠️ **512 KB 轮转**，要留就得先导出 |
+| 签名材料（丢了就无法给老版本做覆盖安装） | `android-shell/scratch/*.p12` / `keystore-password.txt` / `keystore-base64.txt` | 见本文「签名密钥」一节与「交接清单」——**务必备份** |
+| 厂商文档快照 | `android-shell/docs/`（124 MB）、`android-shell/ColorOS_docs/`（87 MB） | 手动拷贝，清单见本文开头「参考库与离线资料索引」 |
+
+> **判不出的**（本节明确留白，未查证，不要当结论用）：① 本节第 5 小节末尾列的 5 条鸿蒙侧未验证项；② 本文实跑确认的三条门禁数字（JS 82/82、结构 42、资源 25）**不含 Kotlin 单测与 lint**——后两条沿用收口时的实测记录（122/0 失败、0 error/36 warning），本机 gradle 全量跑一轮耗时较长，**没有在本次文档工作中重跑**；
+> ③ ~~本 README 内部有一处版本号不一致~~ **已解决（父代理收口时统一）**：**清理轮收尾装机是 `1.0.0-local.187`**（历史口径，保留在下方各节的清理记录里），
+> 而**当前装机是 `1.0.0-local.191`**（清理轮之后又落了"点通知/流体云卡片 → 进任务详情"那个功能及其收尾）；`项目现状` 与「交接文本区」现已同口径。
+> 另有一个**未提交**的新功能（点通知/流体云卡片 → 进任务详情，`1.0.0-local.190` 上真机验证过）—— 它的机制已写进本节第 5 小节的移植把手表，但它**不属于本次死代码清理**（细节见 `HANDOVER.md` §3.6 与 `docs/12` §2.14）。
+
+---
 ## 交接文本区（新会话从这里开始）
 
 > **状态：无待办。** 到 2026-09-18 上午，本文件列过的验收项全部真机跑过（证据在 `docs/18` §3.10／§3.11
@@ -834,6 +1194,7 @@ MSYS_NO_PATHCONV=1 "$ADB" devices -l                 # 确认出现设备
 
 | 文件 | 什么时候读 |
 | --- | --- |
+| **本文上方的〈死代码清理收口与鸿蒙移植把手（2026-09-18 四批 · 自包含）〉** | **要动代码、要往鸿蒙搬、或想再审一遍"这段是不是死代码"之前先读这一节**：四批删了什么（按功能域）、**⚠️ 不可删除清单**（逐条给"为什么不能删"）、十条实测陷阱（`git HEAD` 不是基准 / grep 纪律 / 日志轮转 / "平台事实还是我们自己拍的政策"…）、**鸿蒙逐项移植把手**（含"判不出"的 5 条）、本机门禁与真机回归配方 + CDP 助手全文、盲区登记。**该节自包含**，不依赖任何本地文件 |
 | **`docs/18-全仓审计-错误路线残留与清理.md`** | **要动代码前先读**：开关史（`AUTO_TAKEOVER_ENABLED` / `SHELL_VISIBILITY_HIJACK` / `SHELL_READ_ONLY` / `controllerStreamEnabled`）各封死了什么、哪些已删、哪些刻意保留。**存活数（逐行核实，2026-09-18 之后；audit 4a 更新）：这四个里现在只剩 1 个还在代码里——`SHELL_READ_ONLY = true`（`inject.js:1176`）**；`AUTO_TAKEOVER_ENABLED` 与 `SHELL_VISIBILITY_HIJACK` 早前轮次已从代码删除（只在文档留史），`controllerStreamEnabled` 也已随 `RelayBridge` 的 controller 订阅实现一起删除（4a 轮，`docs/18` §4 留取证；**"四/三/二个开关"都是历史口径，不是现状清单**）。**"别再重做一遍已删的东西"看这份**。§3.10＝提前接管取证，§3.11＝卡片生命周期 + 运行态三源（最完整的一份） |
 | `docs/15-后台原生承载-独立设计.md` | 要**协议契约**时读（逐条 `文件:行:列`）。⚠️ 两处已被推翻：§2.6 平台结论未核验；**§4"原生必须补 window 控制面"是错的**——真凶是 controller 流那次 `rpc:listen`（更正见 `docs/18` §3.7） |
 | `docs/05-远程网页-remote-v4-20260911/` | 要**网页侧契约**时读：bundle 快照 + 注入点审计。所有"源码定案"都从这里读出来 |
@@ -841,7 +1202,7 @@ MSYS_NO_PATHCONV=1 "$ADB" devices -l                 # 确认出现设备
 
 ### 一句话状态
 
-真机跑 **`1.0.0-local.187`**（本机出包、同签名覆盖安装、**零 CI 消耗**）。**2026-09-17/18 这一轮把"卡片"
+真机跑 **`1.0.0-local.191`**（本机出包、同签名覆盖安装、**零 CI 消耗**；清理轮收尾时为 187）。**2026-09-17/18 这一轮把"卡片"
 从头理了一遍**，由用户现场反馈逐条驱动、逐条验收（取证 **`docs/18` §3.10 与 §3.11**）：
 
 1. 「停在概览页退后台，卡片不更新」→ **提前接管**（162 正向 + 163 修掉"接管后把 KICKED 帧误判成链路
