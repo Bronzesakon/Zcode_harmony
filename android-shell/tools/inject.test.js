@@ -1775,3 +1775,225 @@ test('后台承载：恢复推动 close 档关掉页面那条 socket（仅取证
 });
 
 
+
+// ---------------------------------------------------------------------------
+// 档 0 观测（2026-09-19）：`__zcodeShellReportViewSnapshot` —— 回前台视图判据的数据源
+//
+// 为什么需要这一档：三道回前台兜底（KICKED 自愈 / healDeadLinkOnResume /
+// afterCarrierReturn）全都只在"页面已彻底失败"时动手，而假死形态的页面**看起来完全健康**
+// （socket OPEN、有帧、paired=true）⟹ 全部判"无需介入"，日志里一行都不留。
+// 这一档只读一帧快照交给原生，让那种形态变得可见。契约要点（钉住三条）：
+//   ① 纯读：不往页面 socket 写一个字节；
+//   ② 快照要带 `historyChat`（页面自己的路由记忆，跨 reload 存活、**不跨进程**）
+//      与 `sessionId`（用户在看哪个会话）；
+//   ③ 读不到 DOM 时不许抛——判据不齐宁可不判。
+// ---------------------------------------------------------------------------
+
+test('档0：视图快照是纯读，且带上 historyChat 与当前会话', async () => {
+    const page = setupPage();
+    try {
+        const socket = new globalThis.WebSocket('wss://relay.example');
+        socket.dispatchEvent({type: 'open'});
+        socket.send(JSON.stringify({type: 'auth_init', role: 'terminal', device_sid: 'sid-1'}));
+        socket.receive({type: 'pair_status_ack', pair_status: 'matched'});
+        await wait(30);
+
+        // 页面"在对话视图里、时间线有 39 行"——真机 W9 离开时的形状。
+        const timeline = new FakeElement('div');
+        timeline.setAttribute('data-row-count', '39');
+        page.document.querySelector = (selector) => {
+            if (selector === '[data-mobile-page="chat"]') return page.document.body;
+            if (selector === '[data-v4-timeline-scroll]') return timeline;
+            return null;
+        };
+        // 页面自己的路由状态（`history.state.zcodeMobilePage`）。
+        globalThis.history = {state: {zcodeMobilePage: 'chat'}};
+
+        const before = socket.sent.length;
+        assert.strictEqual(
+            globalThis.__zcodeShellReportViewSnapshot('leave'), true,
+            '上报接口必须返回 true（原生据此知道注入层是活的）',
+        );
+        await flush();
+
+        // ① 纯读：一个字节都没往页面那条 socket 写。
+        assert.strictEqual(
+            socket.sent.length, before,
+            '档 0 是纯观测：快照不许写页面 socket',
+        );
+
+        const snaps = findPost(page.posts, 'viewsnap');
+        assert.strictEqual(snaps.length, 1, '一次上报恰好一帧');
+        const data = snaps[0].data;
+        assert.strictEqual(data.phase, 'leave', 'phase 原样带回（原生用它区分离开/返回）');
+        // ② 快照内容。
+        assert.strictEqual(data.snap.chat, true, '在对话视图里');
+        assert.strictEqual(data.snap.rows, 39, '行数从 DOM 属性读');
+        assert.strictEqual(data.snap.historyChat, true, 'historyChat 必须带上——它区分"能自己落回来"与"回不来"');
+        assert.ok('sessionId' in data.snap, 'sessionId 字段必须在（空串也是有意义的读数）');
+    } finally {
+        delete globalThis.history;
+        page.teardown();
+    }
+});
+
+test('档0：DOM 读不到时快照降级为空读数，不抛异常', async () => {
+    const page = setupPage();
+    try {
+        // 不装任何 DOM 覆盖：默认假文档里 querySelector 不存在/返回空。
+        page.document.querySelector = () => null;
+        const ok = globalThis.__zcodeShellReportViewSnapshot('return_late');
+        await flush();
+        assert.strictEqual(ok, true, '读不到 DOM 也必须成功返回——判据不齐宁可不判，但不能炸');
+        const snaps = findPost(page.posts, 'viewsnap');
+        assert.strictEqual(snaps.length, 1);
+        assert.strictEqual(snaps[0].data.snap.chat, false, '读不到就是不在对话视图（保守读数）');
+        assert.strictEqual(snaps[0].data.snap.rows, -1, '没有时间线时 rows 必须是 -1，不能是 0');
+    } finally {
+        page.teardown();
+    }
+});
+
+// ---------------------------------------------------------------------------
+// 档 3（2026-09-19）：`__zcodeShellRecoverConversation` —— 回前台把对话拉回来的那一次写入
+//
+// **这是壳体对页面的第七处写入面**（原六处见 README「实现要点」14）。它存在的理由由
+// 三个真机对照实验支撑（`android-shell/scratch/PROOF-RESULTS.md`）：
+//   ① 卡死态 + 钉 history.state + reload → 落回对话（rows 610）
+//   ② 卡死态 + 不钉 + reload            → 落 home 任务列表
+//   ③ **冷启动**（state 已归零）+ 钉 + reload → 落回对话（rows 645）
+// ⟹ `history.state.zcodeMobilePage==='chat'` 是唯一开关，且**不跨进程存活**。
+//
+// 契约要点（本组测试钉的就是它们）：
+//   A. 两个动作**都发生**：钉 state（保留原字段）+ reload；
+//   B. 幂等/干净：已是 chat 就不重复 replaceState；不写任务槽位（与第六处不同）；
+//   C. 终止性：跨 reload 计数封顶 + 5 分钟限流；
+//   D. 不碰页面 socket（它不该退化成"轻推"）。
+// ---------------------------------------------------------------------------
+
+test('档3：钉住路由状态并重载一次（两个动作都发生）', async () => {
+    const page = setupPage();
+    const {reloads, restore} = stubReload();
+    try {
+        const replaced = [];
+        globalThis.history = {
+            state: {zcodeMobilePage: 'home', keepMe: 1},
+            replaceState: (st) => replaced.push(st)
+        };
+
+        const ok = globalThis.__zcodeShellRecoverConversation('离开时在对话(sess_a) / 12s 后 chat=false');
+        assert.strictEqual(ok, true, '原生判出 S3 后调用它，应当安排重载');
+
+        // A① 钉住路由状态，且**保留原有字段**（页面可能往 state 里放别的东西）。
+        assert.strictEqual(replaced.length, 1, '恰好一次 replaceState');
+        assert.strictEqual(replaced[0].zcodeMobilePage, 'chat', '必须把 zcodeMobilePage 钉成 chat');
+        assert.strictEqual(replaced[0].keepMe, 1, '原有字段必须保留（整份覆盖会弄丢页面的状态）');
+
+        // A② 重载是**延时**派发的（300ms），给 replaceState 落地的时间。
+        assert.strictEqual(reloads.length, 0, '重载不该是同步的');
+        // 在**本测试内**把它结清：不然这个 300ms 定时器会飘进下一个测试制造假失败
+        // （本轮实测踩到过两次）。
+        await wait(400);
+        assert.strictEqual(reloads.length, 1, '延时到点恰好重载一次');
+    } finally {
+        restore();
+        delete globalThis.history;
+        page.teardown();
+    }
+});
+
+test('档3：已是 chat 时不重复 replaceState，但仍重载（幂等）', async () => {
+    const page = setupPage();
+    const {reloads, restore} = stubReload();
+    try {
+        const replaced = [];
+        globalThis.history = {
+            state: {zcodeMobilePage: 'chat'},
+            replaceState: (st) => replaced.push(st)
+        };
+        assert.strictEqual(globalThis.__zcodeShellRecoverConversation('x'), true);
+        assert.strictEqual(replaced.length, 0, '已经是 chat 就不该再写一次 history.state');
+        await wait(400);
+        assert.strictEqual(reloads.length, 1, '延时到点必须真的重载');
+    } finally {
+        restore();
+        delete globalThis.history;
+        page.teardown();
+    }
+});
+
+// ⚠️ **限流不在这层**（2026-09-20 真机实测后改的）：注入层能用的两个计数
+// （sessionStorage 与内存变量）在**进程被杀**后都会归零，而档 3 治的 S3 恰恰是
+// "进程被杀"——限流在最需要它的场景下失效（实测第二次 S3 仍打「第 1/2 次」）。
+// 闸门已移到原生侧（`Prefs.conversationRecovery` + `ShellRuntime` 的
+// `allowConversationRecovery`）。这条测试钉的就是**这一层不许自己加闸门**：
+// 连调两次必须都执行（决策权在原生，这里只是执行者）。
+test('档3：本层不加闸门——连调两次都执行（限流的决策权在原生侧）', async () => {
+    const page = setupPage();
+    const {reloads, restore} = stubReload();
+    try {
+        globalThis.history = {state: {zcodeMobilePage: 'chat'}, replaceState: () => {}};
+        assert.strictEqual(globalThis.__zcodeShellRecoverConversation('first'), true);
+        assert.strictEqual(
+            globalThis.__zcodeShellRecoverConversation('second'), true,
+            '本层是执行者：原生放行几次就执行几次（闸门在原生，见 Prefs.conversationRecovery）',
+        );
+        await wait(400);
+        assert.strictEqual(reloads.length, 2, '两次调用各安排一次重载');
+    } finally {
+        restore();
+        delete globalThis.history;
+        page.teardown();
+    }
+});
+
+test('档3：不写任务槽位——与第六处（通知定位）的关键区别', async () => {
+    const page = setupPage();
+    const {restore} = stubReload();
+    try {
+        const writes = [];
+        globalThis.localStorage = {
+            setItem: (k, v) => writes.push(k + '=' + v),
+            getItem: () => null,
+            removeItem: () => {}
+        };
+        globalThis.history = {state: {zcodeMobilePage: 'chat'}, replaceState: () => {}};
+        globalThis.__zcodeShellRecoverConversation('x');
+        await wait(400);
+        assert.strictEqual(
+            writes.filter((w) => w.indexOf('zcode-v4-last-session') === 0).length, 0,
+            '这条恢复是"放回用户离开的地方"，不是"跳到某个任务"——不写任务槽位',
+        );
+    } finally {
+        restore();
+        delete globalThis.history;
+        delete globalThis.localStorage;
+        page.teardown();
+    }
+});
+
+test('档3：不碰页面 socket（它不许退化成轻推）', async () => {
+    const page = setupPage();
+    const {restore} = stubReload();
+    const session = stubSessionStorage();
+    try {
+        const socket = new globalThis.WebSocket('wss://relay.example');
+        socket.dispatchEvent({type: 'open'});
+        socket.send(JSON.stringify({type: 'auth_init', role: 'terminal', device_sid: 'sid-1'}));
+        socket.receive({type: 'pair_status_ack', pair_status: 'matched'});
+        await wait(30);
+
+        globalThis.history = {state: {zcodeMobilePage: 'chat'}, replaceState: () => {}};
+        const before = socket.sent.length;
+        globalThis.__zcodeShellRecoverConversation('x');
+        await wait(400);
+
+        assert.strictEqual(socket.readyState, FakeWebSocket.OPEN, '不许关页面那条 socket');
+        assert.strictEqual(socket.sent.length, before, '也不许往它上面写帧');
+    } finally {
+        session.restore();
+        restore();
+        delete globalThis.history;
+        page.teardown();
+    }
+});

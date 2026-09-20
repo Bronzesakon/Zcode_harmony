@@ -1655,6 +1655,12 @@
         // 概览页（没进任何任务）永远收不到 conversation/* 帧，而进了任务哪怕 agent 静默，
         // 首屏快照/轮次帧也会到。承载用它做"提前接管"的判据（见 ShellRuntime）。
         this._convLastFrameAt = Date.now();
+        // 最近收到的那个会话 topic（2026-09-19，档 0 观测）：**逐帧**记，不挑内容。
+        // 与 `_convTextTopic` 的区别很重要：后者只在**解出正文**时才更新（见
+        // `_trackConversationText` 末尾），于是"页面在跟一个没正文的会话"（刚进任务、
+        // agent 还没开口）在它那里读不到。档 0 要判的是"用户此刻在看哪个会话"，
+        // 所以必须用"最近收到帧的那个"——哪怕那帧里没有正文。
+        this._convLastTopic = data.topic;
         // **真实结构（2026-09-15 真机打出来，三层，不要再猜）**：
         //   data  = { wireVersion, kind:'complete', deliveryKind, logicalFrameId,
         //             logicalFrameOrdinal, topic, subscriptionId, frame }
@@ -1774,6 +1780,20 @@
             frames: this._convFrames || 0,
             at: this._convTextAt || 0
         };
+    };
+
+    /**
+     * 最近收到过帧的那个会话 topic（`conversation/sess_xxx`），没有则空串。
+     *
+     * 2026-09-19（档 0 观测）新增。与 [latestConversationText] 的关键区别：
+     * 那个读 `_convTextTopic`，而它**只在解出正文时**才更新——于是"页面刚进任务、
+     * agent 还没开口"这种没有正文的状态在它那里读不到。档 0 要回答的是
+     * "用户此刻在看哪个会话"，所以用逐帧更新的 `_convLastTopic`。
+     *
+     * 纯读，不改变任何状态；读者只有注入层的 `__zcodeShellViewSnapshot`。
+     */
+    RemoteClient.prototype.latestConversationTopic = function () {
+        return this._convLastTopic || '';
     };
 
     /**

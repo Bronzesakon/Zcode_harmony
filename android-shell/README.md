@@ -162,7 +162,7 @@ pre.31 起改为**跨连接冷却**（`FAULT_COOLDOWN_CONNECTIONS=3` / `FAULT_CO
 到点（`FALLBACK_CHECK_MS`，现行 **3s**）仍判一次**页面自述的就绪证据**（`store.connect.completed`/订阅确认、时间线有行、信标后页面桥有入站帧）：
 就绪即**本轮收工**（记在 §5b 自己的就绪状态位上）；未就绪**不动页面**，只连打两行拒绝——`只读壳：不轻推页面 socket（本会触发的原因：…）` → `只读壳：不因"…"重载页面（只记录，等页面自己恢复）`。**「撤防」与「放弃态」已随卡死看门狗的决策机器在 4b（2026-09-18）删除**（`docs/18` §2.6）：现在只剩 §5b 自己的就绪状态位，就绪信号到达即复位。
 两个终点（`nudgeReconnect` 关共享 socket、`location.reload()`，连同 15s 最小刷新间隔 + 连续上限 + `sessionStorage` 存证；草稿守卫/前台守卫/真标题交叉验证/每会话限制更早即按用户要求抛弃）**实现已删**（连调用它们的**看门狗决策机器**也已在 4b（2026-09-18）整块拆除，见 `docs/18` §2.6）：它们都是拿"我们的观测"去否定"页面的事实"，
-而只读壳对页面的写入面只允许「要点 14」那五处。DOM 的「标题回退 / 输入框未就绪」只用于日志标注形态，**不作判据**。
+而只读壳对页面的写入面只允许「要点 14」列出的那几处（该清单 2026-09-19 已扩到七处）。DOM 的「标题回退 / 输入框未就绪」只用于日志标注形态，**不作判据**。
 
 **要真正修掉需桌面端回答**：为什么一条"已完成/未加载"的会话不能被 `readSession` 读到（或把用户正在看的会话标记成 active）。
 **用户侧现实办法：再点一次就好。** 壳侧唯一能做的"干预"（注入层读 DOM 看出回退后补点一次任务行）**动了网页 UI**、违反「网页零改动」，
@@ -451,7 +451,20 @@ zcode-remote.apk -> CN=ZCode Remote, OU=Mobile, O=ZCode, L=Unknown, ST=Unknown, 
 11. **改完 Kotlin 先跑 `python tools/check_kotlin_structure.py`**：括号配平、包名与目录一致、合并残留，一秒出结果；CI 的 Static checks job 也跑它。
 12. **滚动条：网页自己那条 14px 经典条是我们隐藏掉的，不要再加第二条。** 引擎层已确认 Android WebView 把 overlay 滚动条整体关掉（`layer_tree_settings.cc:415`，见 issue 40226034，至今 P3/New），唯一把手是 legacy 轨道宽度；而"丑陋滚动条"**是网页自己写的**（`index-BMndL2ru.css` @368578：`*{scrollbar-width:auto}` + `::-webkit-scrollbar{width:14px}` + thumb `var(--color-border)`/`border:3px solid #0000`/`radius:9999px`/`min 32px`）——Chromium **只要自定义 `::-webkit-scrollbar` 就强制经典占位条**，14×dpr3.5 = 49 物理像素，丢宽的是内部 `[data-v4-timeline-scroll]` 容器（**根文档不丢**：真机 `innerWidth==clientWidth==363`）。**现行做法**：照抄网页自己的内嵌模式（bundle 函数 `J0e()` @1422852）把轨道归零——`html,body,*{scrollbar-width:none!important;scrollbar-gutter:auto!important}` + `::-webkit-scrollbar{display:none!important;width:0!important;height:0!important}`——再用自绘 overlay 指示条补回视觉：可见 8px、距右缘内缩 3px、圆角 9999px、最短 32px、颜色读容器上的 `--color-border`、停止 700ms 后淡出、捕获阶段 passive `scroll` 监听（`event.target` 即滚动容器，不依赖选择器）、跳过 `[class*=scrollbar-hide]` / pptx 渲染面 / xterm 视口。⚠️ **滑块宽度必须用常量算**（`rail - 2*inset`）：与网页逐字一致的那套 `border:3px solid transparent` + `background-clip:padding-box` 在真机上不生效，滑块会撑满 14px 轨道、视觉粗一倍。**硬判据**：`滚动条几何: 容器占宽=0 容器宽=363 轨道=14px 内缩=3px 滑块可见宽=8px(28物理) 实测滑块宽=8px 圆角=9999px 最短=32`。**v1 只做指示、不可拖拽，只处理纵向。**
 13. **页面自身的 RPC 要与我们的 bridge 分开看，且「页面覆盖情况」必须活过 relay 重连。** 被动观测也记录页面自己的 promise 调用/回复（`_tracePageCall` / `_tracePageResult` → 日志里的 `页面调用慢`、`页面调用失败`、`页面 RPC 10s`），因为「点进任务不出内容」那个请求是**页面的**，壳的 bridge 永远看不到。硬约束：① 页面已覆盖的工作区**绝不重复开 bridge**，这份认知由 `inject.js` 的 `pageCoverage` 跨 `resetClient()` 存活（第一轮正是它在重连后丢失，导致重复 bridge 与 `rpc-transport-fault` 死循环）；② `_observeInboundRpc` 里 promise 回复按 `(bridgeSessionId, id)` 配对，**不要求先学到工作区**，否则页面 bridge 的回复会被静默丢掉；③ 「页面拥有某工作区」不能只凭一个证据——页面开了 bridge（入站 `workspace-bridge-ready` 且 id 不在 `_requestedBridgeIds` 里）**且**桌面端确实拒掉我们的 bridge，两者同时成立才永久放弃（`_pageOwned`）；④ 同一条 relay 连接内 fault 超过 `_maxReopens`（**现行值 0**，即首次 fault 不再重开）就停止重开，跨连接另设冷却 `FAULT_COOLDOWN_CONNECTIONS=3` / `FAULT_COOLDOWN_MS=10 分钟`（连续 3 条连接都 fault 就冷却 10 分钟，到期自动重试）；⑤ burst 的每一站之前 `awaitPageIdle()`，让路预算整个 burst 共享（8s），故 `主动订阅完成：用时` 可能到 ~19s 是**刻意的**。
-14. **只读壳（`SHELL_READ_ONLY = true`，2026-09-15 定案）：壳永不关闭页面的 socket、永不自动重载页面。** 真机把三种自伤来源抓齐了——`socket.close() 被调用 … 来自 …` 那行会点名调用者：`nudgeReconnect ← fallbackCheck`（"进对话 5s 铁判准"，**40 秒里 10 次**）、`forceReconnect ← G.__zcodeShellSetAppForeground`（**回一次前台拆一次**，20:53:04）、`forceReconnect ← heartbeatTick ← G.__zcodeShellHeartbeat`（18:24 / 18:35 / 19:40 / 20:56）。拆掉的每一次都是**页面正用着的那条** relay 连接，用户看到的"发消息转圈 / 要重连 n 次才出来 / 返回页面是它自己在重连"全是它的下游。对照实验（`diag_cmd passive_off`，这些手段全部失去 socket 句柄）：页面自己的订阅 ack 之后 **5 分钟零生命周期事件**。**壳对页面的写入面只允许六处**：① document-start 的滚动条 CSS；② **退后台之后**每 10s 一帧 `pair_status_query`（前台一帧都不写——页面自己的 10s 心跳在前台是准的，见第 6 条）；③ KICKED 终态时回前台的自愈重载（终态页面自己回不来，只有手动"重新连接"）；④ 通知点击后的定位点击；⑤ **回前台死链兜底重载**（2026-09-15 晚加，**待真机验证**：静默 >60s ＋ 5s 观察窗零入站帧 ＋ 对话 0 行，三条齐了才重载，5 分钟限流；判据是"页面已经失败"，不是"我们怀疑它失败"）；⑥ **通知点击定位时的"预设 + 重载"**（2026-09-18 加）：把 `localStorage['zcode-v4-last-session:v1:<workspaceKey>']` 写成目标 sessionId、并把 `history.state.zcodeMobilePage` 钉成 `chat`，然后 `reload()` 一次——页面自己会因此打开那个任务（页面原生通路，见「死代码清理收口」节第 5 小节第 4 条）。**只在那一种情况下做**：判据是"承载在跑 或 本次后台承载跑过"（`MainActivity.maybeReloadForKickedPage`）——**页面本来好好的就绝不重载**（宁可漏判、不可误判）。**要新增任何写操作之前，先回答两句："页面自己做不到这件事吗？"以及"我怎么知道它已经失败了？"**
+14. **只读壳（`SHELL_READ_ONLY = true`，2026-09-15 定案）：壳永不关闭页面的 socket、永不自动重载页面。** 真机把三种自伤来源抓齐了——`socket.close() 被调用 … 来自 …` 那行会点名调用者：`nudgeReconnect ← fallbackCheck`（"进对话 5s 铁判准"，**40 秒里 10 次**）、`forceReconnect ← G.__zcodeShellSetAppForeground`（**回一次前台拆一次**，20:53:04）、`forceReconnect ← heartbeatTick ← G.__zcodeShellHeartbeat`（18:24 / 18:35 / 19:40 / 20:56）。拆掉的每一次都是**页面正用着的那条** relay 连接，用户看到的"发消息转圈 / 要重连 n 次才出来 / 返回页面是它自己在重连"全是它的下游。对照实验（`diag_cmd passive_off`，这些手段全部失去 socket 句柄）：页面自己的订阅 ack 之后 **5 分钟零生命周期事件**。**壳对页面的写入面只允许七处**：① document-start 的滚动条 CSS；② **退后台之后**每 10s 一帧 `pair_status_query`（前台一帧都不写——页面自己的 10s 心跳在前台是准的，见第 6 条）；③ KICKED 终态时回前台的自愈重载（终态页面自己回不来，只有手动"重新连接"）；④ 通知点击后的定位点击；⑤ **回前台死链兜底重载**（2026-09-15 晚加，**待真机验证**：静默 >60s ＋ 5s 观察窗零入站帧 ＋ 对话 0 行，三条齐了才重载，5 分钟限流；判据是"页面已经失败"，不是"我们怀疑它失败"）；⑥ **通知点击定位时的"预设 + 重载"**（2026-09-18 加）：把 `localStorage['zcode-v4-last-session:v1:<workspaceKey>']` 写成目标 sessionId、并把 `history.state.zcodeMobilePage` 钉成 `chat`，然后 `reload()` 一次——页面自己会因此打开那个任务（页面原生通路，见「死代码清理收口」节第 5 小节第 4 条）。**只在那一种情况下做**：判据是"承载在跑 或 本次后台承载跑过"（`MainActivity.maybeReloadForKickedPage`）——**页面本来好好的就绝不重载**（宁可漏判、不可误判）。⑦ **回前台"对话没回来"的恢复**（2026-09-19 加，**这是政策扩张，已由用户拍板**）：钉住
+`history.state.zcodeMobilePage='chat'` 然后 `reload()` 一次。判据（**档 0**，真机两形态验收过）：退后台那一刻
+`chat=true`（视图快照跨进程落盘）**且**回前台 12s 后仍 `chat=false`——即"用户离开时在对话里，回来却不在"。
+**三个真机对照实验**（证据 `android-shell/scratch/PROOF-RESULTS.md`）证明这是**最小充分**动作：
+① 卡死态 + 钉 + reload → 落回对话（rows 610）；② 卡死态 + **不钉** + reload → 落 home 任务列表；
+③ **冷启动**（进程被杀、`history.state` 已归零）+ 钉 + reload → 落回对话（rows 645）。
+⟹ 那个字段是"落 chat 视图"的**唯一开关**且**不跨进程存活**（这正是"进程被杀后回前台落 home"的根因）；
+只钉它就够，**不需要**喂 `taskId`（页面自己会恢复该显示哪个会话）。
+**与第⑥处（通知定位）的区别**：那条是**用户显式要求**跳某个任务（所以写 workspaceKey/sessionId）；
+这条是**把用户放回他自己离开的地方**，因此**完全不写任务槽位**——少一个写入面，也少一份"跳错任务"的风险。
+终止性与第③处同口径：跨 reload 计数封顶 2 次（配对成功即清零）+ 与死链兜底共用 5 分钟闸门。
+**只在 S3 那一档动手**；"3s 时在、12s 时不在"那一档仍只记录（页面那时已呈现出对话，中途离开更可能是
+用户自己的动作，此时重载会把用户硬拽回去——这是刻意的边界，不是遗漏）。
+**要新增任何写操作之前，先回答两句："页面自己做不到这件事吗？"以及"我怎么知道它已经失败了？"**
 15. **「后台 60 秒墙」= Chromium 的网络栈在后台死掉，不是 App 没网、不是壳的问题（2026-09-16 凌晨定案，别再重查）。** 判据是同刻三件事：墙内页面**新建** `fetch` 挂住 76s（既不成功也不失败）；同刻**原生 Java** 裸 TCP `ok 67ms`、HTTPS `HTTP 200 276ms`；同刻原生 WebSocket 1 秒内 `★配对成功（matched）`。墙的形状是**僵尸连接**：`socket readyState=1(OPEN)`、`paired true`、壳每 10s 仍在发探针，却连 ack 都没有，且**没有任何 close 事件**；连页面自己 `close()` 都卡在 CLOSING（帧发不出去）。**这一条把"页面侧自救"整类方案全部证伪**（合成 `online` 送到了页面也没用），所以：① **落地形态**是「判死 → 原生接管 → 回前台交还」（判死路径的真正形态，触发条件见 `ShellRuntime.maybeStartNativeCarrier`：入站帧静默 ≥35s，**不是**老的"退后台 5 秒"）；② 反向不变式：**页面链路一旦自己活了（入站帧 <35s），原生立刻交还**，任何时刻只有一侧持连接（**例外：提前接管那条路**——它本来就是"页面活着"才触发的，接管后桌面端发的 `KICKED` 会刷新入站帧年龄，于是"已恢复"是假象；那一档要等页面**又在跟会话**（socket OPEN ＋ paired ＋ 30s 内有会话帧）才交还，判定在 `core/CarrierHandback.kt`，取证见 `docs/18` §3.10）；③ 判死时页面那条连接早已是僵尸，且它的网络栈是死的 ⇒ **`KICKED` 帧根本送不到页面**，页面不会进终态（这正是老路径 K1 风险的解）；④ **回前台不需要重载**：原生先交还，页面可见性恢复后 Chromium 网络栈复活，页面自己的 `recoverConnection` 会重拨；只有页面**已经掉进失败态**（`i4t.dispose` 之后自己回不来）才由 `__zcodeShellAfterCarrierReturn` 兜底重载一次（交还后 8s、无 OPEN socket、零入站帧，5 分钟限流）；⑤ 诊断判据三件套（**后台可调用**，`am broadcast` 不碰可见性）：`net_probe`（原生网络）、`bg_http`（Chromium 侧新连接）、`bg_state`（链路现场），用法见「诊断指令全集」。
 16. **后台承载已经把"后台跟手"做通了，而且真凶是我们自己的一条 `rpc:listen`（2026-09-16 01:16 定案）。**
     先前的错误归因：00:52 观察到"原生配对后桌面端 4.3 秒拆 host"，一度以为"裸终端配对没有窗口归属、
@@ -1202,8 +1215,35 @@ if ($obj.result -and $obj.result.result) {
 
 ### 一句话状态
 
-真机跑 **`1.0.0-local.191`**（本机出包、同签名覆盖安装、**零 CI 消耗**；清理轮收尾时为 187）。**2026-09-17/18 这一轮把"卡片"
-从头理了一遍**，由用户现场反馈逐条驱动、逐条验收（取证 **`docs/18` §3.10 与 §3.11**）：
+真机跑 **`1.0.0-local.199`**（本机出包、同签名覆盖安装、**零 CI 消耗**；2026-09-20）。
+
+**2026-09-19 夜这一轮：回前台"对话没回来"的恢复（档 0 判据 + 档 3 动作）。**
+用户报的现象：「切后台后原生接管了、没走流体云点回来，从多任务切回来的界面没有正确加载内容」。
+调研 + 三个真机对照实验 + 落地全在本轮完成，**这是壳体对页面的第七处写入面（政策扩张，用户已拍板）**：
+
+1. **根因（真机 CDP 三实验定案）**：`history.state.zcodeMobilePage==='chat'` 是"落 chat 视图"的
+   **唯一开关**，且它**不跨进程存活**——进程被杀后归零，于是重载只能落 home 任务列表。
+   证据在 `scratch/PROOF-RESULTS.md`（① 钉+reload→对话 rows 610；② 不钉→home；③ 冷启动+钉→对话 rows 645）。
+2. **判据（档 0）**：退后台那一刻采视图快照（`chat`/`rows`/`historyChat`/`sessionId`，**跨进程落盘**），
+   回前台 3s 首判 + 12s 复判。真机两形态验收：S1 `已回到对话视图…首判3.001s=已回`；
+   S3 `复判（12.0s）仍未回到对话视图…historyChat=false`（截图核对：屏幕确实是 home，非误报）。
+3. **动作（档 3）**：仅 S3 触发——注入层 `__zcodeShellRecoverConversation` 钉 `history.state` + 重载一次。
+   **不写任务槽位**（与第六处的关键区别：这条是"放回用户离开的地方"，不是"跳到某个任务"）。
+   **限流判据**在 `core/ConversationRecoveryPolicy.kt`（纯函数 + 9 条单测）：
+   **连续上限 2 次**（到顶彻底停手）＋ **两次之间至少 5 分钟**；
+   计数在**"页面自述在对话视图里"**时清零（`leave` 快照或回前台判据窗任一），
+   ⚠️ **不是"配对成功"**——那两次语义写错都在真机上失效过，见 `scratch/PROOF-RESULTS.md`。
+   真机验收：S3 自动恢复（rows 848/852/896）、S1 零误伤、闸门实测拦下（`距上次 246s < 5 分钟`）、
+   不适用场景不动作、清零三次实测。
+4. **顺带推翻两条既有认知**：① `localStorage` 槽位 `zcode-v4-last-session:v1:<ws>` 在 /remote/v4 上是
+   **死代码**（页面那个 hook 被 `enabled:!$t` 恒假门死，真机实测槽位里是过期会话而恢复仍落到正确会话）；
+   ② 落哪个任务**不需要**壳喂 `activeTaskId`——页面自己从桌面端下发的 `mobileViewState` 恢复。
+5. 本轮改动：`assets/inject.js`（快照 + 恢复函数 + 配对清零）、`assets/zcode-protocol.js`
+   （`latestConversationTopic`）、`core/Prefs.kt`（跨进程落盘）、`ShellRuntime.kt`（判据 + 动作接线）。
+   JS 测试 **52 + 38 = 90 项**全绿（新增 3 条档 0 + 6 条档 3 钉子）；
+   Kotlin 单测 **131 项 / 13 类**（新增 `ConversationRecoveryPolicyTest` 9 条）。
+
+**2026-09-17/18 那一轮把"卡片"从头理了一遍**，由用户现场反馈逐条驱动、逐条验收（取证 **`docs/18` §3.10 与 §3.11**）：
 
 1. 「停在概览页退后台，卡片不更新」→ **提前接管**（162 正向 + 163 修掉"接管后把 KICKED 帧误判成链路
    已恢复 ⇒ 无效交还/重配对"）；

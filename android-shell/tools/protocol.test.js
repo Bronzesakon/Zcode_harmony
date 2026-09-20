@@ -1084,3 +1084,34 @@ test('conversationFrameStats 报出"最后一帧距今多久"（承载提前接�
     assert.strictEqual(after.frames, 1, '帧计数独立于"有没有解出正文"取');
 });
 
+
+// ---------------------------------------------------------------------------
+// 档 0 观测（2026-09-19）：`latestConversationTopic` —— 回前台视图判据要的"用户在看哪个会话"
+// ---------------------------------------------------------------------------
+
+test('latestConversationTopic：逐帧更新，且**不要求**那帧里有正文', () => {
+    const {client} = makeClient();
+    // 没有会话帧时必须是空串（原生据此报"离开时没在跟会话"）。
+    assert.strictEqual(client.latestConversationTopic(), '', '没见过会话帧必须报空串');
+
+    // 关键差异：`latestConversationText()` 读 `_convTextTopic`，而它只在**解出正文**时才更新。
+    // "页面刚进任务、agent 还没开口"这种状态在它那里读不到，但档 0 必须能读到
+    // ——用户明明在对话视图里，只是没有正文而已。
+    client._trackConversationText(convSnapshot('conversation/sess_a', [
+        {kind: 'userInput', rowId: 1, text: '问题'}
+    ]));
+    assert.strictEqual(
+        client.latestConversationTopic(),
+        'conversation/sess_a',
+        '只有用户输入（无 assistantText）时也必须报出 topic',
+    );
+    assert.strictEqual(
+        client.latestConversationText(),
+        null,
+        '同刻 latestConversationText 仍应为 null——两者判据不同，别合并',
+    );
+
+    // 逐帧更新：换一个会话（真机 00:27 实测同刻有主会话 + 子代理会话共 3 个 topic）。
+    client._trackConversationText(convDeltas('conversation/sess_b', []));
+    assert.strictEqual(client.latestConversationTopic(), 'conversation/sess_b', '最近收到帧的 topic 胜出');
+});

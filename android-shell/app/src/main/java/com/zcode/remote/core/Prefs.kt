@@ -69,11 +69,62 @@ class Prefs(context: Context) {
         get() = prefs.getBoolean(KEY_NOTIF_ASKED, false)
         set(value) = prefs.edit().putBoolean(KEY_NOTIF_ASKED, value).apply()
 
+    /**
+     * 档 0 观测（2026-09-19）：**退后台那一刻的视图快照**，JSON 字符串（`{at, snap}`）。
+     *
+     * **为什么必须落盘**（真机 22:32 实测踩到）：这个快照原本只存内存，而档 0 要抓的
+     * 假死形态（S3）恰恰就是「**进程被杀** + 回前台」——进程一死，内存里的"离开时在不在
+     * 对话里"随之消失，判据只剩一行「未采到快照」，**观测不到它要观测的东西**。
+     * 所以它必须跨进程存活。真机 22:31:45 离开（chat=true / 会话 sess_527fb3e6）→
+     * 22:32:30 进程被杀 → 22:32:44 回前台，就是靠这条才判得出来。
+     *
+     * 内容与敏感度：只有视图布尔量、行数与**会话 id**（`sess_…`，与日志里已有的
+     * `会话运行态：在跑 · sess_…` 同级；**不是** URL 里那份 sid/hash/mid 凭证）。
+     * 本文件已被 data_extraction_rules 排除在云备份与设备迁移之外。
+     *
+     * 生命周期：退后台写入 → 回前台判定时消费并清空。判据太旧（>2h）时不判、只记一行。
+     */
+    var viewAtLeave: String?
+        get() = prefs.getString(KEY_VIEW_AT_LEAVE, null)
+        set(value) {
+            prefs.edit().apply {
+                if (value.isNullOrEmpty()) remove(KEY_VIEW_AT_LEAVE) else putString(KEY_VIEW_AT_LEAVE, value)
+            }.apply()
+        }
+
+    /**
+     * 档 3（2026-09-19）：**对话恢复的跨进程记账**，JSON 字符串 `{count, at}`。
+     *
+     * **为什么必须落盘**（真机 16:28 实测踩到，是本轮第二个"内存态在最需要的场景下失效"）：
+     * 注入层原本用 `sessionStorage` 计数 + 内存里的 `lastResumeHealAt` 做限流，
+     * 而档 3 要治的 S3 恰恰是「**进程被杀** + 回前台」——进程一死，**两道限流同时归零**，
+     * 于是每次冷启动都能再重载一次，连续触发会变成"每次回前台都闪一次"。
+     * 真机现场：第二次 S3 仍打「第 1/2 次」（本该是第 2/2 次被计数，或直接被限流拦下）。
+     *
+     * 语义：`count` = 连续自动恢复次数（**配对成功即清零**，与注入层同口径）；
+     * `at` = 上次恢复的时刻（ms），供"距上次不足 5 分钟就跳过"的闸门使用。
+     *
+     * 内容与敏感度：只有两个数字，无任何标识信息。
+     */
+    var conversationRecovery: String?
+        get() = prefs.getString(KEY_CONVERSATION_RECOVERY, null)
+        set(value) {
+            prefs.edit().apply {
+                if (value.isNullOrEmpty()) {
+                    remove(KEY_CONVERSATION_RECOVERY)
+                } else {
+                    putString(KEY_CONVERSATION_RECOVERY, value)
+                }
+            }.apply()
+        }
+
     companion object {
         private const val NAME = "zcode_remote"
         private const val KEY_REMOTE_URL = "remote_url"
         private const val KEY_WEBVIEW_DEBUG = "webview_debugging"
         private const val KEY_PASSIVE_OBSERVE = "passive_observe"
         private const val KEY_NOTIF_ASKED = "notification_permission_requested"
+        private const val KEY_VIEW_AT_LEAVE = "view_at_leave"
+        private const val KEY_CONVERSATION_RECOVERY = "conversation_recovery"
     }
 }

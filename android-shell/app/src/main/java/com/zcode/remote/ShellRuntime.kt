@@ -8,6 +8,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import com.zcode.remote.core.CarrierHandback
+import com.zcode.remote.core.ConversationRecoveryPolicy
 import com.zcode.remote.core.CompletionEvent
 import com.zcode.remote.core.Diagnostics
 import com.zcode.remote.core.InjectionReadiness
@@ -225,6 +226,373 @@ object ShellRuntime {
     private var backgroundStartedForVerdict = 0L
     private var backgroundEndedAt = 0L
 
+    // --------------------------------- 回前台视图恢复：判据（档 0）+ 动作（档 3）
+    //
+    // 缘起（2026-09-19 调研，全文见 `Docs/21-回前台对话恢复-页面机制与真机事实.md`）：
+    // 「回前台后当前对话没回来」这件事在日志里**曾经是隐形的**——三道回前台兜底
+    // （KICKED 自愈 / healDeadLinkOnResume / afterCarrierReturn）全都只在"页面已彻底失败"
+    // 时动手，而假死形态的页面**看起来完全健康**（socket OPEN、有帧、paired=true），
+    // 于是全部判"无需介入"，一行日志都不留。
+    //
+    // 现在这一节做两件事：
+    //   * **档 0（判据）**：退后台那一刻采一次视图快照，回前台 3s 首判 + 12s 复判，
+    //     按形态打判据行。跨进程落盘（见 [readViewAtLeave]）。
+    //   * **档 3（动作）**：仅当判出 S3（离开时在对话 + 12s 仍未回对话视图）时，
+    //     调注入层的 `__zcodeShellRecoverConversation` 钉 `history.state` 并重载一次。
+    //     ⚠️ **这是壳体对页面的第七处写入面**（原六处见 README「实现要点」14），
+    //     合规性论证与"为什么是最小充分动作"见注入层那个函数的注释 +
+    //     `android-shell/scratch/PROOF-RESULTS.md`（三个真机对照实验）。
+    //
+    // 两个必须记住的时序事实（都是真机实测，别"优化"掉）：
+    //   ① **采样必须在退后台那一刻做**：原生承载一配对，页面就 dispose 掉会话并退出
+    //      对话视图（23:59:05 dispose → 23:59:14 体征已 `chat:false`）。等回前台再读，
+    //      "用户离开时在不在对话里"这个事实已经丢了。
+    //   ② **不能依赖周期体征通道**：`页面体征`/`页面开销` 只在后台由原生泵驱动
+    //      （前台 30 分钟窗口实测各 0 条）⇒ 这里走的是**按需求值 + 桥回传**。
+
+    /**
+     * 退后台那一刻的视图快照。
+     *
+     * **必须跨进程存活**（真机 2026-09-19 22:32 实测踩到）：档 0 要抓的假死形态
+     * 恰恰是「进程被杀 + 回前台」——进程一死，内存里的"离开时在不在对话里"随之消失，
+     * 判据只剩一行「未采到快照」，**观测不到它要观测的东西**。所以走 [Prefs.viewAtLeave]
+     * 落盘；读出来时顺手做时效校验（超过 [VIEW_LEAVE_MAX_AGE_MS] 的旧记录不判，
+     * 免得把几天前的一次离开拿来对今天这一次）。
+     */
+    private fun readViewAtLeave(): JSONObject? {
+        val raw = prefs().viewAtLeave ?: return null
+        return try {
+            val root = JSONObject(raw)
+            val at = root.optLong("at", 0L)
+            val age = System.currentTimeMillis() - at
+            if (at <= 0L || age < 0L || age > VIEW_LEAVE_MAX_AGE_MS) {
+                Diagnostics.log(
+                    "debug",
+                    "回前台视图判据：离开快照已过期（${age / 1000}s 前），本轮不判",
+                )
+                return null
+            }
+            root.optJSONObject("snap")
+        } catch (e: Exception) {
+            Diagnostics.log("warn", "回前台视图判据：离开快照解析失败 ${e.message}")
+            null
+        }
+    }
+
+    private fun clearViewAtLeave() {
+        prefs().viewAtLeave = null
+    }
+
+    /** 离开快照的时效上限：超过它就不判（只记一行），避免拿旧记录对本次。 */
+    private const val VIEW_LEAVE_MAX_AGE_MS = 2 * 60 * 60 * 1000L
+
+    /**
+     * 回前台首判（3s）的结果：true = 那一刻已经回到对话视图。
+     *
+     * 为什么要记住它：12s 复判要能说清"是慢恢复还是真没恢复"。
+     * 只留最后一次读数的话，一个 +6s 才回来的健康页面会被报成"没回来"（真机 00:27 就是这个形状）。
+     */
+    private var viewReturnedAt3s = false
+
+    /** 首判窗（用户口径：首个可见动作 ≤3s）。 */
+    private const val VIEW_RETURN_CHECK_MS = 3000L
+
+    /** 复判窗：越过它仍未回到对话，才算"页面自己回不来"。 */
+    private const val VIEW_RETURN_LATE_MS = 12000L
+
+    /** 快照采集的排队重试（注入层 boot 需要时间，冷启动那条路尤其）。 */
+    private const val VIEW_SNAPSHOT_RETRY_MS = 600L
+    private const val VIEW_SNAPSHOT_MAX_ATTEMPTS = 40
+
+    /**
+     * 本次回到前台的真实时刻（`SystemClock.elapsedRealtime()`），0 = 还没回。
+     *
+     * **为什么必须记**：3s / 12s 两个采样点都可能因"注入层还没 boot"而顺延
+     * （冷启动那条路实测能顺延到十几秒）。若只按计划时刻给读数贴标签，一个 20s 才采到的
+     * 快照会被写成"首判3s=未回"——**那是假数据**，而这一档存在的全部意义就是提供可信读数。
+     * 所以日志里报的是**实际用时**，不是计划用时。
+     */
+    private var foregroundReturnedAt = 0L
+
+    /** 离开时的会话 id（`conversation/sess_xxx` 去掉前缀），空 = 那一刻没在跟会话。 */
+    private fun sessionOf(snap: JSONObject?): String =
+        snap?.optString("sessionId").orEmpty().substringAfterLast('/')
+
+    /**
+     * 采一帧视图快照。`phase` = "leave"（退后台那一刻）/ "return" / "return_late"。
+     *
+     * 走注入层的 `__zcodeShellReportViewSnapshot`，快照经桥的 `viewsnap` 事件回传
+     * （`evaluateJavascript` 那条通道是单向的，拿不回值——见 [evaluateJs]）。
+     *
+     * **注入未就绪时排队重试**：冷启动/页面重载后注入层要 boot 完才认这个接口，
+     * 而那正是"进程被杀 + 回前台"这一档的常态。不重试的话判据只剩"未采到快照"，
+     * 档 0 就白做了。重试上限与 `dispatchJsDiag` 同口径（40 × 600ms），
+     * 因为这是同一类"等新文档 boot"的问题。
+     */
+    private fun requestViewSnapshot(phase: String, attempt: Int = 0) {
+        if (!injectionReadiness.isReady()) {
+            if (attempt >= VIEW_SNAPSHOT_MAX_ATTEMPTS) {
+                Diagnostics.log(
+                    "warn",
+                    "视图快照($phase)：注入层始终未就绪，放弃采集（第 $attempt 次）",
+                )
+                return
+            }
+            mainHandler.postDelayed(
+                { requestViewSnapshot(phase, attempt + 1) },
+                VIEW_SNAPSHOT_RETRY_MS,
+            )
+            return
+        }
+        evaluateJs(
+            "window.__zcodeShellReportViewSnapshot && " +
+                "window.__zcodeShellReportViewSnapshot(${org.json.JSONObject.quote(phase)});",
+        )
+        // 记下这一帧的**实际**采集时刻（顺延后也要如实反映，见 foregroundReturnedAt）。
+        if (phase == "return") {
+            viewAt3sActualMs = if (foregroundReturnedAt > 0L) {
+                SystemClock.elapsedRealtime() - foregroundReturnedAt
+            } else {
+                -1L
+            }
+        } else if (phase == "return_late") {
+            viewAtLateActualMs = if (foregroundReturnedAt > 0L) {
+                SystemClock.elapsedRealtime() - foregroundReturnedAt
+            } else {
+                -1L
+            }
+        }
+    }
+
+    /** 首判那一帧的实际用时（ms，−1 = 未知）；顺延后如实反映，见 [foregroundReturnedAt]。 */
+    private var viewAt3sActualMs = -1L
+
+    /** 复判那一帧的实际用时（ms，−1 = 未知）。 */
+    private var viewAtLateActualMs = -1L
+
+    private fun onViewSnapshot(phase: String, snap: JSONObject?) {
+        when (phase) {
+            "leave" -> {
+                if (snap == null) return
+                // 落盘（跨进程），见 readViewAtLeave 的注释。
+                try {
+                    prefs().viewAtLeave = JSONObject()
+                        .put("at", System.currentTimeMillis())
+                        .put("snap", snap)
+                        .toString()
+                } catch (e: Exception) {
+                    Diagnostics.log("warn", "视图快照落盘失败: ${e.message}")
+                }
+                val sid = sessionOf(snap)
+                Diagnostics.log(
+                    "info",
+                    "视图快照(离开)：chat=${snap.optBoolean("chat")} rows=${snap.optInt("rows", -1)}" +
+                        " historyChat=${snap.optBoolean("historyChat")}" +
+                        " 会话=${if (sid.isEmpty()) "无" else sid}" +
+                        "（最近会话帧 ${convAgoText(snap.optLong("convAgoMs", -1L))}）",
+                )
+                // **离开时页面在对话里 ⟹ 上一次恢复（若有）已经成功** ⟹ 清掉计数。
+                //
+                // 为什么必须在这里也清一次（真机 2026-09-20 16:43 实测踩到）：清零原本只写在
+                // 回前台 12s 判据窗的"已回到对话视图"那一支，而那条路要求**先有一次回前台**。
+                // 于是这个真实序列会卡住：恢复成功 → 用户就在对话里读 → 没切前后台（判据不跑、
+                // 计数没清）→ 退后台、进程被杀 → 回前台 → S3 判出，却被"距上次恢复不足 5 分钟"
+                // 的**陈旧闸门**挡下（实测现场 `距上次 246s < 5 分钟`），用户白等。
+                // 判据是页面自述的事实（"我现在在对话视图里"），比任何推断都硬。
+                if (snap.optBoolean("chat")) {
+                    resetConversationRecovery()
+                }
+            }
+            // 首判：只记结果，不出结论（结论在复判那一拍给，才分得清"慢"与"没回来"）。
+            "return" -> viewReturnedAt3s = snap?.optBoolean("chat") == true
+            // 复判：这一拍才下结论，并且消费掉本轮的离开态快照。
+            "return_late" -> {
+                val leave = readViewAtLeave()
+                clearViewAtLeave()
+                val at3s = viewReturnedAt3s
+                viewReturnedAt3s = false
+                reportViewReturn(leave, snap, at3s)
+            }
+            else -> Unit
+        }
+    }
+
+    /**
+     * 回前台判据行：**只判定与记账，不动页面**（档 0 的全部内容）。
+     *
+     * 形态（见 Docs/19 §4 的判据矩阵）：
+     *   * 离开时不在对话里 → 不适用（用户本来就在概览页，没有"该回来的对话"）；
+     *   * 离开在对话里 + 回来还在对话里 → **S1 已恢复**；
+     *   * 离开在对话里 + 3s 未回但 12s 回了 → **慢恢复**（健康，别误报成假死）；
+     *   * 离开在对话里 + 12s 仍未回 → **S3 候选**（本档最想抓的那一类）。
+     *     再用 `historyChat` 区分：为真说明页面还有路由记忆，为假说明连路由状态都没了
+     *     （进程被杀过的典型形状）。
+     *
+     * @param at3s 首判（3s）那一刻是否已在对话视图。
+     */
+    private fun reportViewReturn(leave: JSONObject?, now: JSONObject?, at3s: Boolean) {
+        if (leave == null) {
+            Diagnostics.log("debug", "回前台视图判据：离开时未采到快照，本轮不判（只记录）")
+            return
+        }
+        val leaveChat = leave.optBoolean("chat")
+        val sid = sessionOf(leave)
+        if (!leaveChat) {
+            Diagnostics.log(
+                "debug",
+                "回前台视图判据：离开时不在对话视图（chat=false），本轮不适用",
+            )
+            return
+        }
+        val who = if (sid.isEmpty()) "无" else sid
+        if (now == null) {
+            Diagnostics.log(
+                "warn",
+                "回前台视图判据：离开时在对话（会话=$who），但复判时未采到快照" +
+                    "——页面可能已重载或注入未就绪（只记录）",
+            )
+            return
+        }
+        if (now.optBoolean("chat")) {
+            // **这是档 3 计数唯一的清零点**，语义 = "用户确实回到了对话视图"。
+            //
+            // ⚠️ 别改成"配对成功即清零"（2026-09-20 真机实测踩到）：第一次恢复重载后
+            // 页面**重新配对成功**，而配对成功只说明"链路活了"，**不说明用户回到了对话**。
+            // 那次现场：`对话恢复：链路已恢复，连续计数清零（原 1 次）` 之后 20 秒，
+            // 第二次 S3 又打出「第 1/2 次」——限流形同虚设。
+            // 判据必须是"页面自述在对话视图里"（真机两形态都验过），不是"链路通了"。
+            resetConversationRecovery()
+            Diagnostics.log(
+                "info",
+                "回前台视图判据：**已回到对话视图**（离开时会话=$who · 现在=" +
+                    "${sessionOf(now).ifEmpty { "无" }} · rows=${now.optInt("rows", -1)} · " +
+                    "首判${fmtMs(viewAt3sActualMs)}=${if (at3s) "已回" else "未回"}）" +
+                    "——S1/S2 形态，无需干预",
+            )
+            return
+        }
+        if (at3s) {
+            // 3s 时在、12s 时不在：中途又被带离（例如页面自己重载后落 home）。
+            Diagnostics.log(
+                "warn",
+                "回前台视图判据：首判（${fmtMs(viewAt3sActualMs)}）时还在对话、" +
+                    "复判（${fmtMs(viewAtLateActualMs)}）时已离开（离开时会话=$who · " +
+                    "现在 chat=false · historyChat=${now.optBoolean("historyChat")}" +
+                    " rows=${now.optInt("rows", -1)}）——页面在中途被带离，档 0 只记录",
+            )
+            return
+        }
+        val historyChat = now.optBoolean("historyChat")
+        val hint = if (historyChat) {
+            "页面仍有路由记忆(historyChat=true)"
+        } else {
+            "**路由记忆也没了(historyChat=false)**——进程被杀过的典型形状，页面自己回不来"
+        }
+        Diagnostics.log(
+            "warn",
+            "回前台视图判据：**复判（${fmtMs(viewAtLateActualMs)}）仍未回到对话视图**" +
+                "（离开时会话=$who · 现在 chat=false" +
+                " historyChat=$historyChat · rows=${now.optInt("rows", -1)}" +
+                " 最近会话帧 ${convAgoText(now.optLong("convAgoMs", -1L))}）——$hint",
+        )
+        // 判据成立 ⇒ 主动恢复一次（档 3）。
+        //
+        // **为什么在这里才动手**：这是本壳唯一"页面看起来健康、但确实回不到用户离开的地方"
+        // 的形态。三道回前台兜底（KICKED 自愈 / healDeadLinkOnResume / afterCarrierReturn）
+        // 都只在"页面已彻底失败"时动手，对这个形态全部判"无需介入"——所以在档 3 之前，
+        // 它只能等用户自己点进任务（真机实测卡了 5 分 46 秒）。
+        //
+        // 动作 = 钉 `history.state.zcodeMobilePage='chat'` + 重载一次，在注入层的
+        // `__zcodeShellRecoverConversation` 里执行。三个真机对照实验证明这是**最小充分**
+        // 的动作：只钉不喂任务即可落到正确会话，见 `android-shell/scratch/PROOF-RESULTS.md`。
+        //
+        // ⚠️ **只在这一档动手**：上面的"3s 时在、12s 时不在"那一档仍只记录——
+        // 页面那时已经呈现出对话，中途离开更可能是用户自己的动作（例如按了返回），
+        // 此时重载会把用户硬拽回去。这是刻意的边界，不是遗漏。
+        //
+        // ⚠️ **限流在原生侧做**（真机 16:28 实测踩到）：注入层的计数走 `sessionStorage`、
+        // 闸门走内存变量 `lastResumeHealAt`，而 S3 的定义就是"进程被杀"——**进程一死
+        // 两道限流同时归零**，连续触发会变成"每次回前台都闪一次"。
+        // 所以闸门落在 [Prefs.conversationRecovery]（跨进程落盘），注入层只负责执行。
+        if (!allowConversationRecovery()) return
+        val reason = "离开时在对话($who) / 12s 后 chat=false" +
+            (if (historyChat) " / historyChat=true" else " / historyChat=false")
+        recordConversationRecovery(reason)
+        evaluateJs(
+            "window.__zcodeShellRecoverConversation && " +
+                "window.__zcodeShellRecoverConversation(${org.json.JSONObject.quote(reason)});",
+        )
+    }
+
+    /**
+     * 档 3 的跨进程闸门：判据本体在 [ConversationRecoveryPolicy]（纯函数、有单测钉着），
+     * 这里只负责读盘、记账、把结论写成日志。
+     *
+     * 返回 false 时**不静默**——打一行带原因的日志，否则"为什么这次没恢复"无法从日志判读。
+     */
+    private fun allowConversationRecovery(): Boolean {
+        val decision = ConversationRecoveryPolicy.decide(
+            ConversationRecoveryPolicy.decode(prefs().conversationRecovery),
+            System.currentTimeMillis(),
+        )
+        if (!decision.allowed) {
+            // 两种拦法各自的措辞不同（到顶 vs 限流），级别也不同——看日志的人要能一眼分开。
+            val capped = decision.reason.contains("上限")
+            Diagnostics.log(
+                if (capped) "error" else "warn",
+                "对话恢复被${if (capped) "拦下" else "限流跳过"}（${decision.reason}）",
+            )
+            return false
+        }
+        return true
+    }
+
+    private fun recordConversationRecovery(reason: String) {
+        val now = System.currentTimeMillis()
+        val next = ConversationRecoveryPolicy.afterRecovery(
+            ConversationRecoveryPolicy.decode(prefs().conversationRecovery),
+            now,
+        )
+        try {
+            prefs().conversationRecovery = ConversationRecoveryPolicy.encode(next)
+        } catch (e: Exception) {
+            Diagnostics.log("warn", "对话恢复记账失败: ${e.message}")
+        }
+        Diagnostics.log(
+            "warn",
+            "对话恢复：钉住路由状态后重载一次（第 ${next.count}/" +
+                "${ConversationRecoveryPolicy.CAP} 次）· 判据=$reason",
+        )
+    }
+
+    /**
+     * **确认"用户确实在对话视图里"** ⟹ 清掉连续恢复计数。两个调用点、同一个语义：
+     *
+     *   * [reportViewReturn] 的"已回到对话视图"那一支（回前台 12s 判据）；
+     *   * [onViewSnapshot] 的 `leave` 分支——**离开时页面在对话里**，说明上一次恢复
+     *     （若有）已经成功。
+     *
+     * ⚠️ **别改成"配对成功即清零"**（真机 2026-09-20 16:38 实测踩到）：第一次恢复重载后
+     * 页面**重新配对成功**，而配对成功只说明"链路活了"，**不说明用户回到了对话**。
+     * 那次现场：清零之后 20 秒，第二次 S3 又打出「第 1/2 次」——限流形同虚设。
+     *
+     * ⚠️ **也别只留回前台那一支**（同一天 16:43 踩到）：那条路要求先有一次回前台。
+     * 于是「恢复成功 → 用户就在对话里读 → 没切前后台（判据不跑、计数没清）→ 退后台、
+     * 进程被杀 → 回前台」这个真实序列会被**陈旧闸门**挡下（现场 `距上次 246s < 5 分钟`），
+     * 用户白等。`leave` 那一支补的就是这个洞。
+     *
+     * 判据一律是**页面自述的事实**（"我现在在对话视图里"），不是任何推断。
+     */
+    private fun resetConversationRecovery() {
+        val rec = ConversationRecoveryPolicy.decode(prefs().conversationRecovery)
+        if (rec.count == 0) return
+        prefs().conversationRecovery = null
+        Diagnostics.log("info", "对话恢复：已确认回到对话视图，连续计数清零（原 ${rec.count} 次）")
+    }
+
+    /** 实际用时的日志写法（−1 = 未知；顺延过就如实报，不贴计划值）。 */
+    private fun fmtMs(ms: Long): String = if (ms < 0L) "?" else "${ms / 1000.0}s"
+
     /**
      * Records the background window and, on return, writes the milestone-4
      * verdict to the log. This is the line to read after leaving the app in the
@@ -242,6 +610,24 @@ object ShellRuntime {
         syncAwayStateToStore()
         if (foreground) {
             appIsForeground = true
+            // 档 0 观测：记下"回到前台"的真实时刻——后面两帧采样都会顺延（等注入层 boot），
+            // 日志要报**实际用时**而不是计划时刻（见 foregroundReturnedAt）。
+            foregroundReturnedAt = SystemClock.elapsedRealtime()
+            viewAt3sActualMs = -1L
+            viewAtLateActualMs = -1L
+            // 档 0 观测：回前台采两帧——3s 首判（用户口径的首个可见动作量级）+ 12s 复判。
+            // 两帧的目的是把"恢复慢"与"永不恢复"分开：真机 00:27 那次是 +6s 自己回来的，
+            // 只看 3s 会把它误报成假死。**只观测、不干预。**
+            //
+            // **必须排在下面那串干预之前**：`__zcodeShellSetAppForeground(true)` 会触发注入层的
+            // KICKED 自愈重载，重载把注入层 runtime 换掉，快照请求就落进新文档（还没 boot）。
+            // 排在前面，采到的是"用户回到前台那一刻的真实形态"。
+            //
+            // ⚠️ **进程重启那条路要重试**（真机 22:32 实测）：冷启动时页面还在加载，3s 那一刻
+            // 注入层往往还没 boot，快照请求直接落空——而"进程被杀 + 回前台"**正是**档 0 要抓的
+            // 形态，采不到就等于白做。所以首判与复判都重试到注入就绪为止（见 requestViewSnapshot）。
+            mainHandler.postDelayed({ requestViewSnapshot("return") }, VIEW_RETURN_CHECK_MS)
+            mainHandler.postDelayed({ requestViewSnapshot("return_late") }, VIEW_RETURN_LATE_MS)
             // 回前台清掉"提前接管候选"：下一次退后台重新从头观察（避免拿上一轮的计时直接动手）。
             earlyTakeoverSince = 0L
             // socket 指纹基线也清掉：下一次退后台的第一拍**重新采基线**，不许把"页面在前台
@@ -302,6 +688,13 @@ object ShellRuntime {
             requestLivenessReport()
         } else {
             appIsForeground = false
+            // 档 0 观测：**在退后台那一刻**采视图快照。这一帧是整个判据的地基——
+            // 原生承载一配对，页面就会 dispose 掉会话并退出对话视图（真机 23:59:05 dispose
+            // → 23:59:14 体征已 chat:false），等回前台再读就再也问不出"用户离开时在不在对话里"。
+            //
+            // 排在 `__zcodeShellSetAppForeground(false)` 之前：那一句只是告诉注入层前后台状态，
+            // 不影响 DOM；但排在它前面语义更直白——这是"离开前最后一眼"。
+            requestViewSnapshot("leave")
             evaluateJs("window.__zcodeShellSetAppForeground && window.__zcodeShellSetAppForeground(false);")
             startHeartbeatPump()
             backgroundStartedAt = SystemClock.elapsedRealtime()
@@ -1663,6 +2056,13 @@ object ShellRuntime {
                     pageWorkspaceKey = key
                     pageWorkspaceTaskId = data.optString("taskId")
                     Diagnostics.log("info", "页面当前工作区（原生承载的唯一目标）：$key")
+                }
+                "viewsnap" -> {
+                    // 档 0 观测（2026-09-19）：页面在"离开前台/回到前台"那一刻的视图快照。
+                    // 为什么需要它、以及两个时序坑（接管会让页面退出对话视图、前台期间
+                    // 壳零周期性观测），见 [onAppForegroundChanged] 里 onViewSnapshot 的注释。
+                    val data = root.optJSONObject("data") ?: return
+                    onViewSnapshot(data.optString("phase"), data.optJSONObject("snap"))
                 }
                 "controllertasks" -> {
                     // 第三条源：**页面自己订的** `controller/tasks-index`（全局运行态整表）。

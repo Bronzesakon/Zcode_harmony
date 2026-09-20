@@ -999,6 +999,10 @@
                 if (kickedHealCount() > 0) {
                     storeSet(KICKED_HEAL_STORE, '0');
                 }
+                // ⚠️ 档 3「对话恢复」的计数**不在这里清零**：它的闸门在原生侧
+                // （`Prefs.conversationRecovery`），清零由 `ShellRuntime` 在
+                // `paired` 由假变真时做。理由见 `__zcodeShellRecoverConversation`
+                // 的注释——本层的计数在"进程被杀"后归零，而那正是 S3 的定义。
                 // 只建客户端 + 跟随页面：**不**在这里安排任何主动开桥
                 // （2026-09-17 删 D7；原实现是 `maybeStartActive()`）。
                 ensureClient();
@@ -1690,6 +1694,85 @@
     };
 
     // -----------------------------------------------------------------------
+    // 6b. 回前台"对话没回来"的恢复（档 3，2026-09-19）
+    //
+    // 这是壳体对页面写入面的**第七处**（原六处见 README「实现要点」14），
+    // 与前面六处的区别见下方 `__zcodeShellRecoverConversation` 的注释。
+    //
+    // 缘起（真机三个对照实验，证据在 `android-shell/scratch/PROOF-RESULTS.md`）：
+    //   ① 卡死态 + 钉 `history.state` + reload → chat=true、rows 610、内容回来
+    //   ② 卡死态 + **不钉** + reload          → chat=false、落 home 任务列表
+    //   ③ **冷启动**（进程被杀、state 已归零）+ 钉 + reload → chat=true、rows 645
+    // ⟹ `history.state.zcodeMobilePage==='chat'` 是"落 chat 视图"的**唯一开关**；
+    //    它**不跨进程存活**（这正是"进程被杀后回前台落 home"的根因）；
+    //    只钉它就够，**不需要**喂 taskId——页面自己会恢复该显示哪个会话。
+    // -----------------------------------------------------------------------
+
+    /**
+     * 回前台"对话没回来"的恢复：**钉住路由状态，然后重载一次**。
+     *
+     * 由原生在判出 S3（离开时在对话 + 复判时仍未回对话视图）后调用一次。
+     *
+     * **为什么这一处写入是被允许的**（按「实现要点」14 的两句自问）：
+     *   ① 页面自己做不到这件事吗？——**做不到**。页面不知道"用户离开时在看哪个视图"，
+     *      也拿不回被进程死亡抹掉的 `history.state`；它只会在自己的初始决策里读一次
+     *      那个字段，没有它就只能落 home。实验②就是这个反证。
+     *   ② 怎么知道它已经失败了？——判据全部来自**页面自述的事实**（真机两形态都验过、
+     *      无误报）：离开时 `chat=true`（快照）+ 回前台 12s 后 `chat=false`。
+     *      不猜、不推断。
+     *
+     * **与第六处的区别**（通知点击定位那条）：那条是**用户显式要求**跳某个任务
+     * （所以要写 workspaceKey/sessionId）；这条是**把用户放回他自己离开的地方**，
+     * 因此**完全不写任务槽位**——少一个写入面，也少一份"跳错任务"的风险。
+     *
+     * **不做的事**：不关页面 socket、不轻推、不动 DOM。两个动作分别是一次
+     * `history.replaceState` 与一次 `location.reload`。
+     *
+     * ⚠️ **限流不在这里**（真机 16:28 实测踩到）：本层能用的两个计数
+     * （`sessionStorage` 与内存变量）在**进程被杀**后都会归零，而 S3 的定义恰恰是
+     * "进程被杀"——于是限流在最需要它的场景下失效（实测第二次 S3 仍打「第 1/2 次」）。
+     * 闸门因此移到**原生侧**（`Prefs.conversationRecovery`，跨进程落盘）：
+     * 连续上限 2 次 + 距上次不足 5 分钟跳过 + 配对成功清零。
+     * **本函数是"执行者"，不是"决策者"**——别把闸门加回这里。
+     *
+     * @param reason 判据摘要（原样进日志，便于把"这一次动手"与"那一刻的读数"对上）
+     * @return true = 已安排重载；false = 出错（日志会说明）
+     */
+    G.__zcodeShellRecoverConversation = function (reason) {
+        try {
+            var detail = String(reason || '');
+            // 钉路由状态：保留原有字段（页面可能往 state 里放别的东西），
+            // 只把 zcodeMobilePage 置成 chat。幂等——已是 chat 就不动。
+            var st = (G.history && G.history.state) || null;
+            if (!st || st.zcodeMobilePage !== 'chat') {
+                var next = {};
+                if (st) {
+                    for (var k in st) {
+                        if (Object.prototype.hasOwnProperty.call(st, k)) {
+                            next[k] = st[k];
+                        }
+                    }
+                }
+                next.zcodeMobilePage = 'chat';
+                G.history.replaceState(next, '');
+            }
+            diag('warn', '对话恢复：钉住路由状态后重载一次 · 判据=' + detail);
+            setTimeout(function () {
+                try {
+                    G.location.reload();
+                } catch (e) {
+                    diag('warn', '对话恢复重载失败: ' + e);
+                }
+            }, 300);
+            return true;
+        } catch (e) {
+            diag('warn', '对话恢复失败: ' + e);
+            return false;
+        }
+    };
+
+
+    // -----------------------------------------------------------------------
     // 5b. 进对话铁判准：信标后 3s 内对话详情没就绪 → 只记账，不动页面
     //
     // 来历：用户 2026-09-13 拍板的口径是"进对话 5 s 内加载不出对话详情就触发页面
@@ -2141,6 +2224,97 @@
         }
         return v.composerDisabled || v.fallbackTitle;
     }
+
+    /**
+     * **档 0 观测**：离开前台/回到前台那一刻的"页面视图 + 当前会话"快照。
+     *
+     * 为什么需要它（2026-09-19 调研，见 `Docs/19-回前台对话恢复-调研与计划提议.md`）：
+     * 「回前台后对话没回来」这件事在日志里**曾经是隐形的**——三道回前台兜底
+     * （KICKED 自愈 / healDeadLinkOnResume / afterCarrierReturn）全都只在"页面已彻底失败"
+     * 时动手，而假死形态的页面**看起来完全健康**（socket OPEN、有帧、paired=true），
+     * 于是全部判"无需介入"，日志里一行都不留。
+     *
+     * 两个必须记住的时序事实（都是真机实测）：
+     *   ① **接管动作本身就会让页面退出对话视图**——原生承载一配对，页面就 dispose 掉会话
+     *      （23:59:05 dispose → 23:59:14 体征已 `chat:false`）。所以"用户离开时在不在对话里"
+     *      这个事实**只能在退后台那一刻采**，等回前台再读就晚了。
+     *   ② **前台期间壳零周期性观测**：`页面体征`/`页面开销` 只在后台由原生泵驱动
+     *      （前台 30 分钟窗口实测各 0 条）。所以这里必须是**按需求值**的接口，
+     *      不能指望周期通道。
+     *
+     * **纯读**：只读 DOM 属性与内存里的帧统计，不碰布局、不写页面、不发帧。
+     * 读者只有原生的两处调用（退后台采样 / 回前台判据）。
+     *
+     * `sessionId` 的来源是 `_convText` 的键（`conversation/sess_xxx`，页面**自己**那条
+     * 订阅收到的帧）——壳从未主动订阅，这是搭便车读到的事实。取"最近一帧"的那个，
+     * 因为页面同时可能订着主会话与子代理会话（真机 00:27 实测同刻有 3 个 topic）。
+     */
+    G.__zcodeShellViewSnapshot = function () {
+        try {
+            var v = readVitals();
+            var out = {
+                chat: !!(v && v.chat),
+                rows: v ? v.rows : -1,
+                errorBanner: !!(v && v.errorBanner),
+                // 页面自己的持久化路由状态：跨 reload 存活、**不跨进程**。
+                // 它就是"重载后能不能自己落回 chat"的关键（见 Docs/19 §2.3）。
+                historyChat: (function () {
+                    try {
+                        var st = (G.history && G.history.state) || null;
+                        return !!(st && st.zcodeMobilePage === 'chat');
+                    } catch (e) {
+                        return null;
+                    }
+                })(),
+                sessionId: '',
+                convAgoMs: -1,
+                topics: 0
+            };
+            try {
+                if (client && typeof client.conversationFrameStats === 'function') {
+                    var cs = client.conversationFrameStats();
+                    if (cs) {
+                        out.topics = cs.topics || 0;
+                        out.convAgoMs = typeof cs.lastFrameAgoMs === 'number' ? cs.lastFrameAgoMs : -1;
+                    }
+                }
+                if (client && typeof client.latestConversationTopic === 'function') {
+                    out.sessionId = String(client.latestConversationTopic() || '');
+                }
+            } catch (e) {
+                // 取不到就留空：判据不齐宁可不判
+            }
+            return out;
+        } catch (e) {
+            return null;
+        }
+    };
+
+    /**
+     * 档 0 观测的**回传出口**：把快照交给原生。
+     *
+     * 为什么不直接把快照作为 `evaluateJavascript` 的返回值：原生那条通道是单向的
+     * （`ShellRuntime.evaluateJs` 走 `evaluateJavascript(script, null)`，丢弃结果），
+     * 而桥（`post`）是现成的、可读的、并且已经在承载各种观测数据。
+     *
+     * `phase` 由原生给定（`leave` = 退后台那一刻 / `return` = 回前台判定那一刻），
+     * 原生用它区分两帧、再比对出"离开时在不在对话里"。
+     *
+     * 纯读 + 一次桥消息；不碰页面 socket、不写 DOM。
+     */
+    G.__zcodeShellReportViewSnapshot = function (phase) {
+        try {
+            post('viewsnap', {
+                phase: String(phase || ''),
+                at: Date.now(),
+                snap: G.__zcodeShellViewSnapshot()
+            });
+            return true;
+        } catch (e) {
+            diag('warn', '视图快照上报失败: ' + e);
+            return false;
+        }
+    };
 
     /**
      * 体征上报（原生 `pagevitals` 通道，ShellRuntime 打成一行 `页面体征(why): {...}`）。
@@ -3272,7 +3446,9 @@
     }
 
     // 网页自己那条滚动条，按它自己的宣言逐字复刻成悬浮版。下面每个数字、每条
-    // 声明都来自页面的样式表（快照 index-BMndL2ru.css @368578）：
+    // 声明都来自页面的样式表（2026-09-11 快照 index-BMndL2ru.css @368578；
+    // 2026-09-19 重构建后为 Docs/27-remote-v4-网页快照-20260920/latest/assets/
+    // index-DR0mqKFV.css @374504，规则文本与旧快照逐字相同）：
     //
     //   ::-webkit-scrollbar{width:14px;height:14px}              <- 轨道（rail）
     //   ::-webkit-scrollbar-track{background:0 0}                <- 轨道透明
