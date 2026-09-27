@@ -163,10 +163,13 @@ hdc install entry/build/default/outputs/default/entry-default-signed.hap
 > - `docs/16-remote-v4-bootstrap载荷-完整字段表.md` —— **schema 权威挖掘**：信封层 + `result.workspaces[i]`（8 键）+ `result.tasks[i]`（**14 键**）+ bootstrap 独有的 `initialViewState`/`mobileViewState` + `workspace-list` 族增量；并单列 **「schema 有、壳端没解析」** 一节与**盲区认领**（判不出 + 试过什么 + 下一步）。
 > - `docs/15-remote-v4-bootstrap载荷-我们解析了哪些.md` —— 壳侧消费者视角（我们读了哪些字段、读来干什么、哪些完全没碰）。
 > - `docs/17-remote-v4-网页架构与模块地图.md`、`docs/18-remote-v4-relay协议目录.md` —— **网页端全局材料**（模块地图、以及网页端 ↔ 桌面端的 relay 协议目录）。
+> - `docs/19-remote-v4-bootstrap载荷-合并总表与未解析字段清单.md` —— **父代理合并稿（先看这篇）**：把 15/16 并成 35 行逐字段总表 + 「可用但未被解析」清单（按**流体云卡片 / 后台追踪 / 多工作区覆盖**分档）+ 建议最小落地集 + 两处既有不一致。
+> - `docs/20-remote-v4-功能域-对话渲染与流式更新.md`、`docs/21-remote-v4-功能域-输入附件与文件预览.md`、`docs/22-remote-v4-功能域-导航列表与全局外观.md` —— **三个功能域的行为规格**（鸿蒙复刻用：ops 归约 / 流式与虚拟列表 / live-tail 与滚动 FSM；Lexical 输入与附件分片上传；导航分派、列表分组排序与三态主题）。
 >
-> ⟹ 对鸿蒙侧的直接价值：**"后台卡片/实况窗该喂哪些字段"看 16 篇 §4**（那里列的就是"schema 里有、我们没解析"的字段）；**relay 协议怎么复刻看 18 篇**。
+> ⟹ 对鸿蒙侧的直接价值：**"后台卡片/实况窗该喂哪些字段"看 19 篇**（那里把"已解析"与"schema 有、壳端没解析"并成一张表并按用途分档）；**schema 全枚举看 16 篇**；**relay 协议怎么复刻看 18 篇**；**各功能域的行为规格看 20/21/22 篇**。
+> **一句话结论（19 篇）**：那个 27,832 字符的包里壳端只用了 **2 个字段**（`displayStatus`、`workspacePath`）——`title`/`provider`/`updatedAt`/`taskId`/`pinned`/`workspacePurpose`/`connectionState` 等**全被结构性丢弃**（原文活不过一帧、不落存储）。
 
-> 10/11/12 是迁移方案定下的落点（方案原稿 `.dsh-audit/MIGRATION-PLAN.md` §1-C）：目录里若还没有，说明迁移尚未执行。本节结论的原始素材也在 `.dsh-audit/`（**该目录本轮保留、未删**——是否清掉交由后续新对话决定；不入库），所以**上面的结论都写成了自包含的**，不依赖那些文件还在。
+> 10/11/12 是迁移方案定下的落点（方案原稿 `.dsh-audit/MIGRATION-PLAN.md` §1-C）。**⚠️ 2026-09-19 更新**：remote-v4 这批调研（bootstrap 载荷 + 网页端复刻规格，即 docs 14–22 的源稿）已按用户指示**迁入 `Docs/` 并从 `.dsh-audit/` 删除源文件**；`.dsh-audit/` 里剩下的只有安卓壳清理过程档（`HANDOVER`/`CHANGE-PLAN`/`BATCH-*`/`findings`/`features`），它们是 docs 10–13 与 `Docs/android-shell/` 的原始素材，**本轮保留未删**。本节结论都是自包含的，不依赖任何被删文件。
 
 ## 安全说明
 
