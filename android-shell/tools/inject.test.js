@@ -106,6 +106,30 @@ class FakeElement extends FakeEventTarget {
         return child;
     }
 
+    insertBefore(child, before) {
+        const idx = this.children.indexOf(before);
+        child.parentElement = this;
+        if (idx < 0) {
+            this.children.push(child);
+        } else {
+            this.children.splice(idx, 0, child);
+        }
+        return child;
+    }
+
+    get firstElementChild() {
+        return this.children[0] || null;
+    }
+
+    get previousElementSibling() {
+        const parent = this.parentElement;
+        if (!parent) {
+            return null;
+        }
+        const idx = parent.children.indexOf(this);
+        return idx > 0 ? parent.children[idx - 1] : null;
+    }
+
     scrollIntoView() {}
 
     dispatchEvent(event) {
@@ -1269,6 +1293,122 @@ test('a document-start arrival before <html> exists retries instead of giving up
         await flush();
         assert.deepStrictEqual(pageStates(page.posts), ['main-header/dark'],
             'the reporter must install itself once the tree exists');
+    } finally {
+        page.teardown();
+    }
+});
+
+// ---------------------------------------------------------------------------
+// header refresh button（§8）——壳在对话页头部主题按钮左侧注入的「刷新」
+//
+// 契约：外观克隆主题按钮的 className（不硬编码类名）、锚点是头部行内最后一个
+// button[aria-haspopup="menu"]（locale 无关）、按钮离开 DOM（React 重挂头部）
+// 后借页面状态观察器的同一拍重建、点击做进程内 reload。
+// ---------------------------------------------------------------------------
+
+/** A chat header row the way the page renders it: [back button, title, theme menu]. */
+function stubChatHeader(page) {
+    const theme = new FakeElement('button');
+    theme.setAttribute('aria-haspopup', 'menu');
+    theme.setAttribute('aria-label', '选择主题');
+    theme.className = 'ghost icon-sm-classes';
+    const row = new FakeElement('div');
+    row.querySelectorAll = (sel) => (sel === 'button[aria-haspopup="menu"]' ? [theme] : []);
+    row.appendChild(theme);
+    const section = new FakeElement('section');
+    section.setAttribute('data-mobile-page', 'chat');
+    section.appendChild(row);
+    page.document.querySelector = (sel) => (sel === 'section[data-mobile-page="chat"]' ? section : null);
+    return {section, row, theme};
+}
+
+function bootPageState(page) {
+    page.dom.set('bg-background-win-alt', true);
+    page.dom.setTheme('light');
+    FakeMutationObserver.fire();
+    return flush();
+}
+
+const refreshButtonsIn = (row) =>
+    row.children.filter((child) => child.getAttribute('data-zcode-shell-refresh') === '1');
+
+test('the refresh button lands left of the theme menu trigger with cloned styling', async () => {
+    const page = setupPage({pageState: true, media: {'(max-width: 767px)': true}});
+    try {
+        const {row, theme} = stubChatHeader(page);
+        await bootPageState(page);
+
+        const buttons = refreshButtonsIn(row);
+        assert.strictEqual(buttons.length, 1, 'exactly one refresh button');
+        assert.strictEqual(theme.previousElementSibling, buttons[0],
+            'it sits immediately left of the theme trigger');
+        assert.strictEqual(buttons[0].className, 'ghost icon-sm-classes',
+            'the look is cloned from the page button, not hardcoded');
+        assert.ok(buttons[0].getAttribute('aria-label'), 'it carries a label');
+        assert.ok(findPost(page.posts, 'diag', (data) =>
+            String(data.message).indexOf('刷新按钮已注入') === 0).length === 1,
+            'and says so once in the log');
+
+        // A second settled tick must not duplicate it.
+        FakeMutationObserver.fire();
+        await flush();
+        assert.strictEqual(refreshButtonsIn(row).length, 1, 'still exactly one');
+    } finally {
+        page.teardown();
+    }
+});
+
+test('a remounted header gets a fresh button, and a page without the anchor stays untouched', async () => {
+    const page = setupPage({pageState: true, media: {'(max-width: 767px)': true}});
+    try {
+        const {section, row, theme} = stubChatHeader(page);
+        await bootPageState(page);
+        const first = refreshButtonsIn(row)[0];
+
+        // React remount: the old row (our node included) leaves the document,
+        // a fresh header renders in the same section.
+        const newRow = new FakeElement('div');
+        const theme2 = new FakeElement('button');
+        theme2.setAttribute('aria-haspopup', 'menu');
+        newRow.querySelectorAll = (sel) => (sel === 'button[aria-haspopup="menu"]' ? [theme2] : []);
+        newRow.appendChild(theme2);
+        section.children = [newRow];
+        first.isConnected = false;
+
+        FakeMutationObserver.fire();
+        await flush();
+        assert.strictEqual(theme2.previousElementSibling.getAttribute('data-zcode-shell-refresh'), '1',
+            'the fresh header carries the button again');
+        assert.notStrictEqual(refreshButtonsIn(newRow)[0], first, 'as a fresh node');
+
+        // Page redesign: the row exists but has no menu trigger any more.
+        newRow.children = [];
+        newRow.querySelectorAll = () => [];
+        theme2.parentElement = null;
+        FakeMutationObserver.fire();
+        await flush();
+        assert.strictEqual(refreshButtonsIn(newRow).length, 0,
+            'the failure mode is a quiet absence, not a stray node');
+    } finally {
+        page.teardown();
+    }
+});
+
+test('clicking the refresh button reloads in-process and leaves a log line', async () => {
+    const page = setupPage({pageState: true, media: {'(max-width: 767px)': true}});
+    try {
+        const {row} = stubChatHeader(page);
+        await bootPageState(page);
+        const reload = stubReload();
+        try {
+            refreshButtonsIn(row)[0].dispatchEvent({type: 'click'});
+            assert.strictEqual(reload.reloads.length, 1, 'the click reloads the page itself');
+            assert.ok(findPost(page.posts, 'diag', (data) =>
+                data.level === 'info' && String(data.message).indexOf('刷新按钮：重载') === 0).length === 1,
+                'and the reload is visible in the log');
+        } finally {
+            reload.restore();
+        }
     } finally {
         page.teardown();
     }

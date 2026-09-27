@@ -23,6 +23,10 @@
  *   9. Sink the page's own logs: the production page reports every lifecycle
  *      event (subscribe/store/recovery) solely to `window.zcode?.log`, which
  *      nobody provided — here it becomes native log lines ("页面: …").
+ *  10. Inject a refresh button into the chat page's own header, left of its
+ *      theme-menu trigger with the trigger's own cloned styling, so a stuck
+ *      conversation can be reloaded by hand (in-process reload keeps
+ *      history.state, so the page returns to the current conversation).
  *
  * Installed via WebViewCompat.addDocumentStartJavaScript, i.e. BEFORE any page
  * script runs. That timing is mandatory: the page opens its WebSocket during
@@ -3268,7 +3272,10 @@
             return;
         }
         pageStateScheduled = true;
-        setTimeout(pushPageState, 0);
+        setTimeout(function () {
+            pushPageState();
+            ensureHeaderRefreshButton();
+        }, 0);
         noteChatViewEntered();
     }
 
@@ -3760,6 +3767,107 @@
             });
         } catch (e) {
             diag('warn', '悬浮滚动条安装失败: ' + e);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 8. header refresh button（对话页头部 · 主题按钮左侧）
+    //
+    // 手机壳里没有桌面端那样的菜单栏兜底，页面卡住时用户此前只能等看门狗或杀
+    // 应用重进。这里给页面补一个「刷新」：插在对话页头部行、主题按钮左侧。
+    //
+    // 外观是**克隆**来的：页面按钮 = Tailwind 工具类 + CSS 变量配色（
+    // text-foreground、hover:bg-muted 等定义在 .theme-zai-* 下），把主题按钮的
+    // className 原样复制过来就是同款——hover/focus 态与深浅色自动跟随，而且
+    // 不硬编码任何类名，页面改版调样式不用追。
+    //
+    // 锚点是 `button[aria-haspopup="menu"]`（取头部行内最后一个）：主题按钮是
+    // Radix 菜单触发器，这个属性不随语言变（aria-label 是「选择主题」/
+    // "Switch theme"），返回按钮永远不是菜单。查找范围严格限定在头部行内，
+    // 绝不会落到消息区的菜单上；找不到锚点时失效模式是"按钮安静地不出现"
+    // （一次性 debug 日志），绝不动页面自己的节点。
+    //
+    // 保活不另开观察器：§6 的页面状态观察器本来就全 subtree 监听、每拍合并，
+    // 这里借同一拍做"确保存在"——按钮还连着时一次 isConnected 读就返回，
+    // 真正的查找只在它离开 DOM（对话页↔首页往返把头部整段重挂）时发生。
+    // -----------------------------------------------------------------------
+    var refreshBtn = null;
+    var refreshWarned = false;
+
+    function warnRefreshOnce(message) {
+        if (refreshWarned) {
+            return;
+        }
+        refreshWarned = true;
+        diag('debug', message);
+    }
+
+    function refreshButtonLabel() {
+        var lang = '';
+        try {
+            lang = (G.localStorage && G.localStorage.getItem('zcode-locale-preference')) ||
+                (G.navigator && G.navigator.language) || '';
+        } catch (e) {
+            // locale 拿不到就用英文：纯提示文案，不值得为它冒任何险。
+        }
+        return /zh/i.test(lang) ? '刷新页面' : 'Refresh page';
+    }
+
+    function ensureHeaderRefreshButton() {
+        try {
+            // 快路径：按钮还连着 ⇒ 这一拍到此为止。
+            if (refreshBtn && refreshBtn.isConnected) {
+                return;
+            }
+            var section = document.querySelector('section[data-mobile-page="chat"]');
+            if (!section) {
+                return;
+            }
+            var row = section.firstElementChild;
+            var menus = row && row.querySelectorAll
+                ? row.querySelectorAll('button[aria-haspopup="menu"]')
+                : null;
+            var theme = menus && menus.length ? menus[menus.length - 1] : null;
+            if (!theme || !theme.parentElement) {
+                warnRefreshOnce('刷新按钮：对话页头部找不到主题菜单锚点（页面改版？），不注入');
+                return;
+            }
+            // 已经在位（前一个兄弟就是我们的按钮）＝不重复插。这也是同文档里
+            // 脚本体万一被执行两遍时的幂等闸。
+            var prev = theme.previousElementSibling;
+            if (prev && prev.getAttribute && prev.getAttribute('data-zcode-shell-refresh')) {
+                refreshBtn = prev;
+                return;
+            }
+            var label = refreshButtonLabel();
+            var btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = String(theme.className || '');
+            btn.setAttribute('aria-label', label);
+            btn.setAttribute('title', label);
+            btn.setAttribute('data-zcode-shell-refresh', '1');
+            // lucide refresh-cw 的 pathData 逐字照抄；class="size-4" 与主题按钮
+            // 自己的图标同规格，currentColor 继承按钮文字色（随深浅色走）。
+            btn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"' +
+                ' fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"' +
+                ' stroke-linejoin="round" class="size-4" aria-hidden="true">' +
+                '<path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/>' +
+                '<path d="M21 3v5h-5"/>' +
+                '<path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/>' +
+                '<path d="M8 16H3v5"/></svg>';
+            btn.addEventListener('click', function () {
+                // 进程内重载：history.state 保留（那是页面自己"回到当前对话"的锚），
+                // document-start 注入随新文档自动重跑，所以不需要原生参与。
+                diag('info', '刷新按钮：重载远程页');
+                try {
+                    G.location.reload();
+                } catch (e) {}
+            });
+            theme.parentElement.insertBefore(btn, theme);
+            refreshBtn = btn;
+            diag('debug', '刷新按钮已注入主题按钮左侧');
+        } catch (e) {
+            warnRefreshOnce('刷新按钮注入失败: ' + e);
         }
     }
 
