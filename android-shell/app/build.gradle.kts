@@ -41,13 +41,15 @@ android {
         // had one).
         //
         // CI overrides both through the environment:
-        //   ZCODE_VERSION_CODE = the workflow run number, which makes every
-        //     build installable over the previous one. Android rejects an APK
-        //     whose versionCode is lower than the installed one, so a fixed
-        //     value would force an uninstall between a pre-release and a formal
-        //     release (pre builds would otherwise sit below it forever).
-        //   ZCODE_VERSION_NAME = "<base>-pre.<n>" on the pre branch, so the
-        //     installed app says which pre-release it is.
+        //   ZCODE_VERSION_CODE = the build time in UTC (yyMMddHH, set by the
+        //     workflow), so every build installs over every previous one.
+        //     Android rejects an APK whose versionCode is lower than the
+        //     installed one — the old run-number scheme reset once and stranded
+        //     devices on a higher code than new builds ("已安装高版本",
+        //     2026-09-27); clock time cannot repeat that failure.
+        //   ZCODE_VERSION_NAME = "<base>-dev.<yyyyMMdd.HHmm>" on branch builds,
+        //     so the installed app says which dev build it is (bare "<base>" on
+        //     a tagged formal release).
         // Locally (and for a tagged formal release) the checked-in values apply.
         // The base version lives in gradle.properties so that both Gradle and
         // the workflow can read it with a trivial, stable pattern.

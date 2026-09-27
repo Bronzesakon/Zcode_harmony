@@ -2,7 +2,7 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
-发版流程：日常推 `pre` 分支（CI 把最新 APK **覆写**到滚动预发布 Release `android-pre`：固定资产名 + 移动 tag + 刷新标题/说明与推送、编译时间）；正式版更新本文件顶部段落（须与 `gradle.properties` 的 `zcodeBaseVersion` 一致），把 `pre` 合入 `main` 后 `git tag vX.Y.Z` 推送，CI 读取 `## [X.Y.Z]` 段落作为 Release 说明。
+发版流程（2026-09-27 起）：日常推 `main` 分支（CI 把最新 APK **覆写**到滚动预发布 Release `android-pre`：固定资产名 + 移动 tag + 刷新标题/说明与推送、编译时间；`versionCode`/`versionName` 取构建时间）；正式版更新本文件顶部段落（须与 `gradle.properties` 的 `zcodeBaseVersion` 一致）后 `git tag vX.Y.Z` 推送，CI 读取 `## [X.Y.Z]` 段落作为 Release 说明。原 `pre` 分支已存档为 `debug-history-archive`（停在 2026-09-18 定档封线态），不再推送。
 
 ## [1.0.0] - 2026-09-10
 

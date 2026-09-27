@@ -13,14 +13,18 @@ name: Android Shell Build
 #    assembleRelease, so sources compile once instead of once per variant.
 #    Shallow clone + Gradle caching keep repeat runs to ~2-3 minutes.
 #
-# 2. RELEASE FLOW (user decision, 2026-09-10):
-#      pre branch  -> publishes a PRE-RELEASE automatically, tagged
-#                     v<version>-pre.<run number>, so a test build is one tap
-#                     away on the Releases page instead of hidden in Artifacts.
+# 2. RELEASE FLOW (user decision, 2026-09-27, replacing the 2026-09-10 pre-era):
+#      main branch -> publishes the ROLLING PRE-RELEASE (tag android-pre) with
+#                     the newest APK, so a test build stays one stable download
+#                     link instead of hiding in Artifacts.
 #      v* tag      -> publishes a normal Release, notes taken from CHANGELOG.md.
 #    A tag created here with GITHUB_TOKEN does not re-trigger this workflow
-#    (GitHub suppresses events from its own token), so the pre-release path
-#    cannot recurse.
+#    (GitHub suppresses events from its own token), so the release path cannot
+#    recurse. The former pre branch is archived as debug-history-archive and is
+#    never pushed again.
+#
+# 3. VERSION NUMBERS (user decision, 2026-09-27): derived from the BUILD TIME,
+#    not the run counter — see the "Resolve version" step for why.
 #
 # Build failures are re-emitted as ::error:: annotations on purpose: Actions logs
 # need authentication to read (they 404 anonymously), while annotations are
@@ -29,7 +33,7 @@ name: Android Shell Build
 # tools/watch_ci.py reads them without gh or a token.
 on:
   push:
-    branches: [main, pre]
+    branches: [main]
     tags: ['v*']
     # Only the paths that can change the APK. Documentation and the local-only
     # reference archives (android-shell/docs, ColorOS_docs) are deliberately absent,
@@ -67,7 +71,7 @@ permissions:
   contents: read
 
 # A newer push supersedes an in-flight build of the same ref. The ref is part of
-# the key, so a push to pre never cancels a build of main.
+# the key, so a push to one branch never cancels another branch's build.
 concurrency:
   group: android-shell-${{ github.ref }}
   cancel-in-progress: true
@@ -117,6 +121,9 @@ jobs:
   build:
     name: APK + unit tests
     runs-on: ubuntu-latest
+    outputs:
+      version_name: ${{ steps.version.outputs.version_name }}
+      version_code: ${{ steps.version.outputs.version_code }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -133,11 +140,18 @@ jobs:
           java-version: '17'
           cache: gradle
 
-      # Version numbers, computed from the branch (see app/build.gradle.kts):
-      #   versionCode = run number, so every build installs over the previous one
-      #   versionName = "<base>-pre.<n>" on pre, "<base>" elsewhere
-      # Values go through $GITHUB_ENV, which later steps (including Gradle) and
-      # the publishing jobs read.
+      # Version numbers, computed from the BUILD TIME (see app/build.gradle.kts):
+      #   versionCode = yyMMddHH (UTC). Decoupled from the run counter on
+      #     purpose: the counter once reset and left installed devices sitting on
+      #     a higher code than new builds ("已安装高版本" downgrade refusal,
+      #     2026-09-27). Clock time only moves forward, so every build installs
+      #     over every previous one; two builds inside the same hour share a
+      #     code, which Android still accepts as an update.
+      #   versionName = "<base>-dev.<yyyyMMdd.HHmm>" on branches, "<base>" on
+      #     v* tags.
+      # Values go through $GITHUB_ENV for Gradle and through job outputs for the
+      # publishing jobs — those run minutes later, where a recomputed "now" would
+      # no longer match the APK that is being published.
       - name: Resolve version
         id: version
         working-directory: android-shell
@@ -147,18 +161,23 @@ jobs:
             echo "::error::could not read zcodeBaseVersion from gradle.properties"
             exit 1
           fi
-          if [ "${GITHUB_REF}" = "refs/heads/pre" ]; then
-            name="${base}-pre.${GITHUB_RUN_NUMBER}"
-          else
+          code=$(date -u '+%y%m%d%H')
+          if [ "${GITHUB_REF:0:10}" = "refs/tags/" ]; then
             name="$base"
+          else
+            name="${base}-dev.$(date -u '+%Y%m%d.%H%M')"
           fi
           {
             echo "ZCODE_VERSION_NAME=$name"
-            echo "ZCODE_VERSION_CODE=${GITHUB_RUN_NUMBER}"
+            echo "ZCODE_VERSION_CODE=$code"
             echo "BASE_VERSION=$base"
             echo "VERSION_TAG=v$name"
           } >> "$GITHUB_ENV"
-          echo "version = $name (code ${GITHUB_RUN_NUMBER})"
+          {
+            echo "version_name=$name"
+            echo "version_code=$code"
+          } >> "$GITHUB_OUTPUT"
+          echo "version = $name (code $code)"
 
       # Restore the release keystore from GitHub Secrets so CI-built APKs share
       # the signature of every other build of this app (overwrite-install works).
@@ -264,24 +283,26 @@ jobs:
           retention-days: 30
 
   # ---------------------------------------------------------------------------
-  # pre branch -> the ROLLING pre-release. This is the everyday path: push to
-  # pre and the same release always holds the newest APK, so installing a test
+  # main branch -> the ROLLING pre-release. This is the everyday path: push to
+  # main and the same release always holds the newest APK, so installing a test
   # build is one stable link
   # (…/releases/download/android-pre/zcode-remote.apk) instead of a new tag per
   # push.
   #
-  # Why rolling instead of one v<version>-pre.<run> per push: the tag space is
-  # shared with the HarmonyOS app in this repository (a tag per run piles up
-  # near-identical releases), and the build you actually want is always the
-  # newest one. The trade-off is that the tag no longer identifies a build, so
-  # the title carries the in-app versionName AND the build time, and the notes
-  # list this round's commits plus both timestamps.
+  # Why rolling instead of one tag per push: the tag space is shared with the
+  # HarmonyOS app in this repository (a tag per run piles up near-identical
+  # releases), and the build you actually want is always the newest one. The
+  # trade-off is that the tag no longer identifies a build, so the title carries
+  # the in-app versionName AND the build time, and the notes list this round's
+  # commits plus both timestamps.
   #
-  # Modelled on sevnX's build.yml, which uses the same shape for its main builds.
+  # The tag name and asset names deliberately survive the 2026-09-27 branch
+  # reorganisation untouched (the branch that publishes moved from pre to main;
+  # the download link did not move).
   # ---------------------------------------------------------------------------
   prerelease:
     name: Publish rolling pre-release
-    if: github.ref == 'refs/heads/pre'
+    if: github.ref == 'refs/heads/main'
     needs: [js, build]
     runs-on: ubuntu-latest
     permissions:
@@ -306,12 +327,15 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          base=$(sed -n 's/^zcodeBaseVersion=//p' gradle.properties | tr -d '\r' | head -1)
-          if [ -z "$base" ]; then
-            echo "::error::could not read zcodeBaseVersion from gradle.properties"
+          # The version is the one the APK was actually built with, not a
+          # recomputation: this job runs minutes after the build, and the
+          # version scheme is build-time based, so "now" here would disagree.
+          name="${{ needs.build.outputs.version_name }}"
+          code="${{ needs.build.outputs.version_code }}"
+          if [ -z "$name" ] || [ -z "$code" ]; then
+            echo "::error::build job did not export version_name/version_code"
             exit 1
           fi
-          name="${base}-pre.${{ github.run_number }}"
           # No `v` prefix on purpose: a `v*` tag would match this workflow's own
           # release trigger and start a second run.
           tag="android-pre"
@@ -373,13 +397,13 @@ jobs:
             echo ""
             echo "| 项 | 值 |"
             echo "| --- | --- |"
-            echo "| 应用内版本 | \`$name\`（versionCode ${{ github.run_number }}） |"
+            echo "| 应用内版本 | \`$name\`（versionCode $code） |"
             echo "| 推送时间 | $push_time（UTC+8） |"
             echo "| 编译完成 | $build_time（UTC+8） |"
-            echo "| 来源 | \`pre\` 分支 · 运行 #${{ github.run_number }} |"
+            echo "| 来源 | \`main\` 分支 · 运行 #${{ github.run_number }} |"
             echo ""
             echo "> 滚动发布：资产名固定，下载链接 \`…/releases/download/$tag/zcode-remote.apk\` 始终指向最新构建。"
-            echo "> \`versionCode\` 取 CI 运行号，可直接覆盖安装上一个版本。"
+            echo "> \`versionCode\` 取构建时间（UTC，yyMMddHH），可直接覆盖安装此前任何构建。"
           } >> "$notes"
 
           {
