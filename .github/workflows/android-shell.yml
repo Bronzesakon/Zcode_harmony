@@ -141,12 +141,14 @@ jobs:
           cache: gradle
 
       # Version numbers, computed from the BUILD TIME (see app/build.gradle.kts):
-      #   versionCode = yyMMddHH (UTC). Decoupled from the run counter on
-      #     purpose: the counter once reset and left installed devices sitting on
-      #     a higher code than new builds ("已安装高版本" downgrade refusal,
-      #     2026-09-27). Clock time only moves forward, so every build installs
-      #     over every previous one; two builds inside the same hour share a
-      #     code, which Android still accepts as an update.
+      #   versionCode = yyMMddHH (UTC+8, Beijing — computed arithmetically the
+      #     same way cst() does, no dependence on the runner's tz database).
+      #     Decoupled from the run counter on purpose: the counter once reset
+      #     and left installed devices sitting on a higher code than new builds
+      #     ("已安装高版本" downgrade refusal, 2026-09-27). Clock time only
+      #     moves forward, so every build installs over every previous one; two
+      #     builds inside the same hour share a code, which Android still
+      #     accepts as an update.
       #   versionName = "<base>-dev.<yyyyMMdd.HHmm>" on branches, "<base>" on
       #     v* tags.
       # Values go through $GITHUB_ENV for Gradle and through job outputs for the
@@ -161,11 +163,12 @@ jobs:
             echo "::error::could not read zcodeBaseVersion from gradle.properties"
             exit 1
           fi
-          code=$(date -u '+%y%m%d%H')
+          now8=$(($(date -u +%s) + 28800))
+          code=$(date -u -d "@$now8" '+%y%m%d%H')
           if [ "${GITHUB_REF:0:10}" = "refs/tags/" ]; then
             name="$base"
           else
-            name="${base}-dev.$(date -u '+%Y%m%d.%H%M')"
+            name="${base}-dev.$(date -u -d "@$now8" '+%Y%m%d.%H%M')"
           fi
           {
             echo "ZCODE_VERSION_NAME=$name"
@@ -403,7 +406,7 @@ jobs:
             echo "| 来源 | \`main\` 分支 · 运行 #${{ github.run_number }} |"
             echo ""
             echo "> 滚动发布：资产名固定，下载链接 \`…/releases/download/$tag/zcode-remote.apk\` 始终指向最新构建。"
-            echo "> \`versionCode\` 取构建时间（UTC，yyMMddHH），可直接覆盖安装此前任何构建。"
+            echo "> \`versionCode\` 取构建时间（UTC+8，yyMMddHH），可直接覆盖安装此前任何构建。"
           } >> "$notes"
 
           {

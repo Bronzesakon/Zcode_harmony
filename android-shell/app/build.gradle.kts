@@ -41,7 +41,7 @@ android {
         // had one).
         //
         // CI overrides both through the environment:
-        //   ZCODE_VERSION_CODE = the build time in UTC (yyMMddHH, set by the
+        //   ZCODE_VERSION_CODE = the build time in UTC+8 (yyMMddHH, set by the
         //     workflow), so every build installs over every previous one.
         //     Android rejects an APK whose versionCode is lower than the
         //     installed one — the old run-number scheme reset once and stranded
