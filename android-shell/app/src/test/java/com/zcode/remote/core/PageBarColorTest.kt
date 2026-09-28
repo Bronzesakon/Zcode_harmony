@@ -83,6 +83,6 @@ class PageBarColorTest {
         assertTrue(line.contains("#202020"))
         val system = PageBarColor.describe(PageBarState.BOOT, null, BOOT_LIGHT)
         assertTrue(system.contains("boot/system"))
-        assertTrue(system.contains("#F8F8F8"))
+        assertTrue(system.contains("#FAFAFA"))
     }
 }
