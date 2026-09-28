@@ -976,6 +976,30 @@ object ShellRuntime {
     @Volatile
     private var appIsForeground = true
 
+    /**
+     * 注入层启动时对一次表（`WebAppBridge.config()` 的 `foreground` 字段）：原生的前后台
+     * 权威状态。文档若在后台期间被重载（自愈/兜底重载都可能），注入层的启动默认值
+     * `true` 会让它在真后台里自认前台——KICKED 被误判成"前台被顶→不自动干预"，自愈
+     * 链路就此短路（2026-09-27 17:07 现场的一环）。
+     */
+    fun isAppForeground(): Boolean = appIsForeground
+
+    init {
+        // 配对成功与应用回前台的竞态处置（Tier2Probe 在 OkHttp 线程上回调，转主线程）。
+        Tier2Probe.isForegroundNow = { appIsForeground }
+        Tier2Probe.foregroundConflict = {
+            mainHandler.post {
+                if (!Tier2Probe.isRunning()) return@post
+                Diagnostics.log("warn", "后台原生承载：配对竞态——应用已回前台，交还并重载页面一次")
+                Tier2Probe.stop("配对成功但已回前台——立即交还")
+                carrierHandedBack = true
+                // 页面已被这次配对踢进 KICKED 终态，重载是唯一恢复手段；此时壳在前台，
+                // 原生直接重载（等效用户手动重启，只是快 7 秒）。
+                evaluateJs("window.location && window.location.reload();")
+            }
+        }
+    }
+
     @Volatile
     private var heartbeatPumpRunning = false
 

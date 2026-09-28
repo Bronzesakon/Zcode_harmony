@@ -1135,7 +1135,11 @@
     var lastPairAckAt = 0;
     var lastTickAt = 0;
     var staleTicks = 0;
-    var appForeground = true;
+    // 前后台**初始值**向原生对一次表（2026-09-28）：文档若在后台期间被重载（自愈/
+    // 兜底重载都可能），启动默认 true 会让注入层在真后台里自认前台——KICKED 被误判
+    // 成"前台被顶→不自动干预"，自愈链路（kickedAwayAt）就此短路（真机 17:07 现场一环）。
+    // config() 是 document-start 的同步询问；字段缺失（老壳/测试桩）按 true 兜底。
+    var appForeground = config().foreground !== false;
     var backgroundStartedWallMs = 0;
     var lastBackgroundSilenceLoggedAt = 0;
     /**
@@ -1281,7 +1285,12 @@
 
     function noteRelayKicked() {
         if (appForeground) {
-            diag('warn', '页面连接被顶掉（relay 返回 KICKED，前台）：不自动干预');
+            // paired/visibility 带进日志：前台被踢有两种可能——另一台控制端在抢（不干预
+            // 是对的），或自家承载的配对竞态（原生 matched 回调里会自查并交还+重载）。
+            // 这两个值是区分它们的取证字段（2026-09-27 17:07 现场）。
+            diag('warn', '页面连接被顶掉（relay 返回 KICKED，前台）：不自动干预' +
+                '（paired=' + relayPaired + ' · visibility=' +
+                (document.visibilityState || '?') + '）');
             return;
         }
         kickedAwayAt = Date.now();

@@ -197,6 +197,20 @@ object Tier2Probe {
     @Volatile
     var progressSink: ((workspaceKey: String, sessionId: String, text: String) -> Unit)? = null
 
+    /** 配对成功回调向原生询问的**前台态**（ShellRuntime 注入；null 视为"不在前台"，走老路）。 */
+    @Volatile
+    var isForegroundNow: (() -> Boolean)? = null
+
+    /**
+     * 配对成功但应用已回前台的**竞态处置**（ShellRuntime 注入：交还 + 触发页面恢复）。
+     *
+     * 现场（2026-09-27 17:07）：接管判定在后台做出，配对完成时用户已经回来——relay 在
+     * matched 一刻把页面连接踢掉，页面进 KICKED 终态；而注入层"前台被顶→不自动干预"
+     * 的规则会让它一直挂着，直到用户再进出一次应用（activity 重建）才恢复。
+     */
+    @Volatile
+    var foregroundConflict: (() -> Unit)? = null
+
     /**
      * 会话流运行态出口：用会话尾窗的 `turnHeader.state` 判"在跑"。
      *
@@ -825,6 +839,20 @@ object Tier2Probe {
                     val status = frame.optString("pair_status", "unknown")
                     ackCount += 1
                     if (phase != Phase.PAIRED && status == "matched") {
+                        // 竞态守卫（2026-09-27 真机 17:07 现场）：接管判定在后台做出，但配对
+                        // 完成时用户可能**已经回到前台**——relay 在 matched 这一刻把页面连接
+                        // 踢掉，页面进 KICKED 终态；而注入层"前台被顶→不自动干预"的规则会让
+                        // 它一直挂着（那次靠用户再进出一次应用、activity 重建才恢复）。
+                        // 此时唯一正确的动作：立即交还（关 socket 释放工作区）并重载页面。
+                        if (isForegroundNow?.invoke() == true) {
+                            Diagnostics.log(
+                                "warn",
+                                "Tier2: 配对成功但应用已回前台——立即交还并重载页面" +
+                                    "（接管判定做出后用户才回来的竞态）",
+                            )
+                            foregroundConflict?.invoke()
+                            return
+                        }
                         phase = Phase.PAIRED
                         if (persistent) {
                             Diagnostics.log(

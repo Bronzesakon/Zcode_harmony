@@ -281,10 +281,11 @@ function setupPage(options) {
     const document = new FakeDocument();
     const window = new FakeWindow();
     const posts = [];
-    // 原生 config() 的真实形状：`passiveObserve` + `runningSessions`。
+    // 原生 config() 的真实形状：`passiveObserve` + `foreground` + `runningSessions`。
     // 2026-09-17：D7「订阅所有工作区」（`subscribeAll`）删除后这里不再有这个字段，
     // 所以每个测试跑的都是**只读壳**的默认配置——注入层不许再主动开桥。
-    const configValue = {passiveObserve: true};
+    // 2026-09-28：`foreground` 可由测试注入（验证"后台加载的文档按真实前后台启动"）。
+    const configValue = (options && options.config) || {passiveObserve: true};
 
     install('EventTarget', FakeEventTarget);
     install('Document', FakeDocument);
@@ -1773,6 +1774,33 @@ test('KICKED：前台被顶掉不自动重载（可能与另一台控制端在�
         assert.strictEqual(reloads.length, 0, 'a foreground kick is not ours to fix');
         assert.ok(findPost(page.posts, 'diag', (d) =>
             d.message.includes('前台）：不自动干预')).length === 1);
+    } finally {
+        storage.restore();
+        restore();
+        page.teardown();
+    }
+});
+
+test('后台期间重载的文档按原生真实前后台启动（config.foreground）', async () => {
+    // 2026-09-27 17:07 现场的一环：文档在后台被重载后，注入层启动默认自认前台，
+    // 于是 KICKED 被判成"前台被顶→不自动干预"，自愈链路（kickedAwayAt）短路。
+    // 原生现在在 config() 里给出权威前后台，后台加载的文档必须按它启动。
+    const page = setupPage({config: {passiveObserve: true, foreground: false}});
+    const {reloads, restore} = stubReload();
+    const storage = stubSessionStorage();
+    try {
+        const socket = new globalThis.WebSocket('wss://relay.example');
+        socket.receive({type: 'error', code: 'KICKED', message: 'session-conflict'});
+        assert.ok(findPost(page.posts, 'diag', (d) =>
+            d.message.includes('应用在后台')).length === 1,
+            'a config.foreground=false document must classify the kick as background');
+        assert.ok(findPost(page.posts, 'diag', (d) =>
+            d.message.includes('回前台将自动重载')).length === 1,
+            'and arm the foreground self-heal');
+        globalThis.__zcodeShellSetAppForeground(true);
+        await wait(1700);
+        assert.strictEqual(reloads.length, 1,
+            'the heal must fire once the app is really back');
     } finally {
         storage.restore();
         restore();

@@ -58,6 +58,10 @@ class WebAppBridge(private val prefs: Prefs) {
             }
             JSONObject()
                 .put("passiveObserve", prefs.passiveObserve)
+                // 注入层的前后台**初始值**：文档若在后台期间被重载（自愈/兜底重载都可能），
+                // 没有这个字段它会自认前台——KICKED 被误判成"前台被顶→不自动干预"，自愈
+                // 链路短路（2026-09-27 17:07 现场一环）。
+                .put("foreground", ShellRuntime.isAppForeground())
                 .put("runningSessions", sessions)
                 .toString()
         } catch (e: Exception) {
