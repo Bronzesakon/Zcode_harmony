@@ -591,6 +591,12 @@ class MainActivity : AppCompatActivity() {
         // status bar inset, so this colour shows exactly in that strip and
         // nowhere else (the WebView covers everything below it).
         binding.root.setBackgroundColor(color)
+        // WebView 首绘之前的底色也要与条带同色：冷启动时条带已画上 BOOT 色，而
+        // WebView 默认底是白——用户看到的就是"状态栏一条 #F8F8F8、屏幕一张白"的
+        // 开屏缝（2026-09-28 真机截图）。页面自己的 boot 壳渲染后就是 #f8f8f8
+        //（.theme-zai-light 的 --color-background，与色表逐项一致），所以缝只存在于
+        // 首绘之前；页面完成首绘后自己的背景盖掉这个底色。深色主题顺带消灭开屏白闪。
+        binding.webview.setBackgroundColor(color)
         val controller = WindowInsetsControllerCompat(window, binding.root)
         controller.isAppearanceLightStatusBars = PageBarColor.appearanceLightStatusBars(pageTheme)
         // The gesture bar floats over the page, so its icons have to agree with
