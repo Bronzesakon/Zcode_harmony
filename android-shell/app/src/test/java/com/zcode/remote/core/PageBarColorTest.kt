@@ -16,10 +16,13 @@ import org.junit.Test
  */
 class PageBarColorTest {
 
-    // Not `const`: 0xFFF8F8F8 is a Long literal, so `.toInt()` is a call and the
+    // Not `const`: 0xFFFAFAFA is a Long literal, so `.toInt()` is a call and the
     // value is not a compile-time constant.
-    private val BOOT_LIGHT = 0xFFF8F8F8.toInt()
-    private val BOOT_DARK = 0xFF161616.toInt()
+    // 2026-09-28 像素实测改值：boot 态 = React 挂载前的**预渲染壳**，html 上还没有
+    // theme-zai-* 类，`--color-background` 落回 :root 的 neutral-50/900 —— 亮 #FAFAFA
+    // （真机实测 250/255，缝的位置恰为状态栏高度）、暗 #171717（oklch(20.5% 0 0)）。
+    private val BOOT_LIGHT = 0xFFFAFAFA.toInt()
+    private val BOOT_DARK = 0xFF171717.toInt()
     private val HEADER_LIGHT = 0xFFFFFFFF.toInt()
     private val HEADER_DARK = 0xFF202020.toInt()
     private val SURFACE_LIGHT = 0xFFECECEE.toInt()
