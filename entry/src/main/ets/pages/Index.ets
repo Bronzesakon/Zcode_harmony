@@ -148,20 +148,28 @@ const STATUS_BAR_OBSERVER_JS: string = `
     mo.observe(document.documentElement, { subtree: true, childList: true, attributes: true });
   } catch (e) {}
 
-  // ---- 对话页头部刷新按钮（安卓壳 inject.js §8 同构移植：076a666 + 94b1f7f）----
+  // ---- 对话页头部刷新按钮（安卓壳 inject.js §8 同构移植：076a666 + 94b1f7f；
+  //      宽屏锚点按 2026-09-28 平板调研报告 .workbuddy-ai/tablet-refresh-button-research-20260928.md 扩展）----
   //
-  // 手机端外壳的对话页头部行里，主题菜单按钮左侧补一个「刷新」：页面卡死时手动
-  // 进程内重载——location.reload() 保住 history.state（页面自己据此回到当前对话），
-  // 本脚本随 FCP/onPageEnd 重装，原生零参与。
+  // 对话页头部行里补一个「刷新」：页面卡死时手动进程内重载——location.reload()
+  // 保住 history.state（页面自己据此回到当前对话），本脚本随 FCP/onPageEnd 重装，
+  // 原生零参与。按钮落位随布局：
+  // - 手机端外壳：section[data-mobile-page="chat"] 头部行内、最后一个
+  //   button[aria-haspopup="menu"]（主题按钮）左侧；
+  // - 宽屏桌面外壳：手机锚点不存在（data-mobile-page 只在手机分支渲染），改锚
+  //   header[data-testid="workspace-header"] 内最后一个菜单按钮（实测=帮助菜单）
+  //   左侧；帮助菜单缺席再退 side-pane-toggle / terminal-toggle（testid 直锚）。
+  //   两种外壳互斥渲染，走错的兜底分支只在重锚时刻多一次空扫描，快路径仍是
+  //   isConnected 一次读，无可感知开销。
   //
-  // 外观全靠克隆：按钮 className 原样复制主题按钮（Tailwind 工具类 + .theme-zai-*
-  // CSS 变量，hover/深浅色自动跟随）；图标克隆主题按钮自己的 <svg> 外壳、只换
+  // 外观全靠克隆：按钮 className 原样复制锚点按钮（Tailwind 工具类 + CSS 变量，
+  // hover/深浅色自动跟随；宽屏帮助菜单按钮自带 [app-region:no-drag]，克隆即保留，
+  // 不会被标题栏拖拽区吞掉点击）；图标克隆锚点按钮自己的 <svg> 外壳、只换
   // rotate-cw 字形——refresh-cw 双弧在 16px 下描边发亮（2026-09-27 安卓真机反馈）。
+  // 终端/侧面板开关打开态会带 !bg-selected 高亮类，克隆时剥掉。
   //
-  // 锚点：section[data-mobile-page="chat"]（手机外壳对话页标记，安卓与鸿蒙共用判据）
-  // 头部行内最后一个 button[aria-haspopup="menu"]（Radix 菜单触发器属性，不随语言变；
-  // 返回按钮不是菜单）。找不到锚点时失效模式 = 按钮安静地不出现，绝不动页面自己的
-  // 节点；本脚本无日志通路，与状态判定同等静默。
+  // 找不到锚点时失效模式 = 按钮安静地不出现，绝不动页面自己的节点；本脚本无日志
+  // 通路，与状态判定同等静默。宽屏主页无活动任务时头部整个不渲染 ⇒ 无按钮是预期。
   // 幂等：data-zcode-shell-refresh 标记 + 前兄弟检查，脚本重复执行不会重复插入。
   var REFRESH_GLYPH = '<path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/>' +
     '<path d="M21 3v5h-5"/>';
@@ -182,15 +190,30 @@ const STATUS_BAR_OBSERVER_JS: string = `
     try {
       // 快路径：按钮还连着 ⇒ 这一拍到此为止。
       if (refreshBtn && refreshBtn.isConnected) { return; }
+      // 锚点解析，手机优先、宽屏兜底（两种外壳互斥渲染，走错的兜底分支代价是一次空扫描）：
+      // 手机 = 对话页头部行内最后一个菜单按钮（主题按钮）；
+      // 宽屏 = workspace-header 内最后一个菜单按钮（实测=帮助菜单），缺席时退
+      //        side-pane-toggle → terminal-toggle 的 testid 直锚。
+      var anchor = null;
       var section = document.querySelector('section[data-mobile-page="chat"]');
-      if (!section) { return; }
-      var row = section.firstElementChild;
-      var menus = row && row.querySelectorAll
-        ? row.querySelectorAll('button[aria-haspopup="menu"]') : null;
-      var theme = menus && menus.length ? menus[menus.length - 1] : null;
-      if (!theme || !theme.parentElement) { return; }
+      if (section && section.firstElementChild && section.firstElementChild.querySelectorAll) {
+        var menus = section.firstElementChild.querySelectorAll('button[aria-haspopup="menu"]');
+        anchor = menus && menus.length ? menus[menus.length - 1] : null;
+      }
+      if (!anchor) {
+        var header = document.querySelector('header[data-testid="workspace-header"]');
+        if (header && header.querySelectorAll) {
+          var wmenus = header.querySelectorAll('button[aria-haspopup="menu"]');
+          anchor = wmenus && wmenus.length ? wmenus[wmenus.length - 1] : null;
+        }
+      }
+      if (!anchor) {
+        anchor = document.querySelector('button[data-testid="side-pane-toggle"]') ||
+          document.querySelector('button[data-testid="terminal-toggle"]');
+      }
+      if (!anchor || !anchor.parentElement) { return; }
       // 已在位（前一个兄弟就是我们的按钮）＝不重复插，也是脚本重复执行的幂等闸。
-      var prev = theme.previousElementSibling;
+      var prev = anchor.previousElementSibling;
       if (prev && prev.getAttribute && prev.getAttribute('data-zcode-shell-refresh')) {
         refreshBtn = prev;
         return;
@@ -198,12 +221,14 @@ const STATUS_BAR_OBSERVER_JS: string = `
       var label = refreshButtonLabel();
       var btn = document.createElement('button');
       btn.type = 'button';
-      btn.className = String(theme.className || '');
+      // 克隆锚点按钮的 className；终端/侧面板开关打开态带 !bg-selected 高亮，剥掉。
+      btn.className = String(anchor.className || '')
+        .replace(/(^|\s)!bg-selected(?=\s|$)/g, '').trim();
       btn.setAttribute('aria-label', label);
       btn.setAttribute('title', label);
       btn.setAttribute('data-zcode-shell-refresh', '1');
       // 图标外壳按页面当前渲染照抄（页面以后调图标样式不用追），克隆不到才退回自绘。
-      var shell = theme.querySelector ? theme.querySelector('svg') : null;
+      var shell = anchor.querySelector ? anchor.querySelector('svg') : null;
       var icon = null;
       if (shell && shell.cloneNode) {
         try {
@@ -226,7 +251,7 @@ const STATUS_BAR_OBSERVER_JS: string = `
       btn.addEventListener('click', function () {
         try { window.location.reload(); } catch (e) {}
       });
-      theme.parentElement.insertBefore(btn, theme);
+      anchor.parentElement.insertBefore(btn, anchor);
       refreshBtn = btn;
     } catch (e) {}
   }
