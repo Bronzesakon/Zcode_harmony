@@ -1,0 +1,79 @@
+/node_modules
+/oh_modules
+/local.properties
+/.idea
+**/build
+/.hvigor
+.cxx
+/.clangd
+/.clang-format
+/.clang-tidy
+**/.test
+/.appanalyzer
+
+# 本地参考项目（仅本地保留，不随仓库上传）
+/Deepseek-Harmony_Reference/
+/zemote/
+
+# 本地工具资产（ZCode 项目级技能等），仅本地保留
+/.zcode/
+
+# 项目内部记录（需求、调研与变更记录），仅本地保留，不随仓库上传
+/项目文档.md
+/安卓薄壳迁移文档.md
+
+# 本地构建/调试缓存（arkts 检查缓存、hdc 采集产物、hvigor 临时工作区）
+/.cache/
+/.dsh-hdc/
+/.dsh-hvigor-tmp/
+# adb-bridge（安卓真机调试）的截图 / pull / 取回的日志，仅本机
+/.adb-bridge/
+# 死代码清理审计（.dsh-audit/）：决策与台帐文档 + 子报告 + 门禁日志 + 设备截图/日志，
+# 是本轮会话的工作产物（约 5.5 MB，含截图与设备日志）。加忽略是为了避免 `git add -A`
+# 把它们扫进仓库；**若要入库，请只挑其中的 *.md**。
+/.dsh-audit/
+# 安卓薄壳子工程（android-shell/）**随仓库上传**，不要在根上忽略它；
+# 其自身的构建产物与签名文件由 android-shell/.gitignore 处理。
+
+# 鸿蒙复刻知识库（Docs/，50+ 篇调研文档）与 AI 工作产物（.workbuddy-ai/：审计报告、
+# 探针、记忆），仅本地保留不随仓库上传——README 里引用其文件名，结论已写成自包含的
+/Docs/
+/.workbuddy-ai/
+
+# 根目录下的临时 APK / 校验文件（子目录规则不覆盖根，2026-09-16 审计补上：
+# 此前 zcode-remote-pre93/pre95.apk 及 .md5 处于"未忽略"状态，`git add -A` 会
+# 直接提交 13MB 二进制）
+/*.apk
+/*.apk.md5
+
+# ===== ↑ 以上同步自 .gitignore（「从 .gitignore 同步」只重写以上部分）=====
+.git/
+.hg/
+.svn/
+node_modules/
+bower_components/
+jspm_packages/
+__pycache__/
+site-packages/
+venv/
+coverage/
+htmlcov/
+lcov-report/
+cmakefiles/
+cmake-build-*/
+bazel-*/
+pods/
+deriveddata/
+storybook-static/
+playwright-report/
+test-results/
+allure-results/
+allure-report/
+cdk.out/
+*.egg-info/
+*.dist-info/
+eggs/
+pip-wheel-metadata/
+wheels/
+# ----- ↑ 以上为 ZCode 默认排除规则（自定义规则请写在本行下方，不会被同步/恢复改动）-----
+# 自定义规则写在下方（本行提示可删除）
