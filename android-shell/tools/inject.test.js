@@ -1358,6 +1358,33 @@ test('the refresh button lands left of the theme menu trigger with cloned stylin
     }
 });
 
+test('the refresh icon clones the page icon shell and swaps in the family glyph', async () => {
+    const page = setupPage({pageState: true, media: {'(max-width: 767px)': true}});
+    try {
+        const {row, theme} = stubChatHeader(page);
+        // The page's own icon, as React renders it (a lucide shell).
+        const shell = {
+            attrs: {'class': 'lucide lucide-palette size-4'},
+            getAttribute(name) { return this.attrs[name] || null; },
+            cloneNode() {
+                const c = {attrs: {}, innerHTML: '', setAttribute(n, v) { c.attrs[n] = v; }};
+                return c;
+            },
+        };
+        theme.querySelector = (sel) => (sel === 'svg' ? shell : null);
+        await bootPageState(page);
+
+        const icon = refreshButtonsIn(row)[0].children[0];
+        assert.ok(icon, 'the button carries an icon');
+        assert.strictEqual(icon.attrs['class'], 'lucide lucide-rotate-cw size-4',
+            'the class list is inherited from the page icon, with the glyph name swapped');
+        assert.ok(String(icon.innerHTML).indexOf('M21 12a9 9 0 1 1-9-9') >= 0,
+            'and the glyph is the lighter rotate-cw');
+    } finally {
+        page.teardown();
+    }
+});
+
 test('a remounted header gets a fresh button, and a page without the anchor stays untouched', async () => {
     const page = setupPage({pageState: true, media: {'(max-width: 767px)': true}});
     try {

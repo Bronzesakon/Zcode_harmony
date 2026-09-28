@@ -3813,6 +3813,18 @@
         return /zh/i.test(lang) ? '刷新页面' : 'Refresh page';
     }
 
+    /**
+     * 字形用页面图标集里的 **rotate-cw**（单弧 + 单箭头，逐字照抄
+     * `assets/rotate-cw-DIHP7oCx.js`）。为什么不是 refresh-cw：2026-09-27 真机反馈
+     * "刷新按钮比主题按钮更亮"，像素级复核的结论是**描边属性完全相同**（color/
+     * stroke/stroke-width/尺寸逐项一致），差异只在字形墨量——refresh-cw 的双弧+
+     * 双箭头在 16px 下描边发实发亮，而主题按钮的调色板是单条均匀轮廓线。rotate-cw
+     * 与调色板同档墨量，且是同一图标家族（同 stroke-width、同圆角端点）。
+     */
+    var REFRESH_GLYPH =
+        '<path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/>' +
+        '<path d="M21 3v5h-5"/>';
+
     function ensureHeaderRefreshButton() {
         try {
             // 快路径：按钮还连着 ⇒ 这一拍到此为止。
@@ -3846,15 +3858,29 @@
             btn.setAttribute('aria-label', label);
             btn.setAttribute('title', label);
             btn.setAttribute('data-zcode-shell-refresh', '1');
-            // lucide refresh-cw 的 pathData 逐字照抄；class="size-4" 与主题按钮
-            // 自己的图标同规格，currentColor 继承按钮文字色（随深浅色走）。
-            btn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"' +
-                ' fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"' +
-                ' stroke-linejoin="round" class="size-4" aria-hidden="true">' +
-                '<path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/>' +
-                '<path d="M21 3v5h-5"/>' +
-                '<path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/>' +
-                '<path d="M8 16H3v5"/></svg>';
+            // 图标外壳**克隆主题按钮自己的图标**：class、尺寸、描边、填充等属性全部
+            // 按页面当前渲染照抄（页面以后调图标样式我们不用追），只换字形。克隆不到
+            // 时才退回自绘（属性与 lucide 默认一致）。
+            var shell = theme.querySelector ? theme.querySelector('svg') : null;
+            var icon = null;
+            if (shell && shell.cloneNode) {
+                try {
+                    icon = shell.cloneNode(false);
+                    icon.setAttribute('class', String(shell.getAttribute('class') || '')
+                        .replace(/lucide-[a-z0-9-]+/i, 'lucide-rotate-cw'));
+                    icon.innerHTML = REFRESH_GLYPH;
+                } catch (e) {
+                    icon = null;
+                }
+            }
+            if (icon) {
+                btn.appendChild(icon);
+            } else {
+                btn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"' +
+                    ' fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"' +
+                    ' stroke-linejoin="round" class="size-4" aria-hidden="true">' +
+                    REFRESH_GLYPH + '</svg>';
+            }
             btn.addEventListener('click', function () {
                 // 进程内重载：history.state 保留（那是页面自己"回到当前对话"的锚），
                 // document-start 注入随新文档自动重跑，所以不需要原生参与。
