@@ -67,6 +67,9 @@ const BAR_BOOT_DARK = '#FF161616';
  * 旋转 / 分屏 / 折叠跨过断点，二者都经 rAF 合帧后状态有变才回推状态名（非色值），
  * 空闲零开销。安装幂等：__zcodePageStateHooked 置位后重复安装为空操作；
  * document 尚未就绪时返回 'retry' 且不置位，留待 FCP / onPageEnd 重试。
+ *
+ * 兼职：对话页头部刷新按钮的保活拍点（安卓壳 inject.js §8 同构移植）——同一合帧
+ * tick 里并列 ensure，不另开观察器；按钮点击为页面内 location.reload()，原生零参与。
  */
 const STATUS_BAR_OBSERVER_JS: string = `
 (function () {
@@ -112,15 +115,21 @@ const STATUS_BAR_OBSERVER_JS: string = `
     } catch (e) {}
   }
 
-  // 合并同一帧内的密集 DOM 变更（React 渲染期 MutationObserver 会高频触发）
+  // 合并同一帧内的密集 DOM 变更（React 渲染期 MutationObserver 会高频触发）。
+  // 同一拍并列执行状态推送与刷新按钮保活：ensure 不能放进 push() 的去重早退之后，
+  // 否则状态名不变时（对话页↔首页往返常不变）按钮就没有重建时机（与安卓壳同构）。
   var scheduled = false;
+  function tick() {
+    push();
+    ensureHeaderRefreshButton();
+  }
   function schedule() {
     if (scheduled) { return; }
     scheduled = true;
     if (window.requestAnimationFrame) {
-      window.requestAnimationFrame(function () { setTimeout(push, 0); });
+      window.requestAnimationFrame(function () { setTimeout(tick, 0); });
     } else {
-      setTimeout(push, 0);
+      setTimeout(tick, 0);
     }
   }
 
@@ -138,6 +147,90 @@ const STATUS_BAR_OBSERVER_JS: string = `
     var mo = new MutationObserver(schedule);
     mo.observe(document.documentElement, { subtree: true, childList: true, attributes: true });
   } catch (e) {}
+
+  // ---- 对话页头部刷新按钮（安卓壳 inject.js §8 同构移植：076a666 + 94b1f7f）----
+  //
+  // 手机端外壳的对话页头部行里，主题菜单按钮左侧补一个「刷新」：页面卡死时手动
+  // 进程内重载——location.reload() 保住 history.state（页面自己据此回到当前对话），
+  // 本脚本随 FCP/onPageEnd 重装，原生零参与。
+  //
+  // 外观全靠克隆：按钮 className 原样复制主题按钮（Tailwind 工具类 + .theme-zai-*
+  // CSS 变量，hover/深浅色自动跟随）；图标克隆主题按钮自己的 <svg> 外壳、只换
+  // rotate-cw 字形——refresh-cw 双弧在 16px 下描边发亮（2026-09-27 安卓真机反馈）。
+  //
+  // 锚点：section[data-mobile-page="chat"]（手机外壳对话页标记，安卓与鸿蒙共用判据）
+  // 头部行内最后一个 button[aria-haspopup="menu"]（Radix 菜单触发器属性，不随语言变；
+  // 返回按钮不是菜单）。找不到锚点时失效模式 = 按钮安静地不出现，绝不动页面自己的
+  // 节点；本脚本无日志通路，与状态判定同等静默。
+  // 幂等：data-zcode-shell-refresh 标记 + 前兄弟检查，脚本重复执行不会重复插入。
+  var REFRESH_GLYPH = '<path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/>' +
+    '<path d="M21 3v5h-5"/>';
+  var refreshBtn = null;
+
+  function refreshButtonLabel() {
+    var lang = '';
+    try {
+      lang = (window.localStorage && window.localStorage.getItem('zcode-locale-preference')) ||
+        (window.navigator && window.navigator.language) || '';
+    } catch (e) {
+      // locale 拿不到就用英文：纯提示文案，不值得为它冒任何险。
+    }
+    return /zh/i.test(lang) ? '刷新页面' : 'Refresh page';
+  }
+
+  function ensureHeaderRefreshButton() {
+    try {
+      // 快路径：按钮还连着 ⇒ 这一拍到此为止。
+      if (refreshBtn && refreshBtn.isConnected) { return; }
+      var section = document.querySelector('section[data-mobile-page="chat"]');
+      if (!section) { return; }
+      var row = section.firstElementChild;
+      var menus = row && row.querySelectorAll
+        ? row.querySelectorAll('button[aria-haspopup="menu"]') : null;
+      var theme = menus && menus.length ? menus[menus.length - 1] : null;
+      if (!theme || !theme.parentElement) { return; }
+      // 已在位（前一个兄弟就是我们的按钮）＝不重复插，也是脚本重复执行的幂等闸。
+      var prev = theme.previousElementSibling;
+      if (prev && prev.getAttribute && prev.getAttribute('data-zcode-shell-refresh')) {
+        refreshBtn = prev;
+        return;
+      }
+      var label = refreshButtonLabel();
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = String(theme.className || '');
+      btn.setAttribute('aria-label', label);
+      btn.setAttribute('title', label);
+      btn.setAttribute('data-zcode-shell-refresh', '1');
+      // 图标外壳按页面当前渲染照抄（页面以后调图标样式不用追），克隆不到才退回自绘。
+      var shell = theme.querySelector ? theme.querySelector('svg') : null;
+      var icon = null;
+      if (shell && shell.cloneNode) {
+        try {
+          icon = shell.cloneNode(false);
+          icon.setAttribute('class', String(shell.getAttribute('class') || '')
+            .replace(/lucide-[a-z0-9-]+/i, 'lucide-rotate-cw'));
+          icon.innerHTML = REFRESH_GLYPH;
+        } catch (e) {
+          icon = null;
+        }
+      }
+      if (icon) {
+        btn.appendChild(icon);
+      } else {
+        btn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"' +
+          ' fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"' +
+          ' stroke-linejoin="round" class="size-4" aria-hidden="true">' +
+          REFRESH_GLYPH + '</svg>';
+      }
+      btn.addEventListener('click', function () {
+        try { window.location.reload(); } catch (e) {}
+      });
+      theme.parentElement.insertBefore(btn, theme);
+      refreshBtn = btn;
+    } catch (e) {}
+  }
+
   schedule();
   return 'ok';
 })()
@@ -828,16 +921,12 @@ struct Index {
     }
   }
 
-  // 系统语言变化时，重新注入 JS 覆写 navigator.language 并显示刷新按钮。
-  // 用户可点击按钮手动刷新以应用新语言，避免自动刷新打断当前操作。
+  // 系统语言变化时，重新注入 JS 覆写 navigator.language；网页在下次加载时读到新语言
   onSystemLanguageChange(): void {
     if (this.systemLanguage && this.systemLanguage !== '') {
       this.injectLanguageOverride();
-      this.showLangRefreshBtn = true;
     }
   }
-
-  @State showLangRefreshBtn: boolean = false;
 
   // 判断 URL 是否属于 z.ai 全系域名（z.ai / zcode.z.ai 及其子域名）
   private isZaiDomain(requestUrl: string): boolean {
