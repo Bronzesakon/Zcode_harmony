@@ -60,8 +60,15 @@ object PageBarColor {
         PageTheme.entries.firstOrNull { it.token == token }
 
 
-    private const val BOOT_LIGHT = 0xFFF8F8F8.toInt()
-    private const val BOOT_DARK = 0xFF161616.toInt()
+    // boot 态 = React 挂载前的**预渲染壳**（.zcode-boot-loading）：那一刻 html 上还没有
+    // `theme-zai-light/dark` 类（那是 React 挂载后才加的），`--color-background` 落回
+    // `:root` 的 neutral-50/900——真机像素实测（2026-09-28，缝的位置恰为状态栏高度）：
+    // 亮 #FAFAFA、暗 #171717，而非主题类里的 #f8f8f8/#161616。
+    // ⚠️ 已知残留：KICKED/接管等 **React 状态页**带着主题类渲染（#f8f8f8/#161616），
+    // 与这里的 boot 值会差 1-2 级——状态机里两者共用 boot 态，拆分要扩注入层状态，
+    // 对罕见错误页不值得；boot 壳是每次冷启动必看数秒的主场景。
+    private const val BOOT_LIGHT = 0xFFFAFAFA.toInt()
+    private const val BOOT_DARK = 0xFF171717.toInt()
     private const val MAIN_HEADER_LIGHT = 0xFFFFFFFF.toInt()
     private const val MAIN_HEADER_DARK = 0xFF202020.toInt()
     private const val MAIN_SURFACE_LIGHT = 0xFFECECEE.toInt()
