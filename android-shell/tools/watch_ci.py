@@ -10,21 +10,29 @@ annotations are baked into its page HTML. That makes the pages the only failure
 channel an unauthenticated observer can read, which is why the workflow re-emits
 Gradle errors as `::error::` annotations (see .github/workflows/android-shell.yml).
 
+Data source
+-----------
+Run and job state come from GitHub's public JSON API first, unauthenticated (60
+requests/hour per IP — a single run's worth of polling fits easily). It is
+real-time; the server-rendered Actions pages are not, and trail a finished run by
+minutes, which is the whole reason the API is tried before the page. The page
+stays as the fallback for when the API budget is spent or a request fails, and it
+remains the only source for annotations (no API exposes them).
+
 What it reads, and why those signals
 ------------------------------------
-  * the newest run row of the workflow page: run number, commit, branch, push
-    time. Identity is not decoration. A run takes a few seconds to appear after a
-    push, and the run before yours has the same job names and the same green
-    result, so "the newest run is green" is not the same claim as "my push is
-    green". The commit is therefore printed, and warned about when it disagrees
-    with the local HEAD.
-  * per job, from its `<streaming-graph-job>` element: `data-job-id`,
-    `data-concluded` and the status octicon (`check-circle-fill` success,
-    `x-circle-fill` failure, `skip` skipped). Read the ELEMENT, not the slice
-    after `data-job-id="`: GitHub writes `data-concluded` before that attribute,
-    so slicing from it attributes every job's flag to its predecessor and leaves
-    the last job looking unfinished — which made `--watch` poll to its deadline
-    on every single run, green or not.
+  * the newest run of the workflow: number, commit, branch, push time. Identity
+    is not decoration. A run takes a few seconds to appear after a push, and the
+    run before yours has the same job names and the same green result, so "the
+    newest run is green" is not the same claim as "my push is green". The commit
+    is therefore printed, and warned about when it disagrees with the local HEAD.
+  * per job, its conclusion — from the API's `status`/`conclusion`; from the page,
+    the `<streaming-graph-job>` element's `data-concluded` plus the status octicon
+    (`check-circle-fill` success, `x-circle-fill` failure, `skip` skipped). Read
+    the ELEMENT, not the slice after `data-job-id="`: GitHub writes
+    `data-concluded` before that attribute, so slicing from it attributes every
+    job's flag to its predecessor and leaves the last job looking unfinished —
+    which made `--watch` poll to its deadline on every single run, green or not.
   * per failed job, the `annotation-message` blocks of the Annotations section,
     whose `annotationContainer` div holds the compiler error lines verbatim.
 
@@ -44,6 +52,7 @@ Usage
 import argparse
 import datetime
 import html
+import json
 import re
 import subprocess
 import sys
@@ -54,6 +63,7 @@ from pathlib import Path
 REPO = 'Bronzesakon/Zcode_harmony'
 WORKFLOW = 'android-shell.yml'
 BASE = f'https://github.com/{REPO}'
+API = f'https://api.github.com/repos/{REPO}'
 
 # Octicon -> label, for humans only: the exit code reads the icon key, never the
 # translated label.
@@ -93,6 +103,35 @@ def fetch(url: str) -> str:
     raise RuntimeError('unreachable')
 
 
+# The anonymous budget is per IP and shared with anything else running on it, so
+# stop spending it once it gets thin: a slower answer beats a rate-limited one.
+RATE_FLOOR = 12
+_rate_spent = False
+
+
+def api_get(path: str):
+    """GET from GitHub's JSON API, or None to let the caller fall back to the page.
+
+    Never raises. Every failure mode — budget spent, network, GitHub changing the
+    shape — has a working page-based path behind it, so the caller only has to
+    distinguish "data" from "try the page".
+    """
+    global _rate_spent
+    if _rate_spent:
+        return None
+    req = urllib.request.Request(
+        f'{API}{path}',
+        headers={'User-Agent': 'zcode-ci-watch', 'Accept': 'application/vnd.github+json'})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            left = resp.headers.get('x-ratelimit-remaining')
+            if left and left.isdigit() and int(left) < RATE_FLOOR:
+                _rate_spent = True
+            return json.load(resp)
+    except Exception:
+        return None
+
+
 def text_of(fragment: str) -> str:
     return re.sub(r'\s+', ' ', html.unescape(re.sub(r'<[^>]+>', ' ', fragment))).strip()
 
@@ -107,11 +146,28 @@ def parse_stamp(value: str | None) -> datetime.datetime | None:
 
 
 def latest_run() -> dict | None:
-    """The newest run of this workflow, with the identity shown on its row.
+    """The newest run of this workflow, with the identity the report needs.
 
-    The list is newest-first, so the first anchor is the newest run — but not
-    necessarily the one you just pushed; see the module docstring.
+    The API answers in real time and is tried first; the page is the fallback and
+    trails a finished run by minutes (see the module docstring). Either way the
+    list is newest-first, so the first entry is the newest run — but not
+    necessarily the one you just pushed.
     """
+    data = api_get(f'/actions/workflows/{WORKFLOW}/runs?per_page=1')
+    listed = (data or {}).get('workflow_runs')
+    if listed:
+        r = listed[0]
+        commit = r.get('head_commit') or {}
+        return {
+            'id': str(r.get('id', '')),
+            'number': str(r.get('run_number', '?')),
+            'subject': (r.get('display_title') or commit.get('message') or '').splitlines()[0],
+            'state': r.get('status') or '',
+            'commit': r.get('head_sha') or '',
+            'branch': r.get('head_branch') or '',
+            'pushed_at': parse_stamp(r.get('created_at')),
+        }
+
     page = fetch(f'{BASE}/actions/workflows/{WORKFLOW}')
     first = RUN_ROW.search(page)
     if not first:
@@ -140,7 +196,45 @@ def latest_run() -> dict | None:
     }
 
 
+def _icon(status: str, conclusion: str) -> str:
+    """API status/conclusion -> the octicon key the rest of the script reads.
+
+    Going through the same key keeps the exit-code logic and the printed report
+    identical no matter which source answered.
+    """
+    if conclusion == 'success':
+        return 'check-circle-fill'
+    if conclusion in ('failure', 'timed_out', 'startup_failure'):
+        return 'x-circle-fill'
+    if conclusion == 'cancelled':
+        return 'stop'
+    if conclusion in ('skipped', 'neutral'):
+        return 'skip'
+    if status == 'in_progress':
+        return 'dot-fill'
+    if status == 'queued':
+        return 'clock'
+    return ''
+
+
 def jobs(run_id: str) -> list[dict]:
+    """Per-job state: the API when it answers, the run page otherwise."""
+    data = api_get(f'/actions/runs/{run_id}/jobs?per_page=100')
+    listed = (data or {}).get('jobs')
+    if listed is not None:
+        out = []
+        for job in listed:
+            icon = _icon(job.get('status') or '', job.get('conclusion') or '')
+            out.append({
+                'key': str(job.get('id', '')),
+                'id': str(job.get('id', '')),
+                'icon': icon,
+                'status': STATUS_ICON.get(icon, icon or '?'),
+                'concluded': (job.get('status') or '') == 'completed',
+                'text': job.get('name') or str(job.get('id', '')),
+            })
+        return out
+
     page = fetch(f'{BASE}/actions/runs/{run_id}')
     out = []
     for block in JOB_ELEMENT.split(page)[1:]:
