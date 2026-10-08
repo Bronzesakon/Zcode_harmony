@@ -23,12 +23,12 @@ const DOMAIN = 0x0001;
 const TAG = 'ZCodeEntryAbility';
 
 // 状态栏配色（项目文档 §11）
-// 底色由设备/深浅色限定资源 status_bar_bg 提供，取值对齐远程网页开屏壳底色
-// （亮 #F8F8F8 / 暗 #161616）；常量仅作为资源读取异常时的兜底。
+// 底色由设备/深浅色限定资源 status_bar_bg 提供，取值对齐远程网页预渲染壳底色
+// （亮 #FAFAFA / 暗 #171717）；常量仅作为资源读取异常时的兜底。
 const BAR_ICON_DARK = '#FFFFFF';
 const BAR_ICON_LIGHT = '#000000';
-const BAR_BG_FALLBACK_DARK = '#FF161616';
-const BAR_BG_FALLBACK_LIGHT = '#FFF8F8F8';
+const BAR_BG_FALLBACK_DARK = '#FF171717';
+const BAR_BG_FALLBACK_LIGHT = '#FFFAFAFA';
 
 let webEngineInitialized: boolean = false;
 let mainWindowClass: window.Window | null = null;

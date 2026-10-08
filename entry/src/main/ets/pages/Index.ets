@@ -29,8 +29,15 @@ const TAG = 'ZCodeIndex';
 /**
  * 状态栏两套固定表面色（双端一致，色值取自远程页静态资源解析，2026-09-10 资源嗅探 + 真机像素双验证）。
  * 运行时零取色：网页侧回推状态名，原生查本表直接换色：
- * - Boot 面：网页 bootstrap BROWSER_THEME_COLORS / --color-background，
- *   覆盖 开屏空白、Boot 加载壳、KICKED/接管提示等状态页（页顶同为 bg-background）；
+ * - Boot/Shell 面：网页预渲染壳（.zcode-boot-loading）在、而 <html> 上**还没挂**
+ *   theme-zai-light/dark 类时用 #FAFAFA / #171717 —— 那一刻 --color-background 落回
+ *   :root 的 neutral-50/900 兜底（2026-10-08 快照资源解析 + 真机像素实测：色缝恰在
+ *   状态栏下沿）。该段极短：从 HTML 首绘到主包求值至挂主题类的顶层 IIFE 为止。
+ * - Boot 面：#F8F8F8 / #161616。同一个预渲染壳在主题类挂上之后（主包 IIFE → 首次
+ *   React render，中间夹着 relay 握手 await）就转此色，与 KICKED/接管、配对等待等
+ *   React 状态页同色 —— 三者共用一态，因为此刻网页的 --color-background 都已是
+ *   #f8f8f8。主题类由主包顶层 IIFE 挂上，**早于** React 挂载，故壳存在与否区分不了
+ *   这两段，判据必须落在主题类上；
  * - Main/Surface 面：--color-background-win-alt，即控制页外壳区底色
  *   （宽屏状态栏正下方即此色，真机像素实测一致）；
  * - Main/Header 面：--color-header（#FFFFFF / #202020）。网页以窄屏布局渲染（手机端外壳）时
@@ -47,6 +54,8 @@ const BAR_SURFACE_LIGHT = '#FFECECEE';
 const BAR_SURFACE_DARK = '#FF2B2B2B';
 const BAR_HEADER_LIGHT = '#FFFFFFFF';
 const BAR_HEADER_DARK = '#FF202020';
+const BAR_BOOT_SHELL_LIGHT = '#FFFAFAFA';
+const BAR_BOOT_SHELL_DARK = '#FF171717';
 const BAR_BOOT_LIGHT = '#FFF8F8F8';
 const BAR_BOOT_DARK = '#FF161616';
 
@@ -55,13 +64,16 @@ const BAR_BOOT_DARK = '#FF161616';
  *
  * 色值在开发期已由静态资源解析确定（HTML 内联 BROWSER_THEME_COLORS + CSS token），
  * 运行时唯一要做的是判断网页处于哪个状态，因此本脚本只做存在性检查与同源媒体查询：
- * - '.zcode-boot-loading'：网页预渲染的 Boot 加载壳元素（React 挂载后移除）；
+ * - '.zcode-boot-loading'：网页预渲染的 Boot 加载壳（React 首次 commit 清空 #root 时消失）；
  * - '.bg-background-win-alt'：控制页主视图根节点（SPA 路由/状态页切换时挂载或卸载）；
+ * - <html> 上的 'theme-zai-light|dark' 类：网页自己钉主题用的类，由主包**顶层 IIFE**
+ *   在 React 挂载之前就写上，与 --color-background 的翻转同源同时刻。它把预渲染壳切成
+ *   前后两段：未着主题 = :root 兜底 #FAFAFA，已着主题 = #f8f8f8（与 React 状态页同色）；
  * - matchMedia('(max-width: 767px)')：网页自己用来决定「是否渲染手机端外壳」的查询，
  *   窄屏渲染时状态栏正下方是标题栏（bg-header），宽屏直接是外壳区（win-alt）。
- * 于是回推三种状态名：'boot'（Boot 壳、KICKED/接管等状态页一律归此，与"状态页页顶 =
- * Boot 色"的资源解析结论一致）、'main-surface'（控制页主视图 + 宽屏）、
- * 'main-header'（控制页主视图 + 窄屏）。
+ * 于是回推四种状态名：'boot-shell'（预渲染壳 + 未着主题）、'boot'（预渲染壳已着主题，
+ * 以及 KICKED/接管、配对等待等 React 状态页 —— 两者同色）、'main-surface'（主视图 +
+ * 宽屏）、'main-header'（主视图 + 窄屏）。
  *
  * 事件驱动：MutationObserver 监听 DOM 结构与 class 变化，matchMedia change 监听
  * 旋转 / 分屏 / 折叠跨过断点，二者都经 rAF 合帧后状态有变才回推状态名（非色值），
@@ -88,12 +100,27 @@ const STATUS_BAR_OBSERVER_JS: string = `
     }
   }
 
+  // 主题类判据：直接读根元素 class（不用 getElementsByClassName，避免将来页面里
+  // 出现同名类的「主题预览」子元素时误判）。与 --color-background 的翻转同源同时刻。
+  function hasZaiTheme() {
+    try {
+      var root = document.documentElement;
+      var cls = root && root.getAttribute ? String(root.getAttribute('class') || '') : '';
+      return cls.indexOf('theme-zai-light') >= 0 || cls.indexOf('theme-zai-dark') >= 0;
+    } catch (e) {
+      return false;
+    }
+  }
+
   // 状态判定：纯 DOM 存在性检查（getElementsByClassName 零样式读取）+ 同源媒体查询
   function computeState() {
     try {
       var main = document.getElementsByClassName('bg-background-win-alt');
       var boot = document.getElementsByClassName('zcode-boot-loading');
-      if (boot.length > 0 || main.length === 0) { return 'boot'; }
+      if (boot.length > 0 || main.length === 0) {
+        // 预渲染壳 / 状态页分两段：主题类未挂 = :root 兜底色，已挂 = 主题色（同状态页）
+        return hasZaiTheme() ? 'boot' : 'boot-shell';
+      }
       // 窄屏：状态栏正下方是网页标题栏（bg-header）；宽屏：直接是外壳区（win-alt）
       return isNarrow() ? 'main-header' : 'main-surface';
     } catch (e) {
@@ -297,11 +324,11 @@ struct Index {
   delegate: webview.WebDownloadDelegate = new webview.WebDownloadDelegate();
   private pageLoadTimer: number = -1;
   private readonly LOAD_TIMEOUT_MS: number = 15000;
-  // 深浅色跟随系统：容器/空白底取远程网页自身的开屏壳底色（亮 #F8F8F8 / 暗 #161616），
-  // 与网页 own boot splash 一致，消除开屏二阶段的底色跳变
+  // 深浅色跟随系统：容器/空白底取远程网页自身的开屏壳底色（预渲染壳未着主题那段，
+  // 亮 #FAFAFA / 暗 #171717），与网页 own boot splash 首帧一致，消除开屏底色跳变
   @StorageProp('currentColorMode') @Watch('onColorModeChange')
   currentColorMode: ConfigurationConstant.ColorMode = ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET;
-  @State webBgColor: string = BAR_BOOT_LIGHT;
+  @State webBgColor: string = BAR_BOOT_SHELL_LIGHT;
   // 状态栏占位底色：初始取开屏壳底色资源（四端限定目录已统一为 Boot 色），
   // 之后由「网页状态 → 固定表面色」查表驱动，只会在两套固定色之间切换
   @State statusBarColor: ResourceColor = $r('app.color.status_bar_bg');
@@ -313,6 +340,10 @@ struct Index {
   // 主视图的顶面是否为窄屏标题栏（仅 webPageOnMain 时有意义）：
   // true → 状态栏正下方是 bg-header（窄屏/手机端外壳），false → 外壳区 win-alt
   private webTopHeader: boolean = false;
+  // 非主视图时网页处于哪一段（仅 !webPageOnMain 时有意义）：
+  // true → 预渲染壳且 <html> 尚未着主题类（Shell 色 #FAFAFA），
+  // false → 已着主题类或 React 状态页（Boot 色 #F8F8F8）。默认 true = 冷启动最初那段
+  private webBootShell: boolean = true;
   // 网页底色回推桥（javaScriptProxy 注入为 window.zcodeStatusBar）
   private barBridge: StatusBarColorBridge = new StatusBarColorBridge();
   // 上传方式选择模态框（相册 + 文件两项）
@@ -398,22 +429,23 @@ struct Index {
     AppStorage.set<string>('scanAction', '');
   }
 
-  // 深浅色切换：容器/空白底取远程网页开屏壳底色（BAR_BOOT_*，与 BROWSER_THEME_COLORS 对齐）。
+  // 深浅色切换：容器/空白底取远程网页开屏壳底色（未着主题那段，BAR_BOOT_SHELL_*）。
   // 状态判定与模式无关，不重置：换模式后按当前状态直接重映射固定色
   onColorModeChange(): void {
     this.webBgColor =
       this.currentColorMode === ConfigurationConstant.ColorMode.COLOR_MODE_DARK
-        ? BAR_BOOT_DARK : BAR_BOOT_LIGHT;
+        ? BAR_BOOT_SHELL_DARK : BAR_BOOT_SHELL_LIGHT;
     this.syncStatusBarColor();
   }
 
   /**
-   * 决定状态栏占位 Row 当前应使用的颜色（双端统一，仅两套固定色，运行时零取色）：
-   * - 原生页（扫码引导 / 加载失败）与页面自身背景一致（webBgColor = Boot 色）；
+   * 决定状态栏占位 Row 当前应使用的颜色（双端统一，仅固定色表，运行时零取色）：
+   * - 原生页（扫码引导 / 加载失败）与页面自身背景一致（webBgColor = Shell 色）；
    * - 控制页：网页回推 main-*（主视图在挂）→ 按顶面查表：窄屏布局状态栏正下方是
    *   网页标题栏（bg-header）用 Header 色，宽屏直接是外壳区（win-alt）用 Surface 色；
-   *   回推 boot（Boot 壳 / KICKED 等状态页）或未回推 → Boot 色（webBgColor）。
-   *   宽窄屏由网页侧按同源媒体查询判态回推，旋转 / 分屏后自动跟随，原生不猜断点。
+   * - 其余（预渲染壳 / KICKED 等状态页 / 未回推）：回推 boot-shell 用 Shell 色、
+   *   回推 boot 用 Boot 色；未回推时沿用 webBgColor（= Shell 色，正是冷启动最初那段）。
+   *   宽窄屏与主题类两处判据都由网页侧按同源信号回推，旋转 / 分屏 / 主题翻转后自动跟随。
    */
   // 错误页出现/消失时同步状态栏底色（错误页为原生背景，需与 webBgColor 一致）
   onErrorStateChange(): void {
@@ -431,7 +463,9 @@ struct Index {
         : this.themeColor(BAR_SURFACE_DARK, BAR_SURFACE_LIGHT);
       return;
     }
-    this.statusBarColor = this.webBgColor;
+    this.statusBarColor = this.webBootShell
+      ? this.themeColor(BAR_BOOT_SHELL_DARK, BAR_BOOT_SHELL_LIGHT)
+      : this.themeColor(BAR_BOOT_DARK, BAR_BOOT_LIGHT);
   }
 
   // 网页侧状态切换回调（双端统一：查固定色表直接换色）
@@ -441,11 +475,14 @@ struct Index {
     }
     const onMain: boolean = state === 'main-header' || state === 'main-surface';
     const onHeader: boolean = state === 'main-header';
-    if (onMain === this.webPageOnMain && onHeader === this.webTopHeader) {
+    const onBootShell: boolean = state === 'boot-shell';
+    if (onMain === this.webPageOnMain && onHeader === this.webTopHeader
+      && onBootShell === this.webBootShell) {
       return;
     }
     this.webPageOnMain = onMain;
     this.webTopHeader = onHeader;
+    this.webBootShell = onBootShell;
     this.syncStatusBarColor();
   }
 
@@ -1010,9 +1047,10 @@ struct Index {
   // 热切换到新扫码结果（覆盖式单连接）
   private loadControlPage(target: string): void {
     try {
-      // 新页面从 Boot 状态起步：先回 Boot 色，待观察脚本回推 main-* 后再切 Main 色
+      // 新文档从最初那段起步：先回 Shell 色（预渲染壳未着主题），待观察脚本回推后再切
       this.webPageOnMain = false;
       this.webTopHeader = false;
+      this.webBootShell = true;
       this.syncStatusBarColor();
       this.controller.loadUrl(target);
       this.isError = false;

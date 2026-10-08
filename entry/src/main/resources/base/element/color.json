@@ -2,11 +2,11 @@
   "color": [
     {
       "name": "start_window_background",
-      "value": "#FFF8F8F8"
+      "value": "#FFFAFAFA"
     },
     {
       "name": "status_bar_bg",
-      "value": "#FFF8F8F8"
+      "value": "#FFFAFAFA"
     }
   ]
 }
