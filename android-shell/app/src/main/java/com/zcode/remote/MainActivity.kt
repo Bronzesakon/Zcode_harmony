@@ -280,11 +280,12 @@ class MainActivity : AppCompatActivity() {
                 finishCallbacks = 0
                 pageStartedAt = SystemClock.elapsedRealtime()
                 Diagnostics.info("网页开始加载")
-                // A fresh document boots with the page background at the top (the
-                // boot shell), so drop back to that surface until the new document
-                // reports otherwise. Without this a reload keeps the *previous*
-                // document's header colour under the status bar.
-                onPageStateReported(PageBarState.BOOT.token, null)
+                // A fresh document starts at the very first boot segment: the shell
+                // is up but the page has not stamped its theme class yet, so drop
+                // back to that surface until the new document reports otherwise.
+                // Without this a reload keeps the *previous* document's header
+                // colour under the status bar.
+                onPageStateReported(PageBarState.BOOT_SHELL.token, null)
                 // 与上面那条 boot 底色同理：上一份文档的注入层已随文档一起销毁，
                 // 「已就绪」标记（含注入状态行的去重记忆）必须同时归零。
                 // 这是该标记**唯一**的复位点——此前零调用者，于是一旦置真就永不回落：
@@ -591,11 +592,11 @@ class MainActivity : AppCompatActivity() {
         // status bar inset, so this colour shows exactly in that strip and
         // nowhere else (the WebView covers everything below it).
         binding.root.setBackgroundColor(color)
-        // WebView 首绘之前的底色也要与条带同色：冷启动时条带已画上 BOOT 色，而
-        // WebView 默认底是白——用户看到的就是"状态栏一条 #F8F8F8、屏幕一张白"的
-        // 开屏缝（2026-09-28 真机截图）。页面自己的 boot 壳渲染后就是 #f8f8f8
-        //（.theme-zai-light 的 --color-background，与色表逐项一致），所以缝只存在于
-        // 首绘之前；页面完成首绘后自己的背景盖掉这个底色。深色主题顺带消灭开屏白闪。
+        // WebView 首绘之前的底色也要与条带同色：冷启动时条带已画上 shell 色，而
+        // WebView 默认底是白——用户看到的就是「状态栏一条色、屏幕一张白」的开屏缝
+        //（2026-09-28 真机截图）。页面预渲染壳的首帧底色就是 shell 色（:root 兜底的
+        // neutral-50/900，与色表逐项一致），所以缝只存在于首绘之前；页面完成首绘后
+        // 自己的背景盖掉这个底色。深色主题顺带消灭开屏白闪。
         binding.webview.setBackgroundColor(color)
         val controller = WindowInsetsControllerCompat(window, binding.root)
         controller.isAppearanceLightStatusBars = PageBarColor.appearanceLightStatusBars(pageTheme)

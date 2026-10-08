@@ -18,11 +18,16 @@ class PageBarColorTest {
 
     // Not `const`: 0xFFFAFAFA is a Long literal, so `.toInt()` is a call and the
     // value is not a compile-time constant.
-    // 2026-09-28 像素实测改值：boot 态 = React 挂载前的**预渲染壳**，html 上还没有
-    // theme-zai-* 类，`--color-background` 落回 :root 的 neutral-50/900 —— 亮 #FAFAFA
-    // （真机实测 250/255，缝的位置恰为状态栏高度）、暗 #171717（oklch(20.5% 0 0)）。
-    private val BOOT_LIGHT = 0xFFFAFAFA.toInt()
-    private val BOOT_DARK = 0xFF171717.toInt()
+    // 2026-09-28 像素实测 + 2026-10-08 快照解析：boot 阶段有两段，切点是 <html> 上的
+    // theme-zai-* 类（主包顶层 IIFE 挂上，早于 React 挂载）——
+    //   boot-shell（未着主题）：--color-background 落回 :root 的 neutral-50/900，
+    //                            亮 #FAFAFA（真机实测 250/255，缝恰在状态栏高度）、
+    //                            暗 #171717（oklch(20.5% 0 0)）；
+    //   boot（已着主题）：与 KICKED/配对等待等状态页同色，亮 #F8F8F8、暗 #161616。
+    private val BOOT_SHELL_LIGHT = 0xFFFAFAFA.toInt()
+    private val BOOT_SHELL_DARK = 0xFF171717.toInt()
+    private val BOOT_LIGHT = 0xFFF8F8F8.toInt()
+    private val BOOT_DARK = 0xFF161616.toInt()
     private val HEADER_LIGHT = 0xFFFFFFFF.toInt()
     private val HEADER_DARK = 0xFF202020.toInt()
     private val SURFACE_LIGHT = 0xFFECECEE.toInt()
@@ -30,6 +35,8 @@ class PageBarColorTest {
 
     @Test
     fun `every state has a light and a dark surface`() {
+        assertEquals(BOOT_SHELL_LIGHT, PageBarColor.resolve(PageBarState.BOOT_SHELL, dark = false))
+        assertEquals(BOOT_SHELL_DARK, PageBarColor.resolve(PageBarState.BOOT_SHELL, dark = true))
         assertEquals(BOOT_LIGHT, PageBarColor.resolve(PageBarState.BOOT, dark = false))
         assertEquals(BOOT_DARK, PageBarColor.resolve(PageBarState.BOOT, dark = true))
         assertEquals(HEADER_LIGHT, PageBarColor.resolve(PageBarState.MAIN_HEADER, dark = false))
@@ -42,6 +49,7 @@ class PageBarColorTest {
     fun `the tokens are the ones the injected layer reports`() {
         // These strings are the contract with inject.js section 6; a rename on one
         // side and not the other silently pins the bar to the boot colour.
+        assertEquals("boot-shell", PageBarState.BOOT_SHELL.token)
         assertEquals("boot", PageBarState.BOOT.token)
         assertEquals("main-header", PageBarState.MAIN_HEADER.token)
         assertEquals("main-surface", PageBarState.MAIN_SURFACE.token)
@@ -81,8 +89,11 @@ class PageBarColorTest {
         val line = PageBarColor.describe(PageBarState.MAIN_HEADER, PageTheme.DARK, HEADER_DARK)
         assertTrue(line.contains("main-header/dark"))
         assertTrue(line.contains("#202020"))
-        val system = PageBarColor.describe(PageBarState.BOOT, null, BOOT_LIGHT)
-        assertTrue(system.contains("boot/system"))
-        assertTrue(system.contains("#FAFAFA"))
+        val shell = PageBarColor.describe(PageBarState.BOOT_SHELL, null, BOOT_SHELL_LIGHT)
+        assertTrue(shell.contains("boot-shell/system"))
+        assertTrue(shell.contains("#FAFAFA"))
+        val themed = PageBarColor.describe(PageBarState.BOOT, null, BOOT_LIGHT)
+        assertTrue(themed.contains("boot/system"))
+        assertTrue(themed.contains("#F8F8F8"))
     }
 }

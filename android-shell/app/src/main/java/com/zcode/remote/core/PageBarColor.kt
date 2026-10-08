@@ -16,7 +16,8 @@ package com.zcode.remote.core
  *
  * | token          | light     | dark      | where it is the top surface |
  * | -------------- | --------- | --------- | --------------------------- |
- * | `boot`         | `#f8f8f8` | `#161616` | boot shell, KICKED / takeover pages, and every native screen |
+ * | `boot-shell`   | `#fafafa` | `#171717` | pre-rendered shell before the page stamps its theme class |
+ * | `boot`         | `#f8f8f8` | `#161616` | the same shell once themed, plus KICKED / takeover / pairing pages |
  * | `main-surface` | `#ececee` | `#2b2b2b` | wide layout: the shell area is directly under the status bar |
  * | `main-header`  | `#ffffff` | `#202020` | narrow layout (the phone shell): the page's own title bar is |
  *
@@ -25,7 +26,18 @@ package com.zcode.remote.core
  * See inject.js section 6 for how the state is derived.
  */
 enum class PageBarState(val token: String) {
-    /** Boot shell, status pages, and every screen that is ours rather than the page's. */
+    /**
+     * Pre-rendered boot shell while `<html>` carries no `theme-zai-*` class yet,
+     * i.e. before the page's own top-level IIFE stamps it: the page background
+     * still falls back to the `:root` neutral-50/900 token.
+     */
+    BOOT_SHELL("boot-shell"),
+
+    /**
+     * Themed boot shell (the page's IIFE stamps the theme class before React
+     * mounts), plus status pages and every screen that is ours rather than the
+     * page's — all of them show the themed page background.
+     */
     BOOT("boot"),
 
     /** Control view, narrow: the page's own header sits directly under the bar. */
@@ -60,15 +72,20 @@ object PageBarColor {
         PageTheme.entries.firstOrNull { it.token == token }
 
 
-    // boot 态 = React 挂载前的**预渲染壳**（.zcode-boot-loading）：那一刻 html 上还没有
-    // `theme-zai-light/dark` 类（那是 React 挂载后才加的），`--color-background` 落回
-    // `:root` 的 neutral-50/900——真机像素实测（2026-09-28，缝的位置恰为状态栏高度）：
-    // 亮 #FAFAFA、暗 #171717，而非主题类里的 #f8f8f8/#161616。
-    // ⚠️ 已知残留：KICKED/接管等 **React 状态页**带着主题类渲染（#f8f8f8/#161616），
-    // 与这里的 boot 值会差 1-2 级——状态机里两者共用 boot 态，拆分要扩注入层状态，
-    // 对罕见错误页不值得；boot 壳是每次冷启动必看数秒的主场景。
-    private const val BOOT_LIGHT = 0xFFFAFAFA.toInt()
-    private const val BOOT_DARK = 0xFF171717.toInt()
+    // 网页 boot 阶段有两段底色，切点是 <html> 上的 `theme-zai-*` 类（由主包**顶层
+    // IIFE** 挂上，早于 React 挂载），**不是**预渲染壳是否存在（两段壳都在）：
+    //   boot-shell：壳在、主题类未挂 → `--color-background` 落回 `:root` 的
+    //               neutral-50/900 = #FAFAFA/#171717（2026-09-28 真机像素实测
+    //               250/255，缝恰在状态栏高度）；
+    //   boot：      壳在、主题类已挂（IIFE → 首次 render，中间夹着 relay 握手 await），
+    //               与 KICKED/接管、配对等待等 React 状态页同色 = #F8F8F8/#161616。
+    // 旧实现两段共用一个 boot 态，只能二选一（取 #FAFAFA 则状态页有色缝，取 #F8F8F8
+    // 则开屏第一段有色缝）；2026-10-08 拆分后三段全覆盖，配对 waiting 这类可长时间
+    // 停留的页面不再被当成「罕见错误页」牺牲掉。
+    private const val BOOT_SHELL_LIGHT = 0xFFFAFAFA.toInt()
+    private const val BOOT_SHELL_DARK = 0xFF171717.toInt()
+    private const val BOOT_LIGHT = 0xFFF8F8F8.toInt()
+    private const val BOOT_DARK = 0xFF161616.toInt()
     private const val MAIN_HEADER_LIGHT = 0xFFFFFFFF.toInt()
     private const val MAIN_HEADER_DARK = 0xFF202020.toInt()
     private const val MAIN_SURFACE_LIGHT = 0xFFECECEE.toInt()
@@ -80,6 +97,7 @@ object PageBarColor {
      *   has not said", in which case the caller passes the system's night mode.
      */
     fun resolve(state: PageBarState, dark: Boolean): Int = when (state) {
+        PageBarState.BOOT_SHELL -> if (dark) BOOT_SHELL_DARK else BOOT_SHELL_LIGHT
         PageBarState.BOOT -> if (dark) BOOT_DARK else BOOT_LIGHT
         PageBarState.MAIN_HEADER -> if (dark) MAIN_HEADER_DARK else MAIN_HEADER_LIGHT
         PageBarState.MAIN_SURFACE -> if (dark) MAIN_SURFACE_DARK else MAIN_SURFACE_LIGHT

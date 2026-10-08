@@ -385,6 +385,28 @@ function setupPage(options) {
                 root.setAttribute('data-zcode-browser-theme-surface', theme);
             }
         };
+        /**
+         * The class the page stamps on <html> for its own theme — written by the
+         * bundle's top-level IIFE, i.e. before React mounts. Passing `null` removes
+         * it, which is the state the boot shell starts in (unthemed shell =
+         * `boot-shell`, the `:root` fallback colour).
+         */
+        dom.setZaiTheme = (name) => {
+            if (!root) {
+                return;
+            }
+            const classes = String(root.getAttribute('class') || '')
+                .split(/\s+/)
+                .filter((cls) => cls && cls !== 'theme-zai-light' && cls !== 'theme-zai-dark');
+            if (name) {
+                classes.push(name);
+            }
+            if (classes.length > 0) {
+                root.setAttribute('class', classes.join(' '));
+            } else {
+                delete root._attributes['class'];
+            }
+        };
         const media = (options && options.media) || {};
         mediaQueries = [];
         install('matchMedia', (query) => {
@@ -1173,26 +1195,36 @@ function pageStates(posts) {
 test('the page reports its visual state, and only when it changes', async () => {
     const page = setupPage({pageState: true, media: {'(max-width: 767px)': true}});
     try {
-        // While the boot shell is up there is no control view: 'boot'.
+        // Boot shell is up and the page has not stamped its theme class yet: the
+        // unthemed shell is the one that falls back to the :root token.
         page.dom.set('zcode-boot-loading', true);
         page.dom.setTheme('light');
         FakeMutationObserver.fire();
         await flush();
-        assert.deepStrictEqual(pageStates(page.posts), ['boot/light'],
-            'the boot shell is the first state');
+        assert.deepStrictEqual(pageStates(page.posts), ['boot-shell/light'],
+            'the unthemed boot shell is the first state');
+
+        // The page's own top-level IIFE stamps the theme class: same shell, now
+        // themed — and it is the same colour the status pages use.
+        page.dom.setZaiTheme('theme-zai-light');
+        FakeMutationObserver.fire();
+        await flush();
+        assert.deepStrictEqual(pageStates(page.posts), ['boot-shell/light', 'boot/light'],
+            'themed shell and status pages share one name');
 
         // React mounts: the boot shell goes away and the control view appears.
         page.dom.set('zcode-boot-loading', false);
         page.dom.set('bg-background-win-alt', true);
         FakeMutationObserver.fire();
         await flush();
-        assert.deepStrictEqual(pageStates(page.posts), ['boot/light', 'main-header/light'],
+        assert.deepStrictEqual(pageStates(page.posts),
+            ['boot-shell/light', 'boot/light', 'main-header/light'],
             'a narrow page puts its own title bar under the status bar');
 
         // A second mutation with nothing changed must not report again.
         FakeMutationObserver.fire();
         await flush();
-        assert.strictEqual(pageStates(page.posts).length, 2, 'unchanged state is not re-reported');
+        assert.strictEqual(pageStates(page.posts).length, 3, 'unchanged state is not re-reported');
 
         // The page's theme is the page's own decision, not the system's.
         page.dom.setTheme('dark');

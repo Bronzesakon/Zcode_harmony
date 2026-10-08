@@ -3185,15 +3185,25 @@
     //
     // The state is derived the way the page derives its own layout, not from the
     // device's screen size:
-    //   * `.zcode-boot-loading`   the pre-rendered boot shell (removed once the
-    //                             app mounts) and every status page (KICKED,
-    //                             takeover) — all of them put the page background
-    //                             at the top, so they all map to 'boot';
+    //   * `.zcode-boot-loading`   the pre-rendered boot shell (React clears it on
+    //                             its first commit) and every status page (KICKED,
+    //                             takeover, pairing wait) — they all put the page
+    //                             background at the top;
+    //   * `theme-zai-light|dark`  on <html>: the class the page stamps for its own
+    //                             theme. It is written by the bundle's TOP-LEVEL
+    //                             IIFE, i.e. BEFORE React mounts, and it flips
+    //                             `--color-background` at the same instant — so it
+    //                             splits the boot shell in two: unthemed (the
+    //                             `:root` neutral-50/900 fallback) and themed
+    //                             (the same colour as the status pages). The
+    //                             shell's mere presence cannot tell those apart;
     //   * `.bg-background-win-alt` the control view's root;
     //   * `(max-width: 767px)`    the page's own breakpoint for the phone shell.
     //                             Narrow means the page's own title bar sits
     //                             directly under the status bar (bg-header), wide
     //                             means the shell area does (win-alt).
+    // Hence four names: 'boot-shell' (unthemed shell), 'boot' (themed shell and
+    // status pages), 'main-header', 'main-surface'.
     //
     // Theme: the page stamps `data-zcode-browser-theme-surface` on <html> when it
     // resolves its theme (inline bootstrap in index.html, `syncBrowserThemeSurface`),
@@ -3212,16 +3222,33 @@
         }
     }
 
+    /**
+     * The class the page stamps on <html> for its own theme, written by the
+     * bundle's top-level IIFE before React mounts. Read straight off the root
+     * rather than through getElementsByClassName: a future theme-preview swatch
+     * carrying the same class name would otherwise be mistaken for the page.
+     */
+    function hasZaiTheme() {
+        try {
+            var root = document.documentElement;
+            var cls = root && root.getAttribute ? String(root.getAttribute('class') || '') : '';
+            return cls.indexOf('theme-zai-light') >= 0 || cls.indexOf('theme-zai-dark') >= 0;
+        } catch (e) {
+            return false;
+        }
+    }
+
     function pageStateName() {
         try {
             if (!document.documentElement) {
                 return '';
             }
-            if (document.getElementsByClassName('zcode-boot-loading').length > 0) {
-                return 'boot';
-            }
-            if (document.getElementsByClassName('bg-background-win-alt').length === 0) {
-                return 'boot';
+            var shell = document.getElementsByClassName('zcode-boot-loading').length > 0;
+            var noMain = document.getElementsByClassName('bg-background-win-alt').length === 0;
+            if (shell || noMain) {
+                // Unthemed shell falls back to the :root token; once themed it is the
+                // same colour as every status page, so those two share one name.
+                return hasZaiTheme() ? 'boot' : 'boot-shell';
             }
             return mediaMatches(NARROW_QUERY) ? 'main-header' : 'main-surface';
         } catch (e) {
