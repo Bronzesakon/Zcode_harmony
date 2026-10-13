@@ -25,6 +25,34 @@
         android:background="@android:color/transparent"
         android:visibility="gone" />
 
+    <!-- Cross-document presentation only; the page and its protocol keep running below. -->
+    <FrameLayout
+        android:id="@+id/handoffCover"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="#FFF8F8F8"
+        android:clickable="true"
+        android:focusable="true"
+        android:contentDescription="@string/handoff_loading"
+        android:accessibilityLiveRegion="polite"
+        android:visibility="gone">
+
+        <FrameLayout
+            android:layout_width="96dp"
+            android:layout_height="96dp"
+            android:layout_gravity="center"
+            android:background="@drawable/bg_handoff_logo"
+            android:elevation="12dp">
+
+            <ImageView
+                android:layout_width="56dp"
+                android:layout_height="48dp"
+                android:layout_gravity="center"
+                android:importantForAccessibility="no"
+                android:src="@drawable/ic_handoff_logo" />
+        </FrameLayout>
+    </FrameLayout>
+
     <!-- 首次接入：这是唯一完全原生的界面，所以给它一个像样的空态。 -->
     <ScrollView
         android:id="@+id/setupPanel"

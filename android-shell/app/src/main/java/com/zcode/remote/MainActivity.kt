@@ -20,6 +20,7 @@ import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -86,6 +87,7 @@ class MainActivity : AppCompatActivity() {
     private var injectionScript: String? = null
     private var injectionRegistered = false
     private var foregroundArrivalEpoch: Long? = null
+    private var handoffCoverVisible = false
 
     /** Set when a notification tap asked us to locate a task. */
     private var pendingLocate: Pair<String, String>? = null
@@ -207,6 +209,23 @@ class MainActivity : AppCompatActivity() {
         // 页面状态上报不必跟着提前：它只由注入层从页面里报来，而 handleIntent 里那次
         // loadUrl 的新文档至少还要一个主循环轮次才 boot，届时这里早已注册完。
         ShellRuntime.setPageStateListener { state, theme -> onPageStateReported(state, theme) }
+        ShellRuntime.setHandoffCoverListener { visible ->
+            handoffCoverVisible = visible
+            binding.handoffCover.visibility = if (visible) View.VISIBLE else View.GONE
+            binding.webview.importantForAccessibility = if (visible) {
+                View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
+            } else {
+                View.IMPORTANT_FOR_ACCESSIBILITY_AUTO
+            }
+            applyStatusBarSurface()
+        }
+        ShellRuntime.setHandoffPresentationListener { document, ticket ->
+            binding.webview.postVisualStateCallback(ticket, object : WebView.VisualStateCallback() {
+                override fun onComplete(requestId: Long) {
+                    ShellRuntime.onHandoffPagePresented(document, requestId)
+                }
+            })
+        }
 
         if (!intentHandled) {
             val stored = prefs.remoteUrl
@@ -294,6 +313,7 @@ class MainActivity : AppCompatActivity() {
                 finishCallbacks = 0
                 pageStartedAt = SystemClock.elapsedRealtime()
                 Diagnostics.info("网页开始加载")
+                ShellRuntime.onHandoffPageStarted()
                 // A fresh document starts at the very first boot segment: the shell
                 // is up but the page has not stamped its theme class yet, so drop
                 // back to that surface until the new document reports otherwise.
@@ -313,6 +333,21 @@ class MainActivity : AppCompatActivity() {
                 // 稳定注入第二道：document-start 因任何形态失效时，这里以最早
                 // 可得的时机补注。幂等守卫让已注入的文档近乎零成本地跳过。
                 injectStable(view)
+            }
+
+            override fun onPageCommitVisible(view: WebView, url: String) {
+                super.onPageCommitVisible(view, url)
+                // Re-read after navigation commits; old-document reports cannot uncover it.
+                if (handoffCoverVisible) view.evaluateJavascript(
+                    "window.__zcodeShellReportPageState && window.__zcodeShellReportPageState();", null,
+                )
+            }
+
+            override fun onReceivedHttpError(view: WebView, request: WebResourceRequest, response: WebResourceResponse) {
+                super.onReceivedHttpError(view, request, response)
+                if (request.isForMainFrame) {
+                    ShellRuntime.dismissHandoffCover("HTTP ${response.statusCode}，显示网页错误")
+                }
             }
 
             override fun onPageFinished(view: WebView, url: String) {
@@ -506,12 +541,14 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showSetup() {
+        ShellRuntime.dismissHandoffCover("显示接入页")
         binding.webview.visibility = View.GONE
         binding.errorPanel.visibility = View.GONE
         binding.setupPanel.visibility = View.VISIBLE
     }
 
     private fun showError(message: String) {
+        ShellRuntime.dismissHandoffCover("加载失败，显示原生错误页")
         binding.webview.visibility = View.GONE
         binding.setupPanel.visibility = View.GONE
         binding.errorPanel.visibility = View.VISIBLE
@@ -603,7 +640,9 @@ class MainActivity : AppCompatActivity() {
 
     private fun applyStatusBarSurface() {
         val dark = pageTheme?.let { it == PageTheme.DARK } ?: isSystemDark()
-        val color = PageBarColor.resolve(pageBarState, dark)
+        val surfaceState = if (handoffCoverVisible) PageBarState.BOOT else pageBarState
+        val color = PageBarColor.resolve(surfaceState, dark)
+        binding.handoffCover.setBackgroundColor(PageBarColor.resolve(PageBarState.BOOT, dark))
         // The strip is the root's own background: the root is padded down by the
         // status bar inset, so this colour shows exactly in that strip and
         // nowhere else (the WebView covers everything below it).
@@ -619,7 +658,7 @@ class MainActivity : AppCompatActivity() {
         // The gesture bar floats over the page, so its icons have to agree with
         // the page too. Only matters for 3-button navigation (API 26+).
         controller.isAppearanceLightNavigationBars = PageBarColor.appearanceLightStatusBars(pageTheme)
-        Diagnostics.info(PageBarColor.describe(pageBarState, pageTheme, color))
+        Diagnostics.info(PageBarColor.describe(surfaceState, pageTheme, color))
     }
 
     private fun isSystemDark(): Boolean =
@@ -684,6 +723,8 @@ class MainActivity : AppCompatActivity() {
         ShellRuntime.setJsEvaluator(null)
         ShellRuntime.setPageReloader(null)
         ShellRuntime.setPageStateListener(null)
+        ShellRuntime.setHandoffCoverListener(null)
+        ShellRuntime.setHandoffPresentationListener(null)
         super.onDestroy()
     }
 

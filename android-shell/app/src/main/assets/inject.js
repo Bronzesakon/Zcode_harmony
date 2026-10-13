@@ -65,6 +65,9 @@
 
     var P = G.ZcodeProtocol;
     var bridge = G.ZCodeShell || null;
+    // Opaque per-document identity, so the old KICK page cannot dismiss a new cover.
+    var pageDocumentId = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
+    var pageFailure = '';
 
     // -----------------------------------------------------------------------
     // native bridge
@@ -1032,6 +1035,8 @@
                 return;
             }
             relayPaired = frame.pair_status === 'matched';
+            if (relayPaired) pageFailure = '';
+            schedulePageState();
             lastPairAckAt = Date.now();
             liveness.pairAcks += 1;
             linkWindow.acks += 1;
@@ -1068,6 +1073,13 @@
             return;
         }
         if (frame.type === 'error') {
+            if (!outbound) {
+                pageFailure = String(frame.code) === 'KICKED' ? 'kicked' : 'error';
+                post('pagefailure', {
+                    documentId: pageDocumentId, kind: pageFailure, foreground: appForeground
+                });
+                schedulePageState();
+            }
             // relay 级错误。KICKED ＝ 本端被顶掉：壳在后台的原生接管（预期），
             // 或另一台控制端接入（不是我们的战场）。页面自己的传输层会因此
             // 进入终态（"已被其他设备接管"页，只能手动点"重新连接"），所以
@@ -1250,8 +1262,7 @@
      *     让页面用同一条链路重新握手（原生槽位那时已交还）。
      *   * 前台被顶 → 不自动干预（可能与另一台控制端在抢）。
      *
-     * 重载夹在 1.5 s 之后：原生交还需要先关掉它自己的 socket，立刻重载会再被
-     * 顶一次。跨 reload 用 sessionStorage 记次数，配对成功即清零，所以最坏也
+     * 原生先交还，再立即重载。跨 reload 用 sessionStorage 记次数，配对成功即清零，所以最坏也
      * 只是重载两次而不是死循环。
      */
     var kickedAwayAt = 0;
@@ -3307,12 +3318,16 @@
             return;
         }
         var theme = pageThemeName();
-        var token = state + '|' + theme;
+        var presentation = pageFailure ||
+            (relayPaired && (state === 'main-header' || state === 'main-surface') ? 'content' : 'loading');
+        var token = state + '|' + theme + '|' + presentation;
         if (token === lastPageState) {
             return;
         }
         lastPageState = token;
-        post('pagestate', {state: state, theme: theme});
+        post('pagestate', {
+            state: state, theme: theme, documentId: pageDocumentId, presentation: presentation
+        });
     }
 
     /**
@@ -3971,8 +3986,8 @@
         diag('error', 'WebSocket hook 失败: ' + e);
     }
     installLongTaskObserver();
-    // 只报 href：`subscribeAll` 随 D7 一起删除（2026-09-17），别再往这帧里加"能力开关"。
-    post('ready', {href: location.href});
+    // href + 文档身份；就绪只表示注入完成，不能当作网页内容已恢复。
+    post('ready', {href: location.href, documentId: pageDocumentId});
     reportLiveness();
     // After the first layout pass, and again whenever the viewport changes.
     setTimeout(reportViewport, 1200);

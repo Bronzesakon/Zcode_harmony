@@ -1198,6 +1198,75 @@ function pageStates(posts) {
     return findPost(posts, 'pagestate').map((p) => p.data.state + '/' + p.data.theme);
 }
 
+test('handoff presentation needs both a paired relay and the mounted control view', async () => {
+    const page = setupPage({pageState: true, media: {'(max-width: 767px)': true}});
+    try {
+        page.dom.set('zcode-boot-loading', true);
+        const socket = new globalThis.WebSocket('wss://relay.example');
+        socket.receive({type: 'auth_ack', pair_status: 'matched'});
+        await flush();
+        assert.strictEqual(findPost(page.posts, 'pagestate').at(-1).data.presentation, 'loading');
+        page.dom.set('zcode-boot-loading', false);
+        page.dom.set('bg-background-win-alt', true);
+        FakeMutationObserver.fire();
+        await flush();
+        const content = findPost(page.posts, 'pagestate').at(-1).data;
+        assert.strictEqual(content.presentation, 'content');
+        assert.strictEqual(content.documentId, findPost(page.posts, 'ready')[0].data.documentId);
+        assert.ok(content.documentId);
+        socket.receive({type: 'pair_status_ack', pair_status: 'waiting'});
+        await flush();
+        assert.strictEqual(findPost(page.posts, 'pagestate').at(-1).data.presentation, 'loading',
+            'a paired-state change must report even when the surface colour stays the same');
+    } finally {
+        page.teardown();
+    }
+});
+
+test('foreground KICK remains visible to page listeners and is reported as a terminal failure', async () => {
+    const page = setupPage({pageState: true});
+    try {
+        page.dom.set('bg-background-win-alt', true);
+        const socket = new globalThis.WebSocket('wss://relay.example');
+        const received = [];
+        socket.addEventListener('message', (event) => received.push(JSON.parse(event.data)));
+        socket.receive({type: 'auth_ack', pair_status: 'matched'});
+        await flush();
+        socket.receive({type: 'error', code: 'KICKED', message: 'session-conflict'});
+        await flush();
+        const failure = findPost(page.posts, 'pagefailure').at(-1).data;
+        assert.strictEqual(failure.kind, 'kicked');
+        assert.strictEqual(failure.foreground, true);
+        assert.strictEqual(failure.documentId, findPost(page.posts, 'ready')[0].data.documentId);
+        assert.strictEqual(received.at(-1).code, 'KICKED', 'the observer must not swallow or rewrite KICK');
+        assert.strictEqual(findPost(page.posts, 'pagestate').at(-1).data.presentation, 'kicked',
+            'stale main DOM and paired flags cannot report the kicked page as usable');
+    } finally {
+        page.teardown();
+    }
+});
+
+test('background KICK and other relay failures keep their origin and original page event', async () => {
+    const page = setupPage({config: {passiveObserve: true, foreground: false}});
+    try {
+        const socket = new globalThis.WebSocket('wss://relay.example');
+        const received = [];
+        socket.addEventListener('message', (event) => received.push(JSON.parse(event.data)));
+        socket.receive({type: 'error', code: 'KICKED'});
+        const background = findPost(page.posts, 'pagefailure').at(-1).data;
+        assert.strictEqual(background.foreground, false);
+        assert.strictEqual(background.kind, 'kicked');
+        socket.receive({type: 'error', code: 'AUTH_FAILED'});
+        const failure = findPost(page.posts, 'pagefailure').at(-1).data;
+        assert.strictEqual(failure.kind, 'error');
+        assert.strictEqual(failure.documentId, background.documentId);
+        assert.deepStrictEqual(received.map((event) => event.code), ['KICKED', 'AUTH_FAILED']);
+        await flush();
+    } finally {
+        page.teardown();
+    }
+});
+
 test('the page reports its visual state, and only when it changes', async () => {
     const page = setupPage({pageState: true, media: {'(max-width: 767px)': true}});
     try {

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The three paths of the page's pre-rendered ZCode boot logo (256 × 218). -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="56dp" android:height="48dp"
+    android:viewportWidth="256" android:viewportHeight="218">
+    <path android:fillColor="#FFFFFF"
+        android:pathData="M134.4,0.130152L116.48,25.6022C113.665,29.5699 109.054,32.0019 104.064,32.0019H6.3999V0C6.3999,0.130149 134.4,0.130152 134.4,0.130152Z" />
+    <path android:fillColor="#FFFFFF"
+        android:pathData="M256,0.130127L102.401,217.732H0L153.599,0.130127H256Z" />
+    <path android:fillColor="#FFFFFF"
+        android:pathData="M121.601,217.732L139.65,192.134C142.465,188.166 147.076,185.734 152.067,185.734H249.604V217.736H121.601V217.732Z" />
+</vector>

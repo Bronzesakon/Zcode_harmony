@@ -113,6 +113,8 @@ object Tier2Probe {
     private var ackCount = 0
     private var startedAtMs = 0L
     private var persistent = false
+    private var carrierPaired: (() -> Unit)? = null
+    private var carrierKicked: (() -> Unit)? = null
     @Volatile
     private var stopping = false
     private var reconnectAttempt = 0
@@ -272,6 +274,8 @@ object Tier2Probe {
         onlyTaskId: String = "",
         coverageWorkspaces: List<String> = emptyList(),
         coverageIsDiagnostic: Boolean = false,
+        onPaired: (() -> Unit)? = null,
+        onKicked: (() -> Unit)? = null,
     ) {
         startInternal(
             newCreds,
@@ -281,6 +285,8 @@ object Tier2Probe {
             onlyTaskId = onlyTaskId,
             coverageWorkspaces = coverageWorkspaces,
             coverageIsDiagnostic = coverageIsDiagnostic,
+            onPaired = onPaired,
+            onKicked = onKicked,
         )
     }
 
@@ -306,6 +312,8 @@ object Tier2Probe {
         onlyTaskId: String = "",
         coverageWorkspaces: List<String> = emptyList(),
         coverageIsDiagnostic: Boolean = false,
+        onPaired: (() -> Unit)? = null,
+        onKicked: (() -> Unit)? = null,
     ) {
         if (isRunning()) {
             Diagnostics.log("warn", "Tier2: 已在运行（phase=$phase），忽略重复启动")
@@ -319,6 +327,8 @@ object Tier2Probe {
         bridgeFailCount.clear()
         bridgeCooldownUntil.clear()
         persistent = durationMs <= 0
+        carrierPaired = onPaired
+        carrierKicked = onKicked
         stopping = false
         reconnectAttempt = 0
         heartbeatCount = 0
@@ -373,11 +383,13 @@ object Tier2Probe {
             }
         }
         val request = Request.Builder().url(url).build()
-        socket = client.newWebSocket(request, listener)
+        socket = client.newWebSocket(request, createListener(carrierPaired, carrierKicked))
     }
 
     fun stop(reason: String) {
         stopping = true
+        carrierPaired = null
+        carrierKicked = null
         phase = Phase.CLOSED
         durationTimer?.cancel()
         durationTimer = null
@@ -795,7 +807,7 @@ object Tier2Probe {
         }
     }
 
-    private val listener = object : WebSocketListener() {
+    private fun createListener(onPaired: (() -> Unit)?, onKicked: (() -> Unit)?) = object : WebSocketListener() {
         override fun onOpen(webSocket: WebSocket, response: okhttp3.Response) {
             if (!isCurrent(webSocket)) return
             phase = Phase.AUTHENTICATING
@@ -854,6 +866,7 @@ object Tier2Probe {
                             return
                         }
                         phase = Phase.PAIRED
+                        onPaired?.invoke()
                         if (persistent) {
                             Diagnostics.log(
                                 "warn",
@@ -890,6 +903,7 @@ object Tier2Probe {
                     bridgeManager?.acceptRelayPayload(payload)
                 }
                 "error" -> {
+                    if (frame.optString("code") == "KICKED") onKicked?.invoke()
                     Diagnostics.log(
                         "warn",
                         "Tier2: 服务端 error code=${frame.optString("code")} " +

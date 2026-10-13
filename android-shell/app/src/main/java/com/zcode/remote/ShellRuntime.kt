@@ -13,6 +13,7 @@ import com.zcode.remote.core.CompletionEvent
 import com.zcode.remote.core.Diagnostics
 import com.zcode.remote.core.InjectionReadiness
 import com.zcode.remote.core.HandoffState
+import com.zcode.remote.core.HandoffCoverState
 import com.zcode.remote.core.NotifyState
 import com.zcode.remote.core.Prefs
 import com.zcode.remote.core.PreviewSettle
@@ -650,6 +651,11 @@ object ShellRuntime {
         // 屏幕广播立即驱动切换，5s 看门狗继续兜底。
         syncAwayStateToStore()
         if (foreground) {
+            handoffCover.beginReturn()?.let { carrierEpoch ->
+                mainHandler.postDelayed({
+                    if (handoffCover.expire(carrierEpoch)) notifyHandoffCover("恢复超时，露出网页原有状态")
+                }, HandoffCoverState.RETURN_TIMEOUT_MS)
+            }
             // 档 0 观测：记下"回到前台"的真实时刻——后面两帧采样都会顺延（等注入层 boot），
             // 日志要报**实际用时**而不是计划时刻（见 foregroundReturnedAt）。
             foregroundReturnedAt = SystemClock.elapsedRealtime()
@@ -706,6 +712,7 @@ object ShellRuntime {
             verdictPending = true
             requestLivenessReport()
         } else {
+            dismissHandoffCover("开始新的后台窗口")
             // 档 0 观测：**在退后台那一刻**采视图快照。这一帧是整个判据的地基——
             // 原生承载一配对，页面就会 dispose 掉会话并退出对话视图（真机 23:59:05 dispose
             // → 23:59:14 体征已 chat:false），等回前台再读就再也问不出"用户离开时在不在对话里"。
@@ -1867,6 +1874,7 @@ object ShellRuntime {
     }
 
     private fun startNativeCarrier(creds: RelayCreds, early: Boolean) {
+        val carrierEpoch = handoff.epoch
         carrierStarted = true
         carrierStartedEarly = early
         carrierRanThisStint = true
@@ -1879,6 +1887,21 @@ object ShellRuntime {
             onlyTaskId = pageWorkspaceTaskId,
             coverageWorkspaces = carrierCoverageTargets(),
             coverageIsDiagnostic = coverageOverride.isNotEmpty(),
+            onPaired = {
+                mainHandler.post {
+                    if (!handoff.isCurrent(carrierEpoch, true) || !userIsAway() || !Tier2Probe.isRunning()) return@post
+                    if (handoffCover.carrierMatched(carrierEpoch, true, pageDocumentId)) {
+                        notifyHandoffCover("本轮后台原生配对确认，显示 logo")
+                    }
+                }
+            },
+            onKicked = {
+                mainHandler.post {
+                    if (handoffCover.carrierKicked(carrierEpoch)) {
+                        notifyHandoffCover("原生连接也被踢出，保留网页冲突提示")
+                    }
+                }
+            },
         )
         startLiveProgressPolling()
     }
@@ -2005,6 +2028,51 @@ object ShellRuntime {
     // carry the remote page's top-surface colour. The injected layer reports the
     // state and theme by NAME (see inject.js section 6); only the Activity can
     // paint, and it is not always alive, so the report is dropped when it is not.
+
+    private val handoffCover = HandoffCoverState()
+    @Volatile
+    private var pageDocumentId = ""
+    private var handoffCoverListener: ((Boolean) -> Unit)? = null
+    private var handoffPresentationListener: ((String, Long) -> Unit)? = null
+
+    fun setHandoffCoverListener(listener: ((Boolean) -> Unit)?) {
+        handoffCoverListener = listener
+        listener?.invoke(handoffCover.visible)
+    }
+
+    fun setHandoffPresentationListener(listener: ((String, Long) -> Unit)?) {
+        handoffPresentationListener = listener
+    }
+
+    fun onHandoffPagePresented(document: String, ticket: Long) {
+        if (handoffCover.pagePresented(document, ticket)) notifyHandoffCover("新文档已配对并绘制，撤掉 logo")
+    }
+
+    fun onHandoffPageStarted() {
+        handoffCover.pageStarted()
+    }
+
+    fun dismissHandoffCover(reason: String) {
+        if (handoffCover.clear()) notifyHandoffCover(reason)
+    }
+
+    private fun notifyHandoffCover(reason: String) {
+        Diagnostics.info("交接过渡：$reason")
+        handoffCoverListener?.invoke(handoffCover.visible)
+    }
+
+    private fun onHandoffPresentation(data: JSONObject) {
+        val document = data.optString("documentId")
+        val presentation = data.optString("presentation")
+        mainHandler.post {
+            if (document != pageDocumentId) return@post
+            if (presentation == "content") {
+                handoffCover.contentCandidate(document)?.let { ticket ->
+                    handoffPresentationListener?.invoke(document, ticket)
+                }
+            }
+        }
+    }
 
     /** (page state token, theme token) -> the Activity that paints the strip. */
     @Volatile
@@ -2193,9 +2261,30 @@ object ShellRuntime {
                     // core/PageBarColor.kt and the Activity applies it.
                     val data = root.optJSONObject("data") ?: return
                     onPageState(data.optString("state"), data.optString("theme"))
+                    onHandoffPresentation(data)
+                }
+                "pagefailure" -> {
+                    val data = root.optJSONObject("data") ?: return
+                    val failureEpoch = handoff.epoch
+                    val document = data.optString("documentId")
+                    mainHandler.post {
+                        if (document != pageDocumentId) return@post
+                        var unownedConflict = false
+                        if (failureEpoch == handoff.epoch && data.optString("kind") == "kicked" &&
+                            !carrierStarted && !Tier2Probe.isRunning()) {
+                            // A conflict known before our own attempt is not ours to mask.
+                            unownedConflict = handoffCover.carrierKicked(handoff.epoch)
+                        }
+                        if (handoffCover.pageFailed(document, data.optBoolean("foreground")) || unownedConflict) {
+                            notifyHandoffCover("网页报告 ${data.optString("kind")}，保留原有提示")
+                        }
+                    }
                 }
                 "ready" -> {
                     val data = root.optJSONObject("data") ?: return
+                    pageDocumentId = data.optString("documentId")
+                    val document = pageDocumentId
+                    mainHandler.post { handoffCover.pageReady(document) }
                     onPageReloaded()
                     injectionReadiness.markReady()
                     Diagnostics.log(
