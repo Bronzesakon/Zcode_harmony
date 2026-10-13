@@ -7,11 +7,14 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.os.Bundle
+import android.os.Build
+import androidx.annotation.RequiresApi
 import androidx.core.content.ContextCompat
 import com.google.android.material.color.DynamicColors
 import com.google.android.material.color.DynamicColorsOptions
 import com.zcode.remote.core.Diagnostics
 import com.zcode.remote.core.ShellLog
+import java.util.IdentityHashMap
 
 /**
  * Process entry point: brings up the log file (with its crash handler) and feeds
@@ -66,8 +69,24 @@ class ZcodeRemoteApp : Application() {
 
         registerActivityLifecycleCallbacks(object : ActivityLifecycleCallbacks {
             private var startedActivities = 0
+            private val arrivalEpochs = IdentityHashMap<Activity, Long>()
+
+            @RequiresApi(Build.VERSION_CODES.Q)
+            override fun onActivityPreStarted(activity: Activity) {
+                if (startedActivities == 0) {
+                    ShellRuntime.prepareForegroundArrival("${activity.javaClass.simpleName}.preStarted")
+                        ?.let { arrivalEpochs[activity] = it }
+                }
+            }
+
+            @RequiresApi(Build.VERSION_CODES.Q)
+            override fun onActivityPreResumed(activity: Activity) {
+                ShellRuntime.prepareForegroundArrival("${activity.javaClass.simpleName}.preResumed")
+                    ?.let { arrivalEpochs[activity] = it }
+            }
 
             override fun onActivityStarted(activity: Activity) {
+                arrivalEpochs.remove(activity)
                 startedActivities += 1
                 if (startedActivities == 1) {
                     ShellRuntime.onAppForegroundChanged(true)
@@ -75,6 +94,7 @@ class ZcodeRemoteApp : Application() {
             }
 
             override fun onActivityStopped(activity: Activity) {
+                arrivalEpochs.remove(activity)?.let { ShellRuntime.cancelForegroundArrival(it) }
                 startedActivities = (startedActivities - 1).coerceAtLeast(0)
                 if (startedActivities == 0) {
                     Diagnostics.info("应用进入后台，保活服务继续运行")
@@ -83,10 +103,16 @@ class ZcodeRemoteApp : Application() {
             }
 
             override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) = Unit
-            override fun onActivityResumed(activity: Activity) = Unit
+            override fun onActivityResumed(activity: Activity) {
+                arrivalEpochs.remove(activity)
+                // 仅 paused 的返回没有 onStart，resume 仍需结束“正在返回”阶段。
+                ShellRuntime.confirmForegroundArrival()
+            }
             override fun onActivityPaused(activity: Activity) = Unit
             override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) = Unit
-            override fun onActivityDestroyed(activity: Activity) = Unit
+            override fun onActivityDestroyed(activity: Activity) {
+                arrivalEpochs.remove(activity)?.let { ShellRuntime.cancelForegroundArrival(it) }
+            }
         })
     }
 

@@ -611,17 +611,43 @@ object ShellRuntime {
      */
     fun onAppForegroundChanged(foreground: Boolean) {
         appIsForeground = foreground
+        if (foreground) {
+            handoff.confirmForegroundArrival()
+        } else {
+            handoff.cancelForegroundArrival(handoff.epoch)
+        }
+        onUserPresenceChanged()
+    }
+
+    /** Called before onStart/onResume; it does not falsify the Activity started count. */
+    fun prepareForegroundArrival(reason: String, reloadExistingPage: Boolean = true): Long? {
+        if (!screenIsInteractive()) return null
+        if (handoff.foregroundArrivalPending) return handoff.epoch
+        if (!handoff.prepareForegroundArrival()) return null
+        Diagnostics.info("提前交还：$reason（正式前台计数尚未更新）")
+        onUserPresenceChanged(reloadExistingPage)
+        return if (handoff.foregroundArrivalPending) handoff.epoch else null
+    }
+
+    fun cancelForegroundArrival(token: Long) {
+        if (!handoff.cancelForegroundArrival(token)) return
+        Diagnostics.info("提前交还：返回被取消，恢复实际前后台判据")
+        onUserPresenceChanged()
+    }
+
+    fun confirmForegroundArrival() {
+        if (!handoff.foregroundArrivalPending) return
+        handoff.confirmForegroundArrival()
         onUserPresenceChanged()
     }
 
     /** Lifecycle and screen broadcasts share one transition and cancellation token. */
-    fun onUserPresenceChanged() {
+    fun onUserPresenceChanged(reloadExistingPage: Boolean = true) {
         val foreground = !userIsAway()
         val epoch = handoff.transition(!foreground) ?: return
         handoffChangedAt = SystemClock.elapsedRealtime()
-        // 4c（Q15）：前后台的**权威来源**就是这里（Application 级 started 计数，见
-        // ZcodeRemoteApp），所以"已离开"状态在这里立刻同步给 store——零延迟，
-        // 且与闸门的 [userIsAway] 同源（熄屏那一半由 5s 看门狗补，见 [syncAwayStateToStore]）。
+        // "已离开"在这里同步给 store，与接管闸门同源：started 计数、提前返回状态和屏幕交互性。
+        // 屏幕广播立即驱动切换，5s 看门狗继续兜底。
         syncAwayStateToStore()
         if (foreground) {
             // 档 0 观测：记下"回到前台"的真实时刻——后面两帧采样都会顺延（等注入层 boot），
@@ -657,7 +683,11 @@ object ShellRuntime {
             stopLiveProgressPolling()
             stopHeartbeatPump()
             carrierHandedBack = false
-            if (restoreAfterCarrier || pageReloadExpected) {
+            if (!reloadExistingPage) {
+                // 新 Activity 会创建 WebView 并 loadUrl，不先加载再补一次 reload。
+                carrierRanThisStint = false
+                Diagnostics.info("提前交还：新 WebView 使用首次加载恢复，不额外重载")
+            } else if (restoreAfterCarrier || pageReloadExpected) {
                 requestPageReload("回前台交还原生承载", epoch)
             } else {
                 evaluateJs("window.__zcodeShellSetAppForeground && window.__zcodeShellSetAppForeground(true);")
@@ -1811,10 +1841,15 @@ object ShellRuntime {
 
     private fun requestPageReload(reason: String, epoch: Long) {
         if (!handoff.isCurrent(epoch, false) || pageReloadEpoch == epoch) return
-        val reloader = pageReloader ?: return
+        if (pageReloader == null) return
         pageReloadEpoch = epoch
-        Diagnostics.info("快速交接：开始网页重载（切换后 ${SystemClock.elapsedRealtime() - handoffChangedAt}ms）· $reason")
-        reloader()
+        // 不加延时；让同一生命周期事务内的新 Intent 有机会提供通知定位目标。
+        mainHandler.post {
+            if (!handoff.isCurrent(epoch, false) || userIsAway()) return@post
+            val reloader = pageReloader ?: return@post
+            Diagnostics.info("快速交接：开始网页重载（切换后 ${SystemClock.elapsedRealtime() - handoffChangedAt}ms）· $reason")
+            reloader()
+        }
     }
 
     /** The next document restores the known chat route before the page's bootstrap. */
@@ -1863,16 +1898,13 @@ object ShellRuntime {
      * 启动，而熄屏会让渲染器定时器整体挂起——注入层连"我停了"都报不出来，
      * 流体云随之定格（日志停在熄屏那一刻）。后台与熄屏必须同等对待。
      */
-    private fun userIsAway(): Boolean {
-        if (!appIsForeground) {
-            return true
-        }
+    private fun screenIsInteractive(): Boolean {
         val power = appContext.getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
-        if (power == null) {
-            return false
-        }
-        return !power.isInteractive
+        return power?.isInteractive != false
     }
+
+    private fun userIsAway(): Boolean =
+        !screenIsInteractive() || (!appIsForeground && !handoff.foregroundArrivalPending)
 
     /**
      * 4c（Q15 用户追加裁定）：把"用户是否已离开"这个**闸门自己的口径**同步给 [store]。

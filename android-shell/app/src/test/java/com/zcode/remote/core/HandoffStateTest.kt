@@ -56,4 +56,71 @@ class HandoffStateTest {
         assertFalse(state.ownsAwayWindow)
         assertTrue(state.isCurrent(token, true))
     }
+
+    @Test
+    fun `pre-start arrival invalidates background work and formal start reuses its epoch`() {
+        val state = HandoffState()
+        val background = state.transition(true)!!
+        state.claimCarrier(background)
+        assertTrue(state.prepareForegroundArrival())
+        assertFalse("arrival preparation blocks a claim before the foreground transition", state.claimCarrier(background))
+        val arrival = state.transition(false)!!
+        assertTrue(state.foregroundArrivalPending)
+        assertFalse(state.claimCarrier(background))
+        assertFalse(state.ownsAwayWindow)
+        assertFalse(state.prepareForegroundArrival())
+        assertEquals(arrival, state.epoch)
+        state.confirmForegroundArrival()
+        assertFalse(state.foregroundArrivalPending)
+        assertNull(state.transition(false))
+        assertEquals(arrival, state.epoch)
+    }
+
+    @Test
+    fun `aborted arrival restores background ownership with a new token`() {
+        val state = HandoffState()
+        state.transition(true)
+        state.prepareForegroundArrival()
+        val arrival = state.transition(false)!!
+        assertTrue(state.cancelForegroundArrival(arrival))
+        val background = state.transition(true)!!
+        assertFalse(state.isCurrent(arrival, false))
+        assertTrue(state.claimCarrier(background))
+    }
+
+    @Test
+    fun `an old activity cannot cancel the next activity's arrival`() {
+        val state = HandoffState()
+        state.transition(true)
+        state.prepareForegroundArrival()
+        val oldArrival = state.transition(false)!!
+        state.confirmForegroundArrival()
+        state.transition(true)
+        state.prepareForegroundArrival()
+        val newArrival = state.transition(false)!!
+        assertFalse(state.cancelForegroundArrival(oldArrival))
+        assertTrue(state.foregroundArrivalPending)
+        assertTrue(state.isCurrent(newArrival, false))
+    }
+
+    @Test
+    fun `screen-off cancels preparation even before formal foreground arrives`() {
+        val state = HandoffState()
+        state.transition(true)
+        state.prepareForegroundArrival()
+        state.transition(false)
+        val background = state.transition(true)!!
+        assertFalse(state.foregroundArrivalPending)
+        assertTrue(state.claimCarrier(background))
+    }
+
+    @Test
+    fun `cold initialization and an already visible app do not create a return`() {
+        val state = HandoffState()
+        assertFalse(state.prepareForegroundArrival())
+        assertEquals(0L, state.epoch)
+        state.transition(false)
+        assertFalse(state.prepareForegroundArrival())
+        assertFalse(state.foregroundArrivalPending)
+    }
 }

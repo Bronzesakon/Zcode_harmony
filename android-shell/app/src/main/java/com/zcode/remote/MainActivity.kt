@@ -85,6 +85,7 @@ class MainActivity : AppCompatActivity() {
      */
     private var injectionScript: String? = null
     private var injectionRegistered = false
+    private var foregroundArrivalEpoch: Long? = null
 
     /** Set when a notification tap asked us to locate a task. */
     private var pendingLocate: Pair<String, String>? = null
@@ -161,6 +162,9 @@ class MainActivity : AppCompatActivity() {
         enableThemeEdgeToEdge()
         super.onCreate(savedInstanceState)
         ShellRuntime.init(this)
+        foregroundArrivalEpoch = ShellRuntime.prepareForegroundArrival(
+            "MainActivity.onCreate", reloadExistingPage = false,
+        )
         prefs = ShellRuntime.prefs()
 
         binding = ActivityMainBinding.inflate(layoutInflater)
@@ -626,7 +630,15 @@ class MainActivity : AppCompatActivity() {
         startActivity(Intent(this, SettingsActivity::class.java))
     }
 
+    override fun onRestart() {
+        // stopped 热返回的最早公开入口；先停原生连接，再让已有网页开始恢复。
+        foregroundArrivalEpoch = ShellRuntime.prepareForegroundArrival("MainActivity.onRestart")
+        super.onRestart()
+    }
+
     override fun onResume() {
+        // API 26–28 以及仅 paused 的返回路径；重复信号由交接状态去重。
+        foregroundArrivalEpoch = ShellRuntime.prepareForegroundArrival("MainActivity.onResume")
         super.onResume()
         // Ask the injected layer for fresh counters: if we just came back from a
         // long background stint, this is what resolves the survival verdict.
@@ -663,6 +675,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        foregroundArrivalEpoch?.let { ShellRuntime.cancelForegroundArrival(it) }
         // A callback that outlives the WebView would leak it, and the page would
         // sit waiting on that input forever.
         pendingFileCallback?.onReceiveValue(null)
