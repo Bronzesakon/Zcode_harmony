@@ -12,6 +12,7 @@ import com.zcode.remote.core.ConversationRecoveryPolicy
 import com.zcode.remote.core.CompletionEvent
 import com.zcode.remote.core.Diagnostics
 import com.zcode.remote.core.InjectionReadiness
+import com.zcode.remote.core.HandoffState
 import com.zcode.remote.core.NotifyState
 import com.zcode.remote.core.Prefs
 import com.zcode.remote.core.PreviewSettle
@@ -235,7 +236,7 @@ object ShellRuntime {
     // 于是全部判"无需介入"，一行日志都不留。
     //
     // 现在这一节做两件事：
-    //   * **档 0（判据）**：退后台那一刻采一次视图快照，回前台 3s 首判 + 12s 复判，
+    //   * **档 0（判据）**：退后台那一刻采一次视图快照，回前台立即首判 + 500ms 复判，
     //     按形态打判据行。跨进程落盘（见 [readViewAtLeave]）。
     //   * **档 3（动作）**：仅当判出 S3（离开时在对话 + 12s 仍未回对话视图）时，
     //     调注入层的 `__zcodeShellRecoverConversation` 钉 `history.state` 并重载一次。
@@ -287,18 +288,18 @@ object ShellRuntime {
     private const val VIEW_LEAVE_MAX_AGE_MS = 2 * 60 * 60 * 1000L
 
     /**
-     * 回前台首判（3s）的结果：true = 那一刻已经回到对话视图。
+     * 回前台首判（立即）的结果：true = 那一刻已经回到对话视图。
      *
      * 为什么要记住它：12s 复判要能说清"是慢恢复还是真没恢复"。
      * 只留最后一次读数的话，一个 +6s 才回来的健康页面会被报成"没回来"（真机 00:27 就是这个形状）。
      */
-    private var viewReturnedAt3s = false
+    private var viewReturnedAtFirstCheck = false
 
-    /** 首判窗（用户口径：首个可见动作 ≤3s）。 */
-    private const val VIEW_RETURN_CHECK_MS = 3000L
+    /** 首判窗（切换后立即读取）。 */
+    private const val VIEW_RETURN_CHECK_MS = 0L
 
-    /** 复判窗：越过它仍未回到对话，才算"页面自己回不来"。 */
-    private const val VIEW_RETURN_LATE_MS = 12000L
+    /** 复判窗：500ms 后仅恢复丢失的路由，网页渲染时间不计入交接。 */
+    private const val VIEW_RETURN_LATE_MS = HandoffState.RETURN_CHECK_MS
 
     /** 快照采集的排队重试（注入层 boot 需要时间，冷启动那条路尤其）。 */
     private const val VIEW_SNAPSHOT_RETRY_MS = 600L
@@ -329,7 +330,8 @@ object ShellRuntime {
      * 档 0 就白做了。重试上限与 `dispatchJsDiag` 同口径（40 × 600ms），
      * 因为这是同一类"等新文档 boot"的问题。
      */
-    private fun requestViewSnapshot(phase: String, attempt: Int = 0) {
+    private fun requestViewSnapshot(phase: String, attempt: Int = 0, epoch: Long = handoff.epoch) {
+        if (!handoff.isCurrent(epoch, phase == "leave")) return
         if (!injectionReadiness.isReady()) {
             if (attempt >= VIEW_SNAPSHOT_MAX_ATTEMPTS) {
                 Diagnostics.log(
@@ -339,18 +341,18 @@ object ShellRuntime {
                 return
             }
             mainHandler.postDelayed(
-                { requestViewSnapshot(phase, attempt + 1) },
+                { requestViewSnapshot(phase, attempt + 1, epoch) },
                 VIEW_SNAPSHOT_RETRY_MS,
             )
             return
         }
         evaluateJs(
             "window.__zcodeShellReportViewSnapshot && " +
-                "window.__zcodeShellReportViewSnapshot(${org.json.JSONObject.quote(phase)});",
+                "window.__zcodeShellReportViewSnapshot(${org.json.JSONObject.quote(phase)}, $epoch);",
         )
         // 记下这一帧的**实际**采集时刻（顺延后也要如实反映，见 foregroundReturnedAt）。
         if (phase == "return") {
-            viewAt3sActualMs = if (foregroundReturnedAt > 0L) {
+            viewAtFirstActualMs = if (foregroundReturnedAt > 0L) {
                 SystemClock.elapsedRealtime() - foregroundReturnedAt
             } else {
                 -1L
@@ -365,7 +367,7 @@ object ShellRuntime {
     }
 
     /** 首判那一帧的实际用时（ms，−1 = 未知）；顺延后如实反映，见 [foregroundReturnedAt]。 */
-    private var viewAt3sActualMs = -1L
+    private var viewAtFirstActualMs = -1L
 
     /** 复判那一帧的实际用时（ms，−1 = 未知）。 */
     private var viewAtLateActualMs = -1L
@@ -394,7 +396,7 @@ object ShellRuntime {
                 // **离开时页面在对话里 ⟹ 上一次恢复（若有）已经成功** ⟹ 清掉计数。
                 //
                 // 为什么必须在这里也清一次（真机 2026-09-20 16:43 实测踩到）：清零原本只写在
-                // 回前台 12s 判据窗的"已回到对话视图"那一支，而那条路要求**先有一次回前台**。
+                // 回前台 500ms 判据窗的"已回到对话视图"那一支，而那条路要求**先有一次回前台**。
                 // 于是这个真实序列会卡住：恢复成功 → 用户就在对话里读 → 没切前后台（判据不跑、
                 // 计数没清）→ 退后台、进程被杀 → 回前台 → S3 判出，却被"距上次恢复不足 5 分钟"
                 // 的**陈旧闸门**挡下（实测现场 `距上次 246s < 5 分钟`），用户白等。
@@ -404,14 +406,14 @@ object ShellRuntime {
                 }
             }
             // 首判：只记结果，不出结论（结论在复判那一拍给，才分得清"慢"与"没回来"）。
-            "return" -> viewReturnedAt3s = snap?.optBoolean("chat") == true
+            "return" -> viewReturnedAtFirstCheck = snap?.optBoolean("chat") == true
             // 复判：这一拍才下结论，并且消费掉本轮的离开态快照。
             "return_late" -> {
                 val leave = readViewAtLeave()
                 clearViewAtLeave()
-                val at3s = viewReturnedAt3s
-                viewReturnedAt3s = false
-                reportViewReturn(leave, snap, at3s)
+                val atFirstCheck = viewReturnedAtFirstCheck
+                viewReturnedAtFirstCheck = false
+                reportViewReturn(leave, snap, atFirstCheck)
             }
             else -> Unit
         }
@@ -428,9 +430,9 @@ object ShellRuntime {
      *     再用 `historyChat` 区分：为真说明页面还有路由记忆，为假说明连路由状态都没了
      *     （进程被杀过的典型形状）。
      *
-     * @param at3s 首判（3s）那一刻是否已在对话视图。
+     * @param atFirstCheck 首判（立即）那一刻是否已在对话视图。
      */
-    private fun reportViewReturn(leave: JSONObject?, now: JSONObject?, at3s: Boolean) {
+    private fun reportViewReturn(leave: JSONObject?, now: JSONObject?, atFirstCheck: Boolean) {
         if (leave == null) {
             Diagnostics.log("debug", "回前台视图判据：离开时未采到快照，本轮不判（只记录）")
             return
@@ -466,20 +468,25 @@ object ShellRuntime {
                 "info",
                 "回前台视图判据：**已回到对话视图**（离开时会话=$who · 现在=" +
                     "${sessionOf(now).ifEmpty { "无" }} · rows=${now.optInt("rows", -1)} · " +
-                    "首判${fmtMs(viewAt3sActualMs)}=${if (at3s) "已回" else "未回"}）" +
+                    "首判${fmtMs(viewAtFirstActualMs)}=${if (atFirstCheck) "已回" else "未回"}）" +
                     "——S1/S2 形态，无需干预",
             )
             return
         }
-        if (at3s) {
+        if (atFirstCheck) {
             // 3s 时在、12s 时不在：中途又被带离（例如页面自己重载后落 home）。
             Diagnostics.log(
                 "warn",
-                "回前台视图判据：首判（${fmtMs(viewAt3sActualMs)}）时还在对话、" +
+                "回前台视图判据：首判（${fmtMs(viewAtFirstActualMs)}）时还在对话、" +
                     "复判（${fmtMs(viewAtLateActualMs)}）时已离开（离开时会话=$who · " +
                     "现在 chat=false · historyChat=${now.optBoolean("historyChat")}" +
                     " rows=${now.optInt("rows", -1)}）——页面在中途被带离，档 0 只记录",
             )
+            return
+        }
+        // 路由已经指向 chat 时，剩余时间属于网页自己的渲染/恢复，壳不重复重载它。
+        if (now.optBoolean("historyChat")) {
+            Diagnostics.info("快速交接：聊天路由已保留，等待网页自身恢复（不额外重载）")
             return
         }
         val historyChat = now.optBoolean("historyChat")
@@ -515,7 +522,7 @@ object ShellRuntime {
         // 两道限流同时归零**，连续触发会变成"每次回前台都闪一次"。
         // 所以闸门落在 [Prefs.conversationRecovery]（跨进程落盘），注入层只负责执行。
         if (!allowConversationRecovery()) return
-        val reason = "离开时在对话($who) / 12s 后 chat=false" +
+        val reason = "离开时在对话($who) / ${fmtMs(viewAtLateActualMs)} 复判 chat=false" +
             (if (historyChat) " / historyChat=true" else " / historyChat=false")
         recordConversationRecovery(reason)
         evaluateJs(
@@ -568,7 +575,7 @@ object ShellRuntime {
     /**
      * **确认"用户确实在对话视图里"** ⟹ 清掉连续恢复计数。两个调用点、同一个语义：
      *
-     *   * [reportViewReturn] 的"已回到对话视图"那一支（回前台 12s 判据）；
+     *   * [reportViewReturn] 的"已回到对话视图"那一支（回前台 500ms 判据）；
      *   * [onViewSnapshot] 的 `leave` 分支——**离开时页面在对话里**，说明上一次恢复
      *     （若有）已经成功。
      *
@@ -604,37 +611,35 @@ object ShellRuntime {
      */
     fun onAppForegroundChanged(foreground: Boolean) {
         appIsForeground = foreground
+        onUserPresenceChanged()
+    }
+
+    /** Lifecycle and screen broadcasts share one transition and cancellation token. */
+    fun onUserPresenceChanged() {
+        val foreground = !userIsAway()
+        val epoch = handoff.transition(!foreground) ?: return
+        handoffChangedAt = SystemClock.elapsedRealtime()
         // 4c（Q15）：前后台的**权威来源**就是这里（Application 级 started 计数，见
         // ZcodeRemoteApp），所以"已离开"状态在这里立刻同步给 store——零延迟，
         // 且与闸门的 [userIsAway] 同源（熄屏那一半由 5s 看门狗补，见 [syncAwayStateToStore]）。
         syncAwayStateToStore()
         if (foreground) {
-            appIsForeground = true
             // 档 0 观测：记下"回到前台"的真实时刻——后面两帧采样都会顺延（等注入层 boot），
             // 日志要报**实际用时**而不是计划时刻（见 foregroundReturnedAt）。
             foregroundReturnedAt = SystemClock.elapsedRealtime()
-            viewAt3sActualMs = -1L
+            viewAtFirstActualMs = -1L
             viewAtLateActualMs = -1L
-            // 档 0 观测：回前台采两帧——3s 首判（用户口径的首个可见动作量级）+ 12s 复判。
-            // 两帧的目的是把"恢复慢"与"永不恢复"分开：真机 00:27 那次是 +6s 自己回来的，
-            // 只看 3s 会把它误报成假死。**只观测、不干预。**
-            //
-            // **必须排在下面那串干预之前**：`__zcodeShellSetAppForeground(true)` 会触发注入层的
-            // KICKED 自愈重载，重载把注入层 runtime 换掉，快照请求就落进新文档（还没 boot）。
-            // 排在前面，采到的是"用户回到前台那一刻的真实形态"。
-            //
-            // ⚠️ **进程重启那条路要重试**（真机 22:32 实测）：冷启动时页面还在加载，3s 那一刻
-            // 注入层往往还没 boot，快照请求直接落空——而"进程被杀 + 回前台"**正是**档 0 要抓的
-            // 形态，采不到就等于白做。所以首判与复判都重试到注入就绪为止（见 requestViewSnapshot）。
-            mainHandler.postDelayed({ requestViewSnapshot("return") }, VIEW_RETURN_CHECK_MS)
-            mainHandler.postDelayed({ requestViewSnapshot("return_late") }, VIEW_RETURN_LATE_MS)
+            // 首判立即采样，复判 500ms；已有聊天路由时让网页自行渲染。
+            // 冷启动在 document-start 恢复路由，注入未就绪属于网页加载耗时。
+            mainHandler.postDelayed({ requestViewSnapshot("return", epoch = epoch) }, VIEW_RETURN_CHECK_MS)
+            mainHandler.postDelayed({ requestViewSnapshot("return_late", epoch = epoch) }, VIEW_RETURN_LATE_MS)
             // 回前台清掉"提前接管候选"：下一次退后台重新从头观察（避免拿上一轮的计时直接动手）。
             earlyTakeoverSince = 0L
             // socket 指纹基线也清掉：下一次退后台的第一拍**重新采基线**，不许把"页面在前台
             // 期间开的 socket"当成"刚刚在重拨"（那会白等 20s，见 maybeStartNativeCarrier）。
             lastSocketMarkForStall = -1L
             lastSocketChangeAt = 0L
-            evaluateJs("window.__zcodeShellSetAppForeground && window.__zcodeShellSetAppForeground(true);")
+            val restoreAfterCarrier = Tier2Probe.isRunning() || carrierHandedBack || carrierRanThisStint
             // 成功；重连/重载后注入层 runtime 是新的（状态回默认）。
             // 4b（2026-09-18）起没有"僵尸档"了：页面自己回不来时，靠注入层的 KICKED 终态自愈
             // （healKickedOnForeground，在 __zcodeShellSetAppForeground 里）+ 回前台死链兜底
@@ -645,34 +650,18 @@ object ShellRuntime {
                 Diagnostics.log(
                     "warn",
                     "后台原生承载：回前台交还完成——页面可见性恢复后 Chromium 网络栈复活，" +
-                        "由页面自己的 recoverConnection 重拨（本壳不重载页面）",
+                        "立即触发网页重载，不等待 JS 终态或 8s 观察窗",
                 )
             }
             clearCarrierState()
             stopLiveProgressPolling()
-            if (carrierHandedBack || carrierRanThisStint) {
-                // 8s 后页面若还没开线、也没有新入站帧，说明它已经掉进失败态（自己回不来），
-                // 那时才重载一次（5 分钟限流）。
-                // ⚠️ 条件里的 [carrierRanThisStint] 是 2026-09-18 补的：承载若在**后台期间**就被
-                // 停掉，光看 [carrierHandedBack] 会让这里永不进入 ⟹ 页面被彻底留下（见其注释）。
-                //
-                // 这一行日志是**判据**：兜底安排在注入层的 8s 定时器里，而"页面随即重载"会把
-                // 那个定时器的上下文换掉，于是注入层那两行（`交还后页面已自行恢复` / `交还兜底…`
-                // 限流跳过）可能一条都不出现。没有这行原生日志，就无法区分"没安排"与"安排了但
-                // 被重载抢掉"。**别删。**
-                Diagnostics.log(
-                    "info",
-                    "后台原生承载：回前台安排兜底检查（8s 后页面仍未开线才重载）——来路=" +
-                        (if (carrierHandedBack) "回前台交还" else "承载已在后台停掉"),
-                )
-                carrierHandedBack = false
-                carrierRanThisStint = false
-                evaluateJs(
-                    "window.__zcodeShellAfterCarrierReturn && " +
-                        "window.__zcodeShellAfterCarrierReturn(8000);",
-                )
-            }
             stopHeartbeatPump()
+            carrierHandedBack = false
+            if (restoreAfterCarrier || pageReloadExpected) {
+                requestPageReload("回前台交还原生承载", epoch)
+            } else {
+                evaluateJs("window.__zcodeShellSetAppForeground && window.__zcodeShellSetAppForeground(true);")
+            }
             val startedAt = backgroundStartedAt
             val endedAt = SystemClock.elapsedRealtime()
             backgroundStartedAt = 0L
@@ -687,7 +676,6 @@ object ShellRuntime {
             verdictPending = true
             requestLivenessReport()
         } else {
-            appIsForeground = false
             // 档 0 观测：**在退后台那一刻**采视图快照。这一帧是整个判据的地基——
             // 原生承载一配对，页面就会 dispose 掉会话并退出对话视图（真机 23:59:05 dispose
             // → 23:59:14 体征已 chat:false），等回前台再读就再也问不出"用户离开时在不在对话里"。
@@ -701,6 +689,7 @@ object ShellRuntime {
             // 新一次后台：复位"本次后台承载跑过"，避免把**上一次**后台（或前台）的承载记到
             // 这一次头上——那会让正常回前台也去安排兜底重载（见 [carrierRanThisStint]）。
             carrierRanThisStint = false
+            mainHandler.postDelayed({ maybeStartHandoffCarrier(epoch) }, HandoffState.START_DELAY_MS)
             val snapshot = liveness
             backgroundFrameBase = snapshot?.inboundFrames ?: 0
             backgroundAckBase = snapshot?.pairAcks ?: 0
@@ -968,7 +957,7 @@ object ShellRuntime {
      * 判断要不要提前接管。等满一个整拍只会让卡片的正文晚 10s 出现（用户："后台冒出来的
      * 流体云都得等 20s 体感"）。3s 足够让可见性切换稳定下来，又比 10s 快得多。
      */
-    private const val PUMP_FIRST_TICK_MS = 3_000L
+    private const val PUMP_FIRST_TICK_MS = HandoffState.START_DELAY_MS
 
     /** Every Nth dispatch is logged; the first one always is. */
     private const val PUMP_LOG_EVERY = 20
@@ -984,18 +973,23 @@ object ShellRuntime {
      */
     fun isAppForeground(): Boolean = appIsForeground
 
+    fun isUserPresent(): Boolean = !userIsAway()
+
     init {
         // 配对成功与应用回前台的竞态处置（Tier2Probe 在 OkHttp 线程上回调，转主线程）。
-        Tier2Probe.isForegroundNow = { appIsForeground }
+        Tier2Probe.isForegroundNow = { !userIsAway() }
         Tier2Probe.foregroundConflict = {
             mainHandler.post {
                 if (!Tier2Probe.isRunning()) return@post
+                if (userIsAway()) return@post
                 Diagnostics.log("warn", "后台原生承载：配对竞态——应用已回前台，交还并重载页面一次")
                 Tier2Probe.stop("配对成功但已回前台——立即交还")
                 carrierHandedBack = true
                 // 页面已被这次配对踢进 KICKED 终态，重载是唯一恢复手段；此时壳在前台，
                 // 原生直接重载（等效用户手动重启，只是快 7 秒）。
-                evaluateJs("window.location && window.location.reload();")
+                clearCarrierState()
+                stopLiveProgressPolling()
+                requestPageReload("原生配对与回前台竞态", handoff.epoch)
             }
         }
     }
@@ -1003,7 +997,8 @@ object ShellRuntime {
     @Volatile
     private var heartbeatPumpRunning = false
 
-    private var lastAwayState = false
+    private val handoff = HandoffState()
+    private var handoffChangedAt = 0L
 
     private var pumpDispatches = 0
     private var pumpDispatchesForVerdict = 0
@@ -1037,7 +1032,7 @@ object ShellRuntime {
         mainHandler.postDelayed(pumpRunnable, PUMP_FIRST_TICK_MS)
         Diagnostics.log(
             "debug",
-            "后台心跳泵已启动（首拍 ${PUMP_FIRST_TICK_MS / 1000}s，之后每 ${PUMP_INTERVAL_MS / 1000}s）",
+            "后台心跳泵已启动（首拍 ${PUMP_FIRST_TICK_MS}ms，之后每 ${PUMP_INTERVAL_MS / 1000}s）",
         )
     }
 
@@ -1350,6 +1345,10 @@ object ShellRuntime {
         // 判据**（[userIsAway]）重新同步给 store。这样"窗口武装了但闸门不在判定"（或反过来）
         // 的错位在**判定这一拍**不可能存在——两者用的是同一份读数、同一个函数。
         syncAwayStateToStore()
+        if (!userIsAway()) return
+        if (handoff.ownsAwayWindow && Tier2Probe.isRunning()) return
+        maybeStartHandoffCarrier(handoff.epoch)
+        if (Tier2Probe.isRunning()) return
         if (!carrierEnabled) return
         val age = lastInboundAgeMs() ?: return
         val now = SystemClock.elapsedRealtime()
@@ -1496,11 +1495,6 @@ object ShellRuntime {
             Diagnostics.log("warn", "后台原生承载：等待页面移交 relay 凭证")
             return
         }
-        carrierStarted = true
-        // 走到这里只有两条来路：页面判死（age ≥ 门槛）或**提前接管**（页面活着、只是没人喂卡片）。
-        // 来路决定交还判据能有多宽，见 [carrierStartedEarly] 与 [CarrierHandback]。
-        carrierStartedEarly = age < STALL_SILENCE_MS
-        handbackDeferredLogged = false
         if (age >= STALL_SILENCE_MS) {
             Diagnostics.log(
                 "warn",
@@ -1508,17 +1502,7 @@ object ShellRuntime {
                     "Chromium 网络栈已死）——原生接管 relay 连接并订阅在跑会话，推到流体云",
             )
         }
-        acquireCarrierWakeLock()
-        carrierRanThisStint = true
-        Tier2Probe.start(
-            creds,
-            durationMs = 0L,
-            onlyWorkspace = pageWorkspaceKey,
-            onlyTaskId = pageWorkspaceTaskId,
-            coverageWorkspaces = carrierCoverageTargets(),
-            coverageIsDiagnostic = coverageOverride.isNotEmpty(),
-        )
-        startLiveProgressPolling()
+        startNativeCarrier(creds, early = age < STALL_SILENCE_MS)
     }
 
     // ------------------------------------------------- 承载期间的 wake lock
@@ -1568,6 +1552,7 @@ object ShellRuntime {
 
     /** 交还时清账（由 [onAppForegroundChanged] 的前台分支调用）。 */
     private fun clearCarrierState() {
+        handoff.releaseCarrier()
         releaseCarrierWakeLock()
         carrierStarted = false
         carrierStartedEarly = false
@@ -1812,6 +1797,57 @@ object ShellRuntime {
     @Volatile
     private var jsEvaluator: ((String) -> Unit)? = null
 
+    private var pageReloader: (() -> Unit)? = null
+    private var pageReloadEpoch = -1L
+    private var pageReloadExpected = false
+
+    fun expectPageReload() {
+        pageReloadExpected = true
+    }
+
+    fun setPageReloader(reloader: (() -> Unit)?) {
+        pageReloader = reloader
+    }
+
+    private fun requestPageReload(reason: String, epoch: Long) {
+        if (!handoff.isCurrent(epoch, false) || pageReloadEpoch == epoch) return
+        val reloader = pageReloader ?: return
+        pageReloadEpoch = epoch
+        Diagnostics.info("快速交接：开始网页重载（切换后 ${SystemClock.elapsedRealtime() - handoffChangedAt}ms）· $reason")
+        reloader()
+    }
+
+    /** The next document restores the known chat route before the page's bootstrap. */
+    fun shouldRestoreChatOnLoad(): Boolean =
+        !userIsAway() && readViewAtLeave()?.optBoolean("chat") == true
+
+    private fun maybeStartHandoffCarrier(epoch: Long) {
+        if (!handoff.isCurrent(epoch, true) || !userIsAway() || !carrierEnabled) return
+        if (Tier2Probe.isRunning()) return
+        if (store.runningTaskRefs().isEmpty() && !store.staleGateHold().holds) return
+        val creds = relayCreds ?: return
+        if (!handoff.claimCarrier(epoch)) return
+        Diagnostics.info("快速交接：开始原生接管（切换后 ${SystemClock.elapsedRealtime() - handoffChangedAt}ms）")
+        startNativeCarrier(creds, early = true)
+    }
+
+    private fun startNativeCarrier(creds: RelayCreds, early: Boolean) {
+        carrierStarted = true
+        carrierStartedEarly = early
+        carrierRanThisStint = true
+        handbackDeferredLogged = false
+        acquireCarrierWakeLock()
+        Tier2Probe.start(
+            creds,
+            durationMs = 0L,
+            onlyWorkspace = pageWorkspaceKey,
+            onlyTaskId = pageWorkspaceTaskId,
+            coverageWorkspaces = carrierCoverageTargets(),
+            coverageIsDiagnostic = coverageOverride.isNotEmpty(),
+        )
+        startLiveProgressPolling()
+    }
+
     fun setJsEvaluator(evaluator: ((String) -> Unit)?) {
         jsEvaluator = evaluator
     }
@@ -1864,23 +1900,7 @@ object ShellRuntime {
                 // 有意复用这里的局部量、而不是再调一次 [syncAwayStateToStore]：下面 if/else
                 // 判的就是这个值，两边必须是同一份读数。
                 store.setBackgrounded(away)
-                if (away && !lastAwayState) {
-                    evaluateJs("window.__zcodeShellSetAppForeground && window.__zcodeShellSetAppForeground(false);")
-                    startHeartbeatPump()
-                    requestLivenessReport()
-                } else if (!away && lastAwayState) {
-                    evaluateJs("window.__zcodeShellSetAppForeground && window.__zcodeShellSetAppForeground(true);")
-                    if (Tier2Probe.isRunning()) {
-                        Tier2Probe.stop("亮屏/回前台交还")
-                    }
-                    // 亮屏（应用可能仍在后台）：承载停了就得把 wake lock 与状态一起清掉，
-                    // 否则锁会一直 held 到下一次进前台（耗电）。
-                    stopLiveProgressPolling()
-                    releaseCarrierWakeLock()
-                    carrierStarted = false
-                    stopHeartbeatPump()
-                }
-                lastAwayState = away
+                onUserPresenceChanged()
             } catch (e: Exception) {
                 Diagnostics.log("warn", "Tier1 看门狗异常: ${e.message}")
             }
@@ -2086,6 +2106,7 @@ object ShellRuntime {
                     // 为什么需要它、以及两个时序坑（接管会让页面退出对话视图、前台期间
                     // 壳零周期性观测），见 [onAppForegroundChanged] 里 onViewSnapshot 的注释。
                     val data = root.optJSONObject("data") ?: return
+                    if (data.optLong("epoch", -1L) != handoff.epoch) return
                     onViewSnapshot(data.optString("phase"), data.optJSONObject("snap"))
                 }
                 "controllertasks" -> {
@@ -2131,6 +2152,7 @@ object ShellRuntime {
                         deviceMid = data.optString("deviceMid").ifBlank { null },
                     )
                     Tier2Probe.sessionsSink = { update -> acceptNativeSessions(update) }
+                    mainHandler.post { maybeStartHandoffCarrier(handoff.epoch) }
                     Diagnostics.log("info", "Tier2: relay 凭证已接收（仅内存）")
                 }
                 "pagestate" -> {
@@ -2305,6 +2327,9 @@ object ShellRuntime {
         // 运行集抹成 0（流体云卡片随之被系统收回，下一拍再提升即"重建"）。
         // 真正的"运行集变空"一定带 removedIds（见 TaskStore.buildUpdate），不会被这条挡住。
         if (!urgent && update.running.isEmpty() && update.removedIds.isEmpty()) return
+        if (update.running.isNotEmpty()) {
+            mainHandler.post { maybeStartHandoffCarrier(handoff.epoch) }
+        }
         enqueueOngoing(update, throttled = !urgent)
     }
 
@@ -2433,6 +2458,8 @@ object ShellRuntime {
     fun onPageStarted() {
         injectionReadiness.reset()
         lastInjectStatusLine = ""
+        pageReloadExpected = false
+        if (!userIsAway()) carrierRanThisStint = false
     }
 
     /** Called when a fresh page has finished loading and re-subscribed. */

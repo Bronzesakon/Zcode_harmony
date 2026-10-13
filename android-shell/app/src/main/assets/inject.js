@@ -201,20 +201,51 @@
      * （只读壳契约，见 SHELL_READ_ONLY）。兜底里如果残留一个"开订阅"的字段，就等于给
      * 只读契约留了个后门（2026-09-15 就是这么踩的）。
      */
+    var cachedConfig = null;
+
     function configDefaults() {
         return {passiveObserve: true};
     }
 
     function config() {
+        if (cachedConfig) {
+            return cachedConfig;
+        }
         if (!bridge || typeof bridge.config !== 'function') {
-            return configDefaults();
+            cachedConfig = configDefaults();
+            return cachedConfig;
         }
         try {
             var raw = bridge.config();
             var parsed = raw ? JSON.parse(raw) : null;
-            return parsed && typeof parsed === 'object' ? parsed : configDefaults();
+            cachedConfig = parsed && typeof parsed === 'object' ? parsed : configDefaults();
         } catch (e) {
-            return configDefaults();
+            cachedConfig = configDefaults();
+        }
+        return cachedConfig;
+    }
+
+    /** Shared by cold-load restoration, notification presets and conversation recovery. */
+    function pinChatRoute() {
+        var st = (G.history && G.history.state) || null;
+        if (st && st.zcodeMobilePage === 'chat') return;
+        var next = {};
+        if (st) {
+            for (var k in st) {
+                if (Object.prototype.hasOwnProperty.call(st, k)) next[k] = st[k];
+            }
+        }
+        next.zcodeMobilePage = 'chat';
+        G.history.replaceState(next, '');
+    }
+
+    // 原生知道离开时在聊天页：在网页 bootstrap 之前恢复路由，省去加载后的二次重载。
+    if (config().restoreChat === true && config().foreground !== false) {
+        try {
+            pinChatRoute();
+            diag('info', '快速交接：网页启动前已恢复聊天路由');
+        } catch (e) {
+            diag('warn', '启动前聊天路由恢复失败: ' + e);
         }
     }
 
@@ -333,7 +364,7 @@
             try {
                 adoptSocket(this);
             } catch (e) {}
-            if (!injecting && typeof data === 'string') {
+            if (socketKnown(this) && !injecting && typeof data === 'string') {
                 try {
                     observeText(data, true);
                 } catch (e) {
@@ -360,6 +391,9 @@
             try {
                 adoptSocket(this);
             } catch (e) {}
+            if (!socketKnown(this)) {
+                return originalClose.apply(this, arguments);
+            }
             try {
                 var lines = String((new Error()).stack || '').split('\n');
                 var frames = [];
@@ -401,6 +435,7 @@
             return;
         }
         trackSocket(socket);
+        if (!socketKnown(socket)) return;
         if (!activeSocket) {
             activeSocket = socket;
         }
@@ -412,6 +447,12 @@
 
     function trackSocket(socket, url) {
         if (socketKnown(socket)) {
+            return;
+        }
+        // 内嵌窗口控制是另一套协议：不逐帧解析、不拿它当 relay，也不向它补心跳。
+        url = url || socket.url;
+        var socketUrl = String(url || '');
+        if (/\/ws\/remote-control\/window(?:\/|$)/.test(socketUrl.split('?')[0])) {
             return;
         }
         if (url) {
@@ -1123,7 +1164,7 @@
      * 只有重启应用（全新 bootstrap）才恢复。兜底＝对**已死的链路**重载一次页面，
      * 与用户手动重启等价；健康链路永远不碰（见 SHELL_READ_ONLY 的边界）。
      */
-    var RESUME_HEAL_GRACE_MS = 5000;
+    var RESUME_HEAL_GRACE_MS = 500;
     var RESUME_HEAL_MIN_GAP_MS = 300000;
     var lastResumeHealAt = 0;
     var resumeHealTimer = null;
@@ -1140,6 +1181,7 @@
     // 成"前台被顶→不自动干预"，自愈链路（kickedAwayAt）就此短路（真机 17:07 现场一环）。
     // config() 是 document-start 的同步询问；字段缺失（老壳/测试桩）按 true 兜底。
     var appForeground = config().foreground !== false;
+    var foregroundEpoch = 0;
     var backgroundStartedWallMs = 0;
     var lastBackgroundSilenceLoggedAt = 0;
     /**
@@ -1312,15 +1354,13 @@
             return;
         }
         storeSet(KICKED_HEAL_STORE, String(count + 1));
-        diag('warn', 'KICKED 自愈：1.5s 后重载页面（第 ' + (count + 1) + '/' +
+        diag('warn', 'KICKED 自愈：立即重载页面（第 ' + (count + 1) + '/' +
             KICKED_HEAL_CAP + ' 次），让页面重新配对');
-        setTimeout(function () {
-            try {
-                G.location.reload();
-            } catch (e) {
-                diag('warn', 'KICKED 自愈重载失败: ' + e);
-            }
-        }, 1500);
+        try {
+            G.location.reload();
+        } catch (e) {
+            diag('warn', 'KICKED 自愈重载失败: ' + e);
+        }
     }
 
     /**
@@ -1685,19 +1725,7 @@
             if (workspaceKey && sessionId) {
                 G.localStorage.setItem('zcode-v4-last-session:v1:' + workspaceKey, sessionId);
             }
-            var st = (G.history && G.history.state) || null;
-            if (!st || st.zcodeMobilePage !== 'chat') {
-                var next = {};
-                if (st) {
-                    for (var k in st) {
-                        if (Object.prototype.hasOwnProperty.call(st, k)) {
-                            next[k] = st[k];
-                        }
-                    }
-                }
-                next.zcodeMobilePage = 'chat';
-                G.history.replaceState(next, '');
-            }
+            pinChatRoute();
             diag('info', '已预设下次加载要打开的任务: ' + workspaceKey + ' / ' + sessionId);
             return true;
         } catch (e) {
@@ -1756,27 +1784,9 @@
             var detail = String(reason || '');
             // 钉路由状态：保留原有字段（页面可能往 state 里放别的东西），
             // 只把 zcodeMobilePage 置成 chat。幂等——已是 chat 就不动。
-            var st = (G.history && G.history.state) || null;
-            if (!st || st.zcodeMobilePage !== 'chat') {
-                var next = {};
-                if (st) {
-                    for (var k in st) {
-                        if (Object.prototype.hasOwnProperty.call(st, k)) {
-                            next[k] = st[k];
-                        }
-                    }
-                }
-                next.zcodeMobilePage = 'chat';
-                G.history.replaceState(next, '');
-            }
+            pinChatRoute();
             diag('warn', '对话恢复：钉住路由状态后重载一次 · 判据=' + detail);
-            setTimeout(function () {
-                try {
-                    G.location.reload();
-                } catch (e) {
-                    diag('warn', '对话恢复重载失败: ' + e);
-                }
-            }, 300);
+            G.location.reload();
             return true;
         } catch (e) {
             diag('warn', '对话恢复失败: ' + e);
@@ -2315,10 +2325,11 @@
      *
      * 纯读 + 一次桥消息；不碰页面 socket、不写 DOM。
      */
-    G.__zcodeShellReportViewSnapshot = function (phase) {
+    G.__zcodeShellReportViewSnapshot = function (phase, epoch) {
         try {
             post('viewsnap', {
                 phase: String(phase || ''),
+                epoch: epoch,
                 at: Date.now(),
                 snap: G.__zcodeShellViewSnapshot()
             });
@@ -2685,10 +2696,11 @@
                 return false;
             }
             var framesAtStart = liveness.inboundFrames;
-            var waitMs = graceMs && graceMs > 0 ? graceMs : 8000;
+            var epoch = foregroundEpoch;
+            var waitMs = graceMs && graceMs > 0 ? Math.min(graceMs, 500) : 500;
             G.setTimeout(function () {
                 try {
-                    if (appForeground !== true) return;
+                    if (appForeground !== true || foregroundEpoch !== epoch) return;
                     var open = false;
                     for (var i = 0; i < sockets.length; i++) {
                         if (sockets[i].readyState === 1) {
@@ -3035,8 +3047,13 @@
 /** Called by the native side when the app's foreground state changes. */
     G.__zcodeShellSetAppForeground = function (foreground) {
         diag('info', 'app foreground = ' + (foreground ? 'true' : 'false'));
+        if (foreground !== appForeground) foregroundEpoch += 1;
         appForeground = foreground;
         if (!foreground) {
+            if (resumeHealTimer) {
+                clearTimeout(resumeHealTimer);
+                resumeHealTimer = null;
+            }
             // A fresh window: the survival verdict is about ticks from here on.
             // The COUNT deliberately keeps its value — the native side records a
             // base per window and subtracts it. Zeroing it here looked harmless

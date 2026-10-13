@@ -99,7 +99,17 @@ jobs:
           # modern Node. Assert the floor rather than pin an action SHA that
           # cannot be verified offline.
           node -e "const [maj]=process.versions.node.split('.').map(Number); if (maj < 20) { console.error('Node 20+ required for node --test'); process.exit(1); }"
-          node --test
+          set +e
+          node --test --test-reporter=tap 2>&1 | tee node-test.log
+          status=${PIPESTATUS[0]}
+          set -e
+          if [ "$status" -ne 0 ]; then
+            # JS 错误同样进公开注解，复用 watch_ci.py 的取错通道，无需日志鉴权。
+            grep -aE -A35 -B8 'not ok|SyntaxError|AssertionError|TypeError|ReferenceError' node-test.log \
+              | head -140 | tr -d '\r' | sed 's/%/%25/g' | cut -c1-900 \
+              | sed 's/^/::error::/' || true
+            exit "$status"
+          fi
 
       # About a second, and it catches what hand-editing produces — unbalanced
       # delimiters, a package that disagrees with its directory, leftover merge

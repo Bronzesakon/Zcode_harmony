@@ -260,7 +260,8 @@ FakeWebSocket.instances = [];
 
 const PRISTINE = {
     eventTargetAdd: FakeEventTarget.prototype.addEventListener,
-    webSocketSend: FakeWebSocket.prototype.send
+    webSocketSend: FakeWebSocket.prototype.send,
+    webSocketClose: FakeWebSocket.prototype.close
 };
 
 function setupPage(options) {
@@ -275,6 +276,7 @@ function setupPage(options) {
     // Undo prototype patches left behind by a previous test.
     FakeEventTarget.prototype.addEventListener = PRISTINE.eventTargetAdd;
     FakeWebSocket.prototype.send = PRISTINE.webSocketSend;
+    FakeWebSocket.prototype.close = PRISTINE.webSocketClose;
     FakeWebSocket.instances = [];
     delete globalThis.__zcodeShellInstalled;
 
@@ -286,6 +288,8 @@ function setupPage(options) {
     // 所以每个测试跑的都是**只读壳**的默认配置——注入层不许再主动开桥。
     // 2026-09-28：`foreground` 可由测试注入（验证"后台加载的文档按真实前后台启动"）。
     const configValue = (options && options.config) || {passiveObserve: true};
+    let configReads = 0;
+    if (options && options.history) install('history', options.history);
 
     install('EventTarget', FakeEventTarget);
     install('Document', FakeDocument);
@@ -306,6 +310,7 @@ function setupPage(options) {
             posts.push(JSON.parse(json));
         },
         config() {
+            configReads += 1;
             return JSON.stringify(configValue);
         }
     });
@@ -461,7 +466,8 @@ function setupPage(options) {
         delete globalThis.__zcodeShellFallback;
     };
 
-    return {document, window, posts, protocol, configValue, dom, mediaQueries, teardown};
+    return {document, window, posts, protocol, configValue, configReads: () => configReads,
+        dom, mediaQueries, teardown};
 }
 
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
@@ -1769,7 +1775,7 @@ test('进对话铁判准：页面真实发出的信标会武装 5s 判定', () =
     }
 });
 
-test('KICKED 自愈：后台被顶掉 → 回前台 1.5s 后自己重载回来', async () => {
+test('KICKED 自愈：后台被顶掉 → 回前台立即触发重载', async () => {
     const page = setupPage();
     const {reloads, restore} = stubReload();
     const storage = stubSessionStorage();
@@ -1781,11 +1787,8 @@ test('KICKED 自愈：后台被顶掉 → 回前台 1.5s 后自己重载回来',
             d.message.includes('应用在后台')).length === 1,
             'a background kick must be recorded');
         globalThis.__zcodeShellSetAppForeground(true);
-        assert.strictEqual(reloads.length, 0,
-            'the reload is deferred so the native side can release the slot first');
-        await wait(1700);
         assert.strictEqual(reloads.length, 1,
-            'the kicked page must reload itself back onto a live link');
+            'native releases ownership first; the page must not add a 1.5s delay');
     } finally {
         storage.restore();
         restore();
@@ -2116,12 +2119,8 @@ test('档3：钉住路由状态并重载一次（两个动作都发生）', asyn
         assert.strictEqual(replaced[0].zcodeMobilePage, 'chat', '必须把 zcodeMobilePage 钉成 chat');
         assert.strictEqual(replaced[0].keepMe, 1, '原有字段必须保留（整份覆盖会弄丢页面的状态）');
 
-        // A② 重载是**延时**派发的（300ms），给 replaceState 落地的时间。
-        assert.strictEqual(reloads.length, 0, '重载不该是同步的');
-        // 在**本测试内**把它结清：不然这个 300ms 定时器会飘进下一个测试制造假失败
-        // （本轮实测踩到过两次）。
-        await wait(400);
-        assert.strictEqual(reloads.length, 1, '延时到点恰好重载一次');
+        // replaceState 同步生效，直接重载，不额外排一个 300ms 定时器。
+        assert.strictEqual(reloads.length, 1, '同一调用内恰好重载一次');
     } finally {
         restore();
         delete globalThis.history;
@@ -2223,4 +2222,72 @@ test('档3：不碰页面 socket（它不许退化成轻推）', async () => {
         delete globalThis.history;
         page.teardown();
     }
+});
+
+
+test('快速交接：启动前恢复聊天路由并保留网页其他历史字段', () => {
+    const history = {state: {zcodeMobilePage: 'home', keep: 7}, replaceState(next) { this.state = next; }};
+    const page = setupPage({config: {passiveObserve: true, foreground: true, restoreChat: true}, history});
+    try {
+        assert.deepStrictEqual(history.state, {zcodeMobilePage: 'chat', keep: 7});
+        assert.strictEqual(page.configReads(), 1, 'document config is read once across all consumers');
+        const socket = new globalThis.WebSocket('wss://relay.example');
+        socket.receive({type: 'pair_status_ack', pair_status: 'matched'});
+        assert.strictEqual(page.configReads(), 1, 'creating protocol clients reuses the config');
+    } finally { page.teardown(); }
+});
+
+test('快速交接：后台加载不擅自恢复聊天路由', () => {
+    const history = {state: {zcodeMobilePage: 'home'}, replaceState(next) { this.state = next; }};
+    const page = setupPage({config: {foreground: false, restoreChat: true}, history});
+    try { assert.strictEqual(history.state.zcodeMobilePage, 'home'); }
+    finally { page.teardown(); }
+});
+
+test('旁观收窄：窗口控制 socket 不改变 relay 状态、不解析也不补心跳', () => {
+    const page = setupPage();
+    try {
+        const relay = new globalThis.WebSocket('wss://relay.example');
+        relay.send(JSON.stringify({type: 'auth_init', role: 'terminal', device_sid: 'sid-1'}));
+        relay.receive({type: 'pair_status_ack', pair_status: 'matched'});
+        const other = new globalThis.WebSocket('wss://relay.example/ws/remote-control/window/token');
+        other.dispatchEvent({type: 'open'});
+        other.receive({type: 'window-control-ready'});
+        other.send(JSON.stringify({type: 'data', payload: {zcode_type: 'unrelated'}}));
+        other.close();
+        globalThis.__zcodeShellReportLiveness();
+        const live = findPost(page.posts, 'liveness').at(-1).data;
+        assert.strictEqual(live.inboundFrames, 1, 'only relay input is counted');
+        assert.strictEqual(live.paired, true, 'closing the window socket must not reset relay pairing');
+        globalThis.__zcodeShellSetAppForeground(false);
+        globalThis.__zcodeShellHeartbeat();
+        assert.ok(relay.sent.some(s => JSON.parse(s).type === 'pair_status_query'));
+        assert.strictEqual(other.sent.length, 1, "only the page's own window message was sent");
+    } finally { page.teardown(); }
+});
+
+test('快速交接：交还兜底最多等待 500ms', (t) => {
+    t.mock.timers.enable({apis: ['setTimeout']});
+    const page = setupPage();
+    const {reloads, restore} = stubReload();
+    try {
+        globalThis.__zcodeShellAfterCarrierReturn(8000);
+        t.mock.timers.tick(499);
+        assert.strictEqual(reloads.length, 0);
+        t.mock.timers.tick(1);
+        assert.strictEqual(reloads.length, 1, 'an old 8s caller is clamped to the 500ms budget');
+    } finally { restore(); page.teardown(); t.mock.timers.reset(); }
+});
+
+test('快速交接：旧交还定时器不能干预新的前后台窗口', (t) => {
+    t.mock.timers.enable({apis: ['setTimeout']});
+    const page = setupPage();
+    const {reloads, restore} = stubReload();
+    try {
+        globalThis.__zcodeShellAfterCarrierReturn(500);
+        globalThis.__zcodeShellSetAppForeground(false);
+        globalThis.__zcodeShellSetAppForeground(true);
+        t.mock.timers.tick(500);
+        assert.strictEqual(reloads.length, 0, 'the previous epoch cannot reload a later foreground window');
+    } finally { restore(); page.teardown(); t.mock.timers.reset(); }
 });

@@ -57,6 +57,8 @@
     var MAX_LOGICAL_FRAGMENTS = 1024;
     var MAX_CONTAINER_ITEMS = 100000;
     var MAX_VALUE_BYTES = 16 * 1024 * 1024;
+    var OBSERVED_ASSEMBLY_TTL_MS = 30000;
+    var MAX_OBSERVED_ASSEMBLIES = 16;
 
     // ChannelClient request/response type tags.
     var REQ_PROMISE = 100;
@@ -1830,7 +1832,7 @@
     RemoteClient.prototype._tryAssemble = function (payload, outbound) {
         var table = outbound ? '_observedOut' : '_observedIn';
         if (!this[table]) {
-            this[table] = {};
+            this[table] = Object.create(null);
         }
         var assemblies = this[table];
         var messageSeq = payload.messageSeq;
@@ -1838,44 +1840,84 @@
         var fragmentCount = payload.fragmentCount;
         var messageBytes = payload.messageBytes;
         var dataBase64 = payload.dataBase64;
-        if (typeof messageSeq !== 'number' || typeof fragmentIndex !== 'number' ||
-            typeof fragmentCount !== 'number' || typeof messageBytes !== 'number' ||
+        if (!Number.isInteger(messageSeq) || !Number.isInteger(fragmentIndex) ||
+            !Number.isInteger(fragmentCount) || !Number.isInteger(messageBytes) ||
             typeof dataBase64 !== 'string') {
             return null;
         }
         if (fragmentCount < 1 || fragmentCount > MAX_FRAGMENTS ||
-            messageBytes < 1 || messageBytes > MAX_MESSAGE_BYTES) {
+            fragmentIndex < 0 || fragmentIndex >= fragmentCount ||
+            messageBytes < 1 || messageBytes > MAX_MESSAGE_BYTES ||
+            dataBase64.length > Math.ceil(MAX_FRAGMENT_BYTES / 3) * 4) {
             return null;
         }
-        var assembly = assemblies[messageSeq];
-        if (!assembly || assembly.count !== fragmentCount) {
+        var nowMs = Date.now();
+        var sweepKey = table + 'SweepAt';
+        if (!this[sweepKey] || nowMs - this[sweepKey] >= 1000) {
+            Object.keys(assemblies).forEach(function (id) {
+                if (nowMs - assemblies[id].at >= OBSERVED_ASSEMBLY_TTL_MS) delete assemblies[id];
+            });
+            this[sweepKey] = nowMs;
+        }
+        // Small complete frames dominate normal traffic: no arrays or concatenation needed.
+        if (fragmentCount === 1) {
+            try {
+                var single = base64Decode(dataBase64);
+                return single.length === messageBytes ? single : null;
+            } catch (e) {
+                return null;
+            }
+        }
+        // messageSeq is only unique within a bridge/generation, not the whole socket.
+        var key = JSON.stringify([payload.bridgeSessionId || '', payload.bridgeGeneration || 0,
+            payload.recoveryId || '', messageSeq]);
+        var assembly = assemblies[key];
+        if (!assembly || assembly.count !== fragmentCount || assembly.bytes !== messageBytes) {
+            delete assemblies[key];
+            var ids = Object.keys(assemblies);
+            var reserved = ids.reduce(function (sum, id) { return sum + assemblies[id].bytes; }, 0);
+            ids.sort(function (a, b) { return assemblies[a].at - assemblies[b].at; });
+            while (ids.length >= MAX_OBSERVED_ASSEMBLIES || reserved + messageBytes > MAX_MESSAGE_BYTES) {
+                var oldest = ids.shift();
+                if (oldest === undefined) break;
+                reserved -= assemblies[oldest].bytes;
+                delete assemblies[oldest];
+            }
             assembly = {
                 count: fragmentCount,
                 bytes: messageBytes,
                 parts: new Array(fragmentCount),
                 received: 0,
-                at: Date.now()
+                receivedBytes: 0,
+                at: nowMs
             };
-            assemblies[messageSeq] = assembly;
+            assemblies[key] = assembly;
         }
-        if (assembly.parts[fragmentIndex] === undefined) {
-            assembly.received += 1;
-        }
+        if (assembly.parts[fragmentIndex] !== undefined) return null;
         try {
-            assembly.parts[fragmentIndex] = base64Decode(dataBase64);
+            var part = base64Decode(dataBase64);
+            if (part.length > MAX_FRAGMENT_BYTES || assembly.receivedBytes + part.length > messageBytes) {
+                delete assemblies[key];
+                return null;
+            }
+            assembly.parts[fragmentIndex] = part;
+            assembly.received += 1;
+            assembly.receivedBytes += part.length;
         } catch (e) {
-            delete assemblies[messageSeq];
+            delete assemblies[key];
             return null;
         }
         if (assembly.received !== fragmentCount) {
             return null;
         }
-        delete assemblies[messageSeq];
+        delete assemblies[key];
         var joined = concatBytes(assembly.parts);
         return joined.length === messageBytes ? joined : null;
     };
 
     RemoteClient.prototype.dispose = function () {
+        this._observedIn = null;
+        this._observedOut = null;
         // （曾经这里还有 `this.subscribeAll = false;`——D7 开关本身已删。）
         // （4c·2026-09-18：这里原来还重置 `_bridges`/`_bridgesById`/`_activeKeys`/
         // `_pending` 四张表。四张表已随桥路由子系统删除，重置也就无从谈起。）

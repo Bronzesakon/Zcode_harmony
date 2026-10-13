@@ -1115,3 +1115,46 @@ test('latestConversationTopic：逐帧更新，且**不要求**那帧里有正�
     client._trackConversationText(convDeltas('conversation/sess_b', []));
     assert.strictEqual(client.latestConversationTopic(), 'conversation/sess_b', '最近收到帧的 topic 胜出');
 });
+
+
+test('被动分片：不同桥的相同 messageSeq 交错到达不会串包', () => {
+    const {client} = makeClient();
+    const a = new Uint8Array(600000).fill(65);
+    const b = new Uint8Array(600000).fill(66);
+    const fa = fragment(a, 'bridge-a', 9);
+    const fb = fragment(b, 'bridge-b', 9);
+    assert.strictEqual(client._tryAssemble(fa[0], false), null);
+    assert.strictEqual(client._tryAssemble(fb[0], false), null);
+    assert.deepStrictEqual(client._tryAssemble(fa[1], false), a);
+    assert.deepStrictEqual(client._tryAssemble(fb[1], false), b);
+});
+
+test('被动分片：未完成消息按数量和总预算有界，过期后释放', (t) => {
+    t.mock.timers.enable({apis: ['Date'], now: 100000});
+    const {client} = makeClient();
+    const partial = seq => ({zcode_type: 'rpc-frame', bridgeSessionId: 'b', messageSeq: seq,
+        fragmentIndex: 0, fragmentCount: 2, messageBytes: 2, dataBase64: 'YQ=='});
+    try {
+        for (let i = 0; i < 80; i++) client._tryAssemble(partial(i), false);
+        assert.strictEqual(Object.keys(client._observedIn).length, 16);
+        const large = seq => ({...partial(seq), messageBytes: 16 * 1024 * 1024});
+        client._tryAssemble(large(90), false);
+        client._tryAssemble(large(91), false);
+        assert.strictEqual(Object.keys(client._observedIn).length, 1, 'reserved message sizes share a 16MiB budget');
+        t.mock.timers.tick(30000);
+        client._tryAssemble(partial(99), false);
+        assert.strictEqual(Object.keys(client._observedIn).length, 1, 'stale partial messages are removed');
+        client.dispose();
+        assert.strictEqual(client._observedIn, null);
+    } finally { t.mock.timers.reset(); }
+});
+
+test('被动分片：拒绝越界分片及超过声明长度的内容', () => {
+    const {client} = makeClient();
+    const base = {bridgeSessionId: 'b', messageSeq: 1, fragmentIndex: 0,
+        fragmentCount: 2, messageBytes: 2, dataBase64: 'YWJj'};
+    assert.strictEqual(client._tryAssemble({...base, fragmentIndex: -1}, false), null);
+    assert.strictEqual(client._tryAssemble({...base, fragmentIndex: 2}, false), null);
+    assert.strictEqual(client._tryAssemble(base, false), null);
+    assert.strictEqual(Object.keys(client._observedIn).length, 0);
+});

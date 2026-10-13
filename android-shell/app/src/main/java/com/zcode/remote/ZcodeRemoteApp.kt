@@ -2,7 +2,12 @@ package com.zcode.remote
 
 import android.app.Activity
 import android.app.Application
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.os.Bundle
+import androidx.core.content.ContextCompat
 import com.google.android.material.color.DynamicColors
 import com.google.android.material.color.DynamicColorsOptions
 import com.zcode.remote.core.Diagnostics
@@ -42,6 +47,22 @@ class ZcodeRemoteApp : Application() {
         ShellLog.init(this)
         ShellRuntime.init(this)
         Diagnostics.info("ZCode 远程启动")
+
+        // 熄屏/亮屏直接驱动同一交接入口，不再等 5s 巡检才发现状态变化。
+        ContextCompat.registerReceiver(
+            this,
+            object : BroadcastReceiver() {
+                override fun onReceive(context: Context, intent: Intent) {
+                    ShellRuntime.onUserPresenceChanged()
+                }
+            },
+            IntentFilter().apply {
+                addAction(Intent.ACTION_SCREEN_OFF)
+                addAction(Intent.ACTION_SCREEN_ON)
+                addAction(Intent.ACTION_USER_PRESENT)
+            },
+            ContextCompat.RECEIVER_NOT_EXPORTED,
+        )
 
         registerActivityLifecycleCallbacks(object : ActivityLifecycleCallbacks {
             private var startedActivities = 0

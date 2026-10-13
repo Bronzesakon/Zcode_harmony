@@ -84,6 +84,7 @@ class MainActivity : AppCompatActivity() {
      * 都用同一份脚本；只在首次成功读取时缓存，读失败不缓存（下次加载重试）。
      */
     private var injectionScript: String? = null
+    private var injectionRegistered = false
 
     /** Set when a notification tap asked us to locate a task. */
     private var pendingLocate: Pair<String, String>? = null
@@ -187,6 +188,15 @@ class MainActivity : AppCompatActivity() {
         // ——冷启动的第一条诊断指令会这样丢掉，偏偏冷启动正是那个重试队列存在的理由。
         // （configureWebView 已跑过，binding.webview 就绪。）
         ShellRuntime.setJsEvaluator { script -> binding.webview.evaluateJavascript(script, null) }
+        ShellRuntime.setPageReloader {
+            // 通知定位已安排带目标的重载时复用它，避免一次交还闪两次。
+            if (presetLocatePending) {
+                Diagnostics.info("快速交接：复用通知定位已安排的重载")
+            } else {
+                ShellRuntime.onPageStarted()
+                binding.webview.reload()
+            }
+        }
         // The intent may already have decided what the screen should be — asking
         // for a new link must not be undone by the automatic load right below.
         val intentHandled = handleIntent(intent)
@@ -419,7 +429,7 @@ class MainActivity : AppCompatActivity() {
      * 稳定注入：任何一次主帧加载都有三道互相独立的时机，缺哪道都兜得住——
      *   1. document-start（addDocumentStartJavaScript）：主道，抢在页面任何
      *      脚本之前，能拿到首帧 WebSocket。注册挂在 WebView 实例上、跨 loadUrl
-     *      持续生效，因此每次加载前都无条件重装一次（同脚本幂等）。
+     *      持续生效，同一实例只注册一次，避免重载累积注册。
      *   2. onPageStarted：页面开始加载即补注。document-start 因任何未知的
      *      上层/引擎形态没有生效时，这里是最早的可得时机。
      *   3. onPageFinished：加载完成再兜一道。
@@ -429,14 +439,16 @@ class MainActivity : AppCompatActivity() {
      */
     private fun ensureInjectionScript(): String? {
         injectionScript?.let { return it }
-        val script = (readAsset("zcode-protocol.js") ?: "") + "\n" + (readAsset("inject.js") ?: "")
-        if (script.isNotBlank()) {
-            injectionScript = script
-        }
-        return script.ifBlank { null }
+        val body = (readAsset("zcode-protocol.js") ?: "") + "\n" + (readAsset("inject.js") ?: "")
+        if (body.isBlank()) return null
+        // 补注已安装文档时连协议工厂也跳过，避免重复创建编码器与 CRC 表。
+        val script = "(function(){if(window.__zcodeShellInstalled)return;\n$body\n})();"
+        injectionScript = script
+        return script
     }
 
-    private fun installInjection(url: String) {
+    private fun installInjection() {
+        if (injectionRegistered) return
         val script = ensureInjectionScript()
         if (script == null) {
             Diagnostics.log("error", "注入脚本缺失，通知功能将不可用")
@@ -444,8 +456,9 @@ class MainActivity : AppCompatActivity() {
         }
         val webView = binding.webview
         if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
-            val rules = setOf(RemoteUrl.originRule(url), "https://*.$ALLOWED_ROOT")
+            val rules = setOf("https://$ALLOWED_ROOT", "https://*.$ALLOWED_ROOT")
             WebViewCompat.addDocumentStartJavaScript(webView, script, rules)
+            injectionRegistered = true
             Diagnostics.info("已安装 document-start 注入 (${rules.joinToString()})")
         } else {
             Diagnostics.log(
@@ -475,9 +488,8 @@ class MainActivity : AppCompatActivity() {
         binding.webview.visibility = View.VISIBLE
         binding.setupPanel.visibility = View.GONE
         hideError()
-        // 稳定注入：每次加载前都无条件重装 document-start 注册（同脚本幂等，
-        // 注册挂在 WebView 实例上——这里不再做 host 去重，防任何路径漏装）。
-        installInjection(url)
+        // document-start 注册跨重载保留；加载开始/完成的补注仍兜住引擎失效。
+        installInjection()
         ShellRuntime.ensureServiceRunning(this)
         binding.webview.loadUrl(url)
     }
@@ -485,7 +497,7 @@ class MainActivity : AppCompatActivity() {
     private fun reloadPage() {
         val url = prefs.remoteUrl ?: return showSetup()
         hideError()
-        installInjection(url)
+        installInjection()
         binding.webview.loadUrl(url)
     }
 
@@ -657,6 +669,7 @@ class MainActivity : AppCompatActivity() {
         pendingFileCallback = null
         // Drop the evaluator: it closes over this Activity's binding.
         ShellRuntime.setJsEvaluator(null)
+        ShellRuntime.setPageReloader(null)
         ShellRuntime.setPageStateListener(null)
         super.onDestroy()
     }
@@ -831,6 +844,7 @@ class MainActivity : AppCompatActivity() {
         ShellRuntime.onPageStarted()
         locateAttempts = 0
         presetLocatePending = true
+        ShellRuntime.expectPageReload()
         mainHandler.postDelayed({
             try {
                 binding.webview.reload()
