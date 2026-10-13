@@ -23,14 +23,14 @@ class HandoffCoverStateTest {
     }
 
     @Test
-    fun `old document and injection ready alone cannot dismiss the cover`() {
+    fun `fresh first frame returns ownership without waiting for workspace connection`() {
         val state = returning()
         state.pageReady("old")
-        assertNull(state.contentCandidate("old"))
-        assertNull(state.contentCandidate("new"))
+        assertNull(state.renderedCandidate("old"))
+        assertNull(state.renderedCandidate("new"))
         state.pageReady("new")
         assertTrue(state.visible)
-        val ticket = state.contentCandidate("new")!!
+        val ticket = state.renderedCandidate("new")!!
         assertTrue(state.visible)
         assertTrue(state.pagePresented("new", ticket))
         assertFalse(state.visible)
@@ -40,12 +40,12 @@ class HandoffCoverStateTest {
     fun `a later navigation invalidates the prior visual commit and document`() {
         val state = returning()
         state.pageReady("first")
-        val oldTicket = state.contentCandidate("first")!!
+        val oldTicket = state.renderedCandidate("first")!!
         state.pageStarted()
         state.pageReady("first")
-        assertNull(state.contentCandidate("first"))
+        assertNull(state.renderedCandidate("first"))
         state.pageReady("second")
-        val ticket = state.contentCandidate("second")!!
+        val ticket = state.renderedCandidate("second")!!
         assertFalse(state.pagePresented("first", oldTicket))
         assertFalse(state.pageFailed("first", true))
         assertTrue(state.visible)
@@ -58,7 +58,7 @@ class HandoffCoverStateTest {
         assertFalse(state.pageFailed("old", false))
         assertTrue(state.visible)
         state.pageReady("new")
-        val ticket = state.contentCandidate("new")!!
+        val ticket = state.renderedCandidate("new")!!
         assertTrue(state.pageFailed("new", true))
         assertFalse(state.pagePresented("new", ticket))
         assertFalse(state.visible)

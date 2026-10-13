@@ -360,6 +360,8 @@ function setupPage(options) {
         };
         // Every element the page would have for a class, added/removed by name.
         dom.classes = Object.create(null);
+        dom.pageRoot = new FakeElement('div');
+        document.getElementById = (id) => id === 'root' && root ? dom.pageRoot : null;
         dom.materialiseRoot = () => {
             if (!root) {
                 root = buildRoot();
@@ -1198,26 +1200,34 @@ function pageStates(posts) {
     return findPost(posts, 'pagestate').map((p) => p.data.state + '/' + p.data.theme);
 }
 
-test('handoff presentation needs both a paired relay and the mounted control view', async () => {
+test('handoff returns to the first page frame and never hides workspace connection status', async () => {
     const page = setupPage({pageState: true, media: {'(max-width: 767px)': true}});
     try {
-        page.dom.set('zcode-boot-loading', true);
         const socket = new globalThis.WebSocket('wss://relay.example');
-        socket.receive({type: 'auth_ack', pair_status: 'matched'});
         await flush();
         assert.strictEqual(findPost(page.posts, 'pagestate').at(-1).data.presentation, 'loading');
-        page.dom.set('zcode-boot-loading', false);
-        page.dom.set('bg-background-win-alt', true);
+        page.dom.set('zcode-boot-loading', true);
         FakeMutationObserver.fire();
         await flush();
-        const content = findPost(page.posts, 'pagestate').at(-1).data;
-        assert.strictEqual(content.presentation, 'content');
-        assert.strictEqual(content.documentId, findPost(page.posts, 'ready')[0].data.documentId);
-        assert.ok(content.documentId);
+        const logo = findPost(page.posts, 'pagestate').at(-1).data;
+        assert.strictEqual(logo.presentation, 'logo', 'show the page own logo as soon as it renders');
+        page.dom.set('zcode-boot-loading', false);
+        page.dom.pageRoot.appendChild(new FakeElement('section'));
+        FakeMutationObserver.fire();
+        await flush();
+        const status = findPost(page.posts, 'pagestate').at(-1).data;
+        assert.strictEqual(status.presentation, 'page', 'unpaired connection cards must already be exposed');
+        assert.strictEqual(status.state, logo.state, 'the status and logo share the boot colour, not the same cover duration');
+        assert.strictEqual(status.documentId, findPost(page.posts, 'ready')[0].data.documentId);
+        assert.ok(status.documentId);
         socket.receive({type: 'pair_status_ack', pair_status: 'waiting'});
         await flush();
-        assert.strictEqual(findPost(page.posts, 'pagestate').at(-1).data.presentation, 'loading',
-            'a paired-state change must report even when the surface colour stays the same');
+        assert.strictEqual(findPost(page.posts, 'pagestate').at(-1).data.presentation, 'page',
+            'waiting for pairing must not bring the logo cover back');
+        socket.receive({type: 'auth_ack', pair_status: 'matched'});
+        await flush();
+        assert.strictEqual(findPost(page.posts, 'pagestate').at(-1).data.presentation, 'page',
+            'workspace loading must not bring the logo cover back either');
     } finally {
         page.teardown();
     }

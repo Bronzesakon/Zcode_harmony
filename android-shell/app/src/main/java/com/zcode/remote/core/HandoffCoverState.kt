@@ -52,8 +52,8 @@ class HandoffCoverState {
         activeDocument = document
     }
 
-    /** A fresh, paired control view still needs WebView's visual commit. */
-    fun contentCandidate(document: String): Long? {
+    /** Any fresh logo or status frame gives presentation back to the page. */
+    fun renderedCandidate(document: String): Long? {
         if (!visible || !returning || !loadStarted || document.isEmpty() || document != activeDocument) return null
         candidateDocument = document
         return revision

@@ -1035,8 +1035,10 @@
                 return;
             }
             relayPaired = frame.pair_status === 'matched';
-            if (relayPaired) pageFailure = '';
-            schedulePageState();
+            if (relayPaired && pageFailure) {
+                pageFailure = '';
+                schedulePageState();
+            }
             lastPairAckAt = Date.now();
             liveness.pairAcks += 1;
             linkWindow.acks += 1;
@@ -3311,6 +3313,20 @@
     var lastPageState = '';
     var pageStateScheduled = false;
 
+    /** Release the native cover at the fresh page's first logo or React frame. */
+    function pagePresentationName(state) {
+        if (pageFailure) return pageFailure;
+        try {
+            if (document.getElementsByClassName('zcode-boot-loading').length > 0) return 'logo';
+            var root = document.getElementById && document.getElementById('root');
+            if (root && root.childElementCount > 0) return 'page';
+            if (state === 'main-header' || state === 'main-surface') return 'page';
+        } catch (e) {
+            // No rendered element yet: the native cover only fills this gap.
+        }
+        return 'loading';
+    }
+
     function pushPageState() {
         pageStateScheduled = false;
         var state = pageStateName();
@@ -3318,8 +3334,7 @@
             return;
         }
         var theme = pageThemeName();
-        var presentation = pageFailure ||
-            (relayPaired && (state === 'main-header' || state === 'main-surface') ? 'content' : 'loading');
+        var presentation = pagePresentationName(state);
         var token = state + '|' + theme + '|' + presentation;
         if (token === lastPageState) {
             return;

@@ -2045,7 +2045,7 @@ object ShellRuntime {
     }
 
     fun onHandoffPagePresented(document: String, ticket: Long) {
-        if (handoffCover.pagePresented(document, ticket)) notifyHandoffCover("新文档已配对并绘制，撤掉 logo")
+        if (handoffCover.pagePresented(document, ticket)) notifyHandoffCover("新文档首帧已绘制，交回网页自身展示")
     }
 
     fun onHandoffPageStarted() {
@@ -2066,8 +2066,8 @@ object ShellRuntime {
         val presentation = data.optString("presentation")
         mainHandler.post {
             if (document != pageDocumentId) return@post
-            if (presentation == "content") {
-                handoffCover.contentCandidate(document)?.let { ticket ->
+            if (presentation == "logo" || presentation == "page") {
+                handoffCover.renderedCandidate(document)?.let { ticket ->
                     handoffPresentationListener?.invoke(document, ticket)
                 }
             }
