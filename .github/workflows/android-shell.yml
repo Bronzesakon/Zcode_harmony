@@ -150,6 +150,15 @@ jobs:
           java-version: '17'
           cache: gradle
 
+      # The patch is build-pinned. Check the real public bundle in CI, including
+      # JavaScript syntax after transformation; no third-party bundle is shipped.
+      - name: Fetch audited remote script for history regression
+        run: |
+          curl --fail --silent --show-error --retry 2 --connect-timeout 8 --max-time 30 \
+            'https://zcode.z.ai/remote/v4/3.15.3/assets/index-BGa3KiRe.js' \
+            -o "$RUNNER_TEMP/zcode-remote-history-source.js"
+          echo "REMOTE_HISTORY_SOURCE=$RUNNER_TEMP/zcode-remote-history-source.js" >> "$GITHUB_ENV"
+
       # Version numbers, computed from the BUILD TIME (see app/build.gradle.kts):
       #   versionCode = yyMMddHH (UTC+8, Beijing — computed arithmetically the
       #     same way cst() does, no dependence on the runner's tz database).

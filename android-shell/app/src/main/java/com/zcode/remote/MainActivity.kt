@@ -44,6 +44,7 @@ import com.zcode.remote.core.PageBarState
 import com.zcode.remote.core.PageTheme
 import com.zcode.remote.core.Prefs
 import com.zcode.remote.core.RemoteUrl
+import com.zcode.remote.core.RemoteHistoryResource
 import com.zcode.remote.core.UploadMime
 import com.zcode.remote.core.enableThemeEdgeToEdge
 import com.zcode.remote.core.padForStatusBarAndIme
@@ -288,6 +289,14 @@ class MainActivity : AppCompatActivity() {
         webView.scrollBarStyle = View.SCROLLBARS_INSIDE_OVERLAY
 
         webView.webViewClient = object : WebViewClient() {
+            override fun shouldInterceptRequest(
+                view: WebView,
+                request: WebResourceRequest,
+            ): WebResourceResponse? = RemoteHistoryResource.intercept(
+                request.url.toString(), request.method,
+                request.requestHeaders.entries.firstOrNull { it.key.equals("User-Agent", true) }?.value,
+            )
+
             override fun shouldOverrideUrlLoading(
                 view: WebView,
                 request: WebResourceRequest,

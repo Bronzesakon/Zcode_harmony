@@ -1016,17 +1016,21 @@ object ShellRuntime {
         // 配对成功与应用回前台的竞态处置（Tier2Probe 在 OkHttp 线程上回调，转主线程）。
         Tier2Probe.isForegroundNow = { !userIsAway() }
         Tier2Probe.foregroundConflict = {
+            val conflictEpoch = handoff.epoch
             mainHandler.post {
-                if (!Tier2Probe.isRunning()) return@post
-                if (userIsAway()) return@post
+                // Tier2 has already stopped synchronously on its callback thread.
+                // Do not let a queued conflict recover a later foreground window.
+                if (!handoff.isCurrent(conflictEpoch, false) || userIsAway()) return@post
                 Diagnostics.log("warn", "后台原生承载：配对竞态——应用已回前台，交还并重载页面一次")
-                Tier2Probe.stop("配对成功但已回前台——立即交还")
                 carrierHandedBack = true
                 // 页面已被这次配对踢进 KICKED 终态，重载是唯一恢复手段；此时壳在前台，
                 // 原生直接重载（等效用户手动重启，只是快 7 秒）。
                 clearCarrierState()
                 stopLiveProgressPolling()
-                requestPageReload("原生配对与回前台竞态", handoff.epoch)
+                // A confirmed native match can kick a page AFTER the ordinary return
+                // reload. It is a new fault, so allow its one recovery in this epoch.
+                pageReloadEpoch = -1L
+                requestPageReload("原生配对与回前台竞态", conflictEpoch)
             }
         }
     }

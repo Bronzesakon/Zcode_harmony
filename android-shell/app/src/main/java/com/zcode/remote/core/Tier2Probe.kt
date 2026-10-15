@@ -54,10 +54,15 @@ data class RelayCreds(
  */
 object Tier2Probe {
 
+    // Protect publication/cancellation, never blocking bridge cleanup or RPC waits.
+    private val lifecycleLock = Any()
+    private val lifetime = ProbeLifetime()
+    private var foregroundRestricted = false
+
     /**
      * 握手 FSM 阶段。[Phase.CONNECTING]（[connectNow] 里赋值、`onOpen` 才转
      * [Phase.AUTHENTICATING]）是**真实状态，不是漏删**：今天没有任何分支区分它与
-     * AUTHENTICATING（`isRunning()` 把两者一视同仁），保留是为了与页面侧那台状态机
+     * AUTHENTICATING，保留是为了与页面侧那台状态机
      * 逐步镜像——少一格，将来要按阶段分支时就得回头补。
      */
     enum class Phase { IDLE, CONNECTING, AUTHENTICATING, PAIRED, CLOSED }
@@ -119,6 +124,7 @@ object Tier2Probe {
     private var stopping = false
     private var reconnectAttempt = 0
     private var durationTimer: java.util.Timer? = null
+    private var bootstrapTimer: java.util.Timer? = null
 
     /** 页面正在显示的工作区（view-state 帧用，也是默认的覆盖目标）；空串=未知。 */
     @Volatile
@@ -189,8 +195,8 @@ object Tier2Probe {
             .build()
     }
 
-    /** 探针是否持有（或正在建立）连接——接管触发与前台交还都看它。 */
-    fun isRunning(): Boolean = phase != Phase.IDLE && phase != Phase.CLOSED
+    /** Includes a disconnected persistent session waiting for its retry. */
+    fun isRunning(): Boolean = lifetime.active
 
     /**
      * M4：对话进展的出口（ShellRuntime 注入：工作区键、会话 id、文本）。
@@ -314,11 +320,14 @@ object Tier2Probe {
         coverageIsDiagnostic: Boolean = false,
         onPaired: (() -> Unit)? = null,
         onKicked: (() -> Unit)? = null,
-    ) {
+    ) = synchronized(lifecycleLock) {
         if (isRunning()) {
             Diagnostics.log("warn", "Tier2: 已在运行（phase=$phase），忽略重复启动")
-            return
+            return@synchronized
         }
+        foregroundRestricted = durationMs <= 0 && takeoverOverride == null
+        if (foregroundRestricted && isForegroundNow?.invoke() == true) return@synchronized
+        val token = lifetime.begin() ?: return@synchronized
         creds = newCreds
         this.onlyWorkspace = onlyWorkspace
         this.onlyTaskId = onlyTaskId
@@ -338,12 +347,14 @@ object Tier2Probe {
             "info",
             "Tier2: 启动原生直连探针（${if (persistent) "接管模式" else "duration=${durationMs / 1000}s"}，凭证仅内存）",
         )
-        connectNow()
+        bootstrapActiveWorkspaces = emptyList()
+        connectNow(token)
+        if (!lifetime.isCurrent(token)) return@synchronized
         if (takeoverOverride != null) {
             durationTimer = java.util.Timer(true).apply {
                 schedule(
                     object : java.util.TimerTask() {
-                        override fun run() = stop("接管验证到点")
+                        override fun run() = stopIfCurrent(token, "接管验证到点")
                     },
                     takeoverOverride,
                 )
@@ -352,7 +363,7 @@ object Tier2Probe {
             durationTimer = java.util.Timer(true).apply {
                 schedule(
                     object : java.util.TimerTask() {
-                        override fun run() = stop("duration 到点")
+                        override fun run() = stopIfCurrent(token, "duration 到点")
                     },
                     durationMs,
                 )
@@ -361,7 +372,7 @@ object Tier2Probe {
         heartbeatTimer = java.util.Timer(true).apply {
             scheduleAtFixedRate(
                 object : java.util.TimerTask() {
-                    override fun run() = sendHeartbeat()
+                    override fun run() = sendHeartbeat(token)
                 },
                 10_000L,
                 10_000L,
@@ -369,10 +380,13 @@ object Tier2Probe {
         }
     }
 
-    private fun isCurrent(webSocket: WebSocket): Boolean =
-        !stopping && phase != Phase.CLOSED && socket === webSocket
+    private fun isCurrent(token: Long, webSocket: WebSocket): Boolean =
+        lifetime.isCurrent(token) && !stopping && phase != Phase.CLOSED && socket === webSocket
 
-    private fun connectNow() {
+    /** Caller holds lifecycleLock, so a stop cannot race the connection publication. */
+    private fun connectNow(token: Long) {
+        if (!lifetime.isCurrent(token)) return
+        if (!mayAuthenticate(token)) return
         val c = creds ?: return
         phase = Phase.CONNECTING
         val url = buildString {
@@ -383,43 +397,66 @@ object Tier2Probe {
             }
         }
         val request = Request.Builder().url(url).build()
-        socket = client.newWebSocket(request, createListener(carrierPaired, carrierKicked))
+        socket = client.newWebSocket(request, createListener(token, carrierPaired, carrierKicked))
+    }
+
+    /** Authentication sends must not proceed after an early foreground signal. */
+    private fun mayAuthenticate(token: Long): Boolean {
+        if (!lifetime.isCurrent(token)) return false
+        if (!foregroundRestricted || isForegroundNow?.invoke() != true) return true
+        stop("前台已返回，取消尚未完成的原生配对")
+        return false
+    }
+
+    private fun stopIfCurrent(token: Long, reason: String) {
+        synchronized(lifecycleLock) {
+            if (lifetime.isCurrent(token)) stop(reason)
+        }
     }
 
     fun stop(reason: String) {
-        stopping = true
-        carrierPaired = null
-        carrierKicked = null
-        phase = Phase.CLOSED
-        durationTimer?.cancel()
-        durationTimer = null
-        stopCoverageRefresh()
-        heartbeatTimer?.cancel()
-        heartbeatTimer = null
-        reconnectTimer?.cancel()
-        reconnectTimer = null
-        val manager = bridgeManager
-        bridgeManager = null
-        val s = socket
-        socket = null
-        val lasted = (System.currentTimeMillis() - startedAtMs) / 1000
-        Diagnostics.log(
-            "warn",
-            "Tier2: 关闭（$reason）存活=${lasted}s 心跳=$heartbeatCount ack=$ackCount",
-        )
-        try {
-            s?.close(1000, "tier2 done")
-        } catch (e: Exception) {
-            Diagnostics.log("warn", "Tier2: close 异常 ${e.message}")
-        }
-        if (manager != null) {
-            Thread {
-                try {
-                    manager.disposeEverything(reason)
-                } catch (e: Exception) {
-                    Diagnostics.log("debug", "Tier2: 后台清理桥失败 ${e.message}")
-                }
-            }.start()
+        synchronized(lifecycleLock) {
+            if (!lifetime.active) return
+            lifetime.end()
+            stopping = true
+            persistent = false
+            carrierPaired = null
+            carrierKicked = null
+            phase = Phase.CLOSED
+            durationTimer?.cancel()
+            durationTimer = null
+            bootstrapTimer?.cancel()
+            bootstrapTimer = null
+            stopCoverageRefresh()
+            heartbeatTimer?.cancel()
+            heartbeatTimer = null
+            reconnectTimer?.cancel()
+            reconnectTimer = null
+            val manager = bridgeManager
+            bridgeManager = null
+            val s = socket
+            socket = null
+            creds = null
+            val lasted = (System.currentTimeMillis() - startedAtMs) / 1000
+            Diagnostics.log(
+                "warn",
+                "Tier2: 关闭（$reason）存活=${lasted}s 心跳=$heartbeatCount ack=$ackCount",
+            )
+            try {
+                // A graceful close may still flush a queued authentication proof and kick the page.
+                s?.cancel()
+            } catch (e: Exception) {
+                Diagnostics.log("warn", "Tier2: close 异常 ${e.message}")
+            }
+            if (manager != null) {
+                Thread {
+                    try {
+                        manager.disposeEverything(reason)
+                    } catch (e: Exception) {
+                        Diagnostics.log("debug", "Tier2: 后台清理桥失败 ${e.message}")
+                    }
+                }.start()
+            }
         }
     }
 
@@ -443,8 +480,8 @@ object Tier2Probe {
      * 顺序照页面来：先发 bootstrap，给它 1.2s 收响应（真机实测 300ms 内就回，24KB），
      * 再开桥覆盖。
      */
-    private fun sendBootstrapThenCoverage() {
-        if (stopping || phase == Phase.CLOSED || bridgeManager != null) return
+    private fun sendBootstrapThenCoverage(token: Long, webSocket: WebSocket) {
+        if (!isCurrent(token, webSocket) || phase != Phase.PAIRED || bridgeManager != null) return
         // ① 页面配对后**立刻**发的两帧（2026-09-16 01:12 抓包逐帧录下来的顺序）：
         //    mobile-diagnostic(state-transition: paired) 与 mobile-view-state-update。
         //    后者带着 `viewState.activeWorkspaceKey/activeTaskId`——**这很可能就是桌面端
@@ -460,6 +497,7 @@ object Tier2Probe {
                 .put("previousState", "authenticating")
                 .put("visibilityState", "hidden")
                 .put("online", true),
+            token, webSocket,
         )
         if (onlyWorkspace.isNotEmpty()) {
             val viewState = JSONObject()
@@ -481,6 +519,7 @@ object Tier2Probe {
                             .put("language", "zh-CN")
                             .put("timeZone", java.util.TimeZone.getDefault().id),
                     ),
+                token, webSocket,
             )
             Diagnostics.log(
                 "info",
@@ -493,55 +532,77 @@ object Tier2Probe {
             JSONObject()
                 .put("zcode_type", "bootstrap-request")
                 .put("requestId", "zcshell-bootstrap-" + java.util.UUID.randomUUID()),
+            token, webSocket,
         )
         Diagnostics.log("warn", "Tier2: 已发 bootstrap-request（补上页面配对后的第一步，1.2s 后开桥）")
-        java.util.Timer(true).schedule(
+        bootstrapTimer?.cancel()
+        val timer = java.util.Timer(true)
+        bootstrapTimer = timer
+        timer.schedule(
             object : java.util.TimerTask() {
                 override fun run() {
-                    startCoverage()
+                    startCoverage(token, webSocket)
                 }
             },
             1200L,
         )
     }
 
-    private fun startCoverage() {
-        if (stopping || phase == Phase.CLOSED || bridgeManager != null) return
-        creds ?: return
-        val manager = BridgeManager(
-            sendPayloadOut = { payload -> sendBusinessPayload(payload) },
-            onSessionsUpdate = { update ->
-                try {
-                    sessionsSink?.invoke(update)
-                } catch (e: Exception) {
-                    Diagnostics.log("warn", "Tier2: sessions 回调失败 ${e.message}")
-                }
-            },
-            onLogLine = { line -> Diagnostics.log("debug", line) },
-            progressSink = { key, sessionId, text ->
-                try {
-                    progressSink?.invoke(key, sessionId, text)
-                } catch (e: Exception) {
-                    Diagnostics.log("warn", "Tier2: 活进展回调失败 ${e.message}")
-                }
-            },
-            runningSessions = { key -> runningSessionsProvider?.invoke(key).orEmpty() },
-            turnStateSink = { key, sessionId, running ->
-                try {
-                    turnStateSink?.invoke(key, sessionId, running)
-                } catch (e: Exception) {
-                    Diagnostics.log("warn", "Tier2: 会话运行态回调失败 ${e.message}")
-                }
-            },
-            onBridgeResult = { key, ok -> recordBridgeResult(key, ok) },
-            maxWorkspaces = DEFAULT_MAX_COVERAGE,
-        )
-        bridgeManager = manager
+    private fun startCoverage(token: Long, webSocket: WebSocket) {
+        val manager = synchronized(lifecycleLock) {
+            if (!isCurrent(token, webSocket) || phase != Phase.PAIRED || bridgeManager != null) return
+            if (!mayAuthenticate(token)) return
+            bootstrapTimer?.cancel()
+            bootstrapTimer = null
+            val manager = BridgeManager(
+                // Bind every bridge, including its eventual cleanup, to this socket.
+                sendPayloadOut = { payload -> sendBusinessPayload(payload, token, webSocket) },
+                onSessionsUpdate = { update ->
+                    try {
+                        synchronized(lifecycleLock) {
+                            if (isCurrent(token, webSocket)) sessionsSink?.invoke(update)
+                        }
+                    } catch (e: Exception) {
+                        Diagnostics.log("warn", "Tier2: sessions 回调失败 ${e.message}")
+                    }
+                },
+                onLogLine = { line -> Diagnostics.log("debug", line) },
+                progressSink = { key, sessionId, text ->
+                    try {
+                        synchronized(lifecycleLock) {
+                            if (isCurrent(token, webSocket)) progressSink?.invoke(key, sessionId, text)
+                        }
+                    } catch (e: Exception) {
+                        Diagnostics.log("warn", "Tier2: 活进展回调失败 ${e.message}")
+                    }
+                },
+                runningSessions = { key ->
+                    if (isCurrent(token, webSocket)) runningSessionsProvider?.invoke(key).orEmpty() else emptyList()
+                },
+                turnStateSink = { key, sessionId, running ->
+                    try {
+                        synchronized(lifecycleLock) {
+                            if (isCurrent(token, webSocket)) turnStateSink?.invoke(key, sessionId, running)
+                        }
+                    } catch (e: Exception) {
+                        Diagnostics.log("warn", "Tier2: 会话运行态回调失败 ${e.message}")
+                    }
+                },
+                onBridgeResult = { key, ok ->
+                    synchronized(lifecycleLock) {
+                        if (isCurrent(token, webSocket)) recordBridgeResult(key, ok)
+                    }
+                },
+                maxWorkspaces = DEFAULT_MAX_COVERAGE,
+            )
+            bridgeManager = manager
+            manager
+        }
         Thread {
             try {
-                if (stopping || phase == Phase.CLOSED || bridgeManager !== manager) return@Thread
+                if (!isCurrent(token, webSocket) || bridgeManager !== manager) return@Thread
                 val workspaces = manager.listWorkspacesBlocking()
-                if (stopping || phase == Phase.CLOSED || bridgeManager !== manager) return@Thread
+                if (!isCurrent(token, webSocket) || bridgeManager !== manager) return@Thread
                 if (workspaces.isEmpty()) {
                     Diagnostics.log("warn", "Tier2: 接管模式拿到空工作区列表")
                     return@Thread
@@ -665,8 +726,11 @@ object Tier2Probe {
                     }
                 }
                 if (targets.isEmpty()) return@Thread
-                manager.beginCoverage(targets)
-                startCoverageRefresh(manager)
+                synchronized(lifecycleLock) {
+                    if (!isCurrent(token, webSocket) || bridgeManager !== manager) return@Thread
+                    manager.beginCoverage(targets)
+                    startCoverageRefresh(manager, token, webSocket)
+                }
             } catch (e: Exception) {
                 Diagnostics.log("warn", "Tier2: 覆盖启动失败 ${e.message}")
             }
@@ -687,17 +751,17 @@ object Tier2Probe {
      * （同一座桥连续被拒就别每 60s 再撞一次），③ 受**总上限**约束
      * （[BridgeManager.remainingCoverageSlots]，别让定时刷新把桥数顶过 5）。
      */
-    private fun startCoverageRefresh(manager: BridgeManager) {
+    private fun startCoverageRefresh(manager: BridgeManager, token: Long, webSocket: WebSocket) {
         stopCoverageRefresh()
         val timer = java.util.Timer("tier2-coverage-refresh", true)
         coverageTimer = timer
         timer.schedule(
             object : java.util.TimerTask() {
                 override fun run() {
-                    if (stopping || phase == Phase.CLOSED || bridgeManager !== manager) return
+                    if (!isCurrent(token, webSocket) || bridgeManager !== manager) return
                     try {
                         val workspaces = manager.listWorkspacesBlocking()
-                        if (stopping || phase == Phase.CLOSED || bridgeManager !== manager) return
+                        if (!isCurrent(token, webSocket) || bridgeManager !== manager) return
                         val covered = manager.coveredKeys()
                         val discovered = manager.discoveredActiveWorkspaces
                         val missing = discovered
@@ -739,7 +803,10 @@ object Tier2Probe {
                                 "补开桥（已覆盖 ${covered.size} 座 · 上限 $DEFAULT_MAX_COVERAGE）：" +
                                 targets.mapNotNull { workspaceKeyOf(it) }.joinToString(),
                         )
-                        manager.beginCoverage(targets)
+                        synchronized(lifecycleLock) {
+                            if (!isCurrent(token, webSocket) || bridgeManager !== manager) return
+                            manager.beginCoverage(targets)
+                        }
                     } catch (e: Exception) {
                         Diagnostics.log("debug", "Tier2: 覆盖刷新失败 ${e.message}")
                     }
@@ -785,49 +852,73 @@ object Tier2Probe {
         }
     }
 
-    private fun scheduleReconnect() {
-        if (!persistent || stopping) return
+    private fun scheduleReconnect(token: Long) {
+        if (!lifetime.isCurrent(token) || !persistent || stopping) return
+        bootstrapTimer?.cancel()
+        bootstrapTimer = null
+        stopCoverageRefresh()
+        reconnectTimer?.cancel()
         reconnectAttempt += 1
         val delayMs = 10_000L
         if (reconnectAttempt % 6 == 1) {
             Diagnostics.log("warn", "Tier2: 断线，${delayMs / 1000}s 后重连（第 $reconnectAttempt 次）")
         }
-        reconnectTimer = java.util.Timer(true).apply {
-            schedule(
-                object : java.util.TimerTask() {
-                    override fun run() {
-                        if (stopping || !persistent) return
-                        bridgeManager?.disposeEverything("重连重建")
+        val timer = java.util.Timer(true)
+        reconnectTimer = timer
+        timer.schedule(
+            object : java.util.TimerTask() {
+                override fun run() {
+                    val manager = synchronized(lifecycleLock) {
+                        if (!lifetime.isCurrent(token) || !persistent || reconnectTimer !== timer) return
+                        reconnectTimer = null
+                        timer.cancel()
+                        if (!mayAuthenticate(token)) return
+                        val old = bridgeManager
                         bridgeManager = null
-                        connectNow()
+                        old
                     }
-                },
-                delayMs,
-            )
-        }
+                    try {
+                        manager?.disposeEverything("重连重建")
+                    } catch (e: Exception) {
+                        Diagnostics.log("debug", "Tier2: 重连清理桥失败 ${e.message}")
+                    }
+                    // Cleanup can block for seconds; stop/new start may have happened meanwhile.
+                    synchronized(lifecycleLock) {
+                        if (lifetime.isCurrent(token) && persistent) connectNow(token)
+                    }
+                }
+            },
+            delayMs,
+        )
     }
 
-    private fun createListener(onPaired: (() -> Unit)?, onKicked: (() -> Unit)?) = object : WebSocketListener() {
+    private fun createListener(token: Long, onPaired: (() -> Unit)?, onKicked: (() -> Unit)?) = object : WebSocketListener() {
         override fun onOpen(webSocket: WebSocket, response: okhttp3.Response) {
-            if (!isCurrent(webSocket)) return
-            phase = Phase.AUTHENTICATING
-            val c = creds ?: return
-            val init = JSONObject().apply {
-                put("type", "auth_init")
-                put("role", "terminal")
-                put("device_sid", c.deviceSid)
-                put(
-                    "meta",
-                    JSONObject().put("platform", "web").put("version", "web").put("name", "mobile-browser"),
-                )
-                put("client_ts", System.currentTimeMillis())
+            synchronized(lifecycleLock) {
+                if (!isCurrent(token, webSocket)) {
+                    webSocket.cancel()
+                    return
+                }
+                if (!mayAuthenticate(token)) return
+                phase = Phase.AUTHENTICATING
+                val c = creds ?: return
+                val init = JSONObject().apply {
+                    put("type", "auth_init")
+                    put("role", "terminal")
+                    put("device_sid", c.deviceSid)
+                    put(
+                        "meta",
+                        JSONObject().put("platform", "web").put("version", "web").put("name", "mobile-browser"),
+                    )
+                    put("client_ts", System.currentTimeMillis())
+                }
+                webSocket.send(init.toString())
+                Diagnostics.log("warn", "Tier2: 已连接，auth_init 已发（等待质询）")
             }
-            webSocket.send(init.toString())
-            Diagnostics.log("warn", "Tier2: 已连接，auth_init 已发（等待质询）")
         }
 
         override fun onMessage(webSocket: WebSocket, text: String) {
-            if (!isCurrent(webSocket)) return
+            if (!isCurrent(token, webSocket)) return
             val frame = try {
                 JSONObject(text)
             } catch (e: Exception) {
@@ -835,135 +926,148 @@ object Tier2Probe {
             }
             when (frame.optString("type")) {
                 "auth_challenge" -> {
-                    val c = creds ?: return
-                    val nonce = frame.optString("nonce")
-                    val proof = relayProof(c.passHash, nonce, "terminal", c.deviceSid)
-                    val response = JSONObject().apply {
-                        put("type", "auth_response")
-                        put("device_sid", c.deviceSid)
-                        put("proof", proof)
-                        put("client_ts", System.currentTimeMillis())
+                    synchronized(lifecycleLock) {
+                        if (!isCurrent(token, webSocket) || !mayAuthenticate(token)) return
+                        val c = creds ?: return
+                        val nonce = frame.optString("nonce")
+                        val proof = relayProof(c.passHash, nonce, "terminal", c.deviceSid)
+                        val response = JSONObject().apply {
+                            put("type", "auth_response")
+                            put("device_sid", c.deviceSid)
+                            put("proof", proof)
+                            put("client_ts", System.currentTimeMillis())
+                        }
+                        webSocket.send(response.toString())
+                        Diagnostics.log("warn", "Tier2: 质询已应答（HMAC proof），等待配对判定")
                     }
-                    webSocket.send(response.toString())
-                    Diagnostics.log("warn", "Tier2: 质询已应答（HMAC proof），等待配对判定")
                 }
                 "auth_ack", "pair_status_ack" -> {
-                    val status = frame.optString("pair_status", "unknown")
-                    ackCount += 1
-                    if (phase != Phase.PAIRED && status == "matched") {
-                        // 竞态守卫（2026-09-27 真机 17:07 现场）：接管判定在后台做出，但配对
-                        // 完成时用户可能**已经回到前台**——relay 在 matched 这一刻把页面连接
-                        // 踢掉，页面进 KICKED 终态；而注入层"前台被顶→不自动干预"的规则会让
-                        // 它一直挂着（那次靠用户再进出一次应用、activity 重建才恢复）。
-                        // 此时唯一正确的动作：立即交还（关 socket 释放工作区）并重载页面。
-                        if (isForegroundNow?.invoke() == true) {
-                            Diagnostics.log(
-                                "warn",
-                                "Tier2: 配对成功但应用已回前台——立即交还并重载页面" +
-                                    "（接管判定做出后用户才回来的竞态）",
-                            )
-                            foregroundConflict?.invoke()
-                            return
+                    synchronized(lifecycleLock) {
+                        if (!isCurrent(token, webSocket)) return
+                        val status = frame.optString("pair_status", "unknown")
+                        ackCount += 1
+                        if (phase != Phase.PAIRED && status == "matched") {
+                            // A proof already in flight can be accepted just as the app returns.
+                            if (foregroundRestricted && isForegroundNow?.invoke() == true) {
+                                Diagnostics.log(
+                                    "warn",
+                                    "Tier2: 配对成功但应用已回前台——立即交还并重载页面" +
+                                        "（接管判定做出后用户才回来的竞态）",
+                                )
+                                stop("配对成功但已回前台——立即交还")
+                                foregroundConflict?.invoke()
+                                return
+                            }
+                            phase = Phase.PAIRED
+                            onPaired?.invoke()
+                            if (persistent) {
+                                Diagnostics.log(
+                                    "warn",
+                                    "Tier2: ★接管配对成功（matched）——页面连接已被顶掉，开始桥覆盖",
+                                )
+                            } else {
+                                Diagnostics.log(
+                                    "warn",
+                                    "Tier2: ★配对成功（matched）——实验模式，同时开桥覆盖（验证 M3b/c 解码）",
+                                )
+                            }
+                            sendBootstrapThenCoverage(token, webSocket)
                         }
-                        phase = Phase.PAIRED
-                        onPaired?.invoke()
-                        if (persistent) {
-                            Diagnostics.log(
-                                "warn",
-                                "Tier2: ★接管配对成功（matched）——页面连接已被顶掉，开始桥覆盖",
-                            )
-                        } else {
-                            Diagnostics.log(
-                                "warn",
-                                "Tier2: ★配对成功（matched）——实验模式，同时开桥覆盖（验证 M3b/c 解码）",
-                            )
-                        }
-                        sendBootstrapThenCoverage()
                     }
                 }
                 "data" -> {
-                    // 业务帧路由（M3b）：rpc-frame / 桥开启应答 / 工作区列表应答。
+                    // Keep potentially large bridge decoding outside the lifecycle lock.
                     val payload = frame.optJSONObject("payload") ?: return
                     val kind = payload.optString("zcode_type")
-                    if (kind.startsWith("bootstrap")) {
-                        // 只记大小与类型：bootstrap 响应可能带凭证，**原文绝不落日志**。
-                        Diagnostics.log(
-                            "info",
-                            "Tier2: 收到 $kind（${text.length} 字符）",
-                        )
-                        if (kind == "bootstrap-response") {
-                            // 定向接管的发现链（主源）：这条响应里 `result.tasks` 是 schema **必填**，
-                            // 每次 24–25 KB，之前只记了大小没解析。摘要只落"状态 + 工作区键"。
-                            val result = payload.optJSONObject("result")
-                            Diagnostics.log("info", RelayTaskDigest.describe(result, "bootstrap"))
-                            Diagnostics.log("info", RelayTaskDigest.shapeOf(result))
-                            bootstrapActiveWorkspaces = RelayTaskDigest.activeWorkspaces(result)
+                    val manager = synchronized(lifecycleLock) {
+                        if (!isCurrent(token, webSocket)) return
+                        if (kind.startsWith("bootstrap")) {
+                            // Bootstrap can contain credentials; never log the raw response.
+                            Diagnostics.log("info", "Tier2: 收到 $kind（${text.length} 字符）")
+                            if (kind == "bootstrap-response") {
+                                val result = payload.optJSONObject("result")
+                                Diagnostics.log("info", RelayTaskDigest.describe(result, "bootstrap"))
+                                Diagnostics.log("info", RelayTaskDigest.shapeOf(result))
+                                bootstrapActiveWorkspaces = RelayTaskDigest.activeWorkspaces(result)
+                            }
                         }
+                        bridgeManager
                     }
-                    bridgeManager?.acceptRelayPayload(payload)
+                    manager?.acceptRelayPayload(payload)
                 }
                 "error" -> {
-                    if (frame.optString("code") == "KICKED") onKicked?.invoke()
-                    Diagnostics.log(
-                        "warn",
-                        "Tier2: 服务端 error code=${frame.optString("code")} " +
-                            "msg=${frame.optString("message").take(80)}",
-                    )
+                    synchronized(lifecycleLock) {
+                        if (!isCurrent(token, webSocket)) return
+                        if (frame.optString("code") == "KICKED") onKicked?.invoke()
+                        Diagnostics.log(
+                            "warn",
+                            "Tier2: 服务端 error code=${frame.optString("code")} " +
+                                "msg=${frame.optString("message").take(80)}",
+                        )
+                    }
                 }
             }
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: okhttp3.Response?) {
-            if (!isCurrent(webSocket)) return
-            phase = Phase.CLOSED
-            Diagnostics.log("warn", "Tier2: 连接失败 ${t.javaClass.simpleName}: ${t.message?.take(120)}")
-            scheduleReconnect()
+            synchronized(lifecycleLock) {
+                if (!isCurrent(token, webSocket)) return
+                phase = Phase.CLOSED
+                socket = null
+                Diagnostics.log("warn", "Tier2: 连接失败 ${t.javaClass.simpleName}: ${t.message?.take(120)}")
+                scheduleReconnect(token)
+            }
         }
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-            if (!isCurrent(webSocket)) return
-            phase = Phase.CLOSED
-            Diagnostics.log("warn", "Tier2: 对端关闭 code=$code reason=${reason.take(60)}")
-            scheduleReconnect()
+            synchronized(lifecycleLock) {
+                if (!isCurrent(token, webSocket)) return
+                phase = Phase.CLOSED
+                socket = null
+                Diagnostics.log("warn", "Tier2: 对端关闭 code=$code reason=${reason.take(60)}")
+                scheduleReconnect(token)
+            }
         }
 
         override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
-            if (!isCurrent(webSocket)) return
+            if (!isCurrent(token, webSocket)) return
             // relay 终端协议是 JSON 文本帧；二进制帧出现即记录不处理。
             Diagnostics.log("debug", "Tier2: 收到二进制帧 ${bytes.size}B（忽略）")
         }
     }
 
-    private fun sendBusinessPayload(payload: JSONObject) {
-        val s = socket ?: run {
-            Diagnostics.log("warn", "Tier2: 无 socket，业务帧丢弃 ${payload.optString("zcode_type")}")
-            return
-        }
-        val envelope = JSONObject()
-            .put("type", "data")
-            .put("payload", payload)
-            .put("client_ts", System.currentTimeMillis())
-        try {
-            s.send(envelope.toString())
-        } catch (e: Exception) {
-            Diagnostics.log("warn", "Tier2: 业务帧发送失败 ${e.message}")
+    private fun sendBusinessPayload(payload: JSONObject, token: Long, webSocket: WebSocket) {
+        synchronized(lifecycleLock) {
+            if (!isCurrent(token, webSocket) || phase != Phase.PAIRED) return
+            val envelope = JSONObject()
+                .put("type", "data")
+                .put("payload", payload)
+                .put("client_ts", System.currentTimeMillis())
+            try {
+                webSocket.send(envelope.toString())
+            } catch (e: Exception) {
+                Diagnostics.log("warn", "Tier2: 业务帧发送失败 ${e.message}")
+            }
         }
     }
 
-    private fun sendHeartbeat() {
-        val s = socket ?: return
-        val c = creds ?: return
-        if (phase != Phase.PAIRED && phase != Phase.AUTHENTICATING) return
-        heartbeatCount += 1
-        val q = JSONObject().apply {
-            put("type", "pair_status_query")
-            put("device_sid", c.deviceSid)
-            put("client_ts", System.currentTimeMillis())
-        }
-        try {
-            s.send(q.toString())
-        } catch (e: Exception) {
-            Diagnostics.log("warn", "Tier2: 心跳发送失败 ${e.message}")
+    private fun sendHeartbeat(token: Long) {
+        synchronized(lifecycleLock) {
+            if (!lifetime.isCurrent(token)) return
+            val s = socket ?: return
+            val c = creds ?: return
+            if (phase != Phase.PAIRED && phase != Phase.AUTHENTICATING) return
+            heartbeatCount += 1
+            val q = JSONObject().apply {
+                put("type", "pair_status_query")
+                put("device_sid", c.deviceSid)
+                put("client_ts", System.currentTimeMillis())
+            }
+            try {
+                s.send(q.toString())
+            } catch (e: Exception) {
+                Diagnostics.log("warn", "Tier2: 心跳发送失败 ${e.message}")
+            }
         }
     }
 }
